@@ -1,4 +1,3 @@
-
 from base64 import b64decode as base64_b64decode
 from json import loads as json_loads
 from datetime import datetime
@@ -27,8 +26,6 @@ class HTTPClient():
                 except Exception as e:
                     await session.close()
                     return None
-
-
 
 
 class Route:

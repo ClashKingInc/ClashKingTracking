@@ -6,7 +6,7 @@ from collections import deque
 from redis import asyncio as redis
 from .config import Config
 from .track import main
-from ..utils import create_keys
+from ..utility import create_keys
 
 
 if __name__ == "__main__":

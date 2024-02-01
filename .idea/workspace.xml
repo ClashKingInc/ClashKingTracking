@@ -1,35 +1,81 @@
 <?xml version="1.0" encoding="UTF-8"?>
 <project version="4">
+  <component name="AutoImportSettings">
+    <option name="autoReloadType" value="SELECTIVE" />
+  </component>
   <component name="ChangeListManager">
     <list default="true" id="e7096e79-455b-4aa3-858d-e2defd65b8a9" name="Changes" comment="">
-      <change beforePath="$PROJECT_DIR$/main.py" beforeDir="false" afterPath="$PROJECT_DIR$/main.py" afterDir="false" />
+      <change afterPath="$PROJECT_DIR$/utility/classes.py" afterDir="false" />
+      <change afterPath="$PROJECT_DIR$/utility/config.py" afterDir="false" />
+      <change beforePath="$PROJECT_DIR$/.gitignore" beforeDir="false" afterPath="$PROJECT_DIR$/.gitignore" afterDir="false" />
+      <change beforePath="$PROJECT_DIR$/.idea/misc.xml" beforeDir="false" afterPath="$PROJECT_DIR$/.idea/misc.xml" afterDir="false" />
+      <change beforePath="$PROJECT_DIR$/.idea/workspace.xml" beforeDir="false" afterPath="$PROJECT_DIR$/.idea/workspace.xml" afterDir="false" />
+      <change beforePath="$PROJECT_DIR$/Bot/clash.py" beforeDir="false" afterPath="$PROJECT_DIR$/local/clash.py" afterDir="false" />
+      <change beforePath="$PROJECT_DIR$/Bot/events/clan_events.py" beforeDir="false" afterPath="$PROJECT_DIR$/local/events/clan_events.py" afterDir="false" />
+      <change beforePath="$PROJECT_DIR$/Bot/events/raid_events.py" beforeDir="false" afterPath="$PROJECT_DIR$/local/events/raid_events.py" afterDir="false" />
+      <change beforePath="$PROJECT_DIR$/Bot/events/war_events.py" beforeDir="false" afterPath="$PROJECT_DIR$/local/events/war_events.py" afterDir="false" />
+      <change beforePath="$PROJECT_DIR$/Bot/main.py" beforeDir="false" afterPath="$PROJECT_DIR$/local/main.py" afterDir="false" />
+      <change beforePath="$PROJECT_DIR$/Bot/settings.py" beforeDir="false" afterPath="$PROJECT_DIR$/local/settings.py" afterDir="false" />
+      <change beforePath="$PROJECT_DIR$/Bot/sockets.py" beforeDir="false" afterPath="$PROJECT_DIR$/local/sockets.py" afterDir="false" />
+      <change beforePath="$PROJECT_DIR$/all_players.py" beforeDir="false" afterPath="$PROJECT_DIR$/global/all_players.py" afterDir="false" />
+      <change beforePath="$PROJECT_DIR$/bot_clan_tracking.py" beforeDir="false" afterPath="$PROJECT_DIR$/bot/bot_clan_tracking.py" afterDir="false" />
+      <change beforePath="$PROJECT_DIR$/clan_verifier.py" beforeDir="false" afterPath="$PROJECT_DIR$/global/clan_verifier.py" afterDir="false" />
+      <change beforePath="$PROJECT_DIR$/findclans.py" beforeDir="false" afterPath="$PROJECT_DIR$/global/findclans.py" afterDir="false" />
+      <change beforePath="$PROJECT_DIR$/legends.py" beforeDir="false" afterPath="$PROJECT_DIR$/global/legends.py" afterDir="false" />
+      <change beforePath="$PROJECT_DIR$/old_player_tracking.py" beforeDir="false" afterPath="$PROJECT_DIR$/bot/old_player_tracking.py" afterDir="false" />
+      <change beforePath="$PROJECT_DIR$/player/config.py" beforeDir="false" afterPath="$PROJECT_DIR$/bot/player/config.py" afterDir="false" />
+      <change beforePath="$PROJECT_DIR$/player/main.py" beforeDir="false" />
+      <change beforePath="$PROJECT_DIR$/player/track.py" beforeDir="false" afterPath="$PROJECT_DIR$/bot/player/track.py" afterDir="false" />
+      <change beforePath="$PROJECT_DIR$/player/utils.py" beforeDir="false" afterPath="$PROJECT_DIR$/bot/player/utils.py" afterDir="false" />
+      <change beforePath="$PROJECT_DIR$/player_tracking.py" beforeDir="false" afterPath="$PROJECT_DIR$/bot/player_tracking.py" afterDir="false" />
+      <change beforePath="$PROJECT_DIR$/requirements.txt" beforeDir="false" afterPath="$PROJECT_DIR$/requirements.txt" afterDir="false" />
+      <change beforePath="$PROJECT_DIR$/scheduled.py" beforeDir="false" afterPath="$PROJECT_DIR$/global/scheduled.py" afterDir="false" />
+      <change beforePath="$PROJECT_DIR$/store.py" beforeDir="false" />
+      <change beforePath="$PROJECT_DIR$/test_kafka.py" beforeDir="false" />
+      <change beforePath="$PROJECT_DIR$/utils.py" beforeDir="false" afterPath="$PROJECT_DIR$/utility/utils.py" afterDir="false" />
+      <change beforePath="$PROJECT_DIR$/war_finder.py" beforeDir="false" afterPath="$PROJECT_DIR$/global/war_finder.py" afterDir="false" />
     </list>
     <option name="SHOW_DIALOG" value="false" />
     <option name="HIGHLIGHT_CONFLICTS" value="true" />
     <option name="HIGHLIGHT_NON_ACTIVE_CHANGELIST" value="false" />
     <option name="LAST_RESOLUTION" value="IGNORE" />
   </component>
+  <component name="FileTemplateManagerImpl">
+    <option name="RECENT_TEMPLATES">
+      <list>
+        <option value="Python Script" />
+      </list>
+    </option>
+  </component>
   <component name="Git.Settings">
     <option name="RECENT_GIT_ROOT_PATH" value="$PROJECT_DIR$" />
   </component>
-  <component name="ProjectColorInfo"><![CDATA[{
-  "associatedIndex": 7
-}]]></component>
+  <component name="ProjectColorInfo">{
+  &quot;associatedIndex&quot;: 7
+}</component>
   <component name="ProjectId" id="2beiDRG1ImkxrjJJHVITgZlz8pg" />
   <component name="ProjectLevelVcsManager" settingsEditedManually="true" />
   <component name="ProjectViewState">
     <option name="hideEmptyMiddlePackages" value="true" />
     <option name="showLibraryContents" value="true" />
   </component>
-  <component name="PropertiesComponent"><![CDATA[{
-  "keyToString": {
-    "RunOnceActivity.OpenProjectViewOnStart": "true",
-    "RunOnceActivity.ShowReadmeOnStart": "true",
-    "git-widget-placeholder": "master"
+  <component name="PropertiesComponent">{
+  &quot;keyToString&quot;: {
+    &quot;RunOnceActivity.OpenProjectViewOnStart&quot;: &quot;true&quot;,
+    &quot;RunOnceActivity.ShowReadmeOnStart&quot;: &quot;true&quot;,
+    &quot;git-widget-placeholder&quot;: &quot;master&quot;
   }
-}]]></component>
+}</component>
+  <component name="RecentsManager">
+    <key name="MoveFile.RECENT_KEYS">
+      <recent name="C:\Users\matth\PycharmProjects\clashkingtracking\bot" />
+      <recent name="C:\Users\matth\PycharmProjects\clashkingtracking\global" />
+      <recent name="C:\Users\matth\PycharmProjects\clashkingtracking\utils" />
+      <recent name="C:\Users\matth\PycharmProjects\clashkingtracking" />
+    </key>
+  </component>
   <component name="RunManager">
-    <configuration name="main" type="PythonConfigurationType" factoryName="Python" nameIsGenerated="true">
+    <configuration name="player_tracking" type="PythonConfigurationType" factoryName="Python" nameIsGenerated="true">
       <module name="clashkingtracking" />
       <option name="ENV_FILES" value="" />
       <option name="INTERPRETER_OPTIONS" value="" />
@@ -42,7 +88,7 @@
       <option name="IS_MODULE_SDK" value="true" />
       <option name="ADD_CONTENT_ROOTS" value="true" />
       <option name="ADD_SOURCE_ROOTS" value="true" />
-      <option name="SCRIPT_NAME" value="$PROJECT_DIR$/main.py" />
+      <option name="SCRIPT_NAME" value="C:\Users\matth\PycharmProjects\clashkingtracking\bot\player_tracking.py" />
       <option name="PARAMETERS" value="" />
       <option name="SHOW_COMMAND_LINE" value="false" />
       <option name="EMULATE_TERMINAL" value="false" />
@@ -69,16 +115,5 @@
       <updated>1706581825121</updated>
     </task>
     <servers />
-  </component>
-  <component name="XDebuggerManager">
-    <breakpoint-manager>
-      <breakpoints>
-        <line-breakpoint enabled="true" suspend="THREAD" type="python-line">
-          <url>file://$PROJECT_DIR$/main.py</url>
-          <line>8</line>
-          <option name="timeStamp" value="1" />
-        </line-breakpoint>
-      </breakpoints>
-    </breakpoint-manager>
   </component>
 </project>
