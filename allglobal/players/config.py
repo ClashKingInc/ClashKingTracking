@@ -3,9 +3,9 @@ from dataclasses import dataclass
 
 
 @dataclass
-class BotPlayerTrackingConfig(Config):
+class GlobalPlayerTrackingConfig(Config):
     min_coc_email = 11
-    max_coc_email = 20
+    max_coc_email = 18
     redis_max_connections = 2500
 
     secondary_loop_change = 15
