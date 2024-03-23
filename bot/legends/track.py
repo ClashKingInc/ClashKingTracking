@@ -95,7 +95,7 @@ async def main():
                         diff_attacks = response["attackWins"] - previous_response["attackWins"]
 
                         json_data = {"types": ["legends"], "old_player": previous_response, "new_player": response, "timestamp": int(pend.now(tz=pend.UTC).timestamp())}
-                        if clan_tag in clan_tags:
+                        if response.get("clan", {}).get("tag", "None") in clan_tags:
                             producer.send(topic="player", value=orjson.dumps(json_data), timestamp_ms=int(pend.now(tz=pend.UTC).timestamp()) * 1000)
 
                         if diff_trophies <= - 1:
