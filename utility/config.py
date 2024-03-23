@@ -15,7 +15,18 @@ class Config:
     redis_pw = getenv("REDIS_PW")
 
     #tracking_type = getenv("TYPE")
-    tracking_type = "GLOBALPLAYER"
+    tracking_type = "BOTLEGENDS"
+
+
+master_api_config = {
+    "bot_clan" : (11, 18),
+    "bot_player" : (11, 18),
+    "bot_legends" : (11, 18),
+    "global_clan_find" : (11, 18),
+    "global_clan_verify" : (11, 18),
+    "global_scheduled" : (11, 18),
+    "global_war" : (11, 18)
+}
 
 
 

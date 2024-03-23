@@ -1,9 +1,13 @@
 import asyncio
 from utility.config import Config
+
 from bot.player.track import main as bot_player_main
 from bot.clan.track import main as bot_clan_main
-from allglobal.clan_verify.track import main as clan_verify_main
-from allglobal.players.track import broadcast as global_player_main
+from bot.legends.track import main as bot_legend_main
+
+from gamewide.clan_verify.track import main as clan_verify_main
+from gamewide.players.track import broadcast as global_player_main
+
 '''
 11-20 - player tracking
 21-25 - clan finder
@@ -23,6 +27,8 @@ if __name__ == "__main__":
         task = clan_verify_main
     elif config.tracking_type == "GLOBALPLAYER":
         task = global_player_main
+    elif config.tracking_type == "BOTLEGENDS":
+        task = bot_legend_main
     else:
         task = asyncio.sleep(10)
 
