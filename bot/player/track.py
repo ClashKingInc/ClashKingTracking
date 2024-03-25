@@ -138,7 +138,7 @@ async def main():
                                          "clanCapitalContributions", "Games Champion"}
                         ws_types = {"clanCapitalContributions", "name", "troops", "heroes", "spells", "heroEquipment",
                                     "townHallLevel",
-                                    "league", "trophies", "Most Valuable Clanmate"}
+                                    "league", "Most Valuable Clanmate"}
                         only_once = {"troops": 0, "heroes": 0, "spells": 0, "heroEquipment": 0}
                         if changes:
                             def recursive_defaultdict():
@@ -234,9 +234,6 @@ async def main():
                                     BEEN_ONLINE = True
 
                                 if type_ in ws_types:
-                                    if type_ == "trophies":
-                                        if not (value >= 4900 and league == "Legend League"):
-                                            continue
                                     type_changes.append(type_)
 
                             if type_changes and (clan_tag in clan_tags):
