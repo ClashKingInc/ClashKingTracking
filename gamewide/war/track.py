@@ -40,8 +40,6 @@ in_war = set()
 async def broadcast(scheduler: AsyncIOScheduler):
     global in_war
     x = 1
-    logger.info(config.min_coc_email, config.max_coc_email, config.coc_email)
-
     keys = await create_keys([config.coc_email.format(x=x) for x in range(config.min_coc_email, config.max_coc_email + 1)], [config.coc_password] * config.max_coc_email)
 
     while True:
@@ -79,7 +77,7 @@ async def broadcast(scheduler: AsyncIOScheduler):
             combined_tags = set(opponent_side_tags + clan_side_tags)
             all_tags = [tag for tag in all_tags if tag in combined_tags]
 
-        logger.info(len(all_tags))
+        logger.info(f"{len(all_tags)} tags")
         all_tags = [all_tags[i:i + size_break] for i in range(0, len(all_tags), size_break)]
         ones_that_tried_again = []
 
