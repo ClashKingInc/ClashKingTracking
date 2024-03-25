@@ -13,7 +13,7 @@ from pymongo import UpdateOne, InsertOne
 from utility.classes import MongoDatabase
 from .config import BotPlayerTrackingConfig
 from collections import defaultdict
-from utility.utils import gen_season_date, gen_raid_date, gen_games_season, gen_legend_date
+from utility.utils import gen_season_date, gen_raid_date, gen_games_season
 
 
 async def main():

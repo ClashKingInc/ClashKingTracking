@@ -1,126 +1,24 @@
-import os
-from base64 import b64decode as base64_b64decode
-from json import loads as json_loads
-from datetime import datetime
-from dotenv import dotenv_values, load_dotenv
-from msgspec.json import decode
-from msgspec import Struct
-from pymongo import  InsertOne, UpdateOne
-from apscheduler.schedulers.asyncio import AsyncIOScheduler
-from pytz import utc
-from typing import List
-
-import pymongo
-import motor.motor_asyncio
 import collections
 import aiohttp
 import asyncio
 import coc
-import string
-import random
+import pendulum as pend
 
-load_dotenv()
-keys = []
+from hashids import Hashids
+from datetime import datetime
+from msgspec.json import decode
+from msgspec import Struct
+from pymongo import  InsertOne, UpdateOne
+from apscheduler.schedulers.asyncio import AsyncIOScheduler
+from typing import List
+from utility.classes import MongoDatabase
+from .config import GlobalWarTrackingConfig
+from utility.keycreation import create_keys
 
-client = motor.motor_asyncio.AsyncIOMotorClient(os.getenv("DB_LOGIN"))
-looper = client.looper
-clan_tags = looper.clan_tags
-clan_wars = looper.clan_war
-warhits = looper.warhits
-war_timer = looper.war_timer
-
-db_client = motor.motor_asyncio.AsyncIOMotorClient(os.getenv("STATIC_DB_LOGIN"))
-clan_db = db_client.usafam.clans
-
-scheduler = AsyncIOScheduler(timezone=utc)
-scheduler.start()
-
-emails = []
-passwords = []
-#26-29 (30)
-for x in range(26,30):
-    emails.append(f"apiclashofclans+test{x}@gmail.com")
-    passwords.append(os.getenv("COC_PASSWORD"))
-
-#31-37 (38)
-for x in range(31,38):
-    emails.append(f"apiclashofclans+test{x}@gmail.com")
-    passwords.append(os.getenv("COC_PASSWORD"))
-
+config = GlobalWarTrackingConfig()
+db_client = MongoDatabase(stats_db_connection=config.stats_mongodb, static_db_connection=config.static_mongodb)
 coc_client = coc.Client(key_count=10, throttle_limit=30, cache_max_size=0, raw_attribute=True)
 
-async def get_keys(emails: list, passwords: list, key_names: str, key_count: int):
-    total_keys = []
-
-    for count, email in enumerate(emails):
-        _keys = []
-        password = passwords[count]
-
-        session = aiohttp.ClientSession()
-
-        body = {"email": email, "password": password}
-        resp = await session.post("https://developer.clashofclans.com/api/login", json=body)
-        if resp.status == 403:
-            raise RuntimeError(
-                f"Invalid Credentials, {email} | {password}"
-            )
-
-        resp_paylaod = await resp.json()
-        ip = json_loads(base64_b64decode(resp_paylaod["temporaryAPIToken"].split(".")[1] + "====").decode("utf-8"))[
-            "limits"][1]["cidrs"][0].split("/")[0]
-
-        resp = await session.post("https://developer.clashofclans.com/api/apikey/list")
-        keys = (await resp.json())["keys"]
-        _keys.extend(key["key"] for key in keys if key["name"] == key_names and ip in key["cidrRanges"])
-
-        for key in (k for k in keys if ip not in k["cidrRanges"]):
-            await session.post("https://developer.clashofclans.com/api/apikey/revoke", json={"id": key["id"]})
-
-        print(len(_keys))
-        while len(_keys) < key_count:
-            data = {
-                "name": key_names,
-                "description": "Created on {}".format(datetime.now().strftime("%c")),
-                "cidrRanges": [ip],
-                "scopes": ["clash"],
-            }
-            resp = await session.post("https://developer.clashofclans.com/api/apikey/create", json=data)
-            key = await resp.json()
-            _keys.append(key["key"]["key"])
-
-        if len(keys) == 10 and len(_keys) < key_count:
-            print("%s keys were requested to be used, but a maximum of %s could be "
-                  "found/made on the developer site, as it has a maximum of 10 keys per account. "
-                  "Please delete some keys or lower your `key_count` level."
-                  "I will use %s keys for the life of this client.", )
-
-        if len(_keys) == 0:
-            raise RuntimeError(
-                "There are {} API keys already created and none match a key_name of '{}'."
-                "Please specify a key_name kwarg, or go to 'https://developer.clashofclans.com' to delete "
-                "unused keys.".format(len(keys), key_names)
-            )
-
-        await session.close()
-        #print("Successfully initialised keys for use.")
-        for k in _keys:
-            total_keys.append(k)
-
-    print(len(total_keys))
-    return (total_keys)
-
-def create_keys():
-    done = False
-    while done is False:
-        try:
-            loop = asyncio.get_event_loop()
-            keys = loop.run_until_complete(get_keys(emails=emails,
-                                     passwords=passwords, key_names="test", key_count=10))
-            done = True
-            return keys
-        except Exception as e:
-            done = False
-            print(e)
 
 class Members(Struct):
     tag: str
@@ -139,9 +37,13 @@ class War(Struct):
 
 in_war = set()
 
-async def broadcast(keys):
+async def broadcast(scheduler: AsyncIOScheduler):
     global in_war
     x = 1
+    print(config.min_coc_email, config.max_coc_email, config.coc_email)
+
+    keys = await create_keys([config.coc_email.format(x=x) for x in range(config.min_coc_email, config.max_coc_email + 1)], [config.coc_password] * config.max_coc_email)
+
     while True:
         async def fetch(url, session: aiohttp.ClientSession, headers, tag):
             async with session.get(url, headers=headers) as response:
@@ -153,9 +55,9 @@ async def broadcast(keys):
 
 
         pipeline = [{"$match": {"openWarLog": True}}, {"$group": {"_id": "$tag"}}]
-        all_tags = [x["_id"] for x in (await clan_tags.aggregate(pipeline).to_list(length=None))]
+        all_tags = [x["_id"] for x in (await db_client.global_clans.aggregate(pipeline).to_list(length=None))]
         size_break = 50000
-        bot_clan_tags = await clan_db.distinct("tag")
+        bot_clan_tags = await db_client.clans_db.distinct("tag")
         all_tags = [tag for tag in all_tags if tag not in in_war] + bot_clan_tags
         all_tags = list(set(all_tags))
 
@@ -164,16 +66,16 @@ async def broadcast(keys):
             one_week_ago = int(right_now) - 604800
 
             try:
-                clan_side_tags = await clan_wars.distinct("data.clan.tag", filter={"endTime": {"$gte" : one_week_ago}})
+                clan_side_tags = await db_client.clan_wars.distinct("data.clan.tag", filter={"endTime": {"$gte" : one_week_ago}})
             except Exception:
                 pipeline = [{"$match": {"endTime": {"$gte": one_week_ago}}}, {"$group": {"_id": "$data.clan.tag"}}]
-                clan_side_tags = [x["_id"] for x in (await clan_wars.aggregate(pipeline).to_list(length=None))]
+                clan_side_tags = [x["_id"] for x in (await db_client.clan_wars.aggregate(pipeline).to_list(length=None))]
 
             try:
-                opponent_side_tags = await clan_wars.distinct("data.opponent.tag", filter={"endTime": {"$gte" : one_week_ago}})
+                opponent_side_tags = await db_client.clan_wars.distinct("data.opponent.tag", filter={"endTime": {"$gte" : one_week_ago}})
             except Exception:
                 pipeline = [{"$match": {"endTime": {"$gte": one_week_ago}}}, {"$group": {"_id": "$data.opponent.tag"}}]
-                opponent_side_tags = [x["_id"] for x in (await clan_wars.aggregate(pipeline).to_list(length=None))]
+                opponent_side_tags = [x["_id"] for x in (await db_client.clan_wars.aggregate(pipeline).to_list(length=None))]
             combined_tags = set(opponent_side_tags + clan_side_tags)
             all_tags = [tag for tag in all_tags if tag in combined_tags]
 
@@ -186,7 +88,6 @@ async def broadcast(keys):
             print(f"Group {count}/{len(all_tags)}")
             tasks = []
             connector = aiohttp.TCPConnector(limit=500, ttl_dns_cache=600)
-            keys = collections.deque(keys)
             async with aiohttp.ClientSession(connector=connector) as session:
                 for tag in tag_group:
                     keys.rotate(1)
@@ -208,7 +109,7 @@ async def broadcast(keys):
 
                 if war.state != "notInWar":
                     war_end = coc.Timestamp(data=war.endTime)
-                    run_time = war_end.time.replace(tzinfo=utc)
+                    run_time = war_end.time.replace(tzinfo=pend.UTC)
                     if war_end.seconds_until < 0:
                         continue
                     war_prep = coc.Timestamp(data=war.preparationStartTime)
@@ -220,7 +121,7 @@ async def broadcast(keys):
                         war_timers.append(UpdateOne({"_id" : member.tag}, {"$set" : {"clans" : [war.clan.tag, war.opponent.tag], "time" : war_end.time}}, upsert=True))
                     changes.append(InsertOne({"war_id" : war_unique_id,
                                               "clans" : [tag, opponent_tag],
-                                              "endTime" : int(war_end.time.replace(tzinfo=utc).timestamp())
+                                              "endTime" : int(war_end.time.replace(tzinfo=pend.UTC).timestamp())
                                               }))
                     #schedule getting war
                     try:
@@ -231,13 +132,13 @@ async def broadcast(keys):
                         pass
             if changes:
                 try:
-                    await clan_wars.bulk_write(changes, ordered=False)
+                    await db_client.clan_wars.bulk_write(changes, ordered=False)
                 except Exception:
                     pass
 
             if war_timers:
                 try:
-                    await war_timer.bulk_write(war_timers, ordered=False)
+                    await db_client.war_timer.bulk_write(war_timers, ordered=False)
                 except Exception:
                     pass
 
@@ -247,6 +148,8 @@ async def broadcast(keys):
 
 async def store_war(clan_tag: str, opponent_tag: str, prep_time: int):
     global in_war
+    hashids = Hashids(min_length=7)
+    print("storing war")
 
     if clan_tag in in_war:
         in_war.remove(clan_tag)
@@ -299,28 +202,22 @@ async def store_war(clan_tag: str, opponent_tag: str, prep_time: int):
 
     war_unique_id = "-".join(sorted([war.clan.tag, war.opponent.tag])) + f"-{int(war.preparation_start_time.time.timestamp())}"
 
-    war_result = await clan_wars.find_one({"war_id" : war_unique_id})
+    war_result = await db_client.clan_wars.find_one({"war_id" : war_unique_id})
     if war_result.get("data") is not None:
         return
 
-    source = string.ascii_letters
-    custom_id = str(''.join((random.choice(source) for i in range(6)))).upper()
-    is_used = await clan_wars.find_one({"custom_id": custom_id})
-    while is_used is not None:
-        custom_id = str(''.join((random.choice(source) for i in range(6)))).upper()
-        is_used = await clan_wars.find_one({"custom_id": custom_id})
-
-    await clan_wars.update_one({"war_id": war_unique_id},
+    custom_id = hashids.encode(int(war.preparation_start_time.time.timestamp()) + int(pend.now(tz=pend.UTC).timestamp()))
+    await db_client.clan_wars.update_one({"war_id": war_unique_id},
         {"$set" : {
         "custom_id": custom_id,
         "data": war._raw_data,
         "type" : war.type}}, upsert=True)
 
 
+async def main():
+    scheduler = AsyncIOScheduler(timezone=pend.UTC)
+    scheduler.start()
+    await broadcast(scheduler=scheduler)
 
 
-loop = asyncio.get_event_loop()
-keys = create_keys()
-coc_client.login_with_keys(*keys[:10])
-loop.create_task(broadcast(keys[11:]))
-loop.run_forever()
+

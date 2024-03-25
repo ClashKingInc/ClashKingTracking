@@ -7,15 +7,9 @@ from bot.legends.track import main as bot_legend_main
 
 from gamewide.clan_verify.track import main as clan_verify_main
 from gamewide.players.track import broadcast as global_player_main
+from gamewide.scheduled.track import main as global_scheduled_main
+from gamewide.war.track import main as global_war_main
 
-'''
-11-20 - player tracking
-21-25 - clan finder
-26-30 - scheduled
-31 - 40 - war finder
-41 - 45 - bot tracking
-46- 50 - clan verifier
-'''
 
 if __name__ == "__main__":
     config = Config()
@@ -29,8 +23,12 @@ if __name__ == "__main__":
         task = global_player_main
     elif config.tracking_type == "BOTLEGENDS":
         task = bot_legend_main
+    elif config.tracking_type == "GLOBALSCHEDULED":
+        task = global_scheduled_main
+    elif config.tracking_type == "GLOBALWAR":
+        task = global_war_main
     else:
-        task = asyncio.sleep(10)
+        task = asyncio.sleep
 
     loop = asyncio.get_event_loop()
     loop.create_task(task())

@@ -6,12 +6,10 @@ import ujson
 from msgspec.json import decode
 from msgspec import Struct
 from pymongo import UpdateOne, DeleteOne, InsertOne
-from datetime import timedelta
 from aiohttp import TCPConnector, ClientTimeout, ClientSession
-import collections
 import aiohttp
 import asyncio
-from utility.utils import gen_season_date, gen_raid_date, gen_games_season, gen_legend_date
+from utility.utils import gen_season_date, gen_raid_date
 from utility.keycreation import create_keys
 from .config import ClanVerifyTrackingConfig
 from utility.classes import MongoDatabase

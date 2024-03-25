@@ -14,18 +14,18 @@ class Config:
     redis_ip = getenv("REDIS_IP")
     redis_pw = getenv("REDIS_PW")
 
-    #tracking_type = getenv("TYPE")
-    tracking_type = "BOTLEGENDS"
+    tracking_type = getenv("TYPE")
+    #tracking_type = "GLOBALSCHEDULED"
 
 
 master_api_config = {
-    "bot_clan" : (11, 18),
-    "bot_player" : (11, 18),
-    "bot_legends" : (11, 18),
-    "global_clan_find" : (11, 18),
-    "global_clan_verify" : (11, 18),
-    "global_scheduled" : (11, 18),
-    "global_war" : (11, 18)
+    "bot_clan" : (41, 45),
+    "bot_player" : (11, 15),
+    "bot_legends" : (16, 20),
+    "global_clan_find" : (21, 25),
+    "global_clan_verify" : (46, 50),
+    "global_scheduled" : (26, 30),
+    "global_war" : (31, 40)
 }
 
 
