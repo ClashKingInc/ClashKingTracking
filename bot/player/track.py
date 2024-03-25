@@ -238,7 +238,12 @@ async def main():
                                     only_once[parent] += 1
 
                                 if type_ in online_types:
-                                    BEEN_ONLINE = True
+                                    #if we are comparing, say donations, we only want them to be online because donos went up.. not down because of season reset
+                                    if isinstance(value, int):
+                                        if value > old_value:
+                                            BEEN_ONLINE = True
+                                    else:
+                                        BEEN_ONLINE = True
 
                                 if type_ in ws_types:
                                     type_changes.append(type_)
