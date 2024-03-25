@@ -51,7 +51,7 @@ async def main():
                 db_tags = [x["tag"] for x in (await db_client.player_stats.aggregate(pipeline).to_list(length=None))]
                 all_tags_to_track = list(set(db_tags + all_tags_to_track))
 
-            if loop_spot <= 2:
+            if loop_spot <= 1:
                 pipeline = [{"$match": {}},
                             {"$project": {"tag": "$tag"}},
                             {"$unset": "_id"}]
