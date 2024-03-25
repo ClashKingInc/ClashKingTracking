@@ -262,7 +262,7 @@ async def main():
                                     upsert=True
                                 ))
 
-                            if clan_level_changes:
+                            if clan_level_changes and (clan_tag in clan_tags):
                                 clan_level_changes["$set"][f"{season}.{tag}.name"] = response.get("name")
                                 clan_level_changes["$set"][f"{season}.{tag}.townhall"] = response.get("townHallLevel")
                                 bulk_clan_changes.append(UpdateOne(
