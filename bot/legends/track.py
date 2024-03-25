@@ -23,7 +23,7 @@ async def main():
     producer = KafkaProducer(bootstrap_servers=["85.10.200.219:9092"], api_version=(3, 6, 0))
     db_client = MongoDatabase(stats_db_connection=config.stats_mongodb, static_db_connection=config.static_mongodb)
 
-    cache = redis.Redis(host=config.redis_ip, port=6379, db=0, password=config.redis_pw, decode_responses=False, max_connections=50,
+    cache = redis.Redis(host=config.redis_ip, port=6379, db=10, password=config.redis_pw, decode_responses=False, max_connections=50,
                         health_check_interval=10, socket_connect_timeout=5, retry_on_timeout=True, socket_keepalive=True)
     keys: deque = await create_keys([config.coc_email.format(x=x) for x in range(config.min_coc_email, config.max_coc_email + 1)], [config.coc_password] * config.max_coc_email)
     logger.info(f"{len(keys)} keys created")
