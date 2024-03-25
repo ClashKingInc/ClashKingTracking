@@ -27,7 +27,7 @@ async def main():
     keys: deque = await create_keys([config.coc_email.format(x=x) for x in range(config.min_coc_email, config.max_coc_email + 1)], [config.coc_password] * config.max_coc_email)
     logger.info(f"{len(keys)} keys created")
 
-    loop_spot = 0
+    loop_spot = 1
 
     while True:
             loop_spot += 1
@@ -69,6 +69,7 @@ async def main():
             bulk_db_changes = []
             bulk_insert = []
             bulk_clan_changes = []
+
 
             for count, group in enumerate(split_tags, 1):
                 # update last updated for all the members we are checking this go around
@@ -303,12 +304,7 @@ async def main():
                 logger.info(f"CLAN CHANGES UPDATE: {time.time() - time_inside}")
 
             fix_changes = []
-
-            if loop_spot != 1:
-                not_set_entirely = await db_client.player_stats.distinct("tag", filter={"$or": [{"name": None}, {"league": None}, {"townhall": None}, {"clan_tag": None}]})
-            else:
-                not_set_entirely = all_tags_to_track
-
+            not_set_entirely = await db_client.player_stats.distinct("tag", filter={"$or": [{"name": None}, {"league": None}, {"townhall": None}, {"clan_tag": None}]})
             logger.info(f'{len(not_set_entirely)} tags to fix')
             fix_tag_cache = await cache.mget(keys=not_set_entirely)
             for tag, response in zip(not_set_entirely, fix_tag_cache):
