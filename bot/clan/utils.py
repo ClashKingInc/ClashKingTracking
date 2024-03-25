@@ -125,7 +125,7 @@ async def handle_war_responses(coc_client: coc.Client, producer: KafkaProducer, 
         next_war, current_war = response[1]
         wars = [next_war, current_war]
         for war in wars:
-            if war is None:
+            if not isinstance(war, dict):
                 continue
             war = coc.ClanWar(data=war, client=coc_client, clan_tag=clan_tag)
 
