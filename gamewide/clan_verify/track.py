@@ -1,18 +1,20 @@
-from typing import Optional, List
 
-from collections import deque
 import pendulum as pend
 import ujson
+import aiohttp
+import asyncio
+
+from typing import Optional, List
+from collections import deque
 from msgspec.json import decode
 from msgspec import Struct
 from pymongo import UpdateOne, DeleteOne, InsertOne
 from aiohttp import TCPConnector, ClientTimeout, ClientSession
-import aiohttp
-import asyncio
 from utility.utils import gen_season_date, gen_raid_date
 from utility.keycreation import create_keys
 from .config import ClanVerifyTrackingConfig
 from utility.classes import MongoDatabase
+from loguru import logger
 
 
 
@@ -82,7 +84,7 @@ async def main():
     db_client = MongoDatabase(stats_db_connection=config.stats_mongodb, static_db_connection=config.static_mongodb)
 
     keys: deque = await create_keys([config.coc_email.format(x=x) for x in range(config.min_coc_email, config.max_coc_email + 1)], [config.coc_password] * config.max_coc_email)
-    print(f"{len(keys)} keys")
+    logger.info(f"{len(keys)} keys")
     x = 1
     while True:
         #try:
@@ -101,7 +103,7 @@ async def main():
                                 {"$out": {"db": "new_looper", "coll": "legend_rankings"}}
                                 ]
             await db_client.global_clans.aggregate(ranking_pipeline).to_list(length=None)
-            print("UPDATED RANKING")
+            logger.info("UPDATED RANKING")
 
             keys = deque(keys)
             if x % 20 == 0:
@@ -113,7 +115,7 @@ async def main():
             bot_clan_tags = await db_client.clans_db.distinct("tag")
             all_tags = list(set(all_tags + bot_clan_tags))
 
-            print(f"{len(all_tags)} tags")
+            logger.info(f"{len(all_tags)} tags")
             size_break = 25000
             all_tags = [all_tags[i:i + size_break] for i in range(0, len(all_tags), size_break)]
 
@@ -127,7 +129,7 @@ async def main():
                         tasks.append(fetch(f"https://api.clashofclans.com/v1/clans/{tag.replace('#', '%23')}", session, {"Authorization": f"Bearer {keys[0]}"}))
                     responses = await asyncio.gather(*tasks)
                     await session.close()
-                print(f"fetched {len(responses)} responses")
+                logger.info(f"fetched {len(responses)} responses")
                 changes = []
                 join_leave_changes = []
 
@@ -203,11 +205,11 @@ async def main():
 
                 if changes:
                     await db_client.global_clans.bulk_write(changes, ordered=False)
-                    print(f"Made {len(changes)} clan changes")
+                    logger.info(f"Made {len(changes)} clan changes")
 
                 if join_leave_changes:
                     await db_client.join_leave_history.bulk_write(join_leave_changes, ordered=False)
-                    print(f"Made {len(join_leave_changes)} join/leave changes")
+                    logger.info(f"Made {len(join_leave_changes)} join/leave changes")
 
         #except Exception:
             #continue
