@@ -39,22 +39,29 @@ async def main():
 
             # every 100 loops, track the people who have been inactive for more than a month
             # approx 5-6 hours
-            pipeline = None
-            if loop_spot % 60 == 0 or loop_spot <= 1:
+            if loop_spot % 60 == 0:
                 pipeline = [{"$match": {"last_online": {"$gte": gone_for_a_month}}}, {"$project": {"tag": "$tag"}}, {"$unset": "_id"}]
                 db_tags = [x["tag"] for x in (await db_client.player_stats.aggregate(pipeline).to_list(length=None))]
                 all_tags_to_track = list(set(db_tags + all_tags_to_track))
 
             # every 20 loops, track the people who have been active in the last 30 days
             # approx every 1-1.5 hours
-            if loop_spot % 20 == 0 or loop_spot <= 1:
+            if loop_spot % 20 == 0 and loop_spot % 60 != 0:
                 pipeline = [{"$match": {"last_online": {"$lte": gone_for_a_month}}}, {"$project": {"tag": "$tag"}}, {"$unset": "_id"}]
                 db_tags = [x["tag"] for x in (await db_client.player_stats.aggregate(pipeline).to_list(length=None))]
                 all_tags_to_track = list(set(db_tags + all_tags_to_track))
 
+            if loop_spot <= 2:
+                pipeline = [{"$match": {}},
+                            {"$project": {"tag": "$tag"}},
+                            {"$unset": "_id"}]
+                db_tags = [x["tag"] for x in (await db_client.player_stats.aggregate(pipeline).to_list(length=None))]
+                all_tags_to_track = list(set(db_tags + all_tags_to_track))
+
+
             logger.info(f"{len(all_tags_to_track)} players to track")
 
-            # on the first 2 loops, we get everyone tracked
+            # on the first loop, we get everyone tracked
 
             split_size = 50_000
             split_tags = [all_tags_to_track[i:i + split_size] for i in range(0, len(all_tags_to_track), split_size)]
@@ -295,7 +302,12 @@ async def main():
                 logger.info(f"CLAN CHANGES UPDATE: {time.time() - time_inside}")
 
             fix_changes = []
-            not_set_entirely = await db_client.player_stats.distinct("tag", filter={"$or": [{"name": None}, {"league": None}, {"townhall": None}, {"clan_tag": None}]})
+
+            if loop_spot != 0:
+                not_set_entirely = await db_client.player_stats.distinct("tag", filter={"$or": [{"name": None}, {"league": None}, {"townhall": None}, {"clan_tag": None}]})
+            else:
+                not_set_entirely = all_tags_to_track
+
             logger.info(f'{len(not_set_entirely)} tags to fix')
             fix_tag_cache = await cache.mget(keys=not_set_entirely)
             for tag, response in zip(not_set_entirely, fix_tag_cache):
