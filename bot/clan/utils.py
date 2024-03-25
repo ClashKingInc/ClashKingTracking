@@ -103,7 +103,7 @@ def send_reminder(acceptable_times: list[tuple], time: str, war_unique_id: str, 
     if acceptable_times:
         top_time = acceptable_times.pop(0)
         future_time, r_time = top_time
-        asyncio.get_event_loop().call_later((future_time - pend.now(tz=pend.UTC)).total_seconds(), send_reminder, acceptable_times, war_unique_id, clan_tag, producer)
+        asyncio.get_event_loop().call_later((future_time - pend.now(tz=pend.UTC)).total_seconds(), send_reminder, acceptable_times, r_time, war_unique_id, clan_tag, producer)
 
     json_data = {
         "type" : "reminder",

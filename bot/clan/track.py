@@ -1,16 +1,6 @@
 import time
-
-from redis import asyncio as redis
-
 import asyncio
-import collections
 import pytz
-from loguru import logger
-
-from pymongo import UpdateOne, InsertOne
-from datetime import timedelta
-
-
 import ujson
 import coc
 import aiohttp
@@ -20,7 +10,6 @@ from utility.http import HTTPClient, Route
 from collections import deque
 from datetime import datetime
 from utility.utils import is_raids
-from typing import List
 from utility.keycreation import create_keys
 from .utils import get_war_responses, handle_war_responses
 from .config import BotClanTrackingConfig
@@ -64,7 +53,7 @@ async def main():
                 async def get_raid(clan_tag: str, headers):
                     clan_tag_for_url = clan_tag.replace('#', '%23')
                     raid_log = await http_client.request(Route("GET", f"/clans/{clan_tag_for_url}/capitalraidseasons?limit=1"), headers=headers)
-                    if len(raid_log.get("items", [])) == 0:
+                    if raid_log is None or len(raid_log.get("items", [])) == 0:
                         return None
                     raid = coc.RaidLogEntry(data=raid_log.get("items")[0], client=coc_client, clan_tag=clan_tag)
                     previous_raid = CAPITAL_CACHE.get(clan_tag)
