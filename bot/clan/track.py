@@ -53,7 +53,7 @@ async def main():
                 async def get_raid(clan_tag: str, headers):
                     clan_tag_for_url = clan_tag.replace('#', '%23')
                     raid_log = await http_client.request(Route("GET", f"/clans/{clan_tag_for_url}/capitalraidseasons?limit=1"), headers=headers)
-                    if raid_log is None or len(raid_log.get("items", [])) == 0:
+                    if raid_log is None or len(raid_log.get("items", [])) == 0 or isinstance(raid_log, Exception):
                         return None
                     raid = coc.RaidLogEntry(data=raid_log.get("items")[0], client=coc_client, clan_tag=clan_tag)
                     previous_raid = CAPITAL_CACHE.get(clan_tag)
@@ -118,7 +118,7 @@ async def main():
 
         print(f"{len(clan_responses)} clans")
         for count, clan_response in enumerate(clan_responses):
-            if clan_response is None:
+            if clan_response is None or isinstance(clan_response, Exception):
                 continue
             clan = coc.Clan(data=clan_response, client=coc_client)
 

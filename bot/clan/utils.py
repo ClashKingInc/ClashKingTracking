@@ -119,6 +119,8 @@ async def handle_war_responses(coc_client: coc.Client, producer: KafkaProducer, 
     reminder_times = [f"{int(time)}hr" if time.is_integer() else f"{time}hr" for time in (x * 0.25 for x in range(1, 193))]
 
     for response in responses:
+        if isinstance(response, Exception):
+            continue
         clan_tag = response[0]
         next_war, current_war = response[1]
         wars = [next_war, current_war]
