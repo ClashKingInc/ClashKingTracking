@@ -1,4 +1,3 @@
-import collections
 import aiohttp
 import asyncio
 import coc
@@ -14,6 +13,7 @@ from typing import List
 from utility.classes import MongoDatabase
 from .config import GlobalWarTrackingConfig
 from utility.keycreation import create_keys
+from loguru import logger
 
 config = GlobalWarTrackingConfig()
 db_client = MongoDatabase(stats_db_connection=config.stats_mongodb, static_db_connection=config.static_mongodb)
@@ -40,7 +40,7 @@ in_war = set()
 async def broadcast(scheduler: AsyncIOScheduler):
     global in_war
     x = 1
-    print(config.min_coc_email, config.max_coc_email, config.coc_email)
+    logger.info(config.min_coc_email, config.max_coc_email, config.coc_email)
 
     keys = await create_keys([config.coc_email.format(x=x) for x in range(config.min_coc_email, config.max_coc_email + 1)], [config.coc_password] * config.max_coc_email)
 
@@ -79,13 +79,13 @@ async def broadcast(scheduler: AsyncIOScheduler):
             combined_tags = set(opponent_side_tags + clan_side_tags)
             all_tags = [tag for tag in all_tags if tag in combined_tags]
 
-        print(len(all_tags))
+        logger.info(len(all_tags))
         all_tags = [all_tags[i:i + size_break] for i in range(0, len(all_tags), size_break)]
         ones_that_tried_again = []
 
         x += 1
         for count, tag_group in enumerate(all_tags, 1):
-            print(f"Group {count}/{len(all_tags)}")
+            logger.info(f"Group {count}/{len(all_tags)}")
             tasks = []
             connector = aiohttp.TCPConnector(limit=500, ttl_dns_cache=600)
             async with aiohttp.ClientSession(connector=connector) as session:
@@ -143,13 +143,12 @@ async def broadcast(scheduler: AsyncIOScheduler):
                     pass
 
         if ones_that_tried_again:
-            print(f"{len(ones_that_tried_again)} tried again, examples: {ones_that_tried_again[:5]}")
+            logger.info(f"{len(ones_that_tried_again)} tried again, examples: {ones_that_tried_again[:5]}")
 
 
 async def store_war(clan_tag: str, opponent_tag: str, prep_time: int):
     global in_war
     hashids = Hashids(min_length=7)
-    print("storing war")
 
     if clan_tag in in_war:
         in_war.remove(clan_tag)
