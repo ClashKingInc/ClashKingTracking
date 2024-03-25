@@ -279,10 +279,11 @@ async def main():
                                     "$push": {f"last_online_times.{season}": _time},
                                     "$set": {"last_online": _time}
                                 }, upsert=True))
-                            bulk_clan_changes.append(
-                                UpdateOne({"tag": clan_tag},
-                                          {"$inc": {f"{season}.{tag}.activity": 1}},
-                                          upsert=True))
+                            if clan_tag in clan_tags:
+                                bulk_clan_changes.append(
+                                    UpdateOne({"tag": clan_tag},
+                                              {"$inc": {f"{season}.{tag}.activity": 1}},
+                                              upsert=True))
 
                 await pipe.execute()
                 logger.info(f"LOOP {loop_spot}: Changes Found")
@@ -303,7 +304,7 @@ async def main():
 
             fix_changes = []
 
-            if loop_spot != 0:
+            if loop_spot != 1:
                 not_set_entirely = await db_client.player_stats.distinct("tag", filter={"$or": [{"name": None}, {"league": None}, {"townhall": None}, {"clan_tag": None}]})
             else:
                 not_set_entirely = all_tags_to_track
