@@ -82,6 +82,7 @@ async def main():
     db_client = MongoDatabase(stats_db_connection=config.stats_mongodb, static_db_connection=config.static_mongodb)
 
     keys: deque = await create_keys([config.coc_email.format(x=x) for x in range(config.min_coc_email, config.max_coc_email + 1)], [config.coc_password] * config.max_coc_email)
+    print(f"{len(keys)} keys")
     x = 1
     while True:
         #try:
