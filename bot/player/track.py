@@ -70,7 +70,6 @@ async def main():
             bulk_insert = []
             bulk_clan_changes = []
 
-
             for count, group in enumerate(split_tags, 1):
                 # update last updated for all the members we are checking this go around
                 await db_client.player_stats.update_many({"tag": {"$in": group}}, {"$set": {"last_updated": int(pend.now(tz=pend.UTC).timestamp())}})
