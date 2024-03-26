@@ -59,7 +59,7 @@ async def main():
             pipe = cache.pipeline()
 
             legend_date = gen_legend_date()
-
+            print(len([n for n in t, n in current_player_responses if n is None]))
             for tag, response in current_player_responses:
 
                 previous_response = previous_player_responses.get(tag)
