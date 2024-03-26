@@ -24,6 +24,7 @@ async def get_player_responses(keys: deque, tags: list[str]):
     session = aiohttp.ClientSession(connector=connector, timeout=timeout)
     for tag in tags:
         keys.rotate(1)
+
         async def fetch(url, session: aiohttp.ClientSession, headers, throttler: Throttler):
             async with throttler:
                 async with session.get(url, headers=headers) as response:
