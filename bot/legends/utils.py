@@ -17,7 +17,7 @@ from utility.utils import gen_season_date, gen_raid_date, gen_games_season, gen_
 
 async def get_player_responses(keys: deque, tags: list[str]):
     tasks = []
-    connector = aiohttp.TCPConnector(limit=2000, ttl_dns_cache=300)
+    connector = aiohttp.TCPConnector(limit=1000, ttl_dns_cache=300)
     timeout = aiohttp.ClientTimeout(total=1800)
     session = aiohttp.ClientSession(connector=connector, timeout=timeout)
     for tag in tags:
