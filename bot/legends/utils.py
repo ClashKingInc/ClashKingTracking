@@ -13,7 +13,9 @@ from pymongo import InsertOne, UpdateOne
 from collections import deque, defaultdict
 from utility.classes import MongoDatabase
 from utility.utils import gen_season_date, gen_raid_date, gen_games_season, gen_legend_date
+from asyncio_throttle import Throttler
 
+throttler = Throttler(rate_limit=1000, period=1)
 
 async def get_player_responses(keys: deque, tags: list[str]):
     tasks = []
@@ -24,14 +26,15 @@ async def get_player_responses(keys: deque, tags: list[str]):
         keys.rotate(1)
 
         async def fetch(url, session: aiohttp.ClientSession, headers):
-            new_response = await session.get(url, headers=headers)
-            t = f'#{url.split("%23")[-1]}'
-            if new_response.status == 404:  # remove banned players
-                return (t, "delete")
-            elif new_response.status != 200:
-                return (t, None)
-            new_response = await new_response.read()
-            return (t, new_response)
+            async with throttler:
+                new_response = await session.get(url, headers=headers)
+                t = f'#{url.split("%23")[-1]}'
+                if new_response.status == 404:  # remove banned players
+                    return (t, "delete")
+                elif new_response.status != 200:
+                    return (t, None)
+                new_response = await new_response.read()
+                return (t, new_response)
 
         tasks.append(fetch(url=f'https://api.clashofclans.com/v1/players/{tag.replace("#", "%23")}', session=session, headers={"Authorization": f"Bearer {keys[0]}"}))
 
