@@ -15,7 +15,7 @@ from utility.classes import MongoDatabase
 from utility.utils import gen_season_date, gen_raid_date, gen_games_season, gen_legend_date
 from asyncio_throttle import Throttler
 
-throttler = Throttler(rate_limit=1000, period=1)
+throttler = Throttler(rate_limit=1200, period=1)
 
 async def get_player_responses(keys: deque, tags: list[str]):
     tasks = []
