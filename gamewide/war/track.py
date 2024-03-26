@@ -14,6 +14,7 @@ from utility.classes import MongoDatabase
 from .config import GlobalWarTrackingConfig
 from utility.keycreation import create_keys
 from loguru import logger
+from asyncio_throttle import Throttler
 
 config = GlobalWarTrackingConfig()
 db_client = MongoDatabase(stats_db_connection=config.stats_mongodb, static_db_connection=config.static_mongodb)
@@ -42,14 +43,17 @@ async def broadcast(scheduler: AsyncIOScheduler):
     x = 1
     keys = await create_keys([config.coc_email.format(x=x) for x in range(config.min_coc_email, config.max_coc_email + 1)], [config.coc_password] * config.max_coc_email)
 
+    throttler = Throttler(rate_limit=1200, period=1)
+
     while True:
-        async def fetch(url, session: aiohttp.ClientSession, headers, tag):
-            async with session.get(url, headers=headers) as response:
-                if response.status == 200:
-                    return ((await response.read()), tag)
-                elif response.status == 503:
-                    return (503, 503)
-                return (None, None)
+        async def fetch(url, session: aiohttp.ClientSession, headers, tag, throttler: Throttler):
+            async with throttler:
+                async with session.get(url, headers=headers) as response:
+                    if response.status == 200:
+                        return ((await response.read()), tag)
+                    elif response.status == 503:
+                        return (503, 503)
+                    return (None, None)
 
 
         pipeline = [{"$match": {"openWarLog": True}}, {"$group": {"_id": "$tag"}}]
@@ -89,7 +93,7 @@ async def broadcast(scheduler: AsyncIOScheduler):
             async with aiohttp.ClientSession(connector=connector) as session:
                 for tag in tag_group:
                     keys.rotate(1)
-                    tasks.append(fetch(f"https://api.clashofclans.com/v1/clans/{tag.replace('#', '%23')}/currentwar", session, {"Authorization": f"Bearer {keys[0]}"}, tag))
+                    tasks.append(fetch(f"https://api.clashofclans.com/v1/clans/{tag.replace('#', '%23')}/currentwar", session, {"Authorization": f"Bearer {keys[0]}"}, tag, throttler=throttler))
                 responses = await asyncio.gather(*tasks, return_exceptions=True)
                 await session.close()
 

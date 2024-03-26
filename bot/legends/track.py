@@ -59,7 +59,6 @@ async def main():
             pipe = cache.pipeline()
 
             legend_date = gen_legend_date()
-            logger.info(f"{len([n for t, n in current_player_responses if n is None])} nones")
             for tag, response in current_player_responses:
 
                 previous_response = previous_player_responses.get(tag)
@@ -73,7 +72,6 @@ async def main():
 
                 # if None, update cache and move on
                 if previous_response is None:
-                    response = snappy.compress(response)
                     await pipe.set(tag, response, ex=2_592_000)
                     continue
 
@@ -81,11 +79,10 @@ async def main():
                 # - update cache
                 # - turn responses into dicts
                 # - use function to find changes & update lists of changes
-                compressed_response = snappy.compress(response)
-                if previous_response != compressed_response:
-                    await pipe.set(tag, compressed_response, ex=2_592_000)
+                if previous_response != response:
+                    await pipe.set(tag, response, ex=2_592_000)
                     response = orjson.loads(response)
-                    previous_response = orjson.loads(snappy.decompress(previous_response))
+                    previous_response = orjson.loads(previous_response)
 
                     tag = response.get("tag")
                     league = response.get("league", {}).get("name", "Unranked")
