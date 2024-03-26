@@ -157,7 +157,7 @@ async def main():
                                                                  {"$push": {f"legends.{legend_date}.new_defenses": {
                                                                      "change": diff_trophies,
                                                                      "time": int(pend.now(tz=pend.UTC).timestamp()),
-                                                                     "trophies": response["trophies"]
+                                                                     "trophies": player.trophies
                                                                  }}}, upsert=True))
 
                         elif diff_trophies >= 1:
@@ -180,7 +180,7 @@ async def main():
                                                                  {"$push": {f"legends.{legend_date}.new_attacks": {
                                                                      "change": diff_trophies,
                                                                      "time": int(pend.now(tz=pend.UTC).timestamp()),
-                                                                     "trophies": response["trophies"],
+                                                                     "trophies": player.trophies,
                                                                      "hero_gear": equipment
                                                                  }}}, upsert=True))
                                 if diff_trophies == 40:
@@ -202,7 +202,7 @@ async def main():
                                                                      {"$push": {f"legends.{legend_date}.new_attacks": {
                                                                          "change": 40,
                                                                          "time": int(pend.now(tz=pend.UTC).timestamp()),
-                                                                         "trophies": response["trophies"],
+                                                                         "trophies": player.trophies,
                                                                          "hero_gear": equipment
                                                                      }}}, upsert=True))
                                 legend_changes.append(
@@ -216,7 +216,7 @@ async def main():
                                                                  {"$push": {f"legends.{legend_date}.new_attacks": {
                                                                      "change": diff_trophies,
                                                                      "time": int(pend.now(tz=pend.UTC).timestamp()),
-                                                                     "trophies": response["trophies"],
+                                                                     "trophies": player.trophies,
                                                                      "hero_gear": equipment
                                                                  }}}, upsert=True))
 
@@ -233,7 +233,7 @@ async def main():
                                                                  {"$push": {f"legends.{legend_date}.new_defenses": {
                                                                      "change": 0,
                                                                      "time": int(pend.now(tz=pend.UTC).timestamp()),
-                                                                     "trophies": response["trophies"]
+                                                                     "trophies": player.trophies
                                                                  }}}, upsert=True))
 
             logger.info(f"LOOP {loop_spot}: Changes Found")
