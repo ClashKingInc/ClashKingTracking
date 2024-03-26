@@ -104,7 +104,6 @@ async def main():
             # update last updated for all the members we are checking this go around
             logger.info(f"LOOP {loop_spot} | Group {count}/{len(split_tags)}: {len(group)} tags")
 
-
             # pull current responses from the api, returns (tag: str, response: bytes)
             # response can be bytes, "delete", and None
             current_player_responses = await get_player_responses(keys=keys, tags=group)
@@ -165,7 +164,7 @@ async def main():
                             equipment = []
                             for hero in player.heroes:
                                 for gear in hero.equipment:
-                                    equipment.append({"name": gear.get("name"), "level": gear.get("level")})
+                                    equipment.append({"name": gear.name, "level": gear.level})
 
                             legend_changes.append(
                                 UpdateOne({"tag": tag},
