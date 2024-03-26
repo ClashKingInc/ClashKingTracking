@@ -4,35 +4,7 @@
     <option name="autoReloadType" value="SELECTIVE" />
   </component>
   <component name="ChangeListManager">
-    <list default="true" id="e7096e79-455b-4aa3-858d-e2defd65b8a9" name="Changes" comment="initial">
-      <change afterPath="$PROJECT_DIR$/bot/clan/config.py" afterDir="false" />
-      <change afterPath="$PROJECT_DIR$/bot/clan/track.py" afterDir="false" />
-      <change afterPath="$PROJECT_DIR$/bot/clan/utils.py" afterDir="false" />
-      <change afterPath="$PROJECT_DIR$/bot_clan_tracking.py" afterDir="false" />
-      <change afterPath="$PROJECT_DIR$/classes/player.py" afterDir="false" />
-      <change afterPath="$PROJECT_DIR$/global/clan_verify/config.py" afterDir="false" />
-      <change afterPath="$PROJECT_DIR$/main.py" afterDir="false" />
-      <change afterPath="$PROJECT_DIR$/utility/http.py" afterDir="false" />
-      <change afterPath="$PROJECT_DIR$/utility/keycreation.py" afterDir="false" />
-      <change beforePath="$PROJECT_DIR$/.idea/workspace.xml" beforeDir="false" afterPath="$PROJECT_DIR$/.idea/workspace.xml" afterDir="false" />
-      <change beforePath="$PROJECT_DIR$/Dockerfile" beforeDir="false" afterPath="$PROJECT_DIR$/Dockerfile" afterDir="false" />
-      <change beforePath="$PROJECT_DIR$/bot/bot_clan_tracking.py" beforeDir="false" />
-      <change beforePath="$PROJECT_DIR$/bot/old_player_tracking.py" beforeDir="false" afterPath="$PROJECT_DIR$/archive/old_player_tracking.py" afterDir="false" />
-      <change beforePath="$PROJECT_DIR$/bot/player/config.py" beforeDir="false" afterPath="$PROJECT_DIR$/bot/player/config.py" afterDir="false" />
-      <change beforePath="$PROJECT_DIR$/bot/player/track.py" beforeDir="false" afterPath="$PROJECT_DIR$/bot/player/track.py" afterDir="false" />
-      <change beforePath="$PROJECT_DIR$/bot/player/utils.py" beforeDir="false" afterPath="$PROJECT_DIR$/bot/player/utils.py" afterDir="false" />
-      <change beforePath="$PROJECT_DIR$/bot/player_tracking.py" beforeDir="false" />
-      <change beforePath="$PROJECT_DIR$/global/all_players.py" beforeDir="false" afterPath="$PROJECT_DIR$/global/players/track.py" afterDir="false" />
-      <change beforePath="$PROJECT_DIR$/global/clan_verifier.py" beforeDir="false" afterPath="$PROJECT_DIR$/global/clan_verify/track.py" afterDir="false" />
-      <change beforePath="$PROJECT_DIR$/global/findclans.py" beforeDir="false" afterPath="$PROJECT_DIR$/global/clan_find/track.py" afterDir="false" />
-      <change beforePath="$PROJECT_DIR$/global/legends.py" beforeDir="false" afterPath="$PROJECT_DIR$/global/legends/track.py" afterDir="false" />
-      <change beforePath="$PROJECT_DIR$/global/scheduled.py" beforeDir="false" afterPath="$PROJECT_DIR$/global/scheduled/track.py" afterDir="false" />
-      <change beforePath="$PROJECT_DIR$/global/war_finder.py" beforeDir="false" afterPath="$PROJECT_DIR$/global/war/track.py" afterDir="false" />
-      <change beforePath="$PROJECT_DIR$/requirements.txt" beforeDir="false" afterPath="$PROJECT_DIR$/requirements.txt" afterDir="false" />
-      <change beforePath="$PROJECT_DIR$/utility/classes.py" beforeDir="false" afterPath="$PROJECT_DIR$/utility/classes.py" afterDir="false" />
-      <change beforePath="$PROJECT_DIR$/utility/config.py" beforeDir="false" afterPath="$PROJECT_DIR$/utility/config.py" afterDir="false" />
-      <change beforePath="$PROJECT_DIR$/utility/utils.py" beforeDir="false" afterPath="$PROJECT_DIR$/utility/utils.py" afterDir="false" />
-    </list>
+    <list default="true" id="e7096e79-455b-4aa3-858d-e2defd65b8a9" name="Changes" comment="initial" />
     <option name="SHOW_DIALOG" value="false" />
     <option name="HIGHLIGHT_CONFLICTS" value="true" />
     <option name="HIGHLIGHT_NON_ACTIVE_CHANGELIST" value="false" />
@@ -57,15 +29,17 @@
     <option name="hideEmptyMiddlePackages" value="true" />
     <option name="showLibraryContents" value="true" />
   </component>
-  <component name="PropertiesComponent">{
-  &quot;keyToString&quot;: {
-    &quot;Python.loadtest.executor&quot;: &quot;Run&quot;,
-    &quot;Python.main.executor&quot;: &quot;Run&quot;,
-    &quot;RunOnceActivity.OpenProjectViewOnStart&quot;: &quot;true&quot;,
-    &quot;RunOnceActivity.ShowReadmeOnStart&quot;: &quot;true&quot;,
-    &quot;git-widget-placeholder&quot;: &quot;master&quot;
+  <component name="PropertiesComponent"><![CDATA[{
+  "keyToString": {
+    "Python.loadtest.executor": "Run",
+    "Python.main.executor": "Run",
+    "Python.track (1).executor": "Run",
+    "Python.track.executor": "Run",
+    "RunOnceActivity.OpenProjectViewOnStart": "true",
+    "RunOnceActivity.ShowReadmeOnStart": "true",
+    "git-widget-placeholder": "master"
   }
-}</component>
+}]]></component>
   <component name="RecentsManager">
     <key name="MoveFile.RECENT_KEYS">
       <recent name="C:\Users\matth\PycharmProjects\clashkingtracking\global\scheduled" />
@@ -142,9 +116,55 @@
       <option name="INPUT_FILE" value="" />
       <method v="2" />
     </configuration>
+    <configuration name="track (1)" type="PythonConfigurationType" factoryName="Python" temporary="true" nameIsGenerated="true">
+      <module name="clashkingtracking" />
+      <option name="ENV_FILES" value="" />
+      <option name="INTERPRETER_OPTIONS" value="" />
+      <option name="PARENT_ENVS" value="true" />
+      <envs>
+        <env name="PYTHONUNBUFFERED" value="1" />
+      </envs>
+      <option name="SDK_HOME" value="" />
+      <option name="WORKING_DIRECTORY" value="$PROJECT_DIR$/allglobal/players" />
+      <option name="IS_MODULE_SDK" value="true" />
+      <option name="ADD_CONTENT_ROOTS" value="true" />
+      <option name="ADD_SOURCE_ROOTS" value="true" />
+      <option name="SCRIPT_NAME" value="$PROJECT_DIR$/allglobal/players/track.py" />
+      <option name="PARAMETERS" value="" />
+      <option name="SHOW_COMMAND_LINE" value="false" />
+      <option name="EMULATE_TERMINAL" value="false" />
+      <option name="MODULE_MODE" value="false" />
+      <option name="REDIRECT_INPUT" value="false" />
+      <option name="INPUT_FILE" value="" />
+      <method v="2" />
+    </configuration>
+    <configuration name="track" type="PythonConfigurationType" factoryName="Python" temporary="true" nameIsGenerated="true">
+      <module name="clashkingtracking" />
+      <option name="ENV_FILES" value="" />
+      <option name="INTERPRETER_OPTIONS" value="" />
+      <option name="PARENT_ENVS" value="true" />
+      <envs>
+        <env name="PYTHONUNBUFFERED" value="1" />
+      </envs>
+      <option name="SDK_HOME" value="" />
+      <option name="WORKING_DIRECTORY" value="$PROJECT_DIR$/global/clan_verify" />
+      <option name="IS_MODULE_SDK" value="true" />
+      <option name="ADD_CONTENT_ROOTS" value="true" />
+      <option name="ADD_SOURCE_ROOTS" value="true" />
+      <option name="SCRIPT_NAME" value="$PROJECT_DIR$/global/clan_verify/track.py" />
+      <option name="PARAMETERS" value="" />
+      <option name="SHOW_COMMAND_LINE" value="false" />
+      <option name="EMULATE_TERMINAL" value="false" />
+      <option name="MODULE_MODE" value="false" />
+      <option name="REDIRECT_INPUT" value="false" />
+      <option name="INPUT_FILE" value="" />
+      <method v="2" />
+    </configuration>
     <recent_temporary>
       <list>
         <item itemvalue="Python.main" />
+        <item itemvalue="Python.track (1)" />
+        <item itemvalue="Python.track" />
         <item itemvalue="Python.loadtest" />
       </list>
     </recent_temporary>
@@ -173,7 +193,191 @@
       <option name="project" value="LOCAL" />
       <updated>1706752185760</updated>
     </task>
-    <option name="localTasksCounter" value="2" />
+    <task id="LOCAL-00002" summary="initial">
+      <option name="closed" value="true" />
+      <created>1711069041236</created>
+      <option name="number" value="00002" />
+      <option name="presentableId" value="LOCAL-00002" />
+      <option name="project" value="LOCAL" />
+      <updated>1711069041236</updated>
+    </task>
+    <task id="LOCAL-00003" summary="initial">
+      <option name="closed" value="true" />
+      <created>1711226380697</created>
+      <option name="number" value="00003" />
+      <option name="presentableId" value="LOCAL-00003" />
+      <option name="project" value="LOCAL" />
+      <updated>1711226380697</updated>
+    </task>
+    <task id="LOCAL-00004" summary="initial">
+      <option name="closed" value="true" />
+      <created>1711226712340</created>
+      <option name="number" value="00004" />
+      <option name="presentableId" value="LOCAL-00004" />
+      <option name="project" value="LOCAL" />
+      <updated>1711226712340</updated>
+    </task>
+    <task id="LOCAL-00005" summary="initial">
+      <option name="closed" value="true" />
+      <created>1711234809323</created>
+      <option name="number" value="00005" />
+      <option name="presentableId" value="LOCAL-00005" />
+      <option name="project" value="LOCAL" />
+      <updated>1711234809323</updated>
+    </task>
+    <task id="LOCAL-00006" summary="initial">
+      <option name="closed" value="true" />
+      <created>1711326787328</created>
+      <option name="number" value="00006" />
+      <option name="presentableId" value="LOCAL-00006" />
+      <option name="project" value="LOCAL" />
+      <updated>1711326787328</updated>
+    </task>
+    <task id="LOCAL-00007" summary="initial">
+      <option name="closed" value="true" />
+      <created>1711327046704</created>
+      <option name="number" value="00007" />
+      <option name="presentableId" value="LOCAL-00007" />
+      <option name="project" value="LOCAL" />
+      <updated>1711327046704</updated>
+    </task>
+    <task id="LOCAL-00008" summary="initial">
+      <option name="closed" value="true" />
+      <created>1711327173550</created>
+      <option name="number" value="00008" />
+      <option name="presentableId" value="LOCAL-00008" />
+      <option name="project" value="LOCAL" />
+      <updated>1711327173550</updated>
+    </task>
+    <task id="LOCAL-00009" summary="initial">
+      <option name="closed" value="true" />
+      <created>1711328349385</created>
+      <option name="number" value="00009" />
+      <option name="presentableId" value="LOCAL-00009" />
+      <option name="project" value="LOCAL" />
+      <updated>1711328349385</updated>
+    </task>
+    <task id="LOCAL-00010" summary="initial">
+      <option name="closed" value="true" />
+      <created>1711329016623</created>
+      <option name="number" value="00010" />
+      <option name="presentableId" value="LOCAL-00010" />
+      <option name="project" value="LOCAL" />
+      <updated>1711329016623</updated>
+    </task>
+    <task id="LOCAL-00011" summary="initial">
+      <option name="closed" value="true" />
+      <created>1711329029640</created>
+      <option name="number" value="00011" />
+      <option name="presentableId" value="LOCAL-00011" />
+      <option name="project" value="LOCAL" />
+      <updated>1711329029640</updated>
+    </task>
+    <task id="LOCAL-00012" summary="initial">
+      <option name="closed" value="true" />
+      <created>1711331292843</created>
+      <option name="number" value="00012" />
+      <option name="presentableId" value="LOCAL-00012" />
+      <option name="project" value="LOCAL" />
+      <updated>1711331292843</updated>
+    </task>
+    <task id="LOCAL-00013" summary="initial">
+      <option name="closed" value="true" />
+      <created>1711333171679</created>
+      <option name="number" value="00013" />
+      <option name="presentableId" value="LOCAL-00013" />
+      <option name="project" value="LOCAL" />
+      <updated>1711333171679</updated>
+    </task>
+    <task id="LOCAL-00014" summary="initial">
+      <option name="closed" value="true" />
+      <created>1711335168489</created>
+      <option name="number" value="00014" />
+      <option name="presentableId" value="LOCAL-00014" />
+      <option name="project" value="LOCAL" />
+      <updated>1711335168489</updated>
+    </task>
+    <task id="LOCAL-00015" summary="initial">
+      <option name="closed" value="true" />
+      <created>1711336125689</created>
+      <option name="number" value="00015" />
+      <option name="presentableId" value="LOCAL-00015" />
+      <option name="project" value="LOCAL" />
+      <updated>1711336125689</updated>
+    </task>
+    <task id="LOCAL-00016" summary="initial">
+      <option name="closed" value="true" />
+      <created>1711339804573</created>
+      <option name="number" value="00016" />
+      <option name="presentableId" value="LOCAL-00016" />
+      <option name="project" value="LOCAL" />
+      <updated>1711339804573</updated>
+    </task>
+    <task id="LOCAL-00017" summary="initial">
+      <option name="closed" value="true" />
+      <created>1711343814787</created>
+      <option name="number" value="00017" />
+      <option name="presentableId" value="LOCAL-00017" />
+      <option name="project" value="LOCAL" />
+      <updated>1711343814787</updated>
+    </task>
+    <task id="LOCAL-00018" summary="initial">
+      <option name="closed" value="true" />
+      <created>1711344302232</created>
+      <option name="number" value="00018" />
+      <option name="presentableId" value="LOCAL-00018" />
+      <option name="project" value="LOCAL" />
+      <updated>1711344302232</updated>
+    </task>
+    <task id="LOCAL-00019" summary="initial">
+      <option name="closed" value="true" />
+      <created>1711344762325</created>
+      <option name="number" value="00019" />
+      <option name="presentableId" value="LOCAL-00019" />
+      <option name="project" value="LOCAL" />
+      <updated>1711344762325</updated>
+    </task>
+    <task id="LOCAL-00020" summary="initial">
+      <option name="closed" value="true" />
+      <created>1711344963148</created>
+      <option name="number" value="00020" />
+      <option name="presentableId" value="LOCAL-00020" />
+      <option name="project" value="LOCAL" />
+      <updated>1711344963148</updated>
+    </task>
+    <task id="LOCAL-00021" summary="initial">
+      <option name="closed" value="true" />
+      <created>1711345323280</created>
+      <option name="number" value="00021" />
+      <option name="presentableId" value="LOCAL-00021" />
+      <option name="project" value="LOCAL" />
+      <updated>1711345323280</updated>
+    </task>
+    <task id="LOCAL-00022" summary="initial">
+      <option name="closed" value="true" />
+      <created>1711346024320</created>
+      <option name="number" value="00022" />
+      <option name="presentableId" value="LOCAL-00022" />
+      <option name="project" value="LOCAL" />
+      <updated>1711346024320</updated>
+    </task>
+    <task id="LOCAL-00023" summary="initial">
+      <option name="closed" value="true" />
+      <created>1711346156839</created>
+      <option name="number" value="00023" />
+      <option name="presentableId" value="LOCAL-00023" />
+      <option name="project" value="LOCAL" />
+      <updated>1711346156839</updated>
+    </task>
+    <task id="LOCAL-00024" summary="initial">
+      <option name="closed" value="true" />
+      <created>1711409751413</created>
+      <option name="number" value="00024" />
+      <option name="presentableId" value="LOCAL-00024" />
+      <option name="project" value="LOCAL" />
+      <updated>1711409751413</updated>
+    </task>
+    <option name="localTasksCounter" value="25" />
     <servers />
   </component>
   <component name="VcsManagerConfiguration">

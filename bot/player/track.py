@@ -174,7 +174,7 @@ async def main():
                                 if type_ == "donations":
                                     previous_dono = 0 if (previous_dono := previous_response["donations"]) > (current_dono := response["donations"]) else previous_dono
                                     player_level_changes["$inc"][f"donations.{season}.donated"] = (current_dono - previous_dono)
-                                    clan_level_changes["$inc"][f"{season}.{tag}.donations"] = (current_dono - previous_dono)
+                                    clan_level_changes["$inc"][f"{season}.{tag}.donated"] = (current_dono - previous_dono)
 
                                 elif type_ == "donationsReceived":
                                     previous_dono = 0 if (previous_dono := previous_response["donationsReceived"]) > (
