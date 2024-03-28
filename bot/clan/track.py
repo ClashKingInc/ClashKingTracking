@@ -148,6 +148,15 @@ async def main():
                     json_data = {"type": "member_leave", "clan": clan._raw_data, "member": member._raw_data}
                     producer.send("clan", ujson.dumps(json_data).encode("utf-8"), timestamp_ms=int(datetime.now(tz=pytz.utc).timestamp() * 1000))
 
+            previous_donations = {n.tag : (n.donations, n.received) for n in previous_clan.members}
+            for member in clan.members:
+                if (member_donated := previous_donations.get(member.tag)) is not None:
+                    mem_donos, mem_received = member_donated
+                    if mem_donos < member.donations or mem_received < member.received:
+                        json_data = {"type": "all_member_donations", "old_clan": previous_clan._raw_data, "new_clan": clan._raw_data}
+                        producer.send("clan", ujson.dumps(json_data).encode("utf-8"), timestamp_ms=int(datetime.now(tz=pytz.utc).timestamp() * 1000))
+                        break
+
         print(f"finished: {time.time() - r}")
 
 
