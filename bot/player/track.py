@@ -132,7 +132,7 @@ async def main():
                                         "War League Legend",
                                         "Wall Buster", "name", "Well Seasoned", "Games Champion", "Elixir Escapade",
                                         "Heroic Heist",
-                                        "warPreference", "warStars", "Nice and Tidy", "builderBaseTrophies"}
+                                        "warPreference", "warStars", "Nice and Tidy", "builderBaseTrophies", "heroEquipment"}
                         skip_store_types = {"War League Legend", "Wall Buster", "Aggressive Capitalism",
                                             "Baby Dragon",
                                             "Elixir Escapade",
@@ -145,7 +145,7 @@ async def main():
                                          "clanCapitalContributions", "Games Champion"}
                         ws_types = {"clanCapitalContributions", "name", "troops", "heroes", "spells", "heroEquipment",
                                     "townHallLevel",
-                                    "league", "Most Valuable Clanmate"}
+                                    "league", "Most Valuable Clanmate", "role"}
                         only_once = {"troops": 0, "heroes": 0, "spells": 0, "heroEquipment": 0}
                         if changes:
                             def recursive_defaultdict():
