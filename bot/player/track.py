@@ -132,7 +132,7 @@ async def main():
                                         "War League Legend",
                                         "Wall Buster", "name", "Well Seasoned", "Games Champion", "Elixir Escapade",
                                         "Heroic Heist",
-                                        "warPreference", "warStars", "Nice and Tidy", "builderBaseTrophies", "heroEquipment"}
+                                        "warPreference", "warStars", "Nice and Tidy", "builderBaseTrophies"}
                         skip_store_types = {"War League Legend", "Wall Buster", "Aggressive Capitalism",
                                             "Baby Dragon",
                                             "Elixir Escapade",
@@ -237,7 +237,7 @@ async def main():
                                         continue
                                     only_once[parent] += 1
 
-                                if type_ in online_types:
+                                if type_ in online_types or parent == "heroEquipment":
                                     #if we are comparing, say donations, we only want them to be online because donos went up.. not down because of season reset
                                     if isinstance(value, int):
                                         if value > old_value:
