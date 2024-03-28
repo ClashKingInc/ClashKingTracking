@@ -19,12 +19,25 @@ from msgspec.json import decode
 from msgspec import Struct
 from typing import Optional, List
 
+class Badges(Struct):
+    large: str
+    def to_dict(self):
+        return {f: getattr(self, f) for f in self.__struct_fields__}
+
 class Clan(Struct):
     name: str
     tag: str
+    badgeUrls: Badges
 
     def to_dict(self):
-        return {f: getattr(self, f) for f in self.__struct_fields__}
+        result = {f: getattr(self, f) for f in self.__struct_fields__}
+        for field, value in result.items():
+            if isinstance(value, Struct):
+                result[field] = value.to_dict()  # Recursively convert nested structs
+            elif isinstance(value, list) and all(isinstance(item, Struct) for item in value):
+                result[field] = [item.to_dict() for item in value]  # Convert lists of structs
+
+        return result
 
 class Equipment(Struct):
     name: str
