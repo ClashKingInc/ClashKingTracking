@@ -239,7 +239,7 @@ async def main():
 
                                 if type_ in online_types or parent == "heroEquipment":
                                     #if we are comparing, say donations, we only want them to be online because donos went up.. not down because of season reset
-                                    if isinstance(value, int):
+                                    if isinstance(value, int) and isinstance(old_value, int):
                                         if value > old_value:
                                             BEEN_ONLINE = True
                                     else:
