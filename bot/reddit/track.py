@@ -27,7 +27,7 @@ async def main():
             count = 0
             sub = await reddit.subreddit(subreddit)
             async for submission in sub.stream.submissions():
-                if count < 100:  # This removes the 100 historical submissions that SubredditStream pulls.
+                if count < 99:  # This removes the 100 historical submissions that SubredditStream pulls.
                     count += 1
                     continue
                 if submission.link_flair_text == 'Searching':
