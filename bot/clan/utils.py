@@ -95,7 +95,9 @@ async def get_war_responses(http_client: HTTPClient, db_client: MongoDatabase, k
     logger.info(f"{len(clan_tags)} clan tags | {len(war_responses)} war responses")
     return war_responses
 
+
 def send_reminder(acceptable_times: list[tuple], time: str, war_unique_id: str, clan_tag: str ,producer: KafkaProducer):
+    global WAR_CACHE
     war_data = WAR_CACHE.get(war_unique_id)
     if war_data is None:
         return
@@ -115,6 +117,7 @@ def send_reminder(acceptable_times: list[tuple], time: str, war_unique_id: str, 
 
 
 async def handle_war_responses(coc_client: coc.Client, producer: KafkaProducer, responses):
+    global WAR_CACHE
     loop = asyncio.get_event_loop()
     reminder_times = [f"{int(time)}hr" if time.is_integer() else f"{time}hr" for time in (x * 0.25 for x in range(1, 193))]
 
