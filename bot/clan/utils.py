@@ -158,6 +158,11 @@ async def handle_war_responses(coc_client: coc.Client, producer: KafkaProducer, 
                 schedule_reminders(reminder_times=reminder_times, war_end_time=war.end_time)
                 continue
 
+            if previous_war_data != war._raw_data:
+                WAR_CACHE[war_unique_id] = war._raw_data
+            else:
+                continue
+
             previous_war: coc.ClanWar = coc.ClanWar(data=previous_war_data, client=coc_client)
 
             if previous_war.attacks:
