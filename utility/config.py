@@ -14,8 +14,7 @@ class Config:
     redis_ip = getenv("REDIS_IP")
     redis_pw = getenv("REDIS_PW")
 
-    #tracking_type = getenv("TYPE")
-    tracking_type = "BOTLEGENDS"
+    tracking_type = getenv("TYPE")
 
 
 master_api_config = {
