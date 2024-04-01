@@ -2,19 +2,16 @@
 import pendulum as pend
 import orjson
 import time
-import snappy
 
 from kafka import KafkaProducer
 from collections import deque
-from redis import asyncio as redis
 from loguru import logger
 from utility.keycreation import create_keys
-from pymongo import UpdateOne, InsertOne
+from pymongo import UpdateOne
 from utility.classes import MongoDatabase
 from .config import LegendTrackingConfig
 from .utils import get_player_responses
-from collections import defaultdict
-from utility.utils import gen_season_date, gen_raid_date, gen_games_season, gen_legend_date
+from utility.utils import  gen_legend_date
 from msgspec.json import decode
 from msgspec import Struct
 from typing import Optional, List
