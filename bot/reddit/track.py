@@ -9,8 +9,9 @@ from dotenv import load_dotenv
 load_dotenv()
 
 subreddit = "ClashOfClansRecruit"
-secret = getenv("SECRET")
-RPW = getenv("RPW")
+secret = getenv("REDDIT_SECRET")
+RPW = getenv("REDDIT_PW")
+
 reddit = asyncpraw.Reddit(
     client_id="-dOCgLIHqUJK7g",
     client_secret= secret,
@@ -21,7 +22,6 @@ reddit = asyncpraw.Reddit(
 
 async def main():
     producer = KafkaProducer(bootstrap_servers=["85.10.200.219:9092"], api_version=(3, 6, 0))
-
     while True:
         try:
             count = 0
