@@ -33,6 +33,7 @@ class MongoDatabase():
         self.global_players: collection_class = self.clashking.global_players
         self.raid_weekends: collection_class = self.looper.raid_weekends
         self.war_timer: collection_class = self.looper.war_timer
+        self.legend_history: collection_class = self.looper.legend_history
 
         self.player_trophies: collection_class = self.ranking_history.player_trophies
         self.player_versus_trophies: collection_class = self.ranking_history.player_versus_trophies
@@ -44,4 +45,4 @@ class MongoDatabase():
         self.clans_db: collection_class = self.usafam.clans
         self.player_search: collection_class = self.usafam.player_search
         self.server_db: collection_class = self.usafam.server
-
+        self.player_autocomplete: collection_class = self.usafam.player_search

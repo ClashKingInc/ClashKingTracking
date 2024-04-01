@@ -72,7 +72,6 @@ async def main():
 
             for count, group in enumerate(split_tags, 1):
                 # update last updated for all the members we are checking this go around
-                await db_client.player_stats.update_many({"tag": {"$in": group}}, {"$set": {"last_updated": int(pend.now(tz=pend.UTC).timestamp())}})
                 logger.info(f"LOOP {loop_spot} | Group {count}/{len(split_tags)}: {len(group)} tags")
 
                 # pull previous responses from cache + map to a dict so we can easily pull
@@ -261,6 +260,7 @@ async def main():
                                 return d
 
                             if player_level_changes:
+                                player_level_changes["$set"]["last_updated"] = int(pend.now(tz=pend.UTC).timestamp())
                                 bulk_db_changes.append(UpdateOne(
                                     {"tag": tag},
                                     to_regular_dict(player_level_changes),
