@@ -41,7 +41,7 @@ async def main():
                                            "id" : submission.id,
                                            "comments_link" : f"https://www.reddit.com/r/{subreddit}/comments/{submission.id}",
                                            "tags" : tags}}
-                    producer.send(topic="player", value=orjson.dumps(json_data), timestamp_ms=int(pend.now(tz=pend.UTC).timestamp()) * 1000)
+                    producer.send(topic="reddit", value=orjson.dumps(json_data), timestamp_ms=int(pend.now(tz=pend.UTC).timestamp()) * 1000)
         except Exception as e:
             print(e)
             continue
