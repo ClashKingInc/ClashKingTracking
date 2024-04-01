@@ -4,7 +4,7 @@ from utility.config import Config
 from bot.player.track import main as bot_player_main
 from bot.clan.track import main as bot_clan_main
 from bot.legends.track import main as bot_legend_main
-from bot.reddit import main as bot_reddit_main
+from bot.reddit.track import main as bot_reddit_main
 
 from gamewide.clan_verify.track import main as clan_verify_main
 from gamewide.players.track import broadcast as global_player_main
