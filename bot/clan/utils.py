@@ -42,7 +42,7 @@ async def get_war(http_client: HTTPClient, db_client: MongoDatabase, clan_tag: s
 
     current_round = next_round = None
     if return_value == (True, True):
-        rounds: list = league_group_response.get("rounds")
+        rounds: list = league_group_response.get("rounds", [])
         current_round_war_tags = []
         next_round_war_tags = []
         for count, round in enumerate(reversed(rounds), 1):
