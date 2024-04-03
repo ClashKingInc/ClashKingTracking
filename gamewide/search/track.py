@@ -16,7 +16,7 @@ async def main():
     bot_clan_tags = await db_client.clans_db.distinct("tag")
     all_tags = list(set(all_tags + bot_clan_tags))
     logger.info(f"{len(all_tags)} tags")
-    size_break = 100_000
+    size_break = 75_000
     all_tags = [all_tags[i:i + size_break] for i in range(0, len(all_tags), size_break)]
 
     for tag_group in all_tags:
@@ -64,7 +64,7 @@ async def main():
                 headers = {"Authorization": f"Bearer {config.meili_pw}"}
                 async with aiohttp.ClientSession() as session:
                     async with session.get('http://85.10.200.219:7700/tasks?limit=1', headers=headers) as response:
-                        if response.status == 200:  # Meilisearch accepted the update
+                        if response.status == 200:
                             data = await response.json()
                             results = data.get("results", [])
                             if results[0].get("status") == "succeeded":
