@@ -39,5 +39,11 @@ async def main():
 
         # An index is where the documents are stored.
         index = client.index('players')
-        await index.add_documents_in_batches(documents=docs_to_insert, batch_size=100_000, primary_key="id", compress=True)
-        await asyncio.sleep(15)
+        finished = False
+        while not finished:
+            try:
+                await index.add_documents_in_batches(documents=docs_to_insert, batch_size=5000, primary_key="id", compress=True)
+                finished = True
+            except Exception:
+                logger.info("trying to add again")
+                pass
