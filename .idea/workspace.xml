@@ -4,7 +4,7 @@
     <option name="autoReloadType" value="SELECTIVE" />
   </component>
   <component name="ChangeListManager">
-    <list default="true" id="e7096e79-455b-4aa3-858d-e2defd65b8a9" name="Changes" comment="fix rounds being empty">
+    <list default="true" id="e7096e79-455b-4aa3-858d-e2defd65b8a9" name="Changes" comment="fix: meilisearch size">
       <change beforePath="$PROJECT_DIR$/.idea/workspace.xml" beforeDir="false" afterPath="$PROJECT_DIR$/.idea/workspace.xml" afterDir="false" />
       <change beforePath="$PROJECT_DIR$/gamewide/search/track.py" beforeDir="false" afterPath="$PROJECT_DIR$/gamewide/search/track.py" afterDir="false" />
     </list>
@@ -187,22 +187,6 @@
       <option name="number" value="Default" />
       <option name="presentableId" value="Default" />
       <updated>1706581825121</updated>
-    </task>
-    <task id="LOCAL-00013" summary="initial">
-      <option name="closed" value="true" />
-      <created>1711333171679</created>
-      <option name="number" value="00013" />
-      <option name="presentableId" value="LOCAL-00013" />
-      <option name="project" value="LOCAL" />
-      <updated>1711333171679</updated>
-    </task>
-    <task id="LOCAL-00014" summary="initial">
-      <option name="closed" value="true" />
-      <created>1711335168489</created>
-      <option name="number" value="00014" />
-      <option name="presentableId" value="LOCAL-00014" />
-      <option name="project" value="LOCAL" />
-      <updated>1711335168489</updated>
     </task>
     <task id="LOCAL-00015" summary="initial">
       <option name="closed" value="true" />
@@ -580,7 +564,23 @@
       <option name="project" value="LOCAL" />
       <updated>1712113102870</updated>
     </task>
-    <option name="localTasksCounter" value="62" />
+    <task id="LOCAL-00062" summary="fix: meilisearch size">
+      <option name="closed" value="true" />
+      <created>1712113644830</created>
+      <option name="number" value="00062" />
+      <option name="presentableId" value="LOCAL-00062" />
+      <option name="project" value="LOCAL" />
+      <updated>1712113644830</updated>
+    </task>
+    <task id="LOCAL-00063" summary="fix: meilisearch size">
+      <option name="closed" value="true" />
+      <created>1712113801779</created>
+      <option name="number" value="00063" />
+      <option name="presentableId" value="LOCAL-00063" />
+      <option name="project" value="LOCAL" />
+      <updated>1712113801779</updated>
+    </task>
+    <option name="localTasksCounter" value="64" />
     <servers />
   </component>
   <component name="VcsManagerConfiguration">
@@ -591,6 +591,7 @@
     <MESSAGE value="fix: war cache pull" />
     <MESSAGE value="add: meilisearch" />
     <MESSAGE value="fix rounds being empty" />
-    <option name="LAST_COMMIT_MESSAGE" value="fix rounds being empty" />
+    <MESSAGE value="fix: meilisearch size" />
+    <option name="LAST_COMMIT_MESSAGE" value="fix: meilisearch size" />
   </component>
 </project>
