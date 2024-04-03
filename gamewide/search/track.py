@@ -42,7 +42,7 @@ async def main():
         finished = False
         while not finished:
             try:
-                await index.add_documents_in_batches(documents=docs_to_insert, batch_size=5000, primary_key="id", compress=True)
+                await index.add_documents_in_batches(documents=docs_to_insert, batch_size=50_000, primary_key="id", compress=True)
                 finished = True
             except Exception:
                 logger.info("trying to add again")
