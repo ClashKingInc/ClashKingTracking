@@ -185,14 +185,6 @@
       <option name="presentableId" value="Default" />
       <updated>1706581825121</updated>
     </task>
-    <task id="LOCAL-00001" summary="initial">
-      <option name="closed" value="true" />
-      <created>1706752185760</created>
-      <option name="number" value="00001" />
-      <option name="presentableId" value="LOCAL-00001" />
-      <option name="project" value="LOCAL" />
-      <updated>1706752185760</updated>
-    </task>
     <task id="LOCAL-00002" summary="initial">
       <option name="closed" value="true" />
       <created>1711069041236</created>
@@ -577,7 +569,15 @@
       <option name="project" value="LOCAL" />
       <updated>1712108265312</updated>
     </task>
-    <option name="localTasksCounter" value="50" />
+    <task id="LOCAL-00050" summary="add: meilisearch">
+      <option name="closed" value="true" />
+      <created>1712108422059</created>
+      <option name="number" value="00050" />
+      <option name="presentableId" value="LOCAL-00050" />
+      <option name="project" value="LOCAL" />
+      <updated>1712108422059</updated>
+    </task>
+    <option name="localTasksCounter" value="51" />
     <servers />
   </component>
   <component name="VcsManagerConfiguration">

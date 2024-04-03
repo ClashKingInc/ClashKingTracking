@@ -1,6 +1,8 @@
 from utility.classes import MongoDatabase
 from meilisearch_python_sdk import AsyncClient
 from utility.config import Config
+from loguru import logger
+
 import asyncio
 
 
@@ -13,7 +15,7 @@ async def main():
     all_tags = [x["_id"] for x in (await db_client.global_clans.aggregate(pipeline).to_list(length=None))]
     bot_clan_tags = await db_client.clans_db.distinct("tag")
     all_tags = list(set(all_tags + bot_clan_tags))
-    print(f"{len(all_tags)} tags")
+    logger.info(f"{len(all_tags)} tags")
     size_break = 100_000
     all_tags = [all_tags[i:i + size_break] for i in range(0, len(all_tags), size_break)]
 
@@ -33,9 +35,9 @@ async def main():
             {"$unset": ["_id"]}
         ]
         docs_to_insert = await db_client.global_clans.aggregate(pipeline=pipeline).to_list(length=None)
-        print(len(docs_to_insert), "docs")
+        logger.info(f"{len(docs_to_insert)} docs")
 
         # An index is where the documents are stored.
         index = client.index('players')
-        await index.add_documents_in_batches(documents=docs_to_insert, batch_size=100_000, primary_key="id", compress=True)
+        await index.add_documents_in_batches(documents=docs_to_insert, batch_size=1_000, primary_key="id", compress=True)
         await asyncio.sleep(15)
