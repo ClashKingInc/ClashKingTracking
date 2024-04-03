@@ -7,8 +7,6 @@ import aiohttp
 
 async def main():
     config = Config()
-    print(config.meili_pw)
-    client = AsyncClient('http://85.10.200.219:7700', config.meili_pw, verify=False)
     db_client = MongoDatabase(stats_db_connection=config.stats_mongodb, static_db_connection=config.static_mongodb)
 
     pipeline = [{"$match": {"$nor": [{"members": {"$lt": 10}}, {"level": {"$lt": 3}}, {"capitalLeague": "Unranked"}]}}, {"$group": {"_id": "$tag"}}]
@@ -38,12 +36,11 @@ async def main():
         logger.info(f"{len(docs_to_insert)} docs")
 
         # An index is where the documents are stored.
-        index = client.index('players')
 
         async def add_documents(documents):
             headers = {"Authorization" : f"Bearer {config.meili_pw}"}
             async with aiohttp.ClientSession() as session:
-                async with session.post('http://85.10.200.219:7700', headers=headers, json=documents) as response:
+                async with session.post('http://85.10.200.219:7700/indexes/players/documents', headers=headers, json=documents) as response:
                     if response.status == 202:  # Meilisearch accepted the update
                         print("Documents added successfully")
                     else:
