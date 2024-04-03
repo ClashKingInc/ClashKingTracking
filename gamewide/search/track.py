@@ -5,10 +5,10 @@ from loguru import logger
 
 import asyncio
 
-
 async def main():
     config = Config()
-    client = AsyncClient('http://85.10.200.219:7700', config.redis_pw, verify=False)
+    print(config.meili_pw)
+    client = AsyncClient('http://85.10.200.219:7700', config.meili_pw, verify=False)
     db_client = MongoDatabase(stats_db_connection=config.stats_mongodb, static_db_connection=config.static_mongodb)
 
     pipeline = [{"$match": {"$nor": [{"members": {"$lt": 10}}, {"level": {"$lt": 3}}, {"capitalLeague": "Unranked"}]}}, {"$group": {"_id": "$tag"}}]
@@ -39,5 +39,5 @@ async def main():
 
         # An index is where the documents are stored.
         index = client.index('players')
-        await index.add_documents_in_batches(documents=docs_to_insert, batch_size=1_000, primary_key="id", compress=True)
+        await index.add_documents_in_batches(documents=docs_to_insert, batch_size=100_000, primary_key="id", compress=True)
         await asyncio.sleep(15)

@@ -16,6 +16,7 @@ class Config:
 
     tracking_type = getenv("TYPE")
 
+    meili_pw = getenv("MEILI_PW")
 
 master_api_config = {
     "bot_clan" : (41, 45),
