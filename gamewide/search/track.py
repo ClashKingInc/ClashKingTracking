@@ -59,5 +59,11 @@ async def main():
                 await asyncio.sleep(random.randint(0, 50)/10)
                 await session.post('http://85.10.200.219:7700/indexes/players/documents', headers=headers, json=documents)
 
-        await add_documents(documents=docs_to_insert)
+        worked = False
+        while not worked:
+            try:
+                await add_documents(documents=docs_to_insert)
+                worked = True
+            except:
+                await asyncio.sleep(5)
         await asyncio.sleep(15)
