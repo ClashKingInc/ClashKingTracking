@@ -1,3 +1,5 @@
+import asyncio
+
 from utility.classes import MongoDatabase
 from meilisearch_python_sdk import AsyncClient
 from utility.config import Config
@@ -42,12 +44,15 @@ async def main():
             async with aiohttp.ClientSession() as session:
                 async with session.post('http://85.10.200.219:7700/indexes/players/documents', headers=headers, json=documents) as response:
                     if response.status == 202:  # Meilisearch accepted the update
-                        print("Documents added successfully")
+                        #logger.info("Documents added successfully")
+                        pass
                     else:
                         logger.info(f"Error adding documents. Status code: {response.status}")
                         logger.info(await response.text())
 
-        size_break = 50_000
+        size_break = 3_000
         all_docs = [docs_to_insert[i:i + size_break] for i in range(0, len(docs_to_insert), size_break)]
+        tasks = []
         for doc_group in all_docs:
-            await add_documents(documents=doc_group)
+            tasks.append(asyncio.create_task(add_documents(documents=doc_group)))
+        await asyncio.gather(*tasks)
