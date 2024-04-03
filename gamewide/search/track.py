@@ -56,4 +56,24 @@ async def main():
         for doc_group in all_docs:
             tasks.append(asyncio.create_task(add_documents(documents=doc_group)))
         await asyncio.gather(*tasks)
+
+        done = False
+        while not done:
+            await asyncio.sleep(60)
+            try:
+                headers = {"Authorization": f"Bearer {config.meili_pw}"}
+                async with aiohttp.ClientSession() as session:
+                    async with session.get('http://85.10.200.219:7700/tasks?limit=1', headers=headers) as response:
+                        if response.status == 200:  # Meilisearch accepted the update
+                            data = await response.json()
+                            results = data.get("results", [])
+                            if results[0].get("status") == "succeeded":
+                                done = True
+                            else:
+                                continue
+                        else:
+                            continue
+            except Exception:
+                continue
+
         await asyncio.sleep(60)
