@@ -52,17 +52,12 @@ async def main():
                 docs_to_insert.append(d)
         print(f"starting bulk write: took {time.time() - t} secs")
 
+
         async def add_documents(documents):
             headers = {"Authorization" : f"Bearer {config.meili_pw}"}
             async with aiohttp.ClientSession() as session:
                 await asyncio.sleep(random.randint(0, 50)/10)
                 await session.post('http://85.10.200.219:7700/indexes/players/documents', headers=headers, json=documents)
 
-        size_break = 3_000
-        all_docs = [docs_to_insert[i:i + size_break] for i in range(0, len(docs_to_insert), size_break)]
-        tasks = []
-        for doc_group in all_docs:
-            tasks.append(asyncio.create_task(add_documents(documents=doc_group)))
-        await asyncio.gather(*tasks)
-
+        await add_documents(documents=docs_to_insert)
         await asyncio.sleep(15)
