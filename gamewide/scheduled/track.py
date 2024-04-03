@@ -1,12 +1,14 @@
 import collections
 import time
-
 import aiohttp
 import asyncio
 import ujson
+import orjson
 import coc
 import pendulum as pend
 import orjson
+import snappy
+from redis import asyncio as redis
 
 from hashids import Hashids
 from pymongo import UpdateOne, InsertOne
@@ -238,10 +240,93 @@ async def store_all_leaderboards():
         await database.bulk_write(store_tasks)
 
 
+async def store_legends():
+    keys = await create_keys([config.coc_email.format(x=x) for x in range(config.min_coc_email, config.max_coc_email + 1)], [config.coc_password] * config.max_coc_email)
+    headers = {
+        "Accept": "application/json",
+        "authorization": f"Bearer {keys[0]}"
+    }
+
+    async with aiohttp.ClientSession() as session:
+        async with session.get("https://api.clashofclans.com/v1/leagues/29000022/seasons",headers=headers) as response:
+            data = await response.json()
+            print(data)
+            seasons = [entry["id"] for entry in data["items"]]
+        await session.close()
+    seasons_present = await db_client.legend_history.distinct("season")
+    print(seasons_present)
+    missing = set(seasons) - set(seasons_present)
+    print(missing)
+
+    # print(missing)
+    for year in missing:
+        print(year)
+        after = ""
+        while after is not None:
+            changes = []
+            async with aiohttp.ClientSession() as session:
+                if after != "":
+                    after = f"&after={after}"
+                async with session.get(f"https://api.clashofclans.com/v1/leagues/29000022/seasons/{year}?limit=100000{after}", headers=headers) as response:
+                    items = await response.json()
+                    players = items["items"]
+                    for player in players:
+                        player["season"] = year
+                        changes.append(InsertOne(player))
+                    try:
+                        after = items["paging"]["cursors"]["after"]
+                    except Exception:
+                        after = None
+                await session.close()
+
+            results = await db_client.legend_history.bulk_write(changes, ordered=False)
+            print(results.bulk_api_result)
+
+
+async def update_autocomplete():
+    cache = redis.Redis(host=config.redis_ip, port=6379, db=0, password=config.redis_pw, decode_responses=False, max_connections=50,
+                        health_check_interval=10, socket_connect_timeout=5, retry_on_timeout=True, socket_keepalive=True)
+
+    #change to find changes in last 20 mins
+    current_time = pend.now(tz=pend.UTC)
+    time_20_mins_ago = current_time.subtract(minutes=20).timestamp()
+    #any players that had an update in last 20 mins
+    pipeline = [{"$match": {"last_updated" : {"$gte" : time_20_mins_ago}}},
+                {"$project": {"tag": "$tag"}},
+                {"$unset": "_id"}]
+    all_player_tags = [x["tag"] for x in (await db_client.player_stats.aggregate(pipeline).to_list(length=None))]
+    #delete any tags that are gone
+    #await db_client.player_autocomplete.delete_many({"tag" : {"$nin" : all_player_tags}})
+    split_size = 50_000
+    split_tags = [all_player_tags[i:i + split_size] for i in range(0, len(all_player_tags), split_size)]
+
+    for count, group in enumerate(split_tags, 1):
+        t = time.time()
+        print(f"Group {count}/{len(split_tags)}")
+        tasks = []
+        previous_player_responses = await cache.mget(keys=group)
+        for response in previous_player_responses:
+            if response is not None:
+                response = orjson.loads(snappy.decompress(response))
+                d = {
+                    "name" : response.get("name"),
+                    "clan" : response.get("clan", {}).get("tag", "No Clan"),
+                    "league" : response.get("league", {}).get("name", "Unranked"),
+                    "tag" : response.get("tag"),
+                    "th" : response.get("townHallLevel"),
+                    "clan_name" : response.get("clan", {}).get("name", "No Clan"),
+                    "trophies" : response.get("trophies")
+                }
+                tasks.append(UpdateOne({"tag" : response.get("tag")}, {"$set" : d}, upsert=True))
+        print(f"starting bulk write: took {time.time() - t} secs")
+        await db_client.player_autocomplete.bulk_write(tasks, ordered=False)
+
 async def main():
     scheduler = AsyncIOScheduler(timezone=utc)
     scheduler.add_job(store_all_leaderboards,"cron", hour=4, minute=56)
+    scheduler.add_job(store_legends,"cron", day="", hour=5, minute=56)
     scheduler.add_job(store_rounds,"cron", day="13", hour="19", minute=37)
     scheduler.add_job(store_cwl, "cron", day="9-12", hour="*", minute=35)
+    scheduler.add_job(update_autocomplete, "interval", minutes=15)
     scheduler.add_job(store_clan_capital, "cron", day_of_week="mon", hour=10)
     scheduler.start()

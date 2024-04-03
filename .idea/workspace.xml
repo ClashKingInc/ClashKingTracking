@@ -4,7 +4,10 @@
     <option name="autoReloadType" value="SELECTIVE" />
   </component>
   <component name="ChangeListManager">
-    <list default="true" id="e7096e79-455b-4aa3-858d-e2defd65b8a9" name="Changes" comment="initial" />
+    <list default="true" id="e7096e79-455b-4aa3-858d-e2defd65b8a9" name="Changes" comment="fix: war cache pull">
+      <change beforePath="$PROJECT_DIR$/.idea/workspace.xml" beforeDir="false" afterPath="$PROJECT_DIR$/.idea/workspace.xml" afterDir="false" />
+      <change beforePath="$PROJECT_DIR$/gamewide/scheduled/track.py" beforeDir="false" afterPath="$PROJECT_DIR$/gamewide/scheduled/track.py" afterDir="false" />
+    </list>
     <option name="SHOW_DIALOG" value="false" />
     <option name="HIGHLIGHT_CONFLICTS" value="true" />
     <option name="HIGHLIGHT_NON_ACTIVE_CHANGELIST" value="false" />
@@ -42,11 +45,11 @@
 }]]></component>
   <component name="RecentsManager">
     <key name="MoveFile.RECENT_KEYS">
+      <recent name="C:\Users\matth\PycharmProjects\clashkingtracking\bot\reddit" />
       <recent name="C:\Users\matth\PycharmProjects\clashkingtracking\global\scheduled" />
       <recent name="C:\Users\matth\PycharmProjects\clashkingtracking\global\war" />
       <recent name="C:\Users\matth\PycharmProjects\clashkingtracking\global\legends" />
       <recent name="C:\Users\matth\PycharmProjects\clashkingtracking\global\clan_find" />
-      <recent name="C:\Users\matth\PycharmProjects\clashkingtracking\global\players" />
     </key>
   </component>
   <component name="RunManager" selected="Python.main">
@@ -377,11 +380,207 @@
       <option name="project" value="LOCAL" />
       <updated>1711409751413</updated>
     </task>
-    <option name="localTasksCounter" value="25" />
+    <task id="LOCAL-00025" summary="fix: wrong spelling">
+      <option name="closed" value="true" />
+      <created>1711421617822</created>
+      <option name="number" value="00025" />
+      <option name="presentableId" value="LOCAL-00025" />
+      <option name="project" value="LOCAL" />
+      <updated>1711421617822</updated>
+    </task>
+    <task id="LOCAL-00026" summary="fix: wrong spelling">
+      <option name="closed" value="true" />
+      <created>1711422382011</created>
+      <option name="number" value="00026" />
+      <option name="presentableId" value="LOCAL-00026" />
+      <option name="project" value="LOCAL" />
+      <updated>1711422382011</updated>
+    </task>
+    <task id="LOCAL-00027" summary="fix: wrong spelling">
+      <option name="closed" value="true" />
+      <created>1711422771732</created>
+      <option name="number" value="00027" />
+      <option name="presentableId" value="LOCAL-00027" />
+      <option name="project" value="LOCAL" />
+      <updated>1711422771732</updated>
+    </task>
+    <task id="LOCAL-00028" summary="fix: wrong spelling">
+      <option name="closed" value="true" />
+      <created>1711423241372</created>
+      <option name="number" value="00028" />
+      <option name="presentableId" value="LOCAL-00028" />
+      <option name="project" value="LOCAL" />
+      <updated>1711423241373</updated>
+    </task>
+    <task id="LOCAL-00029" summary="fix: wrong spelling">
+      <option name="closed" value="true" />
+      <created>1711426121242</created>
+      <option name="number" value="00029" />
+      <option name="presentableId" value="LOCAL-00029" />
+      <option name="project" value="LOCAL" />
+      <updated>1711426121242</updated>
+    </task>
+    <task id="LOCAL-00030" summary="fix: better tracking">
+      <option name="closed" value="true" />
+      <created>1711426906482</created>
+      <option name="number" value="00030" />
+      <option name="presentableId" value="LOCAL-00030" />
+      <option name="project" value="LOCAL" />
+      <updated>1711426906482</updated>
+    </task>
+    <task id="LOCAL-00031" summary="fix: better tracking">
+      <option name="closed" value="true" />
+      <created>1711427260644</created>
+      <option name="number" value="00031" />
+      <option name="presentableId" value="LOCAL-00031" />
+      <option name="project" value="LOCAL" />
+      <updated>1711427260644</updated>
+    </task>
+    <task id="LOCAL-00032" summary="fix: better tracking">
+      <option name="closed" value="true" />
+      <created>1711603791047</created>
+      <option name="number" value="00032" />
+      <option name="presentableId" value="LOCAL-00032" />
+      <option name="project" value="LOCAL" />
+      <updated>1711603791047</updated>
+    </task>
+    <task id="LOCAL-00033" summary="fix: better tracking">
+      <option name="closed" value="true" />
+      <created>1711609567965</created>
+      <option name="number" value="00033" />
+      <option name="presentableId" value="LOCAL-00033" />
+      <option name="project" value="LOCAL" />
+      <updated>1711609567965</updated>
+    </task>
+    <task id="LOCAL-00034" summary="fix: better tracking">
+      <option name="closed" value="true" />
+      <created>1711609651278</created>
+      <option name="number" value="00034" />
+      <option name="presentableId" value="LOCAL-00034" />
+      <option name="project" value="LOCAL" />
+      <updated>1711609651278</updated>
+    </task>
+    <task id="LOCAL-00035" summary="fix: better tracking">
+      <option name="closed" value="true" />
+      <created>1711610627117</created>
+      <option name="number" value="00035" />
+      <option name="presentableId" value="LOCAL-00035" />
+      <option name="project" value="LOCAL" />
+      <updated>1711610627117</updated>
+    </task>
+    <task id="LOCAL-00036" summary="fix: better tracking">
+      <option name="closed" value="true" />
+      <created>1711610937593</created>
+      <option name="number" value="00036" />
+      <option name="presentableId" value="LOCAL-00036" />
+      <option name="project" value="LOCAL" />
+      <updated>1711610937593</updated>
+    </task>
+    <task id="LOCAL-00037" summary="fix: better tracking">
+      <option name="closed" value="true" />
+      <created>1711839442784</created>
+      <option name="number" value="00037" />
+      <option name="presentableId" value="LOCAL-00037" />
+      <option name="project" value="LOCAL" />
+      <updated>1711839442784</updated>
+    </task>
+    <task id="LOCAL-00038" summary="add: reddit tracking">
+      <option name="closed" value="true" />
+      <created>1711932481882</created>
+      <option name="number" value="00038" />
+      <option name="presentableId" value="LOCAL-00038" />
+      <option name="project" value="LOCAL" />
+      <updated>1711932481882</updated>
+    </task>
+    <task id="LOCAL-00039" summary="add: reddit tracking">
+      <option name="closed" value="true" />
+      <created>1711933292118</created>
+      <option name="number" value="00039" />
+      <option name="presentableId" value="LOCAL-00039" />
+      <option name="project" value="LOCAL" />
+      <updated>1711933292118</updated>
+    </task>
+    <task id="LOCAL-00040" summary="add: reddit tracking">
+      <option name="closed" value="true" />
+      <created>1711933404442</created>
+      <option name="number" value="00040" />
+      <option name="presentableId" value="LOCAL-00040" />
+      <option name="project" value="LOCAL" />
+      <updated>1711933404442</updated>
+    </task>
+    <task id="LOCAL-00041" summary="add: reddit tracking">
+      <option name="closed" value="true" />
+      <created>1711933448809</created>
+      <option name="number" value="00041" />
+      <option name="presentableId" value="LOCAL-00041" />
+      <option name="project" value="LOCAL" />
+      <updated>1711933448809</updated>
+    </task>
+    <task id="LOCAL-00042" summary="add: reddit tracking">
+      <option name="closed" value="true" />
+      <created>1711933582607</created>
+      <option name="number" value="00042" />
+      <option name="presentableId" value="LOCAL-00042" />
+      <option name="project" value="LOCAL" />
+      <updated>1711933582607</updated>
+    </task>
+    <task id="LOCAL-00043" summary="add: reddit tracking">
+      <option name="closed" value="true" />
+      <created>1711933825665</created>
+      <option name="number" value="00043" />
+      <option name="presentableId" value="LOCAL-00043" />
+      <option name="project" value="LOCAL" />
+      <updated>1711933825665</updated>
+    </task>
+    <task id="LOCAL-00044" summary="add: reddit tracking">
+      <option name="closed" value="true" />
+      <created>1711934081212</created>
+      <option name="number" value="00044" />
+      <option name="presentableId" value="LOCAL-00044" />
+      <option name="project" value="LOCAL" />
+      <updated>1711934081212</updated>
+    </task>
+    <task id="LOCAL-00045" summary="add: reddit tracking">
+      <option name="closed" value="true" />
+      <created>1711934121310</created>
+      <option name="number" value="00045" />
+      <option name="presentableId" value="LOCAL-00045" />
+      <option name="project" value="LOCAL" />
+      <updated>1711934121310</updated>
+    </task>
+    <task id="LOCAL-00046" summary="add: reddit tracking">
+      <option name="closed" value="true" />
+      <created>1711944165418</created>
+      <option name="number" value="00046" />
+      <option name="presentableId" value="LOCAL-00046" />
+      <option name="project" value="LOCAL" />
+      <updated>1711944165418</updated>
+    </task>
+    <task id="LOCAL-00047" summary="fix: war cache pull">
+      <option name="closed" value="true" />
+      <created>1711946691158</created>
+      <option name="number" value="00047" />
+      <option name="presentableId" value="LOCAL-00047" />
+      <option name="project" value="LOCAL" />
+      <updated>1711946691158</updated>
+    </task>
+    <task id="LOCAL-00048" summary="fix: war cache pull">
+      <option name="closed" value="true" />
+      <created>1711946896883</created>
+      <option name="number" value="00048" />
+      <option name="presentableId" value="LOCAL-00048" />
+      <option name="project" value="LOCAL" />
+      <updated>1711946896883</updated>
+    </task>
+    <option name="localTasksCounter" value="49" />
     <servers />
   </component>
   <component name="VcsManagerConfiguration">
     <MESSAGE value="initial" />
-    <option name="LAST_COMMIT_MESSAGE" value="initial" />
+    <MESSAGE value="fix: wrong spelling" />
+    <MESSAGE value="fix: better tracking" />
+    <MESSAGE value="add: reddit tracking" />
+    <MESSAGE value="fix: war cache pull" />
+    <option name="LAST_COMMIT_MESSAGE" value="fix: war cache pull" />
   </component>
 </project>
