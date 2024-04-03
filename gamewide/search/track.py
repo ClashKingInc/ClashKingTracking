@@ -3,7 +3,7 @@ from meilisearch_python_sdk import AsyncClient
 from utility.config import Config
 from loguru import logger
 
-import asyncio
+import aiohttp
 
 async def main():
     config = Config()
@@ -39,11 +39,18 @@ async def main():
 
         # An index is where the documents are stored.
         index = client.index('players')
-        finished = False
-        while not finished:
-            try:
-                await index.add_documents_in_batches(documents=docs_to_insert, batch_size=50_000, primary_key="id", compress=True)
-                finished = True
-            except Exception:
-                logger.info("trying to add again")
-                pass
+
+        async def add_documents(documents):
+            headers = {"Authorization" : f"Bearer {config.meili_pw}"}
+            async with aiohttp.ClientSession() as session:
+                async with session.post('http://85.10.200.219:7700', headers=headers, json=documents) as response:
+                    if response.status == 202:  # Meilisearch accepted the update
+                        print("Documents added successfully")
+                    else:
+                        logger.info(f"Error adding documents. Status code: {response.status}")
+                        logger.info(await response.text())
+
+        size_break = 50_000
+        all_docs = [docs_to_insert[i:i + size_break] for i in range(0, len(docs_to_insert), size_break)]
+        for doc_group in all_docs:
+            await add_documents(documents=doc_group)
