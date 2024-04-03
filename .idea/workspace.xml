@@ -4,10 +4,7 @@
     <option name="autoReloadType" value="SELECTIVE" />
   </component>
   <component name="ChangeListManager">
-    <list default="true" id="e7096e79-455b-4aa3-858d-e2defd65b8a9" name="Changes" comment="fix: war cache pull">
-      <change beforePath="$PROJECT_DIR$/.idea/workspace.xml" beforeDir="false" afterPath="$PROJECT_DIR$/.idea/workspace.xml" afterDir="false" />
-      <change beforePath="$PROJECT_DIR$/gamewide/scheduled/track.py" beforeDir="false" afterPath="$PROJECT_DIR$/gamewide/scheduled/track.py" afterDir="false" />
-    </list>
+    <list default="true" id="e7096e79-455b-4aa3-858d-e2defd65b8a9" name="Changes" comment="add: meilisearch" />
     <option name="SHOW_DIALOG" value="false" />
     <option name="HIGHLIGHT_CONFLICTS" value="true" />
     <option name="HIGHLIGHT_NON_ACTIVE_CHANGELIST" value="false" />
@@ -572,7 +569,15 @@
       <option name="project" value="LOCAL" />
       <updated>1711946896883</updated>
     </task>
-    <option name="localTasksCounter" value="49" />
+    <task id="LOCAL-00049" summary="add: meilisearch">
+      <option name="closed" value="true" />
+      <created>1712108265312</created>
+      <option name="number" value="00049" />
+      <option name="presentableId" value="LOCAL-00049" />
+      <option name="project" value="LOCAL" />
+      <updated>1712108265312</updated>
+    </task>
+    <option name="localTasksCounter" value="50" />
     <servers />
   </component>
   <component name="VcsManagerConfiguration">
@@ -581,6 +586,7 @@
     <MESSAGE value="fix: better tracking" />
     <MESSAGE value="add: reddit tracking" />
     <MESSAGE value="fix: war cache pull" />
-    <option name="LAST_COMMIT_MESSAGE" value="fix: war cache pull" />
+    <MESSAGE value="add: meilisearch" />
+    <option name="LAST_COMMIT_MESSAGE" value="add: meilisearch" />
   </component>
 </project>
