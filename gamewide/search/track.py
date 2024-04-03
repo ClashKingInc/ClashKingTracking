@@ -56,3 +56,4 @@ async def main():
         for doc_group in all_docs:
             tasks.append(asyncio.create_task(add_documents(documents=doc_group)))
         await asyncio.gather(*tasks)
+        await asyncio.sleep(60)
