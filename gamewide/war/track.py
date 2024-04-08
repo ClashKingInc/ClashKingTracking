@@ -44,6 +44,8 @@ async def broadcast(scheduler: AsyncIOScheduler):
     keys = await create_keys([config.coc_email.format(x=x) for x in range(config.min_coc_email, config.max_coc_email + 1)], [config.coc_password] * config.max_coc_email)
 
     throttler = Throttler(rate_limit=1200, period=1)
+    print(f"{len(list(keys))} keys")
+    await coc_client.login_with_tokens(*list(keys))
 
     while True:
         async def fetch(url, session: aiohttp.ClientSession, headers, tag, throttler: Throttler):
@@ -63,7 +65,7 @@ async def broadcast(scheduler: AsyncIOScheduler):
         all_tags = [tag for tag in all_tags if tag not in in_war] + bot_clan_tags
         all_tags = list(set(all_tags))
 
-        if x % 20 != 0:
+        '''if x % 20 != 0:
             right_now = datetime.now().timestamp()
             one_week_ago = int(right_now) - 604800
 
@@ -79,7 +81,7 @@ async def broadcast(scheduler: AsyncIOScheduler):
                 pipeline = [{"$match": {"endTime": {"$gte": one_week_ago}}}, {"$group": {"_id": "$data.opponent.tag"}}]
                 opponent_side_tags = [x["_id"] for x in (await db_client.clan_wars.aggregate(pipeline).to_list(length=None))]
             combined_tags = set(opponent_side_tags + clan_side_tags)
-            all_tags = [tag for tag in all_tags if tag in combined_tags]
+            all_tags = [tag for tag in all_tags if tag in combined_tags]'''
 
         logger.info(f"{len(all_tags)} tags")
         all_tags = [all_tags[i:i + size_break] for i in range(0, len(all_tags), size_break)]
@@ -165,7 +167,8 @@ async def store_war(clan_tag: str, opponent_tag: str, prep_time: int):
             return "no access"
         except coc.errors.Maintenance:
             return "maintenance"
-        except Exception:
+        except Exception as e:
+            print(e)
             return "error"
 
     switched = False
@@ -173,6 +176,7 @@ async def store_war(clan_tag: str, opponent_tag: str, prep_time: int):
     war_found = False
     while not war_found:
         war = await get_war(clan_tag=clan_tag)
+        print(war)
         if isinstance(war, coc.ClanWar):
             if war.preparation_start_time is None or int(war.preparation_start_time.time.timestamp()) != prep_time:
                 if not switched:
