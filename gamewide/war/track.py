@@ -57,15 +57,10 @@ async def broadcast(scheduler: AsyncIOScheduler):
                         return (503, 503)
                     return (None, None)
 
-
-        pipeline = [{"$match": {"openWarLog": True}}, {"$group": {"_id": "$tag"}}]
-        all_tags = [x["_id"] for x in (await db_client.global_clans.aggregate(pipeline).to_list(length=None))]
-        size_break = 50000
         bot_clan_tags = await db_client.clans_db.distinct("tag")
-        all_tags = [tag for tag in all_tags if tag not in in_war] + bot_clan_tags
-        all_tags = list(set(all_tags))
+        size_break = 50_000
 
-        '''if x % 20 != 0:
+        if x % 20 != 0:
             right_now = datetime.now().timestamp()
             one_week_ago = int(right_now) - 604800
 
@@ -80,8 +75,14 @@ async def broadcast(scheduler: AsyncIOScheduler):
             except Exception:
                 pipeline = [{"$match": {"endTime": {"$gte": one_week_ago}}}, {"$group": {"_id": "$data.opponent.tag"}}]
                 opponent_side_tags = [x["_id"] for x in (await db_client.clan_wars.aggregate(pipeline).to_list(length=None))]
-            combined_tags = set(opponent_side_tags + clan_side_tags)
-            all_tags = [tag for tag in all_tags if tag in combined_tags]'''
+            combined_tags = set(opponent_side_tags + clan_side_tags + bot_clan_tags)
+            all_tags = list(combined_tags)
+        else:
+            pipeline = [{"$match": {"openWarLog": True}}, {"$group": {"_id": "$tag"}}]
+            all_tags = [x["_id"] for x in (await db_client.global_clans.aggregate(pipeline).to_list(length=None))]
+            all_tags = [tag for tag in all_tags if tag not in in_war] + bot_clan_tags
+            all_tags = list(set(all_tags))
+
 
         logger.info(f"{len(all_tags)} tags")
         all_tags = [all_tags[i:i + size_break] for i in range(0, len(all_tags), size_break)]
@@ -168,7 +169,6 @@ async def store_war(clan_tag: str, opponent_tag: str, prep_time: int):
         except coc.errors.Maintenance:
             return "maintenance"
         except Exception as e:
-            print(e)
             return "error"
 
     switched = False
@@ -176,7 +176,6 @@ async def store_war(clan_tag: str, opponent_tag: str, prep_time: int):
     war_found = False
     while not war_found:
         war = await get_war(clan_tag=clan_tag)
-        print(war)
         if isinstance(war, coc.ClanWar):
             if war.preparation_start_time is None or int(war.preparation_start_time.time.timestamp()) != prep_time:
                 if not switched:
