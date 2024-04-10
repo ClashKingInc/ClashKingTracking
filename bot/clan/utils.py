@@ -49,6 +49,8 @@ async def clan_war_track(clan_tag: str, db_client: MongoDatabase, coc_client: co
                 war = await coc_client.get_current_war(clan_tag=other_clan)
             except coc.errors.PrivateWarLog:
                 pass
+    except Exception:
+        war = None
 
     next_round = None
     if war is not None and war.is_cwl and war.state != "inPreparation":
