@@ -186,7 +186,11 @@ async def raid_weekend_track(clan_tags: List[str], db_client: MongoDatabase, coc
 
 
 async def clan_track(clan_tag: str, coc_client: coc.Client, producer: KafkaProducer):
-    clan = await coc_client.get_clan(tag=clan_tag)
+    try:
+        clan = await coc_client.get_clan(tag=clan_tag)
+    except Exception:
+        return
+
     previous_clan: coc.Clan = CLAN_CACHE.get(clan.tag)
     CLAN_CACHE[clan.tag] = clan
 
