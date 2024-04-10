@@ -4,8 +4,15 @@
     <option name="autoReloadType" value="SELECTIVE" />
   </component>
   <component name="ChangeListManager">
-    <list default="true" id="e7096e79-455b-4aa3-858d-e2defd65b8a9" name="Changes" comment="fix: meilisearch size">
+    <list default="true" id="e7096e79-455b-4aa3-858d-e2defd65b8a9" name="Changes" comment="fix: no war store">
       <change beforePath="$PROJECT_DIR$/.idea/workspace.xml" beforeDir="false" afterPath="$PROJECT_DIR$/.idea/workspace.xml" afterDir="false" />
+      <change beforePath="$PROJECT_DIR$/bot/clan/track.py" beforeDir="false" afterPath="$PROJECT_DIR$/bot/clan/track.py" afterDir="false" />
+      <change beforePath="$PROJECT_DIR$/bot/clan/utils.py" beforeDir="false" afterPath="$PROJECT_DIR$/bot/clan/utils.py" afterDir="false" />
+      <change beforePath="$PROJECT_DIR$/bot/reddit/track.py" beforeDir="false" afterPath="$PROJECT_DIR$/bot/reddit/track.py" afterDir="false" />
+      <change beforePath="$PROJECT_DIR$/gamewide/scheduled/track.py" beforeDir="false" afterPath="$PROJECT_DIR$/gamewide/scheduled/track.py" afterDir="false" />
+      <change beforePath="$PROJECT_DIR$/gamewide/search/track.py" beforeDir="false" afterPath="$PROJECT_DIR$/gamewide/search/track.py" afterDir="false" />
+      <change beforePath="$PROJECT_DIR$/utility/classes.py" beforeDir="false" afterPath="$PROJECT_DIR$/utility/classes.py" afterDir="false" />
+      <change beforePath="$PROJECT_DIR$/utility/keycreation.py" beforeDir="false" afterPath="$PROJECT_DIR$/utility/keycreation.py" afterDir="false" />
     </list>
     <option name="SHOW_DIALOG" value="false" />
     <option name="HIGHLIGHT_CONFLICTS" value="true" />
@@ -31,17 +38,17 @@
     <option name="hideEmptyMiddlePackages" value="true" />
     <option name="showLibraryContents" value="true" />
   </component>
-  <component name="PropertiesComponent"><![CDATA[{
-  "keyToString": {
-    "Python.loadtest.executor": "Run",
-    "Python.main.executor": "Run",
-    "Python.track (1).executor": "Run",
-    "Python.track.executor": "Run",
-    "RunOnceActivity.OpenProjectViewOnStart": "true",
-    "RunOnceActivity.ShowReadmeOnStart": "true",
-    "git-widget-placeholder": "master"
+  <component name="PropertiesComponent">{
+  &quot;keyToString&quot;: {
+    &quot;Python.loadtest.executor&quot;: &quot;Run&quot;,
+    &quot;Python.main.executor&quot;: &quot;Run&quot;,
+    &quot;Python.track (1).executor&quot;: &quot;Run&quot;,
+    &quot;Python.track.executor&quot;: &quot;Run&quot;,
+    &quot;RunOnceActivity.OpenProjectViewOnStart&quot;: &quot;true&quot;,
+    &quot;RunOnceActivity.ShowReadmeOnStart&quot;: &quot;true&quot;,
+    &quot;git-widget-placeholder&quot;: &quot;master&quot;
   }
-}]]></component>
+}</component>
   <component name="RecentsManager">
     <key name="MoveFile.RECENT_KEYS">
       <recent name="C:\Users\matth\PycharmProjects\clashkingtracking\bot\reddit" />
@@ -186,30 +193,6 @@
       <option name="number" value="Default" />
       <option name="presentableId" value="Default" />
       <updated>1706581825121</updated>
-    </task>
-    <task id="LOCAL-00018" summary="initial">
-      <option name="closed" value="true" />
-      <created>1711344302232</created>
-      <option name="number" value="00018" />
-      <option name="presentableId" value="LOCAL-00018" />
-      <option name="project" value="LOCAL" />
-      <updated>1711344302232</updated>
-    </task>
-    <task id="LOCAL-00019" summary="initial">
-      <option name="closed" value="true" />
-      <created>1711344762325</created>
-      <option name="number" value="00019" />
-      <option name="presentableId" value="LOCAL-00019" />
-      <option name="project" value="LOCAL" />
-      <updated>1711344762325</updated>
-    </task>
-    <task id="LOCAL-00020" summary="initial">
-      <option name="closed" value="true" />
-      <created>1711344963148</created>
-      <option name="number" value="00020" />
-      <option name="presentableId" value="LOCAL-00020" />
-      <option name="project" value="LOCAL" />
-      <updated>1711344963148</updated>
     </task>
     <task id="LOCAL-00021" summary="initial">
       <option name="closed" value="true" />
@@ -579,7 +562,31 @@
       <option name="project" value="LOCAL" />
       <updated>1712115415160</updated>
     </task>
-    <option name="localTasksCounter" value="67" />
+    <task id="LOCAL-00067" summary="fix: meilisearch size">
+      <option name="closed" value="true" />
+      <created>1712117163528</created>
+      <option name="number" value="00067" />
+      <option name="presentableId" value="LOCAL-00067" />
+      <option name="project" value="LOCAL" />
+      <updated>1712117163528</updated>
+    </task>
+    <task id="LOCAL-00068" summary="fix: no war store">
+      <option name="closed" value="true" />
+      <created>1712536737057</created>
+      <option name="number" value="00068" />
+      <option name="presentableId" value="LOCAL-00068" />
+      <option name="project" value="LOCAL" />
+      <updated>1712536737057</updated>
+    </task>
+    <task id="LOCAL-00069" summary="fix: no war store">
+      <option name="closed" value="true" />
+      <created>1712536899467</created>
+      <option name="number" value="00069" />
+      <option name="presentableId" value="LOCAL-00069" />
+      <option name="project" value="LOCAL" />
+      <updated>1712536899468</updated>
+    </task>
+    <option name="localTasksCounter" value="70" />
     <servers />
   </component>
   <component name="VcsManagerConfiguration">
@@ -591,6 +598,7 @@
     <MESSAGE value="add: meilisearch" />
     <MESSAGE value="fix rounds being empty" />
     <MESSAGE value="fix: meilisearch size" />
-    <option name="LAST_COMMIT_MESSAGE" value="fix: meilisearch size" />
+    <MESSAGE value="fix: no war store" />
+    <option name="LAST_COMMIT_MESSAGE" value="fix: no war store" />
   </component>
 </project>

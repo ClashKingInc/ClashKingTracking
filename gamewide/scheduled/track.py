@@ -76,6 +76,8 @@ async def store_clan_capital():
 
 async def store_cwl():
     season = gen_games_season()
+    keys = await create_keys([config.coc_email.format(x=x) for x in range(config.min_coc_email, config.max_coc_email + 1)], [config.coc_password] * config.max_coc_email)
+
     async def fetch(url, session: aiohttp.ClientSession, headers, tag):
         async with session.get(url, headers=headers) as response:
             if response.status == 200:
@@ -83,7 +85,6 @@ async def store_cwl():
             return (None, None)
 
 
-    global keys
     pipeline = [{"$match": {}}, {"$group": {"_id": "$tag"}}]
     all_tags = [x["_id"] for x in (await db_client.global_clans.aggregate(pipeline).to_list(length=None))]
 
@@ -193,7 +194,6 @@ async def store_rounds():
                 response["season"] = season
                 war = coc.ClanWar(data=response, client=coc_client)
                 if war.preparation_start_time is None:
-                    print(war._raw_data)
                     continue
                 custom_id = hashids.encode(int(war.preparation_start_time.time.timestamp()) + int(pend.now(tz=pend.UTC).timestamp()))
                 war_unique_id = "-".join(sorted([war.clan.tag, war.opponent.tag])) + f"-{int(war.preparation_start_time.time.timestamp())}"
@@ -322,6 +322,9 @@ async def update_autocomplete():
         await db_client.player_autocomplete.bulk_write(tasks, ordered=False)
 
 async def main():
+    while True:
+        await store_cwl()
+        await asyncio.sleep(300)
     scheduler = AsyncIOScheduler(timezone=utc)
     scheduler.add_job(store_all_leaderboards,"cron", hour=4, minute=56)
     scheduler.add_job(store_legends,"cron", day="", hour=5, minute=56)

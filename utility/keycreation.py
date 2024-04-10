@@ -64,13 +64,13 @@ async def get_keys(emails: list, passwords: list, key_names: str, key_count: int
     return (total_keys)
 
 
-async def create_keys(emails: list, passwords: list) -> deque:
+async def create_keys(emails: list, passwords: list, as_list: bool = False) -> deque | list:
     done = False
-    while done is False:
+    while not done:
         try:
             keys = await get_keys(emails=emails, passwords=passwords, key_names="test", key_count=10)
-            done = True
+            if as_list:
+                return keys
             return deque(keys)
         except Exception as e:
-            done = False
             print(e)

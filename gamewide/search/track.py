@@ -56,7 +56,6 @@ async def main():
         async def add_documents(documents):
             headers = {"Authorization" : f"Bearer {config.meili_pw}"}
             async with aiohttp.ClientSession() as session:
-                await asyncio.sleep(random.randint(0, 50)/10)
                 await session.post('http://85.10.200.219:7700/indexes/players/documents', headers=headers, json=documents)
 
         worked = False

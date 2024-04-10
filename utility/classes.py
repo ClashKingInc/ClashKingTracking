@@ -10,6 +10,7 @@ class MongoDatabase():
         self.looper = self.stats_client.get_database("looper")
         self.clashking = self.stats_client.get_database("clashking")
         self.ranking_history = self.stats_client.get_database("ranking_history")
+        self.cache = self.stats_client.get_database("cache")
 
         #databases - static
         self.usafam = self.static_client.get_database("usafam")
@@ -41,8 +42,12 @@ class MongoDatabase():
         self.clan_versus_trophies: collection_class = self.ranking_history.clan_versus_trophies
         self.capital: collection_class = self.ranking_history.capital
 
+        self.capital_cache: collection_class = self.cache.capital_raids
+
+
         #collections - static
         self.clans_db: collection_class = self.usafam.clans
         self.player_search: collection_class = self.usafam.player_search
         self.server_db: collection_class = self.usafam.server
         self.player_autocomplete: collection_class = self.usafam.player_search
+        self.reminders: collection_class = self.usafam.reminders
