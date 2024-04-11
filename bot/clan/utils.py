@@ -53,8 +53,11 @@ async def clan_war_track(clan_tag: str, db_client: MongoDatabase, coc_client: co
         war = None
 
     next_round = None
-    if war is not None and war.is_cwl and war.state != "inPreparation":
-        next_round = await coc_client.get_current_war(clan_tag=clan_tag, cwl_round=coc.WarRound.current_preparation)
+    if war is not None and war.is_cwl and war.state != "inPreparation" and war.league_group.state != "ended":
+        try:
+            next_round = await coc_client.get_current_war(clan_tag=clan_tag, cwl_round=coc.WarRound.current_preparation)
+        except Exception:
+            pass
 
     war_list = [w for w in [war, next_round] if w is not None]
 
