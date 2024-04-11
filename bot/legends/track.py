@@ -152,7 +152,7 @@ async def main():
                                      "new_data" : player.to_dict(),
                                      "timestamp": int(pend.now(tz=pend.UTC).timestamp())}
                         if player.clan is not None and player.clan.tag in clan_tags:
-                            producer.send(topic="player", value=orjson.dumps(json_data), timestamp_ms=int(pend.now(tz=pend.UTC).timestamp()) * 1000)
+                            producer.send(topic="player", value=orjson.dumps(json_data), key=player.clan.tag.encode("utf-8"), timestamp_ms=int(pend.now(tz=pend.UTC).timestamp()) * 1000)
 
                         diff_trophies = player.trophies - previous_player.trophies
                         diff_attacks = player.attackWins - previous_player.attackWins

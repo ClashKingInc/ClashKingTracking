@@ -250,7 +250,7 @@ async def main():
                             if type_changes and (clan_tag in clan_tags):
                                 json_data = {"types": type_changes, "old_player": previous_response,
                                              "new_player": response, "timestamp": int(pend.now(tz=pend.UTC).timestamp())}
-                                producer.send(topic="player", value=orjson.dumps(json_data), timestamp_ms=int(pend.now(tz=pend.UTC).timestamp()) * 1000)
+                                producer.send(topic="player", value=orjson.dumps(json_data), key=clan_tag.encode("utf-8"), timestamp_ms=int(pend.now(tz=pend.UTC).timestamp()) * 1000)
 
                             def to_regular_dict(d):
                                 """Recursively converts a defaultdict to a regular dict."""
