@@ -19,7 +19,7 @@ CLAN_CACHE = {}
 reminder_times = [f"{int(time)}hr" if time.is_integer() else f"{time}hr" for time in (x * 0.25 for x in range(1, 193))]
 
 
-def send_reminder(acceptable_times: list[tuple], time: str, war_unique_id: str, clan_tag: str ,producer: KafkaProducer):
+def send_reminder(time: str, war_unique_id: str, clan_tag: str ,producer: KafkaProducer):
     global WAR_CACHE
     war = WAR_CACHE.get(war_unique_id)
     if war is None:
@@ -31,7 +31,7 @@ def send_reminder(acceptable_times: list[tuple], time: str, war_unique_id: str, 
         "time" : time,
         "data" : war._raw_data
     }
-    producer.send("reminder", ujson.dumps(json_data).encode("utf-8"), timestamp_ms=int(pend.now(tz=pend.UTC).timestamp() * 1000))
+    producer.send("reminder", ujson.dumps(json_data).encode("utf-8"), key=clan_tag, timestamp_ms=int(pend.now(tz=pend.UTC).timestamp() * 1000))
 
 
 
@@ -84,7 +84,7 @@ async def clan_war_track(clan_tag: str, db_client: MongoDatabase, coc_client: co
                 if acceptable_times:
                     for future_time, r_time in acceptable_times:
                         if future_time in set_times:
-                            loop.call_later((future_time - pend.now(tz=pend.UTC)).total_seconds(), send_reminder, acceptable_times, r_time, war_unique_id, clan_tag, producer)
+                            loop.call_later((future_time - pend.now(tz=pend.UTC)).total_seconds(), send_reminder,  r_time, war_unique_id, clan_tag, producer)
 
             await schedule_reminders(reminder_times=reminder_times, war_end_time=war.end_time)
             continue
@@ -107,7 +107,7 @@ async def clan_war_track(clan_tag: str, db_client: MongoDatabase, coc_client: co
         for attack in new_attacks:
             json_data = {"type": "new_attack", "war": war._raw_data, "league_group": league_group,
                          "attack": attack._raw_data, "clan_tag": clan_tag}
-            producer.send("war", ujson.dumps(json_data).encode("utf-8"), timestamp_ms=int(pend.now(tz=pend.UTC).timestamp() * 1000))
+            producer.send("war", ujson.dumps(json_data).encode("utf-8"), key=clan_tag, timestamp_ms=int(pend.now(tz=pend.UTC).timestamp() * 1000))
 
         previous_league_group = None
         if previous_war.is_cwl:
@@ -118,16 +118,16 @@ async def clan_war_track(clan_tag: str, db_client: MongoDatabase, coc_client: co
         if previous_war.preparation_start_time and war.preparation_start_time and previous_war.preparation_start_time.time != war.preparation_start_time.time:
             if previous_war.state != "warEnded":
                 json_data = {"type": "war_ended", "war": previous_war._raw_data, "league_group": previous_league_group, "clan_tag": clan_tag}
-                producer.send("war", ujson.dumps(json_data).encode("utf-8"), timestamp_ms=int(pend.now(tz=pend.UTC).timestamp() * 1000))
+                producer.send("war", ujson.dumps(json_data).encode("utf-8"), key=clan_tag, timestamp_ms=int(pend.now(tz=pend.UTC).timestamp() * 1000))
             json_data = {"type": "new_war", "war": war._raw_data, "league_group": league_group, "clan_tag": clan_tag}
-            producer.send("war", ujson.dumps(json_data).encode("utf-8"), timestamp_ms=int(pend.now(tz=pend.UTC).timestamp() * 1000))
+            producer.send("war", ujson.dumps(json_data).encode("utf-8"), key=clan_tag, timestamp_ms=int(pend.now(tz=pend.UTC).timestamp() * 1000))
         elif war.preparation_start_time and not previous_war.preparation_start_time:
             json_data = {"type": "new_war", "war": war._raw_data, "league_group": league_group, "clan_tag": clan_tag}
-            producer.send("war", ujson.dumps(json_data).encode("utf-8"), timestamp_ms=int(pend.now(tz=pend.UTC).timestamp() * 1000))
+            producer.send("war", ujson.dumps(json_data).encode("utf-8"), key=clan_tag, timestamp_ms=int(pend.now(tz=pend.UTC).timestamp() * 1000))
 
         if war.state != previous_war.state and previous_war.state == "warEnded":
             json_data = {"type": "war_ended", "war": previous_war._raw_data, "league_group": previous_league_group, "clan_tag": clan_tag}
-            producer.send("war", ujson.dumps(json_data).encode("utf-8"), timestamp_ms=int(pend.now(tz=pend.UTC).timestamp() * 1000))
+            producer.send("war", ujson.dumps(json_data).encode("utf-8"), key=clan_tag, timestamp_ms=int(pend.now(tz=pend.UTC).timestamp() * 1000))
 
 
 
@@ -165,7 +165,7 @@ async def raid_weekend_track(clan_tags: List[str], db_client: MongoDatabase, coc
 
             for clan in new_clans:
                 json_data = {"type": "new_offensive_opponent", "clan": clan._raw_data, "clan_tag": clan_tag, "raid": current_raid._raw_data}
-                producer.send("capital", ujson.dumps(json_data).encode("utf-8"), timestamp_ms=int(pend.now(tz=pend.UTC).timestamp() * 1000))
+                producer.send("capital", ujson.dumps(json_data).encode("utf-8"), key=clan_tag, timestamp_ms=int(pend.now(tz=pend.UTC).timestamp() * 1000))
 
             attacked = []
             for member in current_raid.members:
@@ -177,11 +177,11 @@ async def raid_weekend_track(clan_tags: List[str], db_client: MongoDatabase, coc
                          "clan_tag": current_raid.clan_tag,
                          "attacked" : attacked,
                          "raid": current_raid._raw_data}
-            producer.send("capital", ujson.dumps(json_data).encode("utf-8"), timestamp_ms=int(pend.now(tz=pend.UTC).timestamp() * 1000))
+            producer.send("capital", ujson.dumps(json_data).encode("utf-8"), key=clan_tag, timestamp_ms=int(pend.now(tz=pend.UTC).timestamp() * 1000))
 
             if current_raid.state != previous_raid.state:
                 json_data = {"type": "raid_state", "clan_tag": current_raid.clan_tag, "old_raid": previous_raid._raw_data, "raid": current_raid._raw_data}
-                producer.send("capital", ujson.dumps(json_data).encode("utf-8"), timestamp_ms=int(pend.now(tz=pend.UTC).timestamp() * 1000))
+                producer.send("capital", ujson.dumps(json_data).encode("utf-8"), key=clan_tag, timestamp_ms=int(pend.now(tz=pend.UTC).timestamp() * 1000))
 
 
     await db_client.capital_cache.bulk_write(db_updates, ordered=False)
@@ -204,21 +204,21 @@ async def clan_track(clan_tag: str, coc_client: coc.Client, producer: KafkaProdu
     for attribute in attributes:
         if getattr(clan, attribute) != getattr(previous_clan, attribute):
             json_data = {"type": attribute, "old_clan": previous_clan._raw_data, "new_clan": clan._raw_data}
-            producer.send("clan", ujson.dumps(json_data).encode("utf-8"), timestamp_ms=int(pend.now(tz=pend.UTC).timestamp() * 1000))
+            producer.send("clan", value=ujson.dumps(json_data).encode("utf-8"), key=clan_tag, timestamp_ms=int(pend.now(tz=pend.UTC).timestamp() * 1000))
     current_tags = set(n.tag for n in previous_clan.members)
     if current_tags:
         # we can't check the member_count first incase 1 person left and joined within the 60sec.
         members_joined = (n for n in clan.members if n.tag not in current_tags)
         for member in members_joined:
             json_data = {"type": "member_join", "clan": clan._raw_data, "member": member._raw_data}
-            producer.send("clan", ujson.dumps(json_data).encode("utf-8"), timestamp_ms=int(pend.now(tz=pend.UTC).timestamp() * 1000))
+            producer.send("clan", ujson.dumps(json_data).encode("utf-8"), key=clan_tag, timestamp_ms=int(pend.now(tz=pend.UTC).timestamp() * 1000))
 
     current_tags = set(n.tag for n in clan.members)
     if current_tags:
         members_left = (n for n in previous_clan.members if n.tag not in current_tags)
         for member in members_left:
             json_data = {"type": "member_leave", "clan": clan._raw_data, "member": member._raw_data}
-            producer.send("clan", ujson.dumps(json_data).encode("utf-8"), timestamp_ms=int(pend.now(tz=pend.UTC).timestamp() * 1000))
+            producer.send("clan", ujson.dumps(json_data).encode("utf-8"), key=clan_tag, timestamp_ms=int(pend.now(tz=pend.UTC).timestamp() * 1000))
 
     previous_donations = {n.tag: (n.donations, n.received) for n in previous_clan.members}
     for member in clan.members:
@@ -226,7 +226,7 @@ async def clan_track(clan_tag: str, coc_client: coc.Client, producer: KafkaProdu
             mem_donos, mem_received = member_donated
             if mem_donos < member.donations or mem_received < member.received:
                 json_data = {"type": "all_member_donations", "old_clan": previous_clan._raw_data, "new_clan": clan._raw_data}
-                producer.send("clan", ujson.dumps(json_data).encode("utf-8"), timestamp_ms=int(pend.now(tz=pend.UTC).timestamp() * 1000))
+                producer.send("clan", ujson.dumps(json_data).encode("utf-8"), key=clan_tag, timestamp_ms=int(pend.now(tz=pend.UTC).timestamp() * 1000))
                 break
 
 
