@@ -63,7 +63,7 @@ async def broadcast():
 
 async def main():
     loop = asyncio.get_event_loop()
-    config = Config(app=app, loop="asyncio", host="localhost", port=8000, ws_ping_interval=120 ,ws_ping_timeout= 120)
+    config = Config(app=app, loop="asyncio", host="0.0.0.0", port=8000, ws_ping_interval=120 ,ws_ping_timeout= 120)
     server = Server(config)
     loop.create_task(server.serve())
     loop.create_task(broadcast())
