@@ -5,6 +5,7 @@ from bot.player.track import main as bot_player_main
 from bot.clan.track import main as bot_clan_main
 from bot.legends.track import main as bot_legend_main
 from bot.reddit.track import main as bot_reddit_main
+from bot.websockets.server import main as websocket_server
 
 from gamewide.clan_verify.track import main as clan_verify_main
 from gamewide.players.track import broadcast as global_player_main
@@ -32,6 +33,8 @@ if __name__ == "__main__":
         task = global_war_main
     elif config.tracking_type == "SEARCH":
         task = search_main
+    elif config.tracking_type == "WEBSOCKET":
+        task = websocket_server
     else:
         task = asyncio.sleep
 
