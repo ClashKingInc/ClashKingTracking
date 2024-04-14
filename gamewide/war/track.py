@@ -66,7 +66,7 @@ async def broadcast(scheduler: AsyncIOScheduler):
 
         if x % 20 != 0:
             right_now = datetime.now().timestamp()
-            one_week_ago = int(right_now) - 604800
+            one_week_ago = int(right_now) - (604800 * 4)
 
             try:
                 clan_tags = await db_client.clan_wars.distinct("clans", filter={"endTime": {"$gte" : one_week_ago}})
