@@ -169,6 +169,7 @@ async def store_war(clan_tag: str, opponent_tag: str, prep_time: int):
         except coc.errors.Maintenance:
             return "maintenance"
         except Exception as e:
+            logger.error(str(e))
             return "error"
 
     switched = False
