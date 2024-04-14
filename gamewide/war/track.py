@@ -94,6 +94,7 @@ async def broadcast(scheduler: AsyncIOScheduler):
 
         x += 1
         for count, tag_group in enumerate(all_tags, 1):
+            await asyncio.sleep(10)
             logger.info(f"Group {count}/{len(all_tags)}")
             tasks = []
             connector = aiohttp.TCPConnector(limit=500, ttl_dns_cache=600)
