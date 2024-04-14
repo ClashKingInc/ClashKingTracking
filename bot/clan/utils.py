@@ -140,7 +140,7 @@ async def raid_weekend_track(clan_tags: List[str], db_client: MongoDatabase, coc
         tasks.append(coc_client.get_raid_log(clan_tag=clan_tag, limit=1))
     current_raids = await asyncio.gather(*tasks, return_exceptions=True)
 
-    current_raids: Dict[str, coc.RaidLogEntry] = {r[0].clan_tag : r[0] for r in current_raids if not isinstance(r, BaseException)}
+    current_raids: Dict[str, coc.RaidLogEntry] = {r[0].clan_tag : r[0] for r in current_raids if r and not isinstance(r, BaseException)}
 
     db_updates = []
     for clan_tag in clan_tags:
