@@ -57,8 +57,8 @@ async def broadcast(scheduler: AsyncIOScheduler):
                 async with session.get(url, headers=headers) as response:
                     if response.status == 200:
                         return ((await response.read()), tag)
-                    elif response.status == 503:
-                        return (503, 503)
+                    elif response.status == 403:
+                        return (403, 403)
                     return (None, None)
 
         bot_clan_tags = await db_client.clans_db.distinct("tag")
@@ -109,8 +109,9 @@ async def broadcast(scheduler: AsyncIOScheduler):
             war_timers = []
             for response, tag in responses:
                 # we shouldnt have completely invalid tags, they all existed at some point
-                if response is None or response == 503:
-                    api_fails += 1
+                if response is None or response == 403:
+                    if response is None:
+                        api_fails += 1
                     continue
                 try:
                     war = decode(response, type=War)
