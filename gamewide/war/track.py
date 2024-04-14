@@ -161,7 +161,7 @@ async def broadcast(scheduler: AsyncIOScheduler):
         logger.info(f"{len(in_war)} clans in war")
 
         if store_fails:
-            f = '\n- '.join(store_fails)
+            f = '\n- '.join([str(s) for s in store_fails])
             logger.info(f"{len(store_fails)} War Store Fails\n"
                         f"Reasons:\n{f}")
 
