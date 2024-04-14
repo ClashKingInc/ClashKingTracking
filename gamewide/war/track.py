@@ -38,7 +38,7 @@ class War(Struct):
 
 in_war = set()
 
-store_fails = 0
+store_fails = []
 
 async def broadcast(scheduler: AsyncIOScheduler):
     global in_war
@@ -138,7 +138,7 @@ async def broadcast(scheduler: AsyncIOScheduler):
                     #schedule getting war
                     try:
                         scheduler.add_job(store_war, 'date', run_date=run_time, args=[tag, opponent_tag, int(coc.Timestamp(data=war.preparationStartTime).time.timestamp())],
-                                          id=f"war_end_{tag}_{opponent_tag}", name=f"{tag}_war_end_{opponent_tag}", misfire_grace_time=1200, max_instances=250)
+                                          id=f"war_end_{tag}_{opponent_tag}", name=f"{tag}_war_end_{opponent_tag}", misfire_grace_time=1200, max_instances=1)
                     except Exception:
                         ones_that_tried_again.append(tag)
                         pass
@@ -160,8 +160,10 @@ async def broadcast(scheduler: AsyncIOScheduler):
         if api_fails != 0:
             logger.info(f"{api_fails} API call fails")
 
-        if store_fails != 0:
-            logger.info(f"{store_fails} War Store Fails")
+        if store_fails:
+            f = '\n- '.join(store_fails)
+            logger.info(f"{len(store_fails)} War Store Fails\n"
+                        f"Reasons:\n{f}")
 
 async def store_war(clan_tag: str, opponent_tag: str, prep_time: int):
     global in_war
@@ -217,7 +219,7 @@ async def store_war(clan_tag: str, opponent_tag: str, prep_time: int):
         await asyncio.sleep(war._response_retry)
 
     if not war_found:
-        store_fails += 1
+        store_fails.append(war)
         return
 
     war_unique_id = "-".join(sorted([war.clan.tag, war.opponent.tag])) + f"-{int(war.preparation_start_time.time.timestamp())}"
