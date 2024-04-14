@@ -148,7 +148,7 @@ async def raid_weekend_track(clan_tags: List[str], db_client: MongoDatabase, coc
         current_raid = current_raids.get(clan_tag)
         previous_raid = cached_raids.get(clan_tag)
 
-        if current_raid is None and previous_raid is None:
+        if current_raid is None:
             continue
 
         if current_raid._raw_data != previous_raid:
