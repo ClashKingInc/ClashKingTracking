@@ -142,6 +142,7 @@ async def raid_weekend_track(clan_tags: List[str], db_client: MongoDatabase, coc
 
     current_raids: Dict[str, coc.RaidLogEntry] = {r[0].clan_tag : r[0] for r in current_raids if r and not isinstance(r, BaseException)}
 
+
     db_updates = []
     for clan_tag in clan_tags:
         current_raid = current_raids.get(clan_tag)
@@ -151,7 +152,7 @@ async def raid_weekend_track(clan_tags: List[str], db_client: MongoDatabase, coc
             continue
 
         if current_raid._raw_data != previous_raid:
-            db_updates.append(UpdateOne({"tag" : clan_tag}, {"$set" : {"data" : current_raid._raw_data}}))
+            db_updates.append(UpdateOne({"tag" : clan_tag}, {"$set" : {"data" : current_raid._raw_data}}, upsert=True))
 
             if previous_raid is None:
                 continue
