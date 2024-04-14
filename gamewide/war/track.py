@@ -38,6 +38,8 @@ class War(Struct):
 
 in_war = set()
 
+store_fails = 0
+
 async def broadcast(scheduler: AsyncIOScheduler):
     global in_war
     x = 1
@@ -48,6 +50,8 @@ async def broadcast(scheduler: AsyncIOScheduler):
     await coc_client.login_with_tokens(*list(keys))
 
     while True:
+        api_fails = 0
+
         async def fetch(url, session: aiohttp.ClientSession, headers, tag, throttler: Throttler):
             async with throttler:
                 async with session.get(url, headers=headers) as response:
@@ -76,7 +80,7 @@ async def broadcast(scheduler: AsyncIOScheduler):
                 pipeline = [{"$match": {"endTime": {"$gte": one_week_ago}}}, {"$group": {"_id": "$data.opponent.tag"}}]
                 opponent_side_tags = [x["_id"] for x in (await db_client.clan_wars.aggregate(pipeline).to_list(length=None))]
             combined_tags = set(opponent_side_tags + clan_side_tags + bot_clan_tags)
-            all_tags = list(combined_tags)
+            all_tags = list([tag for tag in combined_tags if tag not in in_war])
         else:
             pipeline = [{"$match": {"openWarLog": True}}, {"$group": {"_id": "$tag"}}]
             all_tags = [x["_id"] for x in (await db_client.global_clans.aggregate(pipeline).to_list(length=None))]
@@ -106,6 +110,7 @@ async def broadcast(scheduler: AsyncIOScheduler):
             for response, tag in responses:
                 # we shouldnt have completely invalid tags, they all existed at some point
                 if response is None or response == 503:
+                    api_fails += 1
                     continue
                 try:
                     war = decode(response, type=War)
@@ -150,9 +155,16 @@ async def broadcast(scheduler: AsyncIOScheduler):
         if ones_that_tried_again:
             logger.info(f"{len(ones_that_tried_again)} tried again, examples: {ones_that_tried_again[:5]}")
 
+        if api_fails != 0:
+            logger.info(f"{api_fails} API call fails")
+
+        if store_fails != 0:
+            logger.info(f"{store_fails} War Store Fails")
 
 async def store_war(clan_tag: str, opponent_tag: str, prep_time: int):
     global in_war
+    global store_fails
+
     hashids = Hashids(min_length=7)
 
     if clan_tag in in_war:
@@ -203,6 +215,7 @@ async def store_war(clan_tag: str, opponent_tag: str, prep_time: int):
         await asyncio.sleep(war._response_retry)
 
     if not war_found:
+        store_fails += 1
         return
 
     war_unique_id = "-".join(sorted([war.clan.tag, war.opponent.tag])) + f"-{int(war.preparation_start_time.time.timestamp())}"
