@@ -69,17 +69,15 @@ async def broadcast(scheduler: AsyncIOScheduler):
             one_week_ago = int(right_now) - 604800
 
             try:
-                clan_side_tags = await db_client.clan_wars.distinct("data.clan.tag", filter={"endTime": {"$gte" : one_week_ago}})
+                clan_tags = await db_client.clan_wars.distinct("clans", filter={"endTime": {"$gte" : one_week_ago}})
             except Exception:
-                pipeline = [{"$match": {"endTime": {"$gte": one_week_ago}}}, {"$group": {"_id": "$data.clan.tag"}}]
-                clan_side_tags = [x["_id"] for x in (await db_client.clan_wars.aggregate(pipeline).to_list(length=None))]
+                pipeline = [{"$match": {"endTime": {"$gte": one_week_ago}}}, {"$group": {"_id": "$clans"}}]
+                results = await db_client.clan_wars.aggregate(pipeline).to_list(length=None)
+                clan_tags = []
+                for result in results:
+                    clan_tags.extend(result.get("_id", []))
 
-            try:
-                opponent_side_tags = await db_client.clan_wars.distinct("data.opponent.tag", filter={"endTime": {"$gte" : one_week_ago}})
-            except Exception:
-                pipeline = [{"$match": {"endTime": {"$gte": one_week_ago}}}, {"$group": {"_id": "$data.opponent.tag"}}]
-                opponent_side_tags = [x["_id"] for x in (await db_client.clan_wars.aggregate(pipeline).to_list(length=None))]
-            combined_tags = set(opponent_side_tags + clan_side_tags + bot_clan_tags)
+            combined_tags = set(clan_tags + bot_clan_tags)
             all_tags = list([tag for tag in combined_tags if tag not in in_war])
         else:
             pipeline = [{"$match": {"openWarLog": True}}, {"$group": {"_id": "$tag"}}]
