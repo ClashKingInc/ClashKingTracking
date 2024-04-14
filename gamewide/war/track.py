@@ -160,6 +160,8 @@ async def broadcast(scheduler: AsyncIOScheduler):
         if api_fails != 0:
             logger.info(f"{api_fails} API call fails")
 
+        logger.info(f"{len(in_war)} clans in war")
+
         if store_fails:
             f = '\n- '.join(store_fails)
             logger.info(f"{len(store_fails)} War Store Fails\n"
