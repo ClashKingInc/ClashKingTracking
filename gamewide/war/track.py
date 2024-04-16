@@ -2,6 +2,7 @@ import aiohttp
 import asyncio
 import coc
 import pendulum as pend
+import random
 
 from hashids import Hashids
 from datetime import datetime
@@ -232,7 +233,8 @@ async def store_war(clan_tag: str, opponent_tag: str, prep_time: int):
     if war_result.get("data") is not None:
         return
 
-    custom_id = hashids.encode(int(war.preparation_start_time.time.replace(tzinfo=pend.UTC).timestamp()) + int(pend.now(tz=pend.UTC).timestamp()))
+
+    custom_id = hashids.encode(int(war.preparation_start_time.time.replace(tzinfo=pend.UTC).timestamp()) + int(pend.now(tz=pend.UTC).timestamp()) + random.randint(1000000000, 9999999999))
     await db_client.clan_wars.update_one({"war_id": war_unique_id},
         {"$set" : {
         "custom_id": custom_id,
