@@ -42,6 +42,8 @@ store_fails = []
 
 async def broadcast(scheduler: AsyncIOScheduler):
     global in_war
+    global store_fails
+
     x = 1
     keys = await create_keys([config.coc_email.format(x=x) for x in range(config.min_coc_email, config.max_coc_email + 1)], [config.coc_password] * config.max_coc_email)
 
@@ -123,10 +125,12 @@ async def broadcast(scheduler: AsyncIOScheduler):
                     if war_end.seconds_until < 0:
                         continue
                     war_prep = coc.Timestamp(data=war.preparationStartTime)
+                    war_prep = war_prep.time.replace(tzinfo=pend.UTC)
+
                     opponent_tag = war.opponent.tag if war.opponent.tag != tag else war.clan.tag
                     in_war.add(tag)
                     in_war.add(opponent_tag)
-                    war_unique_id = "-".join(sorted([war.clan.tag, war.opponent.tag])) + f"-{int(war_prep.time.timestamp())}"
+                    war_unique_id = "-".join(sorted([war.clan.tag, war.opponent.tag])) + f"-{int(war_prep.timestamp())}"
                     for member in war.clan.members + war.opponent.members:
                         war_timers.append(UpdateOne({"_id" : member.tag}, {"$set" : {"clans" : [war.clan.tag, war.opponent.tag], "time" : war_end.time}}, upsert=True))
                     changes.append(InsertOne({"war_id" : war_unique_id,
@@ -135,7 +139,7 @@ async def broadcast(scheduler: AsyncIOScheduler):
                                               }))
                     #schedule getting war
                     try:
-                        scheduler.add_job(store_war, 'date', run_date=run_time, args=[tag, opponent_tag, int(coc.Timestamp(data=war.preparationStartTime).time.timestamp())],
+                        scheduler.add_job(store_war, 'date', run_date=run_time, args=[tag, opponent_tag, int(war_prep.timestamp())],
                                           id=f"war_end_{tag}_{opponent_tag}", name=f"{tag}_war_end_{opponent_tag}", misfire_grace_time=1200, max_instances=1)
                     except Exception:
                         ones_that_tried_again.append(tag)
@@ -159,8 +163,8 @@ async def broadcast(scheduler: AsyncIOScheduler):
             logger.info(f"{api_fails} API call fails")
 
         logger.info(f"{len(in_war)} clans in war")
-
         if store_fails:
+            store_fails = []
             f = '\n- '.join([str(s) for s in store_fails])
             logger.info(f"{len(store_fails)} War Store Fails\n"
                         f"Reasons:\n{f}")
@@ -194,7 +198,7 @@ async def store_war(clan_tag: str, opponent_tag: str, prep_time: int):
     while not war_found:
         war = await get_war(clan_tag=clan_tag)
         if isinstance(war, coc.ClanWar):
-            if war.preparation_start_time is None or int(war.preparation_start_time.time.timestamp()) != prep_time:
+            if war.preparation_start_time is None or int(war.preparation_start_time.time.replace(tzinfo=pend.UTC).timestamp()) != prep_time:
                 if not switched:
                     clan_tag = opponent_tag
                     switched = True
@@ -222,13 +226,13 @@ async def store_war(clan_tag: str, opponent_tag: str, prep_time: int):
         store_fails.append(war)
         return
 
-    war_unique_id = "-".join(sorted([war.clan.tag, war.opponent.tag])) + f"-{int(war.preparation_start_time.time.timestamp())}"
+    war_unique_id = "-".join(sorted([war.clan.tag, war.opponent.tag])) + f"-{int(war.preparation_start_time.time.replace(tzinfo=pend.UTC).timestamp())}"
 
     war_result = await db_client.clan_wars.find_one({"war_id" : war_unique_id})
     if war_result.get("data") is not None:
         return
 
-    custom_id = hashids.encode(int(war.preparation_start_time.time.timestamp()) + int(pend.now(tz=pend.UTC).timestamp()))
+    custom_id = hashids.encode(int(war.preparation_start_time.time.replace(tzinfo=pend.UTC).timestamp()) + int(pend.now(tz=pend.UTC).timestamp()))
     await db_client.clan_wars.update_one({"war_id": war_unique_id},
         {"$set" : {
         "custom_id": custom_id,
