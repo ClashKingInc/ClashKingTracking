@@ -165,10 +165,10 @@ async def broadcast(scheduler: AsyncIOScheduler):
 
         logger.info(f"{len(in_war)} clans in war")
         if store_fails:
-            store_fails = []
             f = '\n- '.join([str(s) for s in store_fails])
             logger.info(f"{len(store_fails)} War Store Fails\n"
                         f"Reasons:\n{f}")
+            store_fails = []
 
 async def store_war(clan_tag: str, opponent_tag: str, prep_time: int):
     global in_war
