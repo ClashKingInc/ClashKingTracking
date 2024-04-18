@@ -120,96 +120,97 @@ async def main():
             all_tags = [all_tags[i:i + size_break] for i in range(0, len(all_tags), size_break)]
 
             for tag_group in all_tags:
-                tasks = []
-                connector = TCPConnector(limit=500, enable_cleanup_closed=True)
-                timeout = ClientTimeout(total=1800)
-                async with ClientSession(connector=connector, timeout=timeout) as session:
-                    for tag in tag_group:
-                        keys.rotate(1)
-                        tasks.append(fetch(f"https://api.clashofclans.com/v1/clans/{tag.replace('#', '%23')}", session, {"Authorization": f"Bearer {keys[0]}"}))
-                    responses = await asyncio.gather(*tasks)
-                    await session.close()
-                logger.info(f"fetched {len(responses)} responses")
-                changes = []
-                join_leave_changes = []
+                try:
+                    tasks = []
+                    connector = TCPConnector(limit=500, enable_cleanup_closed=True)
+                    timeout = ClientTimeout(total=1800)
+                    async with ClientSession(connector=connector, timeout=timeout) as session:
+                        for tag in tag_group:
+                            keys.rotate(1)
+                            tasks.append(fetch(f"https://api.clashofclans.com/v1/clans/{tag.replace('#', '%23')}", session, {"Authorization": f"Bearer {keys[0]}"}))
+                        responses = await asyncio.gather(*tasks)
+                        await session.close()
+                    logger.info(f"fetched {len(responses)} responses")
+                    changes = []
+                    join_leave_changes = []
 
-                raid_week = gen_raid_date()
-                season = gen_season_date()
-                clan_group_members = await db_client.global_clans.find({"tag" : {"$in" : tag_group}}, {"tag" : 1, "_id" : 0, "memberList" : 1}).to_list(length=None)
-                clan_group_members = {x.get("tag") : x.get("memberList", []) for x in clan_group_members}
-                for response in responses: #type: bytes
-                    # we shouldnt have completely invalid tags, they all existed at some point
-                    if response is None:
-                        continue
-                    #try:
-                    clan = decode(response, type=Clan)
-                    if clan.members == 0:
-                        await db_client.deleted_clans.insert_one(ujson.loads(response))
-                        changes.append(DeleteOne({"tag": clan.tag}))
-                    else:
-                        members = []
-                        if clan.tag in clan_group_members:
-                            clan_member_list = [DBMember(**(m | {"townHallLevel" : m.get("townhall")})) for m in clan_group_members.get(clan.tag)]
-                            new_joins = [player for player in clan.memberList if player.tag not in set(p.tag for p in clan_member_list)]
-                            new_leaves = [player for player in clan_member_list if player.tag not in set(p.tag for p in clan.memberList)]
-                            for join in new_joins:
-                                join_leave_changes.append(InsertOne({
-                                    "type" : "join",
-                                    "clan" : clan.tag,
-                                    "time" : pend.now(tz=pend.UTC),
-                                    "tag" : join.tag,
-                                    "name" : join.name,
-                                    "th" : join.townHallLevel
-                                }))
+                    raid_week = gen_raid_date()
+                    season = gen_season_date()
+                    clan_group_members = await db_client.global_clans.find({"tag" : {"$in" : tag_group}}, {"tag" : 1, "_id" : 0, "memberList" : 1}).to_list(length=None)
+                    clan_group_members = {x.get("tag") : x.get("memberList", []) for x in clan_group_members}
+                    for response in responses: #type: bytes
+                        # we shouldnt have completely invalid tags, they all existed at some point
+                        if response is None:
+                            continue
 
-                            for leave in new_leaves:
-                                join_leave_changes.append(InsertOne({
-                                    "type" : "leave",
-                                    "clan" : clan.tag,
-                                    "time" : pend.now(tz=pend.UTC),
-                                    "tag" : leave.tag,
-                                    "name" : leave.name,
-                                    "th" : leave.townHallLevel
-                                }))
+                        clan = decode(response, type=Clan)
+                        if clan.members == 0:
+                            await db_client.deleted_clans.insert_one(ujson.loads(response))
+                            changes.append(DeleteOne({"tag": clan.tag}))
+                        else:
+                            members = []
+                            if clan.tag in clan_group_members:
+                                clan_member_list = [DBMember(**(m | {"townHallLevel" : m.get("townhall")})) for m in clan_group_members.get(clan.tag)]
+                                new_joins = [player for player in clan.memberList if player.tag not in set(p.tag for p in clan_member_list)]
+                                new_leaves = [player for player in clan_member_list if player.tag not in set(p.tag for p in clan.memberList)]
+                                for join in new_joins:
+                                    join_leave_changes.append(InsertOne({
+                                        "type" : "join",
+                                        "clan" : clan.tag,
+                                        "time" : pend.now(tz=pend.UTC),
+                                        "tag" : join.tag,
+                                        "name" : join.name,
+                                        "th" : join.townHallLevel
+                                    }))
 
-                        for member in clan.memberList:
-                            members.append({"name": member.name, "tag" : member.tag, "role" : member.role, "expLevel" : member.expLevel, "trophies" : member.trophies,
-                                            "townhall" : member.townHallLevel, "league" : member.league.name,
-                                    "builderTrophies" : member.builderBaseTrophies, "donations" : member.donations, "donationsReceived" : member.donationsReceived})
-                        changes.append(UpdateOne({"tag": clan.tag},
-                                                      {"$set":
-                                                           {"name": clan.name,
-                                                            "members" : clan.members,
-                                                            "level" : clan.clanLevel,
-                                                            "type" : clan.type,
-                                                            "location" : {"id" :clan.location.id if clan.location else clan.location, "name" : clan.location.name if clan.location else clan.location},
-                                                            "clanCapitalPoints" : clan.clanCapitalPoints,
-                                                            "clanPoints" : clan.clanPoints,
-                                                            "capitalLeague" : clan.capitalLeague.name,
-                                                            "warLeague" : clan.warLeague.name,
-                                                            "warWinStreak" : clan.warWinStreak,
-                                                            "warWins" : clan.warWins,
-                                                            "clanCapitalHallLevel" : clan.clanCapital.capitalHallLevel,
-                                                            "isValid" : clan.members >= 5,
-                                                            "openWarLog" : clan.isWarLogPublic,
-                                                            f"changes.clanCapital.{raid_week}": {"trophies" : clan.clanCapitalPoints, "league" : clan.capitalLeague.name},
-                                                            f"changes.clanWarLeague.{season}": {"league": clan.warLeague.name},
-                                                            "memberList": members
-                                                            },
-                                                       },
-                                                      upsert=True))
+                                for leave in new_leaves:
+                                    join_leave_changes.append(InsertOne({
+                                        "type" : "leave",
+                                        "clan" : clan.tag,
+                                        "time" : pend.now(tz=pend.UTC),
+                                        "tag" : leave.tag,
+                                        "name" : leave.name,
+                                        "th" : leave.townHallLevel
+                                    }))
+
+                            for member in clan.memberList:
+                                members.append({"name": member.name, "tag" : member.tag, "role" : member.role, "expLevel" : member.expLevel, "trophies" : member.trophies,
+                                                "townhall" : member.townHallLevel, "league" : member.league.name,
+                                        "builderTrophies" : member.builderBaseTrophies, "donations" : member.donations, "donationsReceived" : member.donationsReceived})
+                            changes.append(UpdateOne({"tag": clan.tag},
+                                                          {"$set":
+                                                               {"name": clan.name,
+                                                                "members" : clan.members,
+                                                                "level" : clan.clanLevel,
+                                                                "type" : clan.type,
+                                                                "location" : {"id" :clan.location.id if clan.location else clan.location, "name" : clan.location.name if clan.location else clan.location},
+                                                                "clanCapitalPoints" : clan.clanCapitalPoints,
+                                                                "clanPoints" : clan.clanPoints,
+                                                                "capitalLeague" : clan.capitalLeague.name,
+                                                                "warLeague" : clan.warLeague.name,
+                                                                "warWinStreak" : clan.warWinStreak,
+                                                                "warWins" : clan.warWins,
+                                                                "clanCapitalHallLevel" : clan.clanCapital.capitalHallLevel,
+                                                                "isValid" : clan.members >= 5,
+                                                                "openWarLog" : clan.isWarLogPublic,
+                                                                f"changes.clanCapital.{raid_week}": {"trophies" : clan.clanCapitalPoints, "league" : clan.capitalLeague.name},
+                                                                f"changes.clanWarLeague.{season}": {"league": clan.warLeague.name},
+                                                                "memberList": members
+                                                                },
+                                                           },
+                                                          upsert=True))
 
 
-                    #except Exception:
-                        #continue
 
-                if changes:
-                    await db_client.global_clans.bulk_write(changes, ordered=False)
-                    logger.info(f"Made {len(changes)} clan changes")
+                    if changes:
+                        await db_client.global_clans.bulk_write(changes, ordered=False)
+                        logger.info(f"Made {len(changes)} clan changes")
 
-                if join_leave_changes:
-                    await db_client.join_leave_history.bulk_write(join_leave_changes, ordered=False)
-                    logger.info(f"Made {len(join_leave_changes)} join/leave changes")
+                    if join_leave_changes:
+                        await db_client.join_leave_history.bulk_write(join_leave_changes, ordered=False)
+                        logger.info(f"Made {len(join_leave_changes)} join/leave changes")
+                except Exception:
+                    continue
 
         #except Exception:
             #continue
