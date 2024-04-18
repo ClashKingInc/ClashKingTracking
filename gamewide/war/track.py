@@ -248,7 +248,7 @@ async def store_war(clan_tag: str, opponent_tag: str, prep_time: int):
 
     war_raw_data: dict = war._raw_data
     for member in war_raw_data["clan"]["members"]:
-        member["heroes"] = player_data.get(member["tag"], [])
+        member["heroes"] = player_data.get(member["tag"], {}).get("heroes", [])
 
     for member in war_raw_data["opponent"]["members"]:
         member["heroes"] = player_data.get(member["tag"], [])
