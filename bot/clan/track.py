@@ -1,15 +1,21 @@
 import asyncio
 import coc
-from kafka import KafkaProducer
-from utility.utils import is_raids
-from utility.keycreation import create_keys
-from .utils import clan_war_track, raid_weekend_track, clan_track
-from loguru import logger
+import pendulum as pend
+
+from apscheduler.schedulers.asyncio import AsyncIOScheduler
 from .config import BotClanTrackingConfig
+from loguru import logger
+from kafka import KafkaProducer
 from utility.classes import MongoDatabase
+from utility.keycreation import create_keys
+from utility.utils import is_raids
+from .utils import clan_war_track, raid_weekend_track, clan_track
 
 
 async def main():
+    scheduler = AsyncIOScheduler(timezone=pend.UTC)
+    scheduler.start()
+
     config = BotClanTrackingConfig()
 
     producer = KafkaProducer(bootstrap_servers=["85.10.200.219:9092"], api_version=(3, 6, 0))
@@ -21,10 +27,9 @@ async def main():
 
     while True:
         clan_tags = await db_client.clans_db.distinct("tag")
-
         tasks = []
         for clan_tag in clan_tags:
-            tasks.append(clan_war_track(clan_tag=clan_tag, db_client=db_client, coc_client=coc_client, producer=producer))
+            tasks.append(clan_war_track(clan_tag=clan_tag, db_client=db_client, coc_client=coc_client, producer=producer, scheduler=scheduler))
         await asyncio.gather(*tasks)
 
         logger.info(f"Finished War Tracking")
