@@ -206,8 +206,8 @@ async def clan_track(clan_tag: str, coc_client: coc.Client, producer: KafkaProdu
         producer.send("clan", value=ujson.dumps(json_data).encode("utf-8"), key=clan_tag.encode("utf-8"), timestamp_ms=int(pend.now(tz=pend.UTC).timestamp() * 1000))
 
 
-    members_joined = [n for n in clan.members if n.tag not in set(n.tag for n in previous_clan.members)]
-    members_left = [n for n in previous_clan.members if n.tag not in set(n.tag for n in clan.members)]
+    members_joined = [n._raw_data for n in clan.members if n.tag not in set(n.tag for n in previous_clan.members)]
+    members_left = [n._raw_data for n in previous_clan.members if n.tag not in set(n.tag for n in clan.members)]
     if members_joined or members_left:
         json_data = {"type": "members_join_leave", "old_clan": previous_clan._raw_data, "new_clan": clan._raw_data, "joined": members_joined, "left" : members_left}
         producer.send("clan", ujson.dumps(json_data).encode("utf-8"), key=clan_tag.encode("utf-8"), timestamp_ms=int(pend.now(tz=pend.UTC).timestamp() * 1000))
