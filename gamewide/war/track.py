@@ -251,7 +251,7 @@ async def store_war(clan_tag: str, opponent_tag: str, prep_time: int):
         member["heroes"] = player_data.get(member["tag"], {}).get("heroes", [])
 
     for member in war_raw_data["opponent"]["members"]:
-        member["heroes"] = player_data.get(member["tag"], [])
+        member["heroes"] = player_data.get(member["tag"], {}).get("heroes", [])
 
     custom_id = hashids.encode(int(war.preparation_start_time.time.replace(tzinfo=pend.UTC).timestamp()) + int(pend.now(tz=pend.UTC).timestamp()) + random.randint(1000000000, 9999999999))
     await db_client.clan_wars.update_one({"war_id": war_unique_id},
