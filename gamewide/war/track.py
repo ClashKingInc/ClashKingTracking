@@ -3,6 +3,7 @@ import asyncio
 import coc
 import pendulum as pend
 import random
+import ujson
 
 from hashids import Hashids
 from datetime import datetime
@@ -233,12 +234,30 @@ async def store_war(clan_tag: str, opponent_tag: str, prep_time: int):
     if war_result.get("data") is not None:
         return
 
+    war_members = [m.tag.replace('#', '%23') for m in war.members if len(m.attacks) != 0]
+    headers = {
+        'Authorization': 'Bearer test',
+        'Content-Type': 'application/json',
+        "Accept-Encoding": "gzip"
+    }
+    async with aiohttp.ClientSession() as session:
+        async with session.post("https://api.clashking.xyz/ck/bulk", json=war_members, headers=headers) as response:
+            data = await response.read()
+    player_data: dict = ujson.loads(data)
+    player_data = {d.get("tag") : d for d in player_data}
+
+    war_raw_data: dict = war._raw_data
+    for member in war_raw_data["clan"]["members"]:
+        member["heroes"] = player_data.get(member["tag"], [])
+
+    for member in war_raw_data["opponent"]["members"]:
+        member["heroes"] = player_data.get(member["tag"], [])
 
     custom_id = hashids.encode(int(war.preparation_start_time.time.replace(tzinfo=pend.UTC).timestamp()) + int(pend.now(tz=pend.UTC).timestamp()) + random.randint(1000000000, 9999999999))
     await db_client.clan_wars.update_one({"war_id": war_unique_id},
         {"$set" : {
         "custom_id": custom_id,
-        "data": war._raw_data,
+        "data": war_raw_data,
         "type" : war.type}}, upsert=True)
 
 
