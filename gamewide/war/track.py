@@ -248,10 +248,10 @@ async def store_war(clan_tag: str, opponent_tag: str, prep_time: int):
 
     war_raw_data: dict = war._raw_data
     for member in war_raw_data["clan"]["members"]:
-        member["heroes"] = [{"name" : h.get("name"), "level" : h.get("level"), "equipment" : h.get("equipment")} for h in player_data.get(member["tag"], {}).get("heroes", []) if h.get("village") == "home"]
+        member["heroes"] = [{"name" : h.get("name"), "level" : h.get("level"), "equipment" : h.get("equipment", [])} for h in player_data.get(member["tag"], {}).get("heroes", []) if h.get("village") == "home"]
 
     for member in war_raw_data["opponent"]["members"]:
-        member["heroes"] = [{"name" : h.get("name"), "level" : h.get("level"), "equipment" : h.get("equipment")} for h in player_data.get(member["tag"], {}).get("heroes", []) if h.get("village") == "home"]
+        member["heroes"] = [{"name" : h.get("name"), "level" : h.get("level"), "equipment" : h.get("equipment", [])} for h in player_data.get(member["tag"], {}).get("heroes", []) if h.get("village") == "home"]
 
     custom_id = hashids.encode(int(war.preparation_start_time.time.replace(tzinfo=pend.UTC).timestamp()) + int(pend.now(tz=pend.UTC).timestamp()) + random.randint(1000000000, 9999999999))
     await db_client.clan_wars.update_one({"war_id": war_unique_id},
