@@ -234,7 +234,7 @@ async def store_war(clan_tag: str, opponent_tag: str, prep_time: int):
     if war_result.get("data") is not None:
         return
 
-    war_members = [m.tag.replace('#', '%23') for m in war.members if len(m.attacks) != 0]
+    war_members = [f"players/{m.tag.replace('#', '%23')}" for m in war.members if len(m.attacks) != 0]
     headers = {
         'Authorization': 'Bearer test',
         'Content-Type': 'application/json',
