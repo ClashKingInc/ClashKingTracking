@@ -80,7 +80,7 @@ async def clan_war_track(clan_tag: str, db_client: MongoDatabase, coc_client: co
             if acceptable_times:
                 for future_time, r_time in acceptable_times:
                     if r_time in set_times:
-                        scheduler.add_job(send_reminder, 'date', run_date=pend.now(tz=pend.UTC), args=[r_time, war_unique_id, clan_tag, producer],
+                        scheduler.add_job(send_reminder, 'date', run_date=future_time, args=[r_time, war_unique_id, clan_tag, producer],
                                           id=f"war_end_{war.clan.tag}_{war.opponent.tag}", name=f"war_end_{war.clan.tag}_{war.opponent.tag}", misfire_grace_time=1200, max_instances=1)
             continue
 
