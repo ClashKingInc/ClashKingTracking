@@ -20,7 +20,7 @@ from asyncio_throttle import Throttler
 
 config = GlobalWarTrackingConfig()
 db_client = MongoDatabase(stats_db_connection=config.stats_mongodb, static_db_connection=config.static_mongodb)
-coc_client = coc.Client(key_count=10, throttle_limit=30, cache_max_size=0, raw_attribute=True)
+coc_client = coc.Client(key_count=10, throttle_limit=30, cache_max_size=0, raw_attribute=True, timeout=600)
 
 
 class Members(Struct):
@@ -96,7 +96,7 @@ async def broadcast(scheduler: AsyncIOScheduler):
 
         x += 1
         for count, tag_group in enumerate(all_tags, 1):
-            await asyncio.sleep(10)
+            await asyncio.sleep(7.5)
             logger.info(f"Group {count}/{len(all_tags)}")
             tasks = []
             connector = aiohttp.TCPConnector(limit=500, ttl_dns_cache=600)
