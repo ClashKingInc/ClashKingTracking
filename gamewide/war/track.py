@@ -211,8 +211,7 @@ async def store_war(clan_tag: str, opponent_tag: str, prep_time: int):
                 war_found = True
                 break
         elif war == "maintenance":
-            await asyncio.sleep(30)
-            continue
+            break
         elif war == "no access":
             if not switched:
                 clan_tag = opponent_tag
