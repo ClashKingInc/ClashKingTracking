@@ -179,8 +179,8 @@ async def raid_weekend_track(clan_tags: List[str], db_client: MongoDatabase, coc
                 json_data = {"type": "raid_state", "clan_tag": current_raid.clan_tag, "old_raid": previous_raid._raw_data, "raid": current_raid._raw_data}
                 producer.send("capital", ujson.dumps(json_data).encode("utf-8"), key=clan_tag.encode("utf-8"), timestamp_ms=int(pend.now(tz=pend.UTC).timestamp() * 1000))
 
-
-    await db_client.capital_cache.bulk_write(db_updates, ordered=False)
+    if db_updates:
+        await db_client.capital_cache.bulk_write(db_updates, ordered=False)
 
 
 
