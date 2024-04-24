@@ -246,7 +246,7 @@ async def store_war(clan_tag: str, opponent_tag: str, prep_time: int):
 
 
 async def main():
-    await broadcast(scheduler=None)
+    await broadcast()
 
 
 
