@@ -202,9 +202,13 @@ async def store_war(clan_tag: str, opponent_tag: str, prep_time: int):
     switched = False
     war = None
     war_found = False
+    time_tried = 0
     while not war_found:
         war = await get_war(clan_tag=clan_tag)
         if isinstance(war, coc.ClanWar):
+            #if no war or the wars dont match
+            #try checking opponents side
+            #if we already have, break, is lost cause
             if war.preparation_start_time is None or int(war.preparation_start_time.time.replace(tzinfo=pend.UTC).timestamp()) != prep_time:
                 if not switched:
                     clan_tag = opponent_tag
@@ -216,6 +220,7 @@ async def store_war(clan_tag: str, opponent_tag: str, prep_time: int):
                 war_found = True
                 break
         elif war == "maintenance":
+            await asyncio.sleep(300)
             break
         elif war == "no access":
             if not switched:
@@ -226,7 +231,11 @@ async def store_war(clan_tag: str, opponent_tag: str, prep_time: int):
                 break
         elif war == "error":
             break
+
         await asyncio.sleep(war._response_retry)
+        time_tried += 1
+        if time_tried == 10:
+            break
 
     if not war_found:
         store_fails.append(war)
