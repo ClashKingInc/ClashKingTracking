@@ -68,7 +68,7 @@ async def broadcast(scheduler: AsyncIOScheduler):
         bot_clan_tags = await db_client.clans_db.distinct("tag")
         size_break = 25_000
 
-        if x % 20 != 0:
+        if x % 50 != 0:
             right_now = datetime.now().timestamp()
             one_week_ago = int(right_now) - (604800 * 4)
 
@@ -96,7 +96,7 @@ async def broadcast(scheduler: AsyncIOScheduler):
 
         x += 1
         for count, tag_group in enumerate(all_tags, 1):
-            await asyncio.sleep(5)
+            await asyncio.sleep(10)
             logger.info(f"Group {count}/{len(all_tags)}")
             tasks = []
             connector = aiohttp.TCPConnector(limit=500, ttl_dns_cache=600)
