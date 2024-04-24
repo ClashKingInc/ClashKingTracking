@@ -100,8 +100,9 @@ async def broadcast():
         for count, tag_group in enumerate(all_tags, 1):
 
             store_tasks = []
-            for task in [d for d in global_tasks if d['run_time'] <= pend.now(tz=pend.UTC)]: #{"run_time" : run_time, "tag" : tag, "opponent_tag" : opponent_tag, "prep_time" : int(war_prep.timestamp())}
-                store_tasks.append(store_war(clan_tag=task.get("tag"), opponent_tag=task.get("opponent_tag"), prep_time=task.get("prep_time")))
+            for r_time, tag, opponent_tag, prep_time in global_tasks: #{"run_time" : run_time, "tag" : tag, "opponent_tag" : opponent_tag, "prep_time" : int(war_prep.timestamp())}
+                if r_time <= pend.now(tz=pend.UTC):
+                    store_tasks.append(store_war(clan_tag=tag, opponent_tag=opponent_tag, prep_time=prep_time))
             await asyncio.gather(*store_tasks, return_exceptions=True)
 
             logger.info(f"Group {count}/{len(all_tags)}")
@@ -147,7 +148,7 @@ async def broadcast():
                                               "endTime" : int(war_end.time.replace(tzinfo=pend.UTC).timestamp())
                                               }))
                     #schedule getting war
-                    global_tasks.add({"run_time" : run_time, "tag" : tag, "opponent_tag" : opponent_tag, "prep_time" : int(war_prep.timestamp())})
+                    global_tasks.add((run_time, tag, opponent_tag, int(war_prep.timestamp())))
                     #await schedule_async(delay, store_war, tag, opponent_tag, int(war_prep.timestamp()))
 
             if changes:
