@@ -99,11 +99,9 @@ async def broadcast():
         x += 1
         for count, tag_group in enumerate(all_tags, 1):
 
-            store_tasks = []
             for r_time, tag, opponent_tag, prep_time in global_tasks: #{"run_time" : run_time, "tag" : tag, "opponent_tag" : opponent_tag, "prep_time" : int(war_prep.timestamp())}
                 if r_time <= pend.now(tz=pend.UTC):
-                    store_tasks.append(store_war(clan_tag=tag, opponent_tag=opponent_tag, prep_time=prep_time))
-            await asyncio.gather(*store_tasks, return_exceptions=True)
+                    asyncio.create_task(store_war(clan_tag=tag, opponent_tag=opponent_tag, prep_time=prep_time))
 
             logger.info(f"Group {count}/{len(all_tags)}")
             tasks = []
@@ -177,6 +175,7 @@ async def broadcast():
             store_fails = []
 
 async def store_war(clan_tag: str, opponent_tag: str, prep_time: int):
+    await asyncio.sleep(0)
     global in_war
     global store_fails
 
