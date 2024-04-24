@@ -42,16 +42,18 @@ in_war = set()
 
 store_fails = []
 
-async def broadcast(scheduler: AsyncIOScheduler):
+
+async def broadcast():
     global in_war
     global store_fails
-    loop = asyncio.get_event_loop()
     x = 1
     keys = await create_keys([config.coc_email.format(x=x) for x in range(config.min_coc_email, config.max_coc_email + 1)], [config.coc_password] * config.max_coc_email)
 
     throttler = Throttler(rate_limit=1200, period=1)
     print(f"{len(list(keys))} keys")
     await coc_client.login_with_tokens(*list(keys))
+
+    global_tasks = set()
 
     while True:
         api_fails = 0
@@ -96,7 +98,12 @@ async def broadcast(scheduler: AsyncIOScheduler):
 
         x += 1
         for count, tag_group in enumerate(all_tags, 1):
-            await asyncio.sleep(10)
+
+            store_tasks = []
+            for task in [d for d in global_tasks if d['run_time'] <= pend.now(tz=pend.UTC)]: #{"run_time" : run_time, "tag" : tag, "opponent_tag" : opponent_tag, "prep_time" : int(war_prep.timestamp())}
+                store_tasks.append(store_war(clan_tag=task.get("tag"), opponent_tag=task.get("opponent_tag"), prep_time=task.get("prep_time")))
+            await asyncio.gather(*store_tasks, return_exceptions=True)
+
             logger.info(f"Group {count}/{len(all_tags)}")
             tasks = []
             connector = aiohttp.TCPConnector(limit=500, ttl_dns_cache=600)
@@ -140,17 +147,9 @@ async def broadcast(scheduler: AsyncIOScheduler):
                                               "endTime" : int(war_end.time.replace(tzinfo=pend.UTC).timestamp())
                                               }))
                     #schedule getting war
-                    try:
-                        async def schedule_async(delay: int, coro, *args):
-                            await asyncio.sleep(delay)
-                            await coro(*args)
-                        now = pend.now(tz=pend.UTC)
-                        delay = (run_time - now).total_seconds()
-                        delay = max(0, int(delay))
-                        await schedule_async(delay, store_war, tag, opponent_tag, int(war_prep.timestamp()))
-                    except Exception:
-                        ones_that_tried_again.append(tag)
-                        pass
+                    global_tasks.add({"run_time" : run_time, "tag" : tag, "opponent_tag" : opponent_tag, "prep_time" : int(war_prep.timestamp())})
+                    #await schedule_async(delay, store_war, tag, opponent_tag, int(war_prep.timestamp()))
+
             if changes:
                 try:
                     await db_client.clan_wars.bulk_write(changes, ordered=False)
