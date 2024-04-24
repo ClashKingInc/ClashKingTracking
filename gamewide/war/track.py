@@ -45,7 +45,7 @@ store_fails = []
 async def broadcast(scheduler: AsyncIOScheduler):
     global in_war
     global store_fails
-
+    loop = asyncio.get_event_loop()
     x = 1
     keys = await create_keys([config.coc_email.format(x=x) for x in range(config.min_coc_email, config.max_coc_email + 1)], [config.coc_password] * config.max_coc_email)
 
@@ -96,7 +96,7 @@ async def broadcast(scheduler: AsyncIOScheduler):
 
         x += 1
         for count, tag_group in enumerate(all_tags, 1):
-            await asyncio.sleep(7.5)
+            await asyncio.sleep(5)
             logger.info(f"Group {count}/{len(all_tags)}")
             tasks = []
             connector = aiohttp.TCPConnector(limit=500, ttl_dns_cache=600)
@@ -141,8 +141,13 @@ async def broadcast(scheduler: AsyncIOScheduler):
                                               }))
                     #schedule getting war
                     try:
-                        scheduler.add_job(store_war, 'date', run_date=run_time, args=[tag, opponent_tag, int(war_prep.timestamp())],
-                                          id=f"war_end_{tag}_{opponent_tag}", name=f"{tag}_war_end_{opponent_tag}", misfire_grace_time=1200, max_instances=1)
+                        async def schedule_async(delay: int, coro, *args):
+                            await asyncio.sleep(delay)
+                            await coro(*args)
+                        now = pend.now(tz=pend.UTC)
+                        delay = (run_time - now).total_seconds()
+                        delay = max(0, int(delay))
+                        await schedule_async(delay, store_war, tag, opponent_tag, int(war_prep.timestamp()))
                     except Exception:
                         ones_that_tried_again.append(tag)
                         pass
@@ -242,9 +247,7 @@ async def store_war(clan_tag: str, opponent_tag: str, prep_time: int):
 
 
 async def main():
-    scheduler = AsyncIOScheduler(timezone=pend.UTC)
-    scheduler.start()
-    await broadcast(scheduler=scheduler)
+    await broadcast(scheduler=None)
 
 
 
