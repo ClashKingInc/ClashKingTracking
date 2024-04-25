@@ -3,7 +3,10 @@ import asyncio
 import coc
 import pendulum as pend
 import random
+import logging
 
+logging.basicConfig()
+logging.getLogger('apscheduler').setLevel(logging.DEBUG)
 from hashids import Hashids
 from datetime import datetime
 from msgspec.json import decode
