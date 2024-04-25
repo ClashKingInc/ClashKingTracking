@@ -226,8 +226,7 @@ async def store_war(clan_tag: str, opponent_tag: str, prep_time: int):
                 if war.state == "warEnded":
                     return war  # Found the completed war
                 # Check prep time and retry if needed
-                prep_start_timestamp = int(war.preparation_start_time.time.replace(tzinfo=pend.UTC).timestamp())
-                if war.preparation_start_time is None or prep_start_timestamp != prep_time:
+                if war.preparation_start_time is None or int(war.preparation_start_time.time.replace(tzinfo=pend.UTC).timestamp()) != prep_time:
                     if not switched:
                         clan_tag = opponent_tag
                         switched = True
