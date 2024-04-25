@@ -116,8 +116,9 @@ async def broadcast(scheduler: AsyncIOScheduler):
             connector = aiohttp.TCPConnector(limit=500, ttl_dns_cache=600)
             async with aiohttp.ClientSession(connector=connector) as session:
                 for tag in tag_group:
-                    keys.rotate(1)
-                    tasks.append(fetch(f"https://api.clashofclans.com/v1/clans/{tag.replace('#', '%23')}/currentwar", session, {"Authorization": f"Bearer {keys[0]}"}, tag, throttler=throttler))
+                    if tag not in in_war:
+                        keys.rotate(1)
+                        tasks.append(fetch(f"https://api.clashofclans.com/v1/clans/{tag.replace('#', '%23')}/currentwar", session, {"Authorization": f"Bearer {keys[0]}"}, tag, throttler=throttler))
                 responses = await asyncio.gather(*tasks, return_exceptions=True)
                 await session.close()
 
