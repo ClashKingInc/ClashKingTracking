@@ -65,7 +65,7 @@ async def broadcast(scheduler: AsyncIOScheduler):
                     return (None, None)
 
         bot_clan_tags = await db_client.clans_db.distinct("tag")
-        size_break = 25_000
+        size_break = 60_000
 
         if x % 30 != 0:
             right_now = datetime.now().timestamp()
@@ -150,10 +150,11 @@ async def broadcast(scheduler: AsyncIOScheduler):
                     if war_unique_id not in timers_alr_captured:
                         for member in war.clan.members + war.opponent.members:
                             war_timers.append(UpdateOne({"_id" : member.tag}, {"$set" : {"clans" : [war.clan.tag, war.opponent.tag], "time" : war_end.time}}, upsert=True))
-                    changes.append(InsertOne({"war_id" : war_unique_id,
-                                              "clans" : [tag, opponent_tag],
-                                              "endTime" : int(war_end.time.replace(tzinfo=pend.UTC).timestamp())
-                                              }))
+
+                        changes.append(InsertOne({"war_id" : war_unique_id,
+                                                  "clans" : [tag, opponent_tag],
+                                                  "endTime" : int(war_end.time.replace(tzinfo=pend.UTC).timestamp())
+                                                  }))
                     #schedule getting war
                     try:
                         scheduler.add_job(store_war, 'date', run_date=run_time, args=[tag, opponent_tag, int(war_prep.timestamp())],
@@ -172,6 +173,8 @@ async def broadcast(scheduler: AsyncIOScheduler):
                     await db_client.war_timer.bulk_write(war_timers, ordered=False)
                 except Exception:
                     pass
+
+            await asyncio.sleep(5)
 
         if ones_that_tried_again:
             logger.info(f"{len(ones_that_tried_again)} tried again, examples: {ones_that_tried_again[:5]}")
