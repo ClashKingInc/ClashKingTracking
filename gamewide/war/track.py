@@ -103,7 +103,7 @@ async def broadcast(scheduler: AsyncIOScheduler):
             one_week_ago = int(right_now)
             pipeline = [{"$match": {"$and": [
                 {"endTime": {"$gte": one_week_ago}},
-                {"data": {"$ne": None}}
+                {"data": {"$eq": None}}
             ]}}, {"$group": {"_id": "$war_id"}}]
             results = await db_client.clan_wars.aggregate(pipeline).to_list(length=None)
             for result in results:
