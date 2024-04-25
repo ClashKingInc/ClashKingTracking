@@ -3,17 +3,13 @@ import asyncio
 import coc
 import pendulum as pend
 import random
-import logging
 
-logging.basicConfig()
-logging.getLogger('apscheduler').setLevel(logging.DEBUG)
 from hashids import Hashids
 from datetime import datetime
 from msgspec.json import decode
 from msgspec import Struct
 from pymongo import InsertOne, UpdateOne
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
-from apscheduler.executors.pool import ProcessPoolExecutor
 from typing import List
 from utility.classes import MongoDatabase
 from .config import GlobalWarTrackingConfig
