@@ -120,7 +120,7 @@ async def clan_war_track(clan_tag: str, db_client: MongoDatabase, coc_client: co
             json_data = {"type": "new_war", "war": war._raw_data, "league_group": league_group, "clan_tag": clan_tag}
             producer.send("war", ujson.dumps(json_data).encode("utf-8"), key=clan_tag.encode("utf-8"), timestamp_ms=int(pend.now(tz=pend.UTC).timestamp() * 1000))
 
-        if war.state != previous_war.state and previous_war.state == "warEnded":
+        if war.state != previous_war.state and war.state == "warEnded":
             json_data = {"type": "war_ended", "war": previous_war._raw_data, "league_group": previous_league_group, "clan_tag": clan_tag}
             producer.send("war", ujson.dumps(json_data).encode("utf-8"), key=clan_tag.encode("utf-8"), timestamp_ms=int(pend.now(tz=pend.UTC).timestamp() * 1000))
 
