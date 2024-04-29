@@ -33,7 +33,7 @@ def send_reminder(time: str, war_unique_id: str, clan_tag: str, producer: KafkaP
     producer.send("reminder", ujson.dumps(json_data).encode("utf-8"), key=clan_tag.encode("utf-8"), timestamp_ms=int(pend.now(tz=pend.UTC).timestamp() * 1000))
 
 
-
+ONLY_KEEP = None
 async def clan_war_track(clan_tag: str, db_client: MongoDatabase, coc_client: coc.Client, producer: KafkaProducer, scheduler: AsyncIOScheduler):
     war = None
     try:
@@ -63,7 +63,7 @@ async def clan_war_track(clan_tag: str, db_client: MongoDatabase, coc_client: co
         if war.preparation_start_time is None:
             continue
 
-        war_unique_id = "-".join(sorted([war.clan_tag, war.opponent.tag])) + f"-{int(war.preparation_start_time.time.timestamp())}"
+        war_unique_id = "-".join([war.clan_tag, war.opponent.tag]) + f"-{int(war.preparation_start_time.time.timestamp())}"
 
         previous_war = WAR_CACHE.get(war_unique_id)
         if previous_war is None:
@@ -95,7 +95,7 @@ async def clan_war_track(clan_tag: str, db_client: MongoDatabase, coc_client: co
             league_group = league_group._raw_data
 
         if previous_war.attacks:
-            new_attacks = (a for a in war.attacks if a not in set(previous_war.attacks))
+            new_attacks = [a for a in war.attacks if a not in set(previous_war.attacks)]
         else:
             new_attacks = war.attacks
 
@@ -120,8 +120,8 @@ async def clan_war_track(clan_tag: str, db_client: MongoDatabase, coc_client: co
             json_data = {"type": "new_war", "war": war._raw_data, "league_group": league_group, "clan_tag": clan_tag}
             producer.send("war", ujson.dumps(json_data).encode("utf-8"), key=clan_tag.encode("utf-8"), timestamp_ms=int(pend.now(tz=pend.UTC).timestamp() * 1000))
 
-        if war.state != previous_war.state and war.state == "warEnded":
-            json_data = {"type": "war_ended", "war": previous_war._raw_data, "league_group": previous_league_group, "clan_tag": clan_tag}
+        if war.state != previous_war.state:
+            json_data = {"type": "war_state", "old_war" : previous_war._raw_data, "new_war": war._raw_data, "league_group": previous_league_group, "clan_tag": clan_tag}
             producer.send("war", ujson.dumps(json_data).encode("utf-8"), key=clan_tag.encode("utf-8"), timestamp_ms=int(pend.now(tz=pend.UTC).timestamp() * 1000))
 
 
