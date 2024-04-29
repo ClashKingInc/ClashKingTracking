@@ -109,19 +109,9 @@ async def clan_war_track(clan_tag: str, db_client: MongoDatabase, coc_client: co
             previous_league_group: coc.ClanWarLeagueGroup | None = previous_war.league_group
             previous_league_group = previous_league_group._raw_data
 
-        # NEW WAR
-        if previous_war.preparation_start_time and war.preparation_start_time and previous_war.preparation_start_time.time != war.preparation_start_time.time:
-            if previous_war.state != "warEnded":
-                json_data = {"type": "war_ended", "war": previous_war._raw_data, "league_group": previous_league_group, "clan_tag": clan_tag}
-                producer.send("war", ujson.dumps(json_data).encode("utf-8"), key=clan_tag.encode("utf-8"), timestamp_ms=int(pend.now(tz=pend.UTC).timestamp() * 1000))
-            json_data = {"type": "new_war", "war": war._raw_data, "league_group": league_group, "clan_tag": clan_tag}
-            producer.send("war", ujson.dumps(json_data).encode("utf-8"), key=clan_tag.encode("utf-8"), timestamp_ms=int(pend.now(tz=pend.UTC).timestamp() * 1000))
-        elif war.preparation_start_time and not previous_war.preparation_start_time:
-            json_data = {"type": "new_war", "war": war._raw_data, "league_group": league_group, "clan_tag": clan_tag}
-            producer.send("war", ujson.dumps(json_data).encode("utf-8"), key=clan_tag.encode("utf-8"), timestamp_ms=int(pend.now(tz=pend.UTC).timestamp() * 1000))
-
         if war.state != previous_war.state:
-            json_data = {"type": "war_state", "old_war" : previous_war._raw_data, "new_war": war._raw_data, "league_group": previous_league_group, "clan_tag": clan_tag}
+            json_data = {"type": "war_state", "old_war" : previous_war._raw_data, "new_war": war._raw_data, "previous_league_group": previous_league_group,
+                         "new_league_group" : league_group, "clan_tag": clan_tag}
             producer.send("war", ujson.dumps(json_data).encode("utf-8"), key=clan_tag.encode("utf-8"), timestamp_ms=int(pend.now(tz=pend.UTC).timestamp() * 1000))
 
 
