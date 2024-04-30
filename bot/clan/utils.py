@@ -84,7 +84,7 @@ async def clan_war_track(clan_tag: str, db_client: MongoDatabase, coc_client: co
                                           id=f"war_end_{war.clan.tag}_{war.opponent.tag}_{future_time.timestamp()}", misfire_grace_time=1200, max_instances=1)
             continue
 
-        if war == previous_war:
+        if war._raw_data == previous_war._raw_data:
             continue
 
         WAR_CACHE[war_unique_id] = war
