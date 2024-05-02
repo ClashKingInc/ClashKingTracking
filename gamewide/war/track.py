@@ -10,6 +10,9 @@ from msgspec.json import decode
 from msgspec import Struct
 from pymongo import InsertOne, UpdateOne
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
+from apscheduler.schedulers.background import BackgroundScheduler
+from apscheduler.executors.pool import ProcessPoolExecutor
+
 from typing import List
 from utility.classes import MongoDatabase
 from .config import GlobalWarTrackingConfig
@@ -41,7 +44,8 @@ in_war = set()
 
 store_fails = []
 
-async def broadcast(scheduler: AsyncIOScheduler):
+
+async def broadcast(scheduler: BackgroundScheduler):
     global in_war
     global store_fails
     x = 1
@@ -157,8 +161,9 @@ async def broadcast(scheduler: AsyncIOScheduler):
                                                   }))
                     #schedule getting war
                     try:
-                        scheduler.add_job(store_war, 'date', run_date=run_time, args=[tag, opponent_tag, int(war_prep.timestamp())],
+                        scheduler.add_job(store_war, 'date', run_date=run_time, args=[tag, opponent_tag, int(war_prep.timestamp()), keys[0]],
                                           id=f"war_end_{tag}_{opponent_tag}", name=f"{tag}_war_end_{opponent_tag}", misfire_grace_time=1200, max_instances=1)
+                        keys.rotate(1)
                     except Exception:
                         ones_that_tried_again.append(tag)
                         pass
@@ -183,13 +188,9 @@ async def broadcast(scheduler: AsyncIOScheduler):
             logger.info(f"{api_fails} API call fails")
 
         logger.info(f"{len(in_war)} clans in war")
-        if store_fails:
-            f = '\n- '.join([str(s) for s in store_fails])
-            logger.info(f"{len(store_fails)} War Store Fails\n"
-                        f"Reasons:\n{f}")
-            store_fails = []
 
-async def store_war(clan_tag: str, opponent_tag: str, prep_time: int):
+
+async def store_war(clan_tag: str, opponent_tag: str, prep_time: int, api_token: str):
     global in_war
     global store_fails
 
@@ -200,18 +201,33 @@ async def store_war(clan_tag: str, opponent_tag: str, prep_time: int):
     if opponent_tag in in_war:
         in_war.remove(opponent_tag)
 
-    async def find_active_war(clan_tag: str, opponent_tag: str, prep_time: int):
+    async def find_active_war(clan_tag: str, opponent_tag: str, prep_time: int, api_token: str):
         async def get_war(clan_tag: str):
-            try:
-                war = await coc_client.get_clan_war(clan_tag=clan_tag)
-                return war
-            except (coc.NotFound, coc.errors.Forbidden, coc.errors.PrivateWarLog):
-                return "no access"
-            except coc.errors.Maintenance:
-                return "maintenance"
-            except Exception as e:
-                logger.error(str(e))
-                return "error"
+            retry_attempts = 3  # Total number of attempts including the first one
+            timeout_seconds = 30  # Timeout for each request attempt
+
+            for attempt in range(retry_attempts):
+                try:
+                    async with aiohttp.ClientSession() as session:
+                        async with session.get(f"https://api.clashofclans.com/v1/clans/{clan_tag.replace('#', '%23')}/currentwar",
+                                               headers={"Authorization": f"Bearer {api_token}"}, timeout=timeout_seconds) as response:
+                            if response.status == 200:
+                                data = await response.json()
+                                return coc.ClanWar(data=data, clan_tag=clan_tag, client=None)
+                            elif response.status == 503:
+                                return "maintenance"
+                            elif response.status == 403:
+                                return "no access"
+                            else:
+                                return "error"
+                except asyncio.TimeoutError:
+                    if attempt < retry_attempts - 1:
+                        await asyncio.sleep(5)
+                        continue
+                    else:
+                        logger.info(f"API Request timed out attempt: {attempt}")
+                except Exception as e:
+                    logger.error(f"Error: {str(e)}")
 
         switched = False
         tries = 0
@@ -249,7 +265,7 @@ async def store_war(clan_tag: str, opponent_tag: str, prep_time: int):
 
         return None
 
-    war = await find_active_war(clan_tag=clan_tag, opponent_tag=opponent_tag, prep_time=prep_time)
+    war = await find_active_war(clan_tag=clan_tag, opponent_tag=opponent_tag, prep_time=prep_time, api_token=api_token)
 
     if war is None:
         store_fails.append(war)
@@ -266,7 +282,10 @@ async def store_war(clan_tag: str, opponent_tag: str, prep_time: int):
 
 
 async def main():
-    scheduler = AsyncIOScheduler(timezone=pend.UTC)
+    executors = {
+        'default': ProcessPoolExecutor(2)  # Adjust the number of processes as needed
+    }
+    scheduler = BackgroundScheduler(executors=executors, timezone='UTC')
     scheduler.start()
     await broadcast(scheduler=scheduler)
 
