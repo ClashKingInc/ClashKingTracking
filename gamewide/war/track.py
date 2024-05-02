@@ -3,6 +3,7 @@ import asyncio
 import coc
 import pendulum as pend
 import random
+import threading
 
 from hashids import Hashids
 from datetime import datetime
@@ -45,7 +46,7 @@ in_war = set()
 store_fails = []
 
 
-async def broadcast(scheduler: BackgroundScheduler):
+async def broadcast(scheduler: AsyncIOScheduler):
     global in_war
     global store_fails
     x = 1
@@ -68,11 +69,11 @@ async def broadcast(scheduler: BackgroundScheduler):
                     return (None, None)
 
         bot_clan_tags = await db_client.clans_db.distinct("tag")
-        size_break = 60_000
+        size_break = 50_000
 
-        if x % 30 != 0:
-            right_now = datetime.now().timestamp()
-            one_week_ago = int(right_now) - (604800 * 4)
+        if x % 20 != 0:
+            right_now = pend.now(tz=pend.UTC).timestamp()
+            one_week_ago = int(right_now) - (604800 * 2)
 
             pipeline = [
                 {"$match":
@@ -190,6 +191,7 @@ async def broadcast(scheduler: BackgroundScheduler):
         logger.info(f"{len(in_war)} clans in war")
 
 
+
 async def store_war(clan_tag: str, opponent_tag: str, prep_time: int, api_token: str):
     global in_war
     global store_fails
@@ -213,6 +215,7 @@ async def store_war(clan_tag: str, opponent_tag: str, prep_time: int, api_token:
                                                headers={"Authorization": f"Bearer {api_token}"}, timeout=timeout_seconds) as response:
                             if response.status == 200:
                                 data = await response.json()
+                                data["_response_retry"] = int(response.headers["Cache-Control"].strip("max-age=").strip("public max-age="))
                                 return coc.ClanWar(data=data, clan_tag=clan_tag, client=None)
                             elif response.status == 503:
                                 return "maintenance"
@@ -282,11 +285,9 @@ async def store_war(clan_tag: str, opponent_tag: str, prep_time: int, api_token:
 
 
 async def main():
-    executors = {
-        'default': ProcessPoolExecutor(2)  # Adjust the number of processes as needed
-    }
-    scheduler = BackgroundScheduler(executors=executors, timezone='UTC')
+    scheduler = AsyncIOScheduler(timezone='UTC')
     scheduler.start()
+
     await broadcast(scheduler=scheduler)
 
 
