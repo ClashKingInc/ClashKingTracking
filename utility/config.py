@@ -25,7 +25,9 @@ master_api_config = {
     "global_clan_find" : (21, 25),
     "global_clan_verify" : (46, 50),
     "global_scheduled" : (26, 30),
-    "global_war" : (31, 40)
+    "global_war" : (31, 38),
+    "global_war_store": (39, 40)
+
 }
 
 

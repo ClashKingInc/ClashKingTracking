@@ -323,8 +323,10 @@ async def update_autocomplete():
 
 async def main():
     while True:
-        await store_cwl()
+        await update_autocomplete()
         await asyncio.sleep(300)
+
+    return
     scheduler = AsyncIOScheduler(timezone=utc)
     scheduler.add_job(store_all_leaderboards,"cron", hour=4, minute=56)
     scheduler.add_job(store_legends,"cron", day="", hour=5, minute=56)

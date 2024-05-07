@@ -11,6 +11,7 @@ from gamewide.clan_verify.track import main as clan_verify_main
 from gamewide.players.track import broadcast as global_player_main
 from gamewide.scheduled.track import main as global_scheduled_main
 from gamewide.war.track import main as global_war_main
+from gamewide.war.store import main as global_war_store
 from gamewide.search.track import main as search_main
 
 if __name__ == "__main__":
@@ -31,6 +32,8 @@ if __name__ == "__main__":
         task = global_scheduled_main
     elif config.tracking_type == "GLOBALWAR":
         task = global_war_main
+    elif config.tracking_type == "GLOBALWARSTORE":
+        task = global_war_store
     elif config.tracking_type == "SEARCH":
         task = search_main
     elif config.tracking_type == "WEBSOCKET":

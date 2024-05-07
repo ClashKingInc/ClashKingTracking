@@ -3,16 +3,17 @@ import asyncio
 import coc
 import pendulum as pend
 import random
-import threading
+import logging
+import orjson
 
+from kafka import KafkaProducer
 from hashids import Hashids
 from datetime import datetime
 from msgspec.json import decode
 from msgspec import Struct
 from pymongo import InsertOne, UpdateOne
-from apscheduler.schedulers.asyncio import AsyncIOScheduler
-from apscheduler.schedulers.background import BackgroundScheduler
-from apscheduler.executors.pool import ProcessPoolExecutor
+from expiring_dict import ExpiringDict
+
 
 from typing import List
 from utility.classes import MongoDatabase
@@ -41,16 +42,13 @@ class War(Struct):
     clan: Clan
     opponent: Clan
 
-in_war = set()
 
-store_fails = []
+async def broadcast():
+    in_war = ExpiringDict()
 
-
-async def broadcast(scheduler: AsyncIOScheduler):
-    global in_war
-    global store_fails
     x = 1
     keys = await create_keys([config.coc_email.format(x=x) for x in range(config.min_coc_email, config.max_coc_email + 1)], [config.coc_password] * config.max_coc_email)
+    producer = KafkaProducer(bootstrap_servers=["85.10.200.219:9092"], api_version=(3, 6, 0))
 
     throttler = Throttler(rate_limit=1200, period=1)
     print(f"{len(list(keys))} keys")
@@ -99,7 +97,6 @@ async def broadcast(scheduler: AsyncIOScheduler):
 
         logger.info(f"{len(all_tags)} tags")
         all_tags = [all_tags[i:i + size_break] for i in range(0, len(all_tags), size_break)]
-        ones_that_tried_again = []
 
         timers_alr_captured = set()
         if x == 1:
@@ -149,8 +146,10 @@ async def broadcast(scheduler: AsyncIOScheduler):
                     war_prep = war_prep.time.replace(tzinfo=pend.UTC)
 
                     opponent_tag = war.opponent.tag if war.opponent.tag != tag else war.clan.tag
-                    in_war.add(tag)
-                    in_war.add(opponent_tag)
+
+                    in_war.ttl(key=tag, value=True, ttl=war_end.seconds_until)
+                    in_war.ttl(key=opponent_tag, value=True, ttl=war_end.seconds_until)
+
                     war_unique_id = "-".join(sorted([war.clan.tag, war.opponent.tag])) + f"-{int(war_prep.timestamp())}"
                     if war_unique_id not in timers_alr_captured:
                         for member in war.clan.members + war.opponent.members:
@@ -158,16 +157,16 @@ async def broadcast(scheduler: AsyncIOScheduler):
 
                         changes.append(InsertOne({"war_id" : war_unique_id,
                                                   "clans" : [tag, opponent_tag],
-                                                  "endTime" : int(war_end.time.replace(tzinfo=pend.UTC).timestamp())
+                                                  "endTime" : int(run_time.timestamp())
                                                   }))
-                    #schedule getting war
-                    try:
-                        scheduler.add_job(store_war, 'date', run_date=run_time, args=[tag, opponent_tag, int(war_prep.timestamp()), keys[0]],
-                                          id=f"war_end_{tag}_{opponent_tag}", name=f"{tag}_war_end_{opponent_tag}", misfire_grace_time=1200, max_instances=1)
-                        keys.rotate(1)
-                    except Exception:
-                        ones_that_tried_again.append(tag)
-                        pass
+                    json_data = {
+                        "tag": tag,
+                        "opponent_tag" : opponent_tag,
+                        "prep_time" : int(war_prep.timestamp()),
+                        "run_time" : int(run_time.timestamp())
+                    }
+                    producer.send(topic="war_store", value=orjson.dumps(json_data))
+
             if changes:
                 try:
                     await db_client.clan_wars.bulk_write(changes, ordered=False)
@@ -182,9 +181,6 @@ async def broadcast(scheduler: AsyncIOScheduler):
 
             await asyncio.sleep(5)
 
-        if ones_that_tried_again:
-            logger.info(f"{len(ones_that_tried_again)} tried again, examples: {ones_that_tried_again[:5]}")
-
         if api_fails != 0:
             logger.info(f"{api_fails} API call fails")
 
@@ -192,103 +188,9 @@ async def broadcast(scheduler: AsyncIOScheduler):
 
 
 
-async def store_war(clan_tag: str, opponent_tag: str, prep_time: int, api_token: str):
-    global in_war
-    global store_fails
-
-    hashids = Hashids(min_length=7)
-
-    if clan_tag in in_war:
-        in_war.remove(clan_tag)
-    if opponent_tag in in_war:
-        in_war.remove(opponent_tag)
-
-    async def find_active_war(clan_tag: str, opponent_tag: str, prep_time: int, api_token: str):
-        async def get_war(clan_tag: str):
-            retry_attempts = 3  # Total number of attempts including the first one
-            timeout_seconds = 30  # Timeout for each request attempt
-
-            for attempt in range(retry_attempts):
-                try:
-                    async with aiohttp.ClientSession() as session:
-                        async with session.get(f"https://api.clashofclans.com/v1/clans/{clan_tag.replace('#', '%23')}/currentwar",
-                                               headers={"Authorization": f"Bearer {api_token}"}, timeout=timeout_seconds) as response:
-                            if response.status == 200:
-                                data = await response.json()
-                                data["_response_retry"] = int(response.headers["Cache-Control"].strip("max-age=").strip("public max-age="))
-                                return coc.ClanWar(data=data, clan_tag=clan_tag, client=None)
-                            elif response.status == 503:
-                                return "maintenance"
-                            elif response.status == 403:
-                                return "no access"
-                            else:
-                                return "error"
-                except asyncio.TimeoutError:
-                    if attempt < retry_attempts - 1:
-                        await asyncio.sleep(5)
-                        continue
-                    else:
-                        logger.info(f"API Request timed out attempt: {attempt}")
-                except Exception as e:
-                    logger.error(f"Error: {str(e)}")
-
-        switched = False
-        tries = 0
-        while True:
-            war = await get_war(clan_tag=clan_tag)
-
-            if isinstance(war, coc.ClanWar):
-                if war.state == "warEnded":
-                    return war  # Found the completed war
-                # Check prep time and retry if needed
-                if war.preparation_start_time is None or int(war.preparation_start_time.time.replace(tzinfo=pend.UTC).timestamp()) != prep_time:
-                    if not switched:
-                        clan_tag = opponent_tag
-                        switched = True
-                        continue  # Try with the opponent's tag
-                    else:
-                        return None  # Both tags checked, no valid war found
-            elif war == "maintenance":
-                await asyncio.sleep(15 * 60)  # Wait 15 minutes for maintenance, then continue loop
-                continue
-            elif war == "error":
-                break  # Stop on error
-            elif war == "no access":
-                if not switched:
-                    clan_tag = opponent_tag
-                    switched = True
-                    continue  # Access issue, switch clan tag
-                else:
-                    return None  # Both tags checked, no access to either
-
-            await asyncio.sleep(war._response_retry)  # Wait before retry based on response retry attribute
-            tries += 1
-            if tries == 10:
-                break
-
-        return None
-
-    war = await find_active_war(clan_tag=clan_tag, opponent_tag=opponent_tag, prep_time=prep_time, api_token=api_token)
-
-    if war is None:
-        store_fails.append(war)
-        return
-
-    war_unique_id = "-".join(sorted([war.clan.tag, war.opponent.tag])) + f"-{int(war.preparation_start_time.time.replace(tzinfo=pend.UTC).timestamp())}"
-    
-    custom_id = hashids.encode(int(war.preparation_start_time.time.replace(tzinfo=pend.UTC).timestamp()) + int(pend.now(tz=pend.UTC).timestamp()) + random.randint(1000000000, 9999999999))
-    await db_client.clan_wars.update_one({"war_id": war_unique_id},
-        {"$set" : {
-        "custom_id": custom_id,
-        "data": war._raw_data,
-        "type" : war.type}}, upsert=True)
-
 
 async def main():
-    scheduler = AsyncIOScheduler(timezone='UTC')
-    scheduler.start()
-
-    await broadcast(scheduler=scheduler)
+    await broadcast()
 
 
 
