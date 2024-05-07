@@ -8,8 +8,6 @@ import ujson
 from hashids import Hashids
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
 
-logging.getLogger("apscheduler.scheduler").setLevel(logging.DEBUG)
-
 from utility.classes import MongoDatabase
 from .config import GlobalWarTrackingConfig
 from utility.keycreation import create_keys
