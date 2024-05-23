@@ -33,8 +33,7 @@ async def store(scheduler: AsyncIOScheduler):
         msg = ujson.loads(msg.value)
         run_time = pend.from_timestamp(timestamp=msg.get("run_time"), tz=pend.UTC)
         try:
-            scheduler.add_job(store_war, 'date', run_date=run_time, args=[msg.get("tag"), msg.get("opponent_tag"), msg.get("prep_time")],
-                              id=f'war_end_{msg.get("tag")}_{msg.get("opponent_tag")}', misfire_grace_time=1200, max_instances=100, coalesce=True)
+            scheduler.add_job(store_war, 'date', run_date=run_time, args=[msg.get("tag"), msg.get("opponent_tag"), msg.get("prep_time")], misfire_grace_time=None, max_instances=1)
         except Exception:
             pass
 
