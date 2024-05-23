@@ -34,7 +34,7 @@ async def store(scheduler: AsyncIOScheduler):
         run_time = pend.from_timestamp(timestamp=msg.get("run_time"), tz=pend.UTC)
         try:
             scheduler.add_job(store_war, 'date', run_date=run_time, args=[msg.get("tag"), msg.get("opponent_tag"), msg.get("prep_time")],
-                              id=f'war_end_{msg.get("tag")}_{msg.get("opponent_tag")}', misfire_grace_time=1200, max_instances=1)
+                              id=f'war_end_{msg.get("tag")}_{msg.get("opponent_tag")}', misfire_grace_time=1200, max_instances=100, coalesce=True)
         except Exception:
             pass
 
@@ -84,7 +84,7 @@ async def store_war(clan_tag: str, opponent_tag: str, prep_time: int):
                 else:
                     return None  # Both tags checked, no access to either
 
-            await asyncio.sleep(war._response_retry)  # Wait before retry based on response retry attribute
+            await asyncio.sleep(min(war._response_retry, 120))  # Wait before retry based on response retry attribute
             tries += 1
             if tries == 10:
                 break
