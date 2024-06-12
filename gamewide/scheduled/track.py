@@ -404,5 +404,6 @@ async def main():
     scheduler.add_job(store_cwl_wars, "cron", day="13", hour="19", minute=37)
     scheduler.add_job(store_cwl_groups, "cron", day="9-12", hour="*", minute=35)
     scheduler.add_job(update_autocomplete, "interval", minutes=30)
+    scheduler.add_job(update_region_leaderboards, "interval", minutes=15)
     #scheduler.add_job(store_clan_capital, "cron", day_of_week="mon", hour=10)
     scheduler.start()
