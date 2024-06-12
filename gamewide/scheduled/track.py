@@ -1,33 +1,34 @@
-import collections
-import time
 import aiohttp
 import asyncio
-import ujson
-import orjson
 import coc
-import pendulum as pend
 import orjson
+import pendulum as pend
+import random
 import snappy
-from redis import asyncio as redis
-
-from hashids import Hashids
-from pymongo import UpdateOne, InsertOne
-from pytz import utc
-from .config import GlobalScheduledConfig
-
-from utility.keycreation import create_keys
-from utility.constants import locations
+import time
+import ujson
 
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
+from .capital_lb import calculate_clan_capital_leaderboards, calculate_player_capital_looted_leaderboards, calculate_raid_medal_leaderboards
+from .config import GlobalScheduledConfig
+from dhooks import Webhook, Embed
+from hashids import Hashids
+from pymongo import UpdateOne, InsertOne
+from redis import asyncio as redis
+from utility.keycreation import create_keys
+from utility.constants import locations
 from utility.classes import MongoDatabase
-from utility.utils import gen_season_date, gen_games_season
+from utility.utils import gen_season_date, gen_games_season, gen_raid_date
 
 config = GlobalScheduledConfig()
 db_client = MongoDatabase(stats_db_connection=config.stats_mongodb, static_db_connection=config.static_mongodb)
 
+coc_client = coc.Client(key_count=10, throttle_limit=500, cache_max_size=0, raw_attribute=True)
+
+hook = Webhook(config.webhook_url)
+
 
 async def store_clan_capital():
-    keys = await create_keys([config.coc_email.format(x=x) for x in range(config.min_coc_email, config.max_coc_email + 1)], [config.coc_password] * config.max_coc_email)
 
     async def fetch(url, session: aiohttp.ClientSession, headers, tag):
         async with session.get(url, headers=headers) as response:
@@ -46,9 +47,8 @@ async def store_clan_capital():
         timeout = aiohttp.ClientTimeout(total=1800)
         async with aiohttp.ClientSession(connector=connector, timeout=timeout, json_serialize=ujson.dumps) as session:
             for tag in tag_group:
-                keys.rotate(1)
                 tasks.append(fetch(f"https://api.clashofclans.com/v1/clans/{tag.replace('#', '%23')}/capitalraidseasons?limit=1", session,
-                                   {"Authorization": f"Bearer {keys[0]}"}, tag))
+                                   {"Authorization": f"Bearer {next(coc_client.http.keys)}"}, tag))
             responses = await asyncio.gather(*tasks, return_exceptions=True)
             await session.close()
 
@@ -73,10 +73,13 @@ async def store_clan_capital():
         except Exception:
             pass
 
+    await calculate_player_capital_looted_leaderboards(db_client=db_client)
+    await calculate_clan_capital_leaderboards(db_client=db_client)
+    await calculate_raid_medal_leaderboards(db_client=db_client)
 
-async def store_cwl():
+
+async def store_cwl_groups():
     season = gen_games_season()
-    keys = await create_keys([config.coc_email.format(x=x) for x in range(config.min_coc_email, config.max_coc_email + 1)], [config.coc_password] * config.max_coc_email)
 
     async def fetch(url, session: aiohttp.ClientSession, headers, tag):
         async with session.get(url, headers=headers) as response:
@@ -86,7 +89,7 @@ async def store_cwl():
 
 
     pipeline = [{"$match": {}}, {"$group": {"_id": "$tag"}}]
-    all_tags = [x["_id"] for x in (await db_client.global_clans.aggregate(pipeline).to_list(length=None))]
+    all_tags = [x["_id"] for x in (await db_client.basic_clan.aggregate(pipeline).to_list(length=None))]
 
     pipeline = [{"$match": {"$and" : [{"data.season" : season}, {"data.state" : "ended"}]}}, {"$group": {"_id": "$data.clans.tag"}}]
     done_for_this_season = [x["_id"] for x in (await db_client.cwl_group.aggregate(pipeline).to_list(length=None))]
@@ -100,17 +103,14 @@ async def store_cwl():
     was_found_in_a_previous_group = set()
     for tag_group in all_tags:
         tasks = []
-        deque = collections.deque
         connector = aiohttp.TCPConnector(limit=250, ttl_dns_cache=300)
-        keys = deque(keys)
         timeout = aiohttp.ClientTimeout(total=1800)
         async with aiohttp.ClientSession(connector=connector, timeout=timeout, json_serialize=ujson.dumps) as session:
             for tag in tag_group:
                 if tag in was_found_in_a_previous_group:
                     continue
-                keys.rotate(1)
                 tasks.append(fetch(f"https://api.clashofclans.com/v1/clans/{tag.replace('#', '%23')}/currentwar/leaguegroup", session,
-                                   {"Authorization": f"Bearer {keys[0]}"}, tag))
+                                   {"Authorization": f"Bearer {next(coc_client.http.keys)}"}, tag))
             responses = await asyncio.gather(*tasks, return_exceptions=True)
             await session.close()
 
@@ -134,7 +134,7 @@ async def store_cwl():
             print(f"{len(changes)} Changes Updated/Inserted")
 
 
-async def store_rounds():
+async def store_cwl_wars():
     hashids = Hashids(min_length=7)
     season = gen_games_season()
 
@@ -153,12 +153,10 @@ async def store_rounds():
     all_tags = [t for t in all_tags if t not in tags_already_found]
     print(f"{len(all_tags)} war tags to find")
 
+
     size_break = 60000
     all_tags = [all_tags[i:i + size_break] for i in range(0, len(all_tags), size_break)]
-    keys = await create_keys([config.coc_email.format(x=x) for x in range(config.min_coc_email, config.max_coc_email + 1)], [config.coc_password] * config.max_coc_email)
-    coc_client = coc.Client(key_count=10, throttle_limit=25, cache_max_size=0, raw_attribute=True)
 
-    print(f"{len(keys)} keys")
     async def fetch(url, session: aiohttp.ClientSession, headers, tag):
         async with session.get(url, headers=headers) as response:
             if response.status == 200:
@@ -174,9 +172,8 @@ async def store_rounds():
         timeout = aiohttp.ClientTimeout(total=1800)
         session = aiohttp.ClientSession(connector=connector, timeout=timeout)
         for tag in tag_group:
-            keys.rotate(1)
             tasks.append(fetch(f"https://api.clashofclans.com/v1/clanwarleagues/wars/{tag.replace('#', '%23')}", session,
-                               {"Authorization": f"Bearer {keys[0]}"}, tag))
+                               {"Authorization": f"Bearer {next(coc_client.http.keys)}"}, tag))
         print(f"{len(tasks)} tasks")
         responses = await asyncio.gather(*tasks, return_exceptions=True)
         await session.close()
@@ -195,7 +192,8 @@ async def store_rounds():
                 war = coc.ClanWar(data=response, client=coc_client)
                 if war.preparation_start_time is None:
                     continue
-                custom_id = hashids.encode(int(war.preparation_start_time.time.timestamp()) + int(pend.now(tz=pend.UTC).timestamp()))
+                custom_id = hashids.encode(
+                    int(war.preparation_start_time.time.replace(tzinfo=pend.UTC).timestamp()) + int(pend.now(tz=pend.UTC).timestamp()) + random.randint(1000000000, 9999999999))
                 war_unique_id = "-".join(sorted([war.clan.tag, war.opponent.tag])) + f"-{int(war.preparation_start_time.time.timestamp())}"
 
                 add_war.append(
@@ -214,9 +212,6 @@ async def store_rounds():
 
 
 async def store_all_leaderboards():
-    coc_client = coc.Client(key_count=10, throttle_limit=25, cache_max_size=0, raw_attribute=True)
-    keys = await create_keys([config.coc_email.format(x=x) for x in range(config.min_coc_email, config.max_coc_email + 1)], [config.coc_password] * config.max_coc_email)
-    coc_client.login_with_keys(*keys[:10])
 
     for database, function in \
             zip([db_client.clan_trophies, db_client.clan_versus_trophies, db_client.capital, db_client.player_trophies, db_client.player_versus_trophies],
@@ -237,36 +232,28 @@ async def store_all_leaderboards():
                                           "date" : str(pend.now(tz=pend.UTC).date()),
                                           "data" : {"items": [x._raw_data for x in response]}}))
 
-        await database.bulk_write(store_tasks)
+        print(store_tasks)
+
+        #await database.bulk_write(store_tasks)
 
 
 async def store_legends():
-    keys = await create_keys([config.coc_email.format(x=x) for x in range(config.min_coc_email, config.max_coc_email + 1)], [config.coc_password] * config.max_coc_email)
-    headers = {
-        "Accept": "application/json",
-        "authorization": f"Bearer {keys[0]}"
-    }
+    seasons = await coc_client.get_seasons(league_id=29000022)
 
-    async with aiohttp.ClientSession() as session:
-        async with session.get("https://api.clashofclans.com/v1/leagues/29000022/seasons",headers=headers) as response:
-            data = await response.json()
-            print(data)
-            seasons = [entry["id"] for entry in data["items"]]
-        await session.close()
     seasons_present = await db_client.legend_history.distinct("season")
-    print(seasons_present)
     missing = set(seasons) - set(seasons_present)
-    print(missing)
 
-    # print(missing)
     for year in missing:
-        print(year)
         after = ""
         while after is not None:
             changes = []
             async with aiohttp.ClientSession() as session:
                 if after != "":
                     after = f"&after={after}"
+                headers = {
+                    "Accept": "application/json",
+                    "authorization": f"Bearer {next(coc_client.http.keys)}"
+                }
                 async with session.get(f"https://api.clashofclans.com/v1/leagues/29000022/seasons/{year}?limit=100000{after}", headers=headers) as response:
                     items = await response.json()
                     players = items["items"]
@@ -280,21 +267,20 @@ async def store_legends():
                 await session.close()
 
             results = await db_client.legend_history.bulk_write(changes, ordered=False)
-            print(results.bulk_api_result)
 
 
 async def update_autocomplete():
     cache = redis.Redis(host=config.redis_ip, port=6379, db=0, password=config.redis_pw, decode_responses=False, max_connections=50,
                         health_check_interval=10, socket_connect_timeout=5, retry_on_timeout=True, socket_keepalive=True)
 
-    #change to find changes in last 20 mins
     current_time = pend.now(tz=pend.UTC)
-    time_20_mins_ago = current_time.subtract(minutes=20).timestamp()
-    #any players that had an update in last 20 mins
-    pipeline = [{"$match": {"last_updated" : {"$gte" : time_20_mins_ago}}},
+    one_day_ago = current_time.subtract(hours=1).timestamp()
+    #any players that had an update in last 24 hours
+    pipeline = [{"$match": {"last_updated" : {"$gte" : one_day_ago}}},
                 {"$project": {"tag": "$tag"}},
                 {"$unset": "_id"}]
     all_player_tags = [x["tag"] for x in (await db_client.player_stats.aggregate(pipeline).to_list(length=None))]
+
     #delete any tags that are gone
     #await db_client.player_autocomplete.delete_many({"tag" : {"$nin" : all_player_tags}})
     split_size = 50_000
@@ -321,17 +307,105 @@ async def update_autocomplete():
         print(f"starting bulk write: took {time.time() - t} secs")
         await db_client.player_autocomplete.bulk_write(tasks, ordered=False)
 
-async def main():
-    while True:
-        await update_autocomplete()
-        await asyncio.sleep(300)
 
+async def update_region_leaderboards():
+    await db_client.region_leaderboard.update_many({}, {"$set": {"global_rank": None, "local_rank": None}})
+    lb_changes = []
+    tasks = []
+    for location in locations:
+        task = asyncio.ensure_future(coc_client.get_location_players(location_id=location))
+        tasks.append(task)
+    responses = await asyncio.gather(*tasks, return_exceptions=True)
+
+    for index, response in enumerate(responses):
+        if isinstance(response, Exception):
+            continue
+        location = locations[index]
+        if location != "global":
+            location = await coc_client.get_location(location)
+        for player in response:
+            player: coc.RankedPlayer
+            if location == "global":
+                lb_changes.append(
+                    UpdateOne({"tag": player.tag}, {"$set": {f"global_rank": player.rank}}, upsert=True))
+            else:
+                lb_changes.append(UpdateOne({"tag": player.tag},
+                                            {"$set": {f"local_rank": player.rank, f"country_name": location.name, f"country_code": location.country_code}}, upsert=True))
+
+    if lb_changes != []:
+        results = await db_client.region_leaderboard.bulk_write(lb_changes)
+
+    await db_client.region_leaderboard.update_many({}, {"$set": {"builder_global_rank": None, "builder_local_rank": None}})
+    lb_changes = []
+    tasks = []
+    for location in locations:
+        task = asyncio.ensure_future(coc_client.get_location_players_builder_base(location_id=location))
+        tasks.append(task)
+    responses = await asyncio.gather(*tasks, return_exceptions=True)
+
+    for index, response in enumerate(responses):
+        if isinstance(response, Exception):
+            continue
+        location = locations[index]
+        if location != "global":
+            location = await coc_client.get_location(location)
+        for player in response:
+            player: coc.RankedPlayer
+            if location == "global":
+                lb_changes.append(
+                    UpdateOne({"tag": player.tag}, {"$set": {f"builder_global_rank": player.builder_base_rank}}, upsert=True))
+            else:
+                lb_changes.append(UpdateOne({"tag": player.tag},
+                                            {"$set": {f"builder_local_rank": player.builder_base_rank, f"country_name": location.name,
+                                                      f"country_code": location.country_code}}, upsert=True))
+
+    if lb_changes != []:
+        results = await db_client.region_leaderboard.bulk_write(lb_changes)
+
+    '''# clan changes
+    await self.bot.clan_leaderboard_db.update_many({}, {"$set": {"global_rank": None, "local_rank": None}})
+    lb_changes = []
+    tasks = []
+    for location in self.bot.locations:
+        task = asyncio.ensure_future(self.bot.coc_client.get_location_clans(location_id=location))
+        tasks.append(task)
+    responses = await asyncio.gather(*tasks)
+
+    for index, response in enumerate(responses):
+        location = self.bot.locations[index]
+        if location != "global":
+            location = await self.bot.coc_client.get_location(location)
+        for clan in response:
+            clan: coc.RankedClan
+            if location == "global":
+                lb_changes.append(
+                    UpdateOne({"tag": clan.tag}, {"$set": {f"global_rank": clan.rank}}, upsert=True))
+            else:
+                lb_changes.append(UpdateOne({"tag": clan.tag},
+                                            {"$set": {f"local_rank": clan.rank, f"country_name": location.name,
+                                                      f"country_code": location.country_code}}, upsert=True))
+
+    if lb_changes != []:
+        results = await self.bot.clan_leaderboard_db.bulk_write(lb_changes)'''
+
+
+async def main():
+    keys = await create_keys([config.coc_email.format(x=x) for x in range(config.min_coc_email, config.max_coc_email + 1)], [config.coc_password] * config.max_coc_email, as_list=True)
+    await coc_client.login_with_tokens(*keys)
+
+    '''await calculate_clan_capital_leaderboards(db_client=db_client)
+    await calculate_raid_medal_leaderboards(db_client=db_client)
     return
-    scheduler = AsyncIOScheduler(timezone=utc)
-    scheduler.add_job(store_all_leaderboards,"cron", hour=4, minute=56)
-    scheduler.add_job(store_legends,"cron", day="", hour=5, minute=56)
-    scheduler.add_job(store_rounds,"cron", day="13", hour="19", minute=37)
-    scheduler.add_job(store_cwl, "cron", day="9-12", hour="*", minute=35)
-    scheduler.add_job(update_autocomplete, "interval", minutes=15)
-    scheduler.add_job(store_clan_capital, "cron", day_of_week="mon", hour=10)
+    while True:
+        await store_cwl_groups()
+
+    await store_cwl_wars()'''
+
+    scheduler = AsyncIOScheduler(timezone=pend.UTC)
+    scheduler.add_job(store_all_leaderboards, "cron", hour=4, minute=56)
+    scheduler.add_job(store_legends, "cron", day="", hour=5, minute=56)
+    scheduler.add_job(store_cwl_wars, "cron", day="13", hour="19", minute=37)
+    scheduler.add_job(store_cwl_groups, "cron", day="9-12", hour="*", minute=35)
+    scheduler.add_job(update_autocomplete, "interval", minutes=30)
+    #scheduler.add_job(store_clan_capital, "cron", day_of_week="mon", hour=10)
     scheduler.start()

@@ -44,3 +44,10 @@ locations = ["global", 32000007, 32000008, 32000009, 32000010, 32000011, 3200001
              32000248,
              32000249, 32000250, 32000251, 32000252, 32000253, 32000254, 32000255, 32000256, 32000257, 32000258,
              32000259, 32000260, 32000006]
+
+leagues = ["Legend League", "Titan League I" , "Titan League II" , "Titan League III" ,"Champion League I", "Champion League II", "Champion League III",
+                   "Master League I", "Master League II", "Master League III",
+                   "Crystal League I","Crystal League II", "Crystal League III",
+                   "Gold League I","Gold League II", "Gold League III",
+                   "Silver League I","Silver League II","Silver League III",
+                   "Bronze League I", "Bronze League II", "Bronze League III", "Unranked"]

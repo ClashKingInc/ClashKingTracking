@@ -18,6 +18,9 @@ class Config:
 
     meili_pw = getenv("MEILI_PW")
 
+    webhook_url = getenv("WEBHOOK_URL")
+
+
 master_api_config = {
     "bot_clan" : (41, 45),
     "bot_player" : (11, 15),
