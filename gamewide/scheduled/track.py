@@ -400,7 +400,7 @@ async def main():
 
     scheduler = AsyncIOScheduler(timezone=pend.UTC)
     scheduler.add_job(store_all_leaderboards, "cron", hour=4, minute=56)
-    scheduler.add_job(store_legends, "cron", day="", hour=5, minute=56)
+    scheduler.add_job(store_legends, "cron", day="*", hour=5, minute=56)
     scheduler.add_job(store_cwl_wars, "cron", day="13", hour="19", minute=37)
     scheduler.add_job(store_cwl_groups, "cron", day="9-12", hour="*", minute=35)
     scheduler.add_job(update_autocomplete, "interval", minutes=30)
