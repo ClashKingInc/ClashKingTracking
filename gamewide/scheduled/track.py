@@ -11,7 +11,6 @@ import ujson
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
 from .capital_lb import calculate_clan_capital_leaderboards, calculate_player_capital_looted_leaderboards, calculate_raid_medal_leaderboards
 from .config import GlobalScheduledConfig
-from dhooks import Webhook, Embed
 from hashids import Hashids
 from pymongo import UpdateOne, InsertOne
 from redis import asyncio as redis
@@ -24,8 +23,6 @@ config = GlobalScheduledConfig()
 db_client = MongoDatabase(stats_db_connection=config.stats_mongodb, static_db_connection=config.static_mongodb)
 
 coc_client = coc.Client(key_count=10, throttle_limit=500, cache_max_size=0, raw_attribute=True)
-
-hook = Webhook(config.webhook_url)
 
 
 async def store_clan_capital():
