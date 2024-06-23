@@ -31,7 +31,8 @@ class MongoDatabase():
         self.cwl_group: collection_class = self.looper.cwl_group
         self.basic_clan: collection_class = self.looper.clan_tags
 
-        self.global_clans: collection_class = self.looper.global_clans
+        self.global_clans: collection_class = self.looper.clan_tags
+
         self.deleted_clans: collection_class = self.new_looper.deleted_clans
         self.join_leave_history: collection_class = self.looper.join_leave_history
         self.global_players: collection_class = self.clashking.global_players

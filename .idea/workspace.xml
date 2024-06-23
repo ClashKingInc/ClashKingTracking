@@ -4,8 +4,8 @@
     <option name="autoReloadType" value="SELECTIVE" />
   </component>
   <component name="ChangeListManager">
-    <list default="true" id="e7096e79-455b-4aa3-858d-e2defd65b8a9" name="Changes" comment="add: scheduled tracking">
-      <change beforePath="$PROJECT_DIR$/.idea/workspace.xml" beforeDir="false" afterPath="$PROJECT_DIR$/.idea/workspace.xml" afterDir="false" />
+    <list default="true" id="e7096e79-455b-4aa3-858d-e2defd65b8a9" name="Changes" comment="revert: tracking migration">
+      <change beforePath="$PROJECT_DIR$/utility/classes.py" beforeDir="false" afterPath="$PROJECT_DIR$/utility/classes.py" afterDir="false" />
     </list>
     <option name="SHOW_DIALOG" value="false" />
     <option name="HIGHLIGHT_CONFLICTS" value="true" />
@@ -187,14 +187,6 @@
       <option name="number" value="Default" />
       <option name="presentableId" value="Default" />
       <updated>1706581825121</updated>
-    </task>
-    <task id="LOCAL-00069" summary="fix: no war store">
-      <option name="closed" value="true" />
-      <created>1712536899467</created>
-      <option name="number" value="00069" />
-      <option name="presentableId" value="LOCAL-00069" />
-      <option name="project" value="LOCAL" />
-      <updated>1712536899468</updated>
     </task>
     <task id="LOCAL-00070" summary="changes">
       <option name="closed" value="true" />
@@ -580,11 +572,18 @@
       <option name="project" value="LOCAL" />
       <updated>1718170291215</updated>
     </task>
-    <option name="localTasksCounter" value="118" />
+    <task id="LOCAL-00118" summary="revert: tracking migration">
+      <option name="closed" value="true" />
+      <created>1719171681522</created>
+      <option name="number" value="00118" />
+      <option name="presentableId" value="LOCAL-00118" />
+      <option name="project" value="LOCAL" />
+      <updated>1719171681522</updated>
+    </task>
+    <option name="localTasksCounter" value="119" />
     <servers />
   </component>
   <component name="VcsManagerConfiguration">
-    <MESSAGE value="fix: wrong spelling" />
     <MESSAGE value="fix: better tracking" />
     <MESSAGE value="add: reddit tracking" />
     <MESSAGE value="fix: war cache pull" />
@@ -609,6 +608,7 @@
     <MESSAGE value="reminder fix &amp; improve efficiency" />
     <MESSAGE value="try new" />
     <MESSAGE value="add: scheduled tracking" />
-    <option name="LAST_COMMIT_MESSAGE" value="add: scheduled tracking" />
+    <MESSAGE value="revert: tracking migration" />
+    <option name="LAST_COMMIT_MESSAGE" value="revert: tracking migration" />
   </component>
 </project>
