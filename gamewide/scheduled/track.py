@@ -222,16 +222,14 @@ async def store_all_leaderboards():
         responses = await asyncio.gather(*tasks, return_exceptions=True)
         store_tasks = []
         for index, response in enumerate(responses):
-            if isinstance(response, BaseException) or isinstance(response, coc.NotFound):
+            if isinstance(response, Exception):
                 continue
             location = locations[index]
             store_tasks.append(InsertOne({"location" : location,
                                           "date" : str(pend.now(tz=pend.UTC).date()),
                                           "data" : {"items": [x._raw_data for x in response]}}))
 
-        print(store_tasks)
-
-        #await database.bulk_write(store_tasks)
+        await database.bulk_write(store_tasks)
 
 
 async def store_legends():
@@ -389,6 +387,7 @@ async def update_region_leaderboards():
 async def main():
     keys = await create_keys([config.coc_email.format(x=x) for x in range(config.min_coc_email, config.max_coc_email + 1)], [config.coc_password] * config.max_coc_email, as_list=True)
     await coc_client.login_with_tokens(*keys)
+
 
     '''await calculate_clan_capital_leaderboards(db_client=db_client)
     await calculate_raid_medal_leaderboards(db_client=db_client)
