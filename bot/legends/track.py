@@ -98,161 +98,166 @@ async def main():
     loop_spot = 0
 
     while True:
-        loop_spot += 1
-        time_inside = time.time()
 
-        all_tags_to_track = await db_client.player_stats.distinct("tag", filter={"league" : "Legend League"})
-        logger.info(f"{len(all_tags_to_track)} players to track")
+        try:
+            loop_spot += 1
+            time_inside = time.time()
 
-        split_size = 50_000
-        split_tags = [all_tags_to_track[i:i + split_size] for i in range(0, len(all_tags_to_track), split_size)]
+            all_tags_to_track = await db_client.player_stats.distinct("tag", filter={"league" : "Legend League"})
+            logger.info(f"{len(all_tags_to_track)} players to track")
 
-        legend_changes = []
-        clan_tags: set = set(await db_client.clans_db.distinct("tag"))
+            split_size = 50_000
+            split_tags = [all_tags_to_track[i:i + split_size] for i in range(0, len(all_tags_to_track), split_size)]
 
-        for count, group in enumerate(split_tags, 1):
-            # update last updated for all the members we are checking this go around
-            logger.info(f"LOOP {loop_spot} | Group {count}/{len(split_tags)}: {len(group)} tags")
+            legend_changes = []
+            clan_tags: set = set(await db_client.clans_db.distinct("tag"))
 
-            # pull current responses from the api, returns (tag: str, response: bytes)
-            # response can be bytes, "delete", and None
-            current_player_responses = await get_player_responses(keys=keys, tags=group)
+            for count, group in enumerate(split_tags, 1):
+                # update last updated for all the members we are checking this go around
+                logger.info(f"LOOP {loop_spot} | Group {count}/{len(split_tags)}: {len(group)} tags")
 
-            logger.info(f"LOOP {loop_spot} | Group {count}: Entering Changes Loop/Pulled Responses")
+                # pull current responses from the api, returns (tag: str, response: bytes)
+                # response can be bytes, "delete", and None
+                current_player_responses = await get_player_responses(keys=keys, tags=group)
 
-            legend_date = gen_legend_date()
-            for tag, response in current_player_responses:
+                logger.info(f"LOOP {loop_spot} | Group {count}: Entering Changes Loop/Pulled Responses")
 
-                if response is None:
-                    continue
+                legend_date = gen_legend_date()
+                for tag, response in current_player_responses:
 
-                if response == "delete":
-                    await db_client.player_stats.delete_one({"tag" : tag})
-                    LEGENDS_CACHE.pop(tag, "gone")
-                    continue
-
-                player = decode(response, type=Player)
-                # if None, update cache and move on
-                previous_player: Player = LEGENDS_CACHE.get(tag)
-                if previous_player is None:
-                    LEGENDS_CACHE[tag] = player
-                    continue
-
-                # if the responses don't match:
-                # - update cache
-                if previous_player.trophies != player.trophies:
-                    LEGENDS_CACHE[tag] = player
-
-                    if player.league is None:
+                    if response is None:
                         continue
 
-                    if player.trophies >= 4900 and player.league.name == "Legend League":
-                        json_data = {"types": ["legends"],
-                                     "old_data" : previous_player.to_dict(),
-                                     "new_data" : player.to_dict(),
-                                     "timestamp": int(pend.now(tz=pend.UTC).timestamp())}
-                        if player.clan is not None and player.clan.tag in clan_tags:
-                            producer.send(topic="player", value=orjson.dumps(json_data), key=player.clan.tag.encode("utf-8"), timestamp_ms=int(pend.now(tz=pend.UTC).timestamp()) * 1000)
+                    if response == "delete":
+                        await db_client.player_stats.delete_one({"tag" : tag})
+                        LEGENDS_CACHE.pop(tag, "gone")
+                        continue
 
-                        diff_trophies = player.trophies - previous_player.trophies
-                        diff_attacks = player.attackWins - previous_player.attackWins
+                    player = decode(response, type=Player)
+                    # if None, update cache and move on
+                    previous_player: Player = LEGENDS_CACHE.get(tag)
+                    if previous_player is None:
+                        LEGENDS_CACHE[tag] = player
+                        continue
 
-                        if diff_trophies <= - 1:
-                            diff_trophies = abs(diff_trophies)
-                            if diff_trophies <= 100:
-                                legend_changes.append(UpdateOne({"tag": tag},
-                                                                 {"$push": {f"legends.{legend_date}.defenses": diff_trophies}}, upsert=True))
+                    # if the responses don't match:
+                    # - update cache
+                    if previous_player.trophies != player.trophies:
+                        LEGENDS_CACHE[tag] = player
 
-                                legend_changes.append(UpdateOne({"tag": tag},
-                                                                 {"$push": {f"legends.{legend_date}.new_defenses": {
-                                                                     "change": diff_trophies,
-                                                                     "time": int(pend.now(tz=pend.UTC).timestamp()),
-                                                                     "trophies": player.trophies
-                                                                 }}}, upsert=True))
+                        if player.league is None:
+                            continue
 
-                        elif diff_trophies >= 1:
-                            equipment = []
-                            for hero in player.heroes:
-                                for gear in hero.equipment:
-                                    equipment.append({"name": gear.name, "level": gear.level})
+                        if player.trophies >= 4900 and player.league.name == "Legend League":
+                            json_data = {"types": ["legends"],
+                                         "old_data" : previous_player.to_dict(),
+                                         "new_data" : player.to_dict(),
+                                         "timestamp": int(pend.now(tz=pend.UTC).timestamp())}
+                            if player.clan is not None and player.clan.tag in clan_tags:
+                                producer.send(topic="player", value=orjson.dumps(json_data), key=player.clan.tag.encode("utf-8"), timestamp_ms=int(pend.now(tz=pend.UTC).timestamp()) * 1000)
 
-                            legend_changes.append(
-                                UpdateOne({"tag": tag},
-                                          {"$inc": {f"legends.{legend_date}.num_attacks": diff_attacks}},
-                                          upsert=True))
-                            # if one attack
-                            if diff_attacks == 1:
-                                legend_changes.append(UpdateOne({"tag": tag},
-                                                                 {"$push": {
-                                                                     f"legends.{legend_date}.attacks": diff_trophies}},
-                                                                 upsert=True))
-                                legend_changes.append(UpdateOne({"tag": tag},
-                                                                 {"$push": {f"legends.{legend_date}.new_attacks": {
-                                                                     "change": diff_trophies,
-                                                                     "time": int(pend.now(tz=pend.UTC).timestamp()),
-                                                                     "trophies": player.trophies,
-                                                                     "hero_gear": equipment
-                                                                 }}}, upsert=True))
-                                if diff_trophies == 40:
-                                    legend_changes.append(
-                                        UpdateOne({"tag": tag}, {"$inc": {f"legends.streak": 1}}))
+                            diff_trophies = player.trophies - previous_player.trophies
+                            diff_attacks = player.attackWins - previous_player.attackWins
 
-                                else:
-                                    legend_changes.append(
-                                        UpdateOne({"tag": tag}, {"$set": {f"legends.streak": 0}}))
+                            if diff_trophies <= - 1:
+                                diff_trophies = abs(diff_trophies)
+                                if diff_trophies <= 100:
+                                    legend_changes.append(UpdateOne({"tag": tag},
+                                                                     {"$push": {f"legends.{legend_date}.defenses": diff_trophies}}, upsert=True))
 
-                            # if multiple attacks, but divisible by 40
-                            elif diff_attacks > 1 and diff_trophies / 40 == diff_attacks:
-                                for x in range(0, diff_attacks):
-                                    legend_changes.append(
-                                        UpdateOne({"tag": tag},
-                                                  {"$push": {f"legends.{legend_date}.attacks": 40}},
-                                                  upsert=True))
+                                    legend_changes.append(UpdateOne({"tag": tag},
+                                                                     {"$push": {f"legends.{legend_date}.new_defenses": {
+                                                                         "change": diff_trophies,
+                                                                         "time": int(pend.now(tz=pend.UTC).timestamp()),
+                                                                         "trophies": player.trophies
+                                                                     }}}, upsert=True))
+
+                            elif diff_trophies >= 1:
+                                equipment = []
+                                for hero in player.heroes:
+                                    for gear in hero.equipment:
+                                        equipment.append({"name": gear.name, "level": gear.level})
+
+                                legend_changes.append(
+                                    UpdateOne({"tag": tag},
+                                              {"$inc": {f"legends.{legend_date}.num_attacks": diff_attacks}},
+                                              upsert=True))
+                                # if one attack
+                                if diff_attacks == 1:
+                                    legend_changes.append(UpdateOne({"tag": tag},
+                                                                     {"$push": {
+                                                                         f"legends.{legend_date}.attacks": diff_trophies}},
+                                                                     upsert=True))
                                     legend_changes.append(UpdateOne({"tag": tag},
                                                                      {"$push": {f"legends.{legend_date}.new_attacks": {
-                                                                         "change": 40,
+                                                                         "change": diff_trophies,
                                                                          "time": int(pend.now(tz=pend.UTC).timestamp()),
                                                                          "trophies": player.trophies,
                                                                          "hero_gear": equipment
                                                                      }}}, upsert=True))
-                                legend_changes.append(
-                                    UpdateOne({"tag": tag}, {"$inc": {f"legends.streak": diff_attacks}}))
-                            else:
-                                legend_changes.append(UpdateOne({"tag": tag},
-                                                                 {"$push": {
-                                                                     f"legends.{legend_date}.attacks": diff_trophies}},
-                                                                 upsert=True))
-                                legend_changes.append(UpdateOne({"tag": tag},
-                                                                 {"$push": {f"legends.{legend_date}.new_attacks": {
-                                                                     "change": diff_trophies,
-                                                                     "time": int(pend.now(tz=pend.UTC).timestamp()),
-                                                                     "trophies": player.trophies,
-                                                                     "hero_gear": equipment
-                                                                 }}}, upsert=True))
+                                    if diff_trophies == 40:
+                                        legend_changes.append(
+                                            UpdateOne({"tag": tag}, {"$inc": {f"legends.streak": 1}}))
 
-                                legend_changes.append(
-                                    UpdateOne({"tag": tag}, {"$set": {f"legends.streak": 0}}, upsert=True))
+                                    else:
+                                        legend_changes.append(
+                                            UpdateOne({"tag": tag}, {"$set": {f"legends.streak": 0}}))
 
-                        if player.defenseWins != previous_player.defenseWins:
-                            diff_defenses = player.defenseWins - previous_player.defenseWins
-                            for x in range(0, diff_defenses):
-                                legend_changes.append(
-                                    UpdateOne({"tag": tag}, {"$push": {f"legends.{legend_date}.defenses": 0}},
-                                              upsert=True))
-                                legend_changes.append(UpdateOne({"tag": tag},
-                                                                 {"$push": {f"legends.{legend_date}.new_defenses": {
-                                                                     "change": 0,
-                                                                     "time": int(pend.now(tz=pend.UTC).timestamp()),
-                                                                     "trophies": player.trophies
-                                                                 }}}, upsert=True))
+                                # if multiple attacks, but divisible by 40
+                                elif diff_attacks > 1 and diff_trophies / 40 == diff_attacks:
+                                    for x in range(0, diff_attacks):
+                                        legend_changes.append(
+                                            UpdateOne({"tag": tag},
+                                                      {"$push": {f"legends.{legend_date}.attacks": 40}},
+                                                      upsert=True))
+                                        legend_changes.append(UpdateOne({"tag": tag},
+                                                                         {"$push": {f"legends.{legend_date}.new_attacks": {
+                                                                             "change": 40,
+                                                                             "time": int(pend.now(tz=pend.UTC).timestamp()),
+                                                                             "trophies": player.trophies,
+                                                                             "hero_gear": equipment
+                                                                         }}}, upsert=True))
+                                    legend_changes.append(
+                                        UpdateOne({"tag": tag}, {"$inc": {f"legends.streak": diff_attacks}}))
+                                else:
+                                    legend_changes.append(UpdateOne({"tag": tag},
+                                                                     {"$push": {
+                                                                         f"legends.{legend_date}.attacks": diff_trophies}},
+                                                                     upsert=True))
+                                    legend_changes.append(UpdateOne({"tag": tag},
+                                                                     {"$push": {f"legends.{legend_date}.new_attacks": {
+                                                                         "change": diff_trophies,
+                                                                         "time": int(pend.now(tz=pend.UTC).timestamp()),
+                                                                         "trophies": player.trophies,
+                                                                         "hero_gear": equipment
+                                                                     }}}, upsert=True))
 
-            logger.info(f"LOOP {loop_spot}: Changes Found")
+                                    legend_changes.append(
+                                        UpdateOne({"tag": tag}, {"$set": {f"legends.streak": 0}}, upsert=True))
+
+                            if player.defenseWins != previous_player.defenseWins:
+                                diff_defenses = player.defenseWins - previous_player.defenseWins
+                                for x in range(0, diff_defenses):
+                                    legend_changes.append(
+                                        UpdateOne({"tag": tag}, {"$push": {f"legends.{legend_date}.defenses": 0}},
+                                                  upsert=True))
+                                    legend_changes.append(UpdateOne({"tag": tag},
+                                                                     {"$push": {f"legends.{legend_date}.new_defenses": {
+                                                                         "change": 0,
+                                                                         "time": int(pend.now(tz=pend.UTC).timestamp()),
+                                                                         "trophies": player.trophies
+                                                                     }}}, upsert=True))
+
+                logger.info(f"LOOP {loop_spot}: Changes Found")
 
 
-        logger.info(f"{len(legend_changes)} db changes")
-        if legend_changes:
-            await db_client.player_stats.bulk_write(legend_changes)
-            logger.info(f"STAT CHANGES INSERT: {time.time() - time_inside}")
+            logger.info(f"{len(legend_changes)} db changes")
+            if legend_changes:
+                await db_client.player_stats.bulk_write(legend_changes)
+                logger.info(f"STAT CHANGES INSERT: {time.time() - time_inside}")
+
+        except:
+            continue
 
 
 
