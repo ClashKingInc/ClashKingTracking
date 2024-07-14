@@ -23,7 +23,7 @@ async def post_stream(reddit: asyncpraw.Reddit):
         try:
             count = 0
             sub = await reddit.subreddit(subreddit)
-            async for submission in sub.stream.submissions():
+            async for submission in sub.stream.submissions(skip_existing=True):
                 if count < 100:  # This removes the 100 historical submissions that SubredditStream pulls.
                     count += 1
                     continue
@@ -49,10 +49,7 @@ async def comment_stream(reddit: asyncpraw.Reddit):
         try:
             count = 0
             sub = await reddit.subreddit(subreddit)
-            async for comment in sub.stream.comments():
-                if count < 100:  # This removes the 100 historical submissions that SubredditStream pulls.
-                    count += 1
-                    continue
+            async for comment in sub.stream.comments(skip_existing=True):
                 await comment.author.load()
                 await comment.submission.load()
                 json_data = {"type": "redditcomment",
