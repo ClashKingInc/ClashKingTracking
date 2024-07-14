@@ -62,6 +62,8 @@ async def comment_stream():
                 if count < 100:  # This removes the 100 historical submissions that SubredditStream pulls.
                     count += 1
                     continue
+                await comment.author.load()
+                await comment.submission.load()
                 json_data = {"type": "redditcomment",
                              "data" : {"author" : comment.author.name,
                                        "avatar" : comment.author.icon_img,

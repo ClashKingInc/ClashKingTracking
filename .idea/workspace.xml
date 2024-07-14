@@ -4,7 +4,9 @@
     <option name="autoReloadType" value="SELECTIVE" />
   </component>
   <component name="ChangeListManager">
-    <list default="true" id="e7096e79-455b-4aa3-858d-e2defd65b8a9" name="Changes" comment="add: reddit comment tracking" />
+    <list default="true" id="e7096e79-455b-4aa3-858d-e2defd65b8a9" name="Changes" comment="add: reddit comment tracking">
+      <change beforePath="$PROJECT_DIR$/bot/reddit/track.py" beforeDir="false" afterPath="$PROJECT_DIR$/bot/reddit/track.py" afterDir="false" />
+    </list>
     <option name="SHOW_DIALOG" value="false" />
     <option name="HIGHLIGHT_CONFLICTS" value="true" />
     <option name="HIGHLIGHT_NON_ACTIVE_CHANGELIST" value="false" />
@@ -185,14 +187,6 @@
       <option name="number" value="Default" />
       <option name="presentableId" value="Default" />
       <updated>1706581825121</updated>
-    </task>
-    <task id="LOCAL-00072" summary="fix: timeout issue">
-      <option name="closed" value="true" />
-      <created>1712792878485</created>
-      <option name="number" value="00072" />
-      <option name="presentableId" value="LOCAL-00072" />
-      <option name="project" value="LOCAL" />
-      <updated>1712792878485</updated>
     </task>
     <task id="LOCAL-00073" summary="fix: timeout issue">
       <option name="closed" value="true" />
@@ -578,7 +572,15 @@
       <option name="project" value="LOCAL" />
       <updated>1720964920590</updated>
     </task>
-    <option name="localTasksCounter" value="121" />
+    <task id="LOCAL-00121" summary="add: reddit comment tracking">
+      <option name="closed" value="true" />
+      <created>1720965222823</created>
+      <option name="number" value="00121" />
+      <option name="presentableId" value="LOCAL-00121" />
+      <option name="project" value="LOCAL" />
+      <updated>1720965222823</updated>
+    </task>
+    <option name="localTasksCounter" value="122" />
     <servers />
   </component>
   <component name="VcsManagerConfiguration">
