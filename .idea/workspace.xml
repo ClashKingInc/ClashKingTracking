@@ -5,7 +5,7 @@
   </component>
   <component name="ChangeListManager">
     <list default="true" id="e7096e79-455b-4aa3-858d-e2defd65b8a9" name="Changes" comment="add: reddit comment tracking">
-      <change beforePath="$PROJECT_DIR$/bot/reddit/track.py" beforeDir="false" afterPath="$PROJECT_DIR$/bot/reddit/track.py" afterDir="false" />
+      <change beforePath="$PROJECT_DIR$/.idea/workspace.xml" beforeDir="false" afterPath="$PROJECT_DIR$/.idea/workspace.xml" afterDir="false" />
     </list>
     <option name="SHOW_DIALOG" value="false" />
     <option name="HIGHLIGHT_CONFLICTS" value="true" />
@@ -187,14 +187,6 @@
       <option name="number" value="Default" />
       <option name="presentableId" value="Default" />
       <updated>1706581825121</updated>
-    </task>
-    <task id="LOCAL-00073" summary="fix: timeout issue">
-      <option name="closed" value="true" />
-      <created>1712795023805</created>
-      <option name="number" value="00073" />
-      <option name="presentableId" value="LOCAL-00073" />
-      <option name="project" value="LOCAL" />
-      <updated>1712795023805</updated>
     </task>
     <task id="LOCAL-00074" summary="add: key to producer send">
       <option name="closed" value="true" />
@@ -580,7 +572,15 @@
       <option name="project" value="LOCAL" />
       <updated>1720965222823</updated>
     </task>
-    <option name="localTasksCounter" value="122" />
+    <task id="LOCAL-00122" summary="add: reddit comment tracking">
+      <option name="closed" value="true" />
+      <created>1720965999774</created>
+      <option name="number" value="00122" />
+      <option name="presentableId" value="LOCAL-00122" />
+      <option name="project" value="LOCAL" />
+      <updated>1720965999774</updated>
+    </task>
+    <option name="localTasksCounter" value="123" />
     <servers />
   </component>
   <component name="VcsManagerConfiguration">

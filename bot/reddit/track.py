@@ -11,22 +11,12 @@ from os import getenv
 from dotenv import load_dotenv
 load_dotenv()
 
-subreddit = "ClashOfClansRecruit"
-secret = getenv("REDDIT_SECRET")
-RPW = getenv("REDDIT_PW")
-
-reddit = asyncpraw.Reddit(
-    client_id="-dOCgLIHqUJK7g",
-    client_secret= secret,
-    username="Powerful-Flight2605",
-    password=RPW,
-    user_agent="Reply Recruit"
-)
-
 producer = KafkaProducer(bootstrap_servers=["85.10.200.219:9092"], api_version=(3, 6, 0))
 
+subreddit = "ClashOfClansRecruit"
 
-async def post_stream():
+
+async def post_stream(reddit: asyncpraw.Reddit):
     logger.info("Started Post Stream")
     while True:
         try:
@@ -52,7 +42,7 @@ async def post_stream():
             logger.error(str(e))
             continue
 
-async def comment_stream():
+async def comment_stream(reddit: asyncpraw.Reddit):
     logger.info("Started Comment Stream")
     while True:
         try:
@@ -80,8 +70,18 @@ async def comment_stream():
 
 
 async def main():
+    secret = getenv("REDDIT_SECRET")
+    RPW = getenv("REDDIT_PW")
+
+    reddit = asyncpraw.Reddit(
+        client_id="-dOCgLIHqUJK7g",
+        client_secret=secret,
+        username="Powerful-Flight2605",
+        password=RPW,
+        user_agent="Reply Recruit"
+    )
     loop = asyncio.get_event_loop()
-    loop.create_task(comment_stream())
-    loop.create_task(post_stream())
+    loop.create_task(comment_stream(reddit))
+    loop.create_task(post_stream(reddit))
 
 
