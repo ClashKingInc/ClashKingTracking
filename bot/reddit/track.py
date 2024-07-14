@@ -68,18 +68,19 @@ async def comment_stream(reddit: asyncpraw.Reddit):
             logger.error(str(e))
             continue
 
-
-async def main():
+async def create_reddit():
     secret = getenv("REDDIT_SECRET")
     RPW = getenv("REDDIT_PW")
-
-    reddit = asyncpraw.Reddit(
+    return asyncpraw.Reddit(
         client_id="-dOCgLIHqUJK7g",
         client_secret=secret,
         username="Powerful-Flight2605",
         password=RPW,
         user_agent="Reply Recruit"
     )
+
+async def main():
+    reddit = await create_reddit()
     loop = asyncio.get_event_loop()
     loop.create_task(comment_stream(reddit))
     loop.create_task(post_stream(reddit))
