@@ -47,14 +47,16 @@ async def comment_stream(reddit: asyncpraw.Reddit):
         try:
             sub = await reddit.subreddit(subreddit)
             async for comment in sub.stream.comments(skip_existing=True):
+                await comment.author.load()
                 json_data = {"type": "redditcomment",
-                         "data" : {"author" : comment.author.name,
-                                   "body" : comment.body,
-                                   "url" : comment.permalink,
-                                   "score" : comment.score,
-                                   "submission_author" : comment.link_author,
-                                   "submission_title" : comment.link_title
-                                   }}
+                             "data" : {"author" : comment.author.name,
+                                       "avatar" : comment.author.icon_img,
+                                       "body" : comment.body,
+                                       "url" : comment.permalink,
+                                       "score" : comment.score,
+                                       "submission_author" : comment.link_author,
+                                       "submission_title" : comment.link_title
+                                       }}
                 producer.send(topic="reddit", value=orjson.dumps(json_data), timestamp_ms=int(pend.now(tz=pend.UTC).timestamp()) * 1000)
         except Exception as e:
             logger.error(traceback.format_exc())
