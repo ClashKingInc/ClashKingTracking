@@ -1,4 +1,5 @@
 import asyncio
+import traceback
 
 import asyncpraw
 import re
@@ -39,7 +40,7 @@ async def post_stream(reddit: asyncpraw.Reddit):
                                            "tags" : tags}}
                     producer.send(topic="reddit", value=orjson.dumps(json_data), timestamp_ms=int(pend.now(tz=pend.UTC).timestamp()) * 1000)
         except Exception as e:
-            logger.error(str(e))
+            logger.error("Traceback: %s", traceback.format_exc())
             continue
 
 async def comment_stream(reddit: asyncpraw.Reddit):
@@ -65,7 +66,7 @@ async def comment_stream(reddit: asyncpraw.Reddit):
                                        }}
                 producer.send(topic="reddit", value=orjson.dumps(json_data), timestamp_ms=int(pend.now(tz=pend.UTC).timestamp()) * 1000)
         except Exception as e:
-            logger.error(str(e))
+            logger.error("Traceback: %s", traceback.format_exc())
             continue
 
 async def create_reddit():
