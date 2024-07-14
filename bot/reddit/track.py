@@ -1,5 +1,6 @@
 import asyncio
 import traceback
+import pprint
 
 import asyncpraw
 import re
@@ -21,12 +22,8 @@ async def post_stream(reddit: asyncpraw.Reddit):
     logger.info("Started Post Stream")
     while True:
         try:
-            count = 0
             sub = await reddit.subreddit(subreddit)
             async for submission in sub.stream.submissions(skip_existing=True):
-                if count < 100:  # This removes the 100 historical submissions that SubredditStream pulls.
-                    count += 1
-                    continue
                 if submission.link_flair_text == 'Searching':
                     text = f"{submission.selftext} {submission.title}"
                     tags = re.findall('[#PYLQGRJCUVOpylqgrjcuvo0289]{5,11}', text)
@@ -43,28 +40,27 @@ async def post_stream(reddit: asyncpraw.Reddit):
             logger.error(traceback.format_exc())
             continue
 
+
 async def comment_stream(reddit: asyncpraw.Reddit):
     logger.info("Started Comment Stream")
     while True:
         try:
-            count = 0
             sub = await reddit.subreddit(subreddit)
             async for comment in sub.stream.comments(skip_existing=True):
-                await comment.author.load()
-                await comment.submission.load()
                 json_data = {"type": "redditcomment",
-                             "data" : {"author" : comment.author.name,
-                                       "avatar" : comment.author.icon_img,
-                                       "body" : comment.body,
-                                       "url" : comment.permalink,
-                                       "score" : comment.score,
-                                       "submission_author" : comment.submission.author.name,
-                                       "submission_title" : comment.submission.title
-                                       }}
+                         "data" : {"author" : comment.author.name,
+                                   "body" : comment.body,
+                                   "url" : comment.permalink,
+                                   "score" : comment.score,
+                                   "submission_author" : comment.link_author,
+                                   "submission_title" : comment.link_title
+                                   }}
                 producer.send(topic="reddit", value=orjson.dumps(json_data), timestamp_ms=int(pend.now(tz=pend.UTC).timestamp()) * 1000)
         except Exception as e:
             logger.error(traceback.format_exc())
             continue
+
+
 
 async def create_reddit():
     secret = getenv("REDDIT_SECRET")
