@@ -4,10 +4,7 @@
     <option name="autoReloadType" value="SELECTIVE" />
   </component>
   <component name="ChangeListManager">
-    <list default="true" id="e7096e79-455b-4aa3-858d-e2defd65b8a9" name="Changes" comment="revert: tracking migration">
-      <change beforePath="$PROJECT_DIR$/.idea/workspace.xml" beforeDir="false" afterPath="$PROJECT_DIR$/.idea/workspace.xml" afterDir="false" />
-      <change beforePath="$PROJECT_DIR$/bot/reddit/track.py" beforeDir="false" afterPath="$PROJECT_DIR$/bot/reddit/track.py" afterDir="false" />
-    </list>
+    <list default="true" id="e7096e79-455b-4aa3-858d-e2defd65b8a9" name="Changes" comment="add: reddit comment tracking" />
     <option name="SHOW_DIALOG" value="false" />
     <option name="HIGHLIGHT_CONFLICTS" value="true" />
     <option name="HIGHLIGHT_NON_ACTIVE_CHANGELIST" value="false" />
@@ -188,14 +185,6 @@
       <option name="number" value="Default" />
       <option name="presentableId" value="Default" />
       <updated>1706581825121</updated>
-    </task>
-    <task id="LOCAL-00071" summary="fix: timeout issue">
-      <option name="closed" value="true" />
-      <created>1712790050272</created>
-      <option name="number" value="00071" />
-      <option name="presentableId" value="LOCAL-00071" />
-      <option name="project" value="LOCAL" />
-      <updated>1712790050272</updated>
     </task>
     <task id="LOCAL-00072" summary="fix: timeout issue">
       <option name="closed" value="true" />
@@ -581,11 +570,18 @@
       <option name="project" value="LOCAL" />
       <updated>1719171760660</updated>
     </task>
-    <option name="localTasksCounter" value="120" />
+    <task id="LOCAL-00120" summary="add: reddit comment tracking">
+      <option name="closed" value="true" />
+      <created>1720964920590</created>
+      <option name="number" value="00120" />
+      <option name="presentableId" value="LOCAL-00120" />
+      <option name="project" value="LOCAL" />
+      <updated>1720964920590</updated>
+    </task>
+    <option name="localTasksCounter" value="121" />
     <servers />
   </component>
   <component name="VcsManagerConfiguration">
-    <MESSAGE value="fix: better tracking" />
     <MESSAGE value="add: reddit tracking" />
     <MESSAGE value="fix: war cache pull" />
     <MESSAGE value="add: meilisearch" />
@@ -610,6 +606,7 @@
     <MESSAGE value="try new" />
     <MESSAGE value="add: scheduled tracking" />
     <MESSAGE value="revert: tracking migration" />
-    <option name="LAST_COMMIT_MESSAGE" value="revert: tracking migration" />
+    <MESSAGE value="add: reddit comment tracking" />
+    <option name="LAST_COMMIT_MESSAGE" value="add: reddit comment tracking" />
   </component>
 </project>

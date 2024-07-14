@@ -4,6 +4,7 @@ import asyncpraw
 import re
 import orjson
 import pendulum as pend
+from loguru import logger
 
 from kafka import KafkaProducer
 from os import getenv
@@ -26,6 +27,7 @@ producer = KafkaProducer(bootstrap_servers=["85.10.200.219:9092"], api_version=(
 
 
 async def post_stream():
+    logger.info("Started Post Stream")
     while True:
         try:
             count = 0
@@ -47,9 +49,11 @@ async def post_stream():
                                            "tags" : tags}}
                     producer.send(topic="reddit", value=orjson.dumps(json_data), timestamp_ms=int(pend.now(tz=pend.UTC).timestamp()) * 1000)
         except Exception as e:
+            logger.error(str(e))
             continue
 
 async def comment_stream():
+    logger.info("Started Comment Stream")
     while True:
         try:
             count = 0
@@ -69,6 +73,7 @@ async def comment_stream():
                                        }}
                 producer.send(topic="reddit", value=orjson.dumps(json_data), timestamp_ms=int(pend.now(tz=pend.UTC).timestamp()) * 1000)
         except Exception as e:
+            logger.error(str(e))
             continue
 
 
