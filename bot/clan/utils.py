@@ -161,14 +161,15 @@ async def raid_weekend_track(clan_tags: List[str], db_client: MongoDatabase, coc
 
             clan_data = CLAN_CACHE.get(clan_tag)
 
-            json_data = {"type": "raid_attacks",
-                         "clan_tag": current_raid.clan_tag,
-                         "attacked" : attacked,
-                         "raid": current_raid._raw_data,
-                         "old_raid" : previous_raid._raw_data,
-                         "clan" : clan_data._raw_data
-                         }
-            producer.send("capital", ujson.dumps(json_data).encode("utf-8"), key=clan_tag.encode("utf-8"), timestamp_ms=int(pend.now(tz=pend.UTC).timestamp() * 1000))
+            if clan_data:
+                json_data = {"type": "raid_attacks",
+                             "clan_tag": current_raid.clan_tag,
+                             "attacked" : attacked,
+                             "raid": current_raid._raw_data,
+                             "old_raid" : previous_raid._raw_data,
+                             "clan" : clan_data._raw_data
+                             }
+                producer.send("capital", ujson.dumps(json_data).encode("utf-8"), key=clan_tag.encode("utf-8"), timestamp_ms=int(pend.now(tz=pend.UTC).timestamp() * 1000))
 
             if current_raid.state != previous_raid.state:
                 json_data = {"type": "raid_state", "clan_tag": current_raid.clan_tag, "old_raid": previous_raid._raw_data, "raid": current_raid._raw_data}
