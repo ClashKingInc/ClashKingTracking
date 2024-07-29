@@ -89,6 +89,25 @@ async def clan_war_track(clan_tag: str, db_client: MongoDatabase, coc_client: co
 
         WAR_CACHE[war_unique_id] = war
 
+        if war.is_cwl and war.state == "inPreparation":
+            clan_members_added = [n._raw_data for n in war.clan.members if n.tag not in set(n.tag for n in previous_war.clan.members)]
+            clan_members_removed = [n._raw_data for n in previous_war.clan.members if n.tag not in set(n.tag for n in war.clan.members)]
+
+            if clan_members_added or clan_members_removed:
+                json_data = {"type": "cwl_lineup_change", "war": war._raw_data, "league_group": league_group,
+                             "added": clan_members_added, "removed" : clan_members_removed, "clan_tag": war.clan.tag}
+                producer.send("war", ujson.dumps(json_data).encode("utf-8"), key=clan_tag.encode("utf-8"), timestamp_ms=int(pend.now(tz=pend.UTC).timestamp() * 1000))
+
+
+            opponent_members_added = [n._raw_data for n in war.opponent.members if n.tag not in set(n.tag for n in previous_war.opponent.members)]
+            opponent_members_removed = [n._raw_data for n in previous_war.opponent.members if n.tag not in set(n.tag for n in war.opponent.members)]
+
+            if opponent_members_added or opponent_members_removed:
+                json_data = {"type": "cwl_lineup_change", "war": war._raw_data, "league_group": league_group,
+                             "added": opponent_members_added, "removed" : opponent_members_removed, "clan_tag": war.opponent.tag}
+                producer.send("war", ujson.dumps(json_data).encode("utf-8"), key=clan_tag.encode("utf-8"), timestamp_ms=int(pend.now(tz=pend.UTC).timestamp() * 1000))
+
+
         league_group = None
         if war.is_cwl:
             league_group: coc.ClanWarLeagueGroup | None = war.league_group
