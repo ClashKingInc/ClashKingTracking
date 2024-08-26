@@ -104,6 +104,11 @@ async def main():
             time_inside = time.time()
 
             all_tags_to_track = await db_client.player_stats.distinct("tag", filter={"league" : "Legend League"})
+            tag_set = set(all_tags_to_track)
+            keys_to_remove = [key for key in LEGENDS_CACHE if key not in tag_set]
+            for key in keys_to_remove:
+                del LEGENDS_CACHE[key]
+
             logger.info(f"{len(all_tags_to_track)} players to track")
 
             split_size = 50_000
