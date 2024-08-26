@@ -30,6 +30,7 @@ async def main():
     loop_spot = 1
 
     while True:
+        try:
             loop_spot += 1
             time_inside = time.time()
 
@@ -123,7 +124,10 @@ async def main():
                         league = response.get("league", {}).get("name", "Unranked")
                         prev_league = previous_response.get("league", {}).get("name", "Unranked")
                         if league != prev_league:
-                            bulk_db_changes.append(UpdateOne({"tag": tag}, {"$set": {"league": league}}))
+                            if prev_league == "Legend League" and league == "Unranked":
+                                pass
+                            else:
+                                bulk_db_changes.append(UpdateOne({"tag": tag}, {"$set": {"league": league}}))
 
                         changes, fields_to_update = get_player_changes(previous_response, response)
 
@@ -322,3 +326,5 @@ async def main():
             if fix_changes:
                 await db_client.player_stats.bulk_write(fix_changes, ordered=False)
                 logger.info(f"FIX CHANGES: {time.time() - time_inside}")
+        except:
+            continue
