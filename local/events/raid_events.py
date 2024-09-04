@@ -1,13 +1,19 @@
-import coc
 import sys
-sys.path.append("..")
-import settings
+
+import coc
+
+sys.path.append('..')
 import asyncio
 
+import settings
 
 
 @coc.RaidEvents.raid_attack()
-async def raid_attack(old_member: coc.RaidMember, new_member: coc.RaidMember, raid: coc.RaidLogEntry):
+async def raid_attack(
+    old_member: coc.RaidMember,
+    new_member: coc.RaidMember,
+    raid: coc.RaidLogEntry,
+):
     clan_tasks = []
 
     async def send_ws(ws, json):
@@ -19,11 +25,13 @@ async def raid_attack(old_member: coc.RaidMember, new_member: coc.RaidMember, ra
             except:
                 pass
 
-    json_data = {"type": "raid_attacks",
-                 "clan_tag" : raid.clan_tag,
-                 "old_member": old_member._raw_data,
-                 "new_member": new_member._raw_data,
-                 "raid": raid._raw_data}
+    json_data = {
+        'type': 'raid_attacks',
+        'clan_tag': raid.clan_tag,
+        'old_member': old_member._raw_data,
+        'new_member': new_member._raw_data,
+        'raid': raid._raw_data,
+    }
 
     for client in settings.RAID_CLIENTS.copy():
         task = asyncio.ensure_future(send_ws(ws=client, json=json_data))
@@ -44,7 +52,12 @@ async def state(old_raid: coc.RaidLogEntry, raid: coc.RaidLogEntry):
             except:
                 pass
 
-    json_data = {"type": "raid_state", "clan_tag" : raid.clan_tag, "old_raid": old_raid._raw_data, "raid": raid._raw_data}
+    json_data = {
+        'type': 'raid_state',
+        'clan_tag': raid.clan_tag,
+        'old_raid': old_raid._raw_data,
+        'raid': raid._raw_data,
+    }
 
     for client in settings.RAID_CLIENTS.copy():
         task = asyncio.ensure_future(send_ws(ws=client, json=json_data))

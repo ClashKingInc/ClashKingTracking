@@ -1,5 +1,6 @@
-from utility.config import Config
 from dataclasses import dataclass
+
+from utility.config import Config
 
 
 @dataclass
