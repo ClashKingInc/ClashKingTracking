@@ -42,7 +42,7 @@ async def broadcast():
             logger.error(e)
             EVENT_CLIENTS.discard(ws)
 
-    topics = ['clan', 'player', 'war', 'capital', 'reminder', 'reddit']
+    topics = ['clan', 'player', 'war', 'capital', 'reminder', 'reddit', 'giveaway']
     consumer: AIOKafkaConsumer = AIOKafkaConsumer(
         *topics,
         bootstrap_servers='85.10.200.219:9092',

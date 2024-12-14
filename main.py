@@ -5,6 +5,7 @@ from bot.legends.track import main as bot_legend_main
 from bot.player.track import main as bot_player_main
 from bot.reddit.track import main as bot_reddit_main
 from bot.websockets.server import main as websocket_server
+from bot.giveaway.track import main as bot_giveaway_main
 from gamewide.clan_verify.track import main as clan_verify_main
 from gamewide.players.track import broadcast as global_player_main
 from gamewide.scheduled.track import main as global_scheduled_main
@@ -27,6 +28,8 @@ if __name__ == '__main__':
         task = global_player_main
     elif config.tracking_type == 'BOTLEGENDS':
         task = bot_legend_main
+    elif config.tracking_type == 'GIVEAWAY':
+        task = bot_giveaway_main
     elif config.tracking_type == 'GLOBALSCHEDULED':
         task = global_scheduled_main
     elif config.tracking_type == 'GLOBALWAR':

@@ -44,6 +44,7 @@ class MongoDatabase:
             self.looper.join_leave_history
         )
         self.global_players: collection_class = self.clashking.global_players
+        self.giveaways: collection_class = self.clashking.giveaways
         self.raid_weekends: collection_class = self.looper.raid_weekends
         self.war_timer: collection_class = self.looper.war_timer
         self.legend_history: collection_class = self.looper.legend_history
