@@ -76,7 +76,7 @@ async def main():
             static_db_connection=Config.static_mongodb,
         )
         producer = AIOKafkaProducer(
-            bootstrap_servers=['85.10.200.219:9092'], api_version=(3, 6, 0),
+            bootstrap_servers=['85.10.200.219:9092']
         )
         await producer.start()
 
