@@ -6,7 +6,7 @@ from aiokafka import AIOKafkaProducer
 from loguru import logger
 
 from bot.giveaway.utils import produce_giveaway_event
-from local.main import config
+from utility.config import Config
 from utility.classes import MongoDatabase  # Your MongoDB utility
 
 # Schedule giveaways to start or end
@@ -72,8 +72,8 @@ async def main():
     try:
         # Initialize database and Kafka producer
         db_client = MongoDatabase(
-            stats_db_connection=config.stats_mongodb,
-            static_db_connection=config.static_mongodb,
+            stats_db_connection=Config.stats_mongodb,
+            static_db_connection=Config.static_mongodb,
         )
         producer = AIOKafkaProducer(
             bootstrap_servers=['85.10.200.219:9092'], api_version=(3, 6, 0),
