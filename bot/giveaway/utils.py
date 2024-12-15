@@ -9,11 +9,12 @@ async def produce_giveaway_event(producer, event_type, giveaway):
     # Build the base message
     message = {
         "type": event_type,
+        "giveaway_id": giveaway['_id'],
         "server_id": giveaway['server_id'],
         "channel_id": giveaway['channel_id'],
         "prize": giveaway['prize'],
         "mentions": giveaway.get('mentions', []),
-        "winner_count": giveaway.get('winners') if event_type == "giveaway_end" else None,
+        "winner_count": giveaway.get('winners'),
         "message": giveaway.get('text_above_embed', "") if event_type == "giveaway_start" else None,
         "image_url": giveaway.get('image_url', None),
     }
