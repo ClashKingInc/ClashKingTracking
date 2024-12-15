@@ -37,6 +37,7 @@ async def schedule_giveaways(db_client, producer, scheduler):
                 run_date=giveaway["start_time"],
                 args=[producer, "giveaway_start", giveaway],  # Call Kafka producer
                 id=f"start-{giveaway['_id']}",
+                misfire_grace_time=60,  # 1 minute grace period
             )
             # Update database status
             await db_client.giveaways.update_one(
@@ -53,6 +54,7 @@ async def schedule_giveaways(db_client, producer, scheduler):
                 run_date=giveaway["end_time"],
                 args=[producer, "giveaway_end", giveaway],  # Call Kafka producer
                 id=f"end-{giveaway['_id']}",
+                misfire_grace_time=60,  # 1 minute grace period
             )
             # Update database status
             await db_client.giveaways.update_one(
