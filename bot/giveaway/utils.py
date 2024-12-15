@@ -15,7 +15,12 @@ async def produce_giveaway_event(producer, event_type, giveaway):
         "mentions": giveaway.get('mentions', []),
         "winner_count": giveaway.get('winners') if event_type == "giveaway_end" else None,
         "message": giveaway.get('text_above_embed', "") if event_type == "giveaway_start" else None,
+        "image_url": giveaway.get('image_url', None),
     }
+
+    if event_type == "giveaway_start":
+        end_time = giveaway.get('end_time')
+        message["end_time"] = end_time.timestamp()
 
     # Include participants if it's a giveaway end event
     if event_type == "giveaway_end":
