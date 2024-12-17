@@ -19,6 +19,7 @@ async def produce_giveaway_event(producer, event_type, giveaway):
         "text_in_embed": giveaway.get('text_in_embed', "") if event_type == "giveaway_start" else None,
         "text_on_end": giveaway.get('text_on_end', "") if event_type == "giveaway_end" else None,
         "image_url": giveaway.get('image_url', None),
+        "boosters": giveaway.get('boosters', []),  # Ajout des boosters
     }
 
     if event_type == "giveaway_start":
