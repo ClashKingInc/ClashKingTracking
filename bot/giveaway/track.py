@@ -57,7 +57,7 @@ async def schedule_giveaways(db_client, producer, scheduler):
             scheduler.add_job(
                 produce_giveaway_event,
                 "date",
-                run_date=giveaway["giveaway_update"],
+                run_date=datetime.utcnow(),
                 args=[producer, "giveaway_update", giveaway],  # Call Kafka producer
                 id=f"update-{giveaway['_id']}",
                 misfire_grace_time=300,  # 5 minutes grace period
