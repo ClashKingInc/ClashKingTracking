@@ -31,7 +31,7 @@ async def schedule_giveaways(db_client, producer, scheduler):
         # Fetch giveaways to update
         giveaways_to_update = await db_client.giveaways.find({
             "status": "ongoing",
-            "updated": {"$gte": "yes"}
+            "updated": "yes",
         }).to_list(length=None)
 
         # Schedule start events
