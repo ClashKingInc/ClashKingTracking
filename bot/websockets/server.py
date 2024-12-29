@@ -32,16 +32,14 @@ async def event_websocket(websocket: WebSocket):
                 return
 
             CONNECTED_CLIENTS[client_id] = websocket
-            for clan in clans:
-                CLAN_MAP[client_id].add(clan)
+            CLAN_MAP[client_id] = set(clans)
 
             # Send missed events if any exist
-            if client_id in MISSED_EVENTS and MISSED_EVENTS[client_id]:
-                while MISSED_EVENTS[client_id]:
-                    missed_event = MISSED_EVENTS[client_id].popleft()
-                    await websocket.send_json(missed_event)
+            while MISSED_EVENTS.get(client_id):
+                missed_event = MISSED_EVENTS[client_id].popleft()
+                await websocket.send_json(missed_event)
     except Exception as e:
-        await websocket.close()
+        pass
 
 async def broadcast():
     global CLAN_MAP
