@@ -28,6 +28,12 @@ async def schedule_giveaways(db_client, producer, scheduler):
             "status": "ongoing"
         }).to_list(length=None)
 
+        # Fetch giveaways to update
+        giveaways_to_update = await db_client.giveaways.find({
+            "status": "ongoing",
+            "updated": "yes",
+        }).to_list(length=None)
+
         # Schedule start events
         for giveaway in giveaways_to_start:
             logger.info(f"Scheduling giveaway start: {giveaway['_id']}")
@@ -37,11 +43,29 @@ async def schedule_giveaways(db_client, producer, scheduler):
                 run_date=giveaway["start_time"],
                 args=[producer, "giveaway_start", giveaway],  # Call Kafka producer
                 id=f"start-{giveaway['_id']}",
+                misfire_grace_time=300,  # 5 minuteS grace period
             )
             # Update database status
             await db_client.giveaways.update_one(
                 {"_id": giveaway["_id"]},
                 {"$set": {"status": "ongoing"}}
+            )
+
+        # Schedule update events
+        for giveaway in giveaways_to_update:
+            logger.info(f"Scheduling giveaway update: {giveaway['_id']}")
+            scheduler.add_job(
+                produce_giveaway_event,
+                "date",
+                run_date=datetime.utcnow(),
+                args=[producer, "giveaway_update", giveaway],  # Call Kafka producer
+                id=f"update-{giveaway['_id']}",
+                misfire_grace_time=300,  # 5 minutes grace period
+            )
+            # Update database status
+            await db_client.giveaways.update_one(
+                {"_id": giveaway["_id"]},
+                {"$set": {"updated": "no"}}
             )
 
         # Schedule end events
@@ -53,6 +77,7 @@ async def schedule_giveaways(db_client, producer, scheduler):
                 run_date=giveaway["end_time"],
                 args=[producer, "giveaway_end", giveaway],  # Call Kafka producer
                 id=f"end-{giveaway['_id']}",
+                misfire_grace_time=300,  # 5 minutes grace period
             )
             # Update database status
             await db_client.giveaways.update_one(
