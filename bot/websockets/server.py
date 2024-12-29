@@ -1,5 +1,5 @@
 import asyncio
-from collections import defaultdict
+from collections import defaultdict, deque
 
 import orjson
 import ujson
@@ -8,39 +8,53 @@ from fastapi import FastAPI, WebSocket
 from loguru import logger
 from uvicorn import Config, Server
 
-EVENT_CLIENTS = set()
 CLAN_MAP = defaultdict(set)
+MISSED_EVENTS = defaultdict(lambda: deque(maxlen=10_000))
 app = FastAPI()
-
+CONNECTED_CLIENTS = {}
 
 @app.websocket('/events')
 async def event_websocket(websocket: WebSocket):
-    global EVENT_CLIENTS
     global CLAN_MAP
+    global MISSED_EVENTS
+    global CONNECTED_CLIENTS
+
     await websocket.accept()
-    EVENT_CLIENTS.add(websocket)
     await websocket.send_text('Successfully Login!')
     try:
         while True:
             data: bytes = await websocket.receive_bytes()
             data: dict = orjson.loads(data)
             clans = data.get('clans', [])
-            for clan in clans:
-                CLAN_MAP[websocket.client].add(clan)
-    except Exception:
-        EVENT_CLIENTS.remove(websocket)
+            client_id = data.get('client_id')
+            if client_id is None:
+                await websocket.close()
+                return
 
+            CONNECTED_CLIENTS[client_id] = websocket
+            CLAN_MAP[client_id] = set(clans)
+
+            # Send missed events if any exist
+            while MISSED_EVENTS.get(client_id):
+                missed_event = MISSED_EVENTS[client_id].popleft()
+                await websocket.send_json(missed_event)
+    except Exception as e:
+        pass
 
 async def broadcast():
-    global EVENT_CLIENTS
     global CLAN_MAP
 
-    async def send_ws(ws, json):
+    async def send_ws(client_id, ws, json):
         try:
-            await ws.send_json(json)
+            if ws is not None:
+                await ws.send_json(json)
+            else:
+                MISSED_EVENTS[client_id].append(json)
         except Exception as e:
             logger.error(e)
-            EVENT_CLIENTS.discard(ws)
+            for client_id, websocket in CONNECTED_CLIENTS.copy().items():
+                if websocket == ws:
+                    CONNECTED_CLIENTS[client_id] = None
 
     topics = ['clan', 'player', 'war', 'capital', 'reminder', 'reddit', 'giveaway']
     consumer: AIOKafkaConsumer = AIOKafkaConsumer(
@@ -55,10 +69,10 @@ async def broadcast():
 
         key = msg.key.decode('utf-8') if msg.key is not None else None
         tasks = []
-        for client in EVENT_CLIENTS.copy():   # type: WebSocket
-            clans = CLAN_MAP.get(client.client, [])
-            if key in clans or key is None:
-                tasks.append(send_ws(ws=client, json=message_to_send))
+        for client_id, client in CONNECTED_CLIENTS.items():   # type: str, WebSocket
+            clans = CLAN_MAP.get(client_id, [])
+            if key in clans or key is None or not clans:
+                tasks.append(send_ws(client_id=client_id, ws=client, json=message_to_send))
         await asyncio.gather(*tasks)
 
 
