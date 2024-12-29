@@ -30,6 +30,7 @@ async def event_websocket(websocket: WebSocket):
             if client_id is None:
                 await websocket.close()
                 return
+            await websocket.send_text(f'Login! with clans: {clans} and id: {client_id}')
 
             CONNECTED_CLIENTS[client_id] = websocket
             CLAN_MAP[client_id] = set(clans)
@@ -39,6 +40,7 @@ async def event_websocket(websocket: WebSocket):
                 missed_event = MISSED_EVENTS[client_id].popleft()
                 await websocket.send_json(missed_event)
     except Exception as e:
+        logger.error(e)
         pass
 
 async def broadcast():
