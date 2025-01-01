@@ -18,10 +18,10 @@ class Tracking():
         #maybe add different stats, and then a function that print them out or smthn
 
 
-    def initialize(self):
+    async def initialize(self):
         print(self.type)
         self.config = Config(config_type=self.type)
-        self.config.initialize()
+        await self.config.initialize()
 
         self.db_client = MongoDatabase(
             stats_db_connection=self.config.stats_mongodb,
