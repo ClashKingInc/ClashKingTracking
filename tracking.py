@@ -16,7 +16,7 @@ class Tracking():
         self.throttler: Throttler = Throttler(1000)
         self.iterations = 0
         #maybe add different stats, and then a function that print them out or smthn
-
+        self.batch_size = 50_000
 
     async def initialize(self):
         self.config = Config(config_type=self.type)
