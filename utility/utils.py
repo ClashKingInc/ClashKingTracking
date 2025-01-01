@@ -4,14 +4,15 @@ import pendulum as pend
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
 from utility.keycreation import create_keys
 
+
 def gen_raid_date():
     now = pend.now(tz=pend.UTC)
     current_dayofweek = now.weekday()
     if (
-        (current_dayofweek == 4 and now.hour >= 7)
-        or (current_dayofweek == 5)
-        or (current_dayofweek == 6)
-        or (current_dayofweek == 0 and now.hour < 7)
+            (current_dayofweek == 4 and now.hour >= 7)
+            or (current_dayofweek == 5)
+            or (current_dayofweek == 6)
+            or (current_dayofweek == 0 and now.hour < 7)
     ):
         if current_dayofweek == 0:
             current_dayofweek = 7
@@ -50,21 +51,23 @@ def is_raids():
     now = pend.now(tz=pend.UTC)
     current_dayofweek = now.weekday()
     if (
-        (current_dayofweek == 4 and now.hour >= 7)
-        or (current_dayofweek == 5)
-        or (current_dayofweek == 6)
-        or (current_dayofweek == 0 and now.hour < 9)
+            (current_dayofweek == 4 and now.hour >= 7)
+            or (current_dayofweek == 5)
+            or (current_dayofweek == 6)
+            or (current_dayofweek == 0 and now.hour < 9)
     ):
         raid_on = True
     else:
         raid_on = False
     return raid_on
 
+
 def initialize_scheduler():
     """Initialize the scheduler for periodic tasks."""
     scheduler = AsyncIOScheduler(timezone=pend.UTC)
     scheduler.start()
     return scheduler
+
 
 async def initialize_coc_client(config):
     """Initialize the coc.py client with the configured keys."""
@@ -80,3 +83,12 @@ async def initialize_coc_client(config):
     coc_client = coc.Client(raw_attribute=True, key_count=10, throttle_limit=30)
     await coc_client.login_with_tokens(*keys)
     return coc_client
+
+
+def sentry_filter(event, hint):
+    """Filter out events that are not errors."""
+    if 'exception' in hint:
+        exc_type, exc_value, exc_tb = hint['exception']
+        if exc_type == KeyboardInterrupt:
+            return None
+    return event

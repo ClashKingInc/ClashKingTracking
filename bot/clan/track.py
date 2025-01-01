@@ -4,17 +4,18 @@ from kafka import KafkaProducer
 from sentry_sdk.integrations.asyncio import AsyncioIntegration
 
 from bot.dev.kafka_mock import MockKafkaProducer
-from utility.utils import initialize_coc_client
+from utility.utils import initialize_coc_client, sentry_filter
 from utility.classes import MongoDatabase
 from config import BotClanTrackingConfig
 import pendulum as pend
 import ujson
+import time
 
 
 class ClanTracker:
     """Class to manage clan tracking."""
 
-    def __init__(self, config, producer=None, max_concurrent_requests=900):
+    def __init__(self, config, producer=None, max_concurrent_requests=1000, max_requests_per_second=1000):
         self.config = config
         self.producer = producer or KafkaProducer(bootstrap_servers=["85.10.200.219:9092"])
         self.db_client = MongoDatabase(
@@ -25,10 +26,20 @@ class ClanTracker:
         self.clan_cache = {}  # Cache for tracking clan states
         self.last_private_warlog_warn = {}  # Cache for private war log warnings
         self.semaphore = asyncio.Semaphore(max_concurrent_requests)
+        self.max_requests_per_second = max_requests_per_second
+        self.last_request_time = time.time()  # Track last request time
+        self.message_count = 0  # Initialize the message counter
 
     async def initialize(self):
         """Initialize the CoC client."""
         self.coc_client = await initialize_coc_client(self.config)
+
+    async def throttle(self):
+        """Ensure requests are sent within the allowed rate limit."""
+        elapsed_time = time.time() - self.last_request_time
+        if elapsed_time < 1 / self.max_requests_per_second:
+            await asyncio.sleep(1 / self.max_requests_per_second - elapsed_time)
+        self.last_request_time = time.time()  # Update time after sending request
 
     async def track_batch(self, batch):
         """Track a batch of clans."""
@@ -44,7 +55,8 @@ class ClanTracker:
 
     async def track(self, clan_tags):
         """Track updates for all clans in batches."""
-        batch_size = 100  # Adjust batch size based on available resources
+        self.message_count = 0  # Reset message count
+        batch_size = 1000  # Adjust batch size based on available resources
         for i in range(0, len(clan_tags), batch_size):
             batch = clan_tags[i:i + batch_size]
             print(f"Processing batch {i // batch_size + 1} of {len(clan_tags) // batch_size + 1}.")
@@ -55,10 +67,11 @@ class ClanTracker:
 
     async def track_clan(self, clan_tag: str):
         """Track updates for a specific clan."""
+        await self.throttle()
         sentry_sdk.set_context("clan_tracking", {"clan_tag": clan_tag})
-        print(f"Tracking clan: {clan_tag}")  # Added print
         try:
             async with self.semaphore:
+                await self.throttle()  # Ensure requests are sent within the rate limit
                 clan = await self.coc_client.get_clan(tag=clan_tag)
         except Exception as e:
             self._handle_exception(f"Error fetching clan {clan_tag}", e)
@@ -75,7 +88,6 @@ class ClanTracker:
         self._handle_attribute_changes(clan, previous_clan)
         self._handle_member_changes(clan, previous_clan)
         self._handle_donation_updates(clan, previous_clan)
-        print(f"Finished tracking clan: {clan_tag}")  # Added print
 
     def _send_to_kafka(self, topic, key, data):
         """Helper to send data to Kafka."""
@@ -90,6 +102,7 @@ class ClanTracker:
             key=key.encode('utf-8'),
             timestamp_ms=int(pend.now(tz=pend.UTC).timestamp() * 1000),
         )
+        self.message_count += 1
 
     def _handle_exception(self, message, exception):
         """Handle exceptions by logging to Sentry and console."""
@@ -136,8 +149,8 @@ class ClanTracker:
 
     def _handle_member_changes(self, clan, previous_clan):
         """Handle changes in clan membership."""
-        current_members = {n.tag for n in clan.members}
-        previous_members = {m.tag for m in previous_clan.members}
+        current_members = clan.members_dict
+        previous_members = previous_clan.members_dict
 
         members_joined = [n._raw_data for n in clan.members if n.tag not in previous_members]
         members_left = [m._raw_data for m in previous_clan.members if m.tag not in current_members]
@@ -180,6 +193,7 @@ async def main():
         integrations=[AsyncioIntegration()],
         profiles_sample_rate=1.0,
         environment="production" if not config.is_beta else "beta",
+        before_send=sentry_filter,
     )
 
     producer = MockKafkaProducer() if config.is_beta else KafkaProducer(bootstrap_servers=["85.10.200.219:9092"])
@@ -194,7 +208,8 @@ async def main():
             await tracker.track(clan_tags)
             elapsed_time = pend.now(tz=pend.UTC) - start_time
             print(f"Tracked all {len(clan_tags)} clans in {elapsed_time.in_seconds()} seconds.")
-            await asyncio.sleep(20 if config.is_beta else 0)
+            print(f"Total messages sent: {tracker.message_count} which is {tracker.message_count / elapsed_time.in_seconds()} messages per second.")
+            await asyncio.sleep(60 if config.is_beta else 0)
     except KeyboardInterrupt:
         print("Tracking interrupted by user.")
     finally:
