@@ -71,13 +71,13 @@ class ScheduledTracking(Tracking):
             name="Update Region Leaderboards",
             misfire_grace_time=300,
         )
-        # Uncomment if you want to schedule store_clan_capital
-        # self.scheduler.add_job(
-        #     self.store_clan_capital,
-        #     CronTrigger(...),  # Define appropriate trigger
-        #     name="Store Clan Capital",
-        #     misfire_grace_time=300,
-        # )
+        self.scheduler.add_job(
+             self.store_clan_capital,
+             CronTrigger(day_of_week="mon", hour=10),
+             name="Store Clan Capital",
+             misfire_grace_time=300,
+        )
+
 
     async def store_all_leaderboards(self):
         """
@@ -132,6 +132,7 @@ class ScheduledTracking(Tracking):
         except Exception as e:
             self.logger.exception(f"Unexpected error in store_all_leaderboards: {e}")
 
+
     async def store_legends(self):
         """
         Store legends data at scheduled times.
@@ -178,6 +179,7 @@ class ScheduledTracking(Tracking):
         except Exception as e:
             self.logger.exception(f"Unexpected error in store_legends: {e}")
 
+
     async def store_cwl_wars(self):
         """
         Store Clan War League wars data at scheduled times.
@@ -194,10 +196,9 @@ class ScheduledTracking(Tracking):
             done_for_this_season = [x['_id'] for x in result]
             done_for_this_season = [j for sub in done_for_this_season for j in sub]
             all_tags = set([j for sub in done_for_this_season for j in sub])
-            all_tags = list(all_tags)
             self.logger.info(f'{len(all_tags)} war tags total')
 
-            '''pipeline = [
+            pipeline = [
                 {'$match': {'data.season': season}},
                 {'$group': {'_id': '$data.tag'}},
             ]
@@ -212,13 +213,12 @@ class ScheduledTracking(Tracking):
                 ]
             )
             self.logger.info(f'{len(tags_already_found)} war tags already found')
-            all_tags = [t for t in all_tags if t not in tags_already_found]'''
+            all_tags = [t for t in all_tags if t not in tags_already_found]
 
             self.logger.info(f'{len(all_tags)} war tags to find')
-            size_break = 60000
             all_tags = [
-                all_tags[i: i + size_break]
-                for i in range(0, len(all_tags), size_break)
+                all_tags[i: i + self.batch_size]
+                for i in range(0, len(all_tags), self.batch_size)
             ]
 
             for count, tag_group in enumerate(all_tags, 1):
@@ -250,7 +250,6 @@ class ScheduledTracking(Tracking):
                 self.logger.info(
                     f'{len(responses)} valid responses | {time.time() - start_time} sec'
                 )
-                continue
                 for response, tag in responses:   # type: dict, str
                     try:
                         response['tag'] = tag
@@ -296,6 +295,7 @@ class ScheduledTracking(Tracking):
                         self.logger.error(f"Error inserting wars: {e}")
         except Exception as e:
             self.logger.exception(f"Unexpected error in store_cwl_wars: {e}")
+
 
     async def store_cwl_groups(self):
         """
@@ -399,6 +399,7 @@ class ScheduledTracking(Tracking):
         except Exception as e:
             self.logger.exception(f"Unexpected error in store_cwl_groups: {e}")
 
+
     async def update_autocomplete(self):
         """
         Update the autocomplete data for players every 30 minutes.
@@ -465,6 +466,7 @@ class ScheduledTracking(Tracking):
                         self.logger.error(f"Error updating autocomplete: {e}")
         except Exception as e:
             self.logger.exception(f"Unexpected error in update_autocomplete: {e}")
+
 
     async def update_region_leaderboards(self):
         """
@@ -591,6 +593,7 @@ class ScheduledTracking(Tracking):
         except Exception as e:
             self.logger.exception(f"Unexpected error in update_region_leaderboards: {e}")
 
+
     async def store_clan_capital(self):
         """
         Store clan capital raid seasons data.
@@ -668,6 +671,7 @@ class ScheduledTracking(Tracking):
             # await calculate_raid_medal_leaderboards(db_client=self.db_client)
         except Exception as e:
             self.logger.exception(f"Unexpected error in store_clan_capital: {e}")
+
 
     async def run(self):
         """
