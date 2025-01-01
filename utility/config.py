@@ -42,6 +42,7 @@ class Config():
         self.coc_client = coc.Client()
         self.keys = deque()
 
+
     def _fetch_remote_settings(self):
         """
         Fetch remote configuration settings from the API and assign them to instance attributes.
@@ -75,7 +76,7 @@ class Config():
         self.webhook_url = remote_settings.get("webhook_url")
 
         # Determine the account range based on config_type
-        self.__beta_range = (0,0)
+        self.__beta_range = (7,10)
         self.account_range = MASTER_API_CONFIG.get(self.type, (0, 0)) if not self.is_beta else self.__beta_range
         self.min_coc_email, self.max_coc_email = self.account_range
 
