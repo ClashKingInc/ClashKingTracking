@@ -30,8 +30,6 @@ class ScheduledTracking(Tracking):
     def __init__(self, tracker_type: str):
         super().__init__()
         self.type = tracker_type
-        self.initialize()
-        self.setup_scheduler()
 
     def setup_scheduler(self):
         """
@@ -676,6 +674,8 @@ class ScheduledTracking(Tracking):
         Start the scheduler and keep the application running.
         """
         try:
+            await self.initialize()
+            self.setup_scheduler()
             await self.store_cwl_wars()
             #self.scheduler.start()
             self.logger.info("Scheduler started. Running scheduled jobs...")

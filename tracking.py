@@ -19,7 +19,6 @@ class Tracking():
 
 
     async def initialize(self):
-        print(self.type)
         self.config = Config(config_type=self.type)
         await self.config.initialize()
 
