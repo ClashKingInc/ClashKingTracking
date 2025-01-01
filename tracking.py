@@ -7,6 +7,7 @@ from redis import asyncio as redis
 from kafka import KafkaProducer
 from loguru import logger
 import aiohttp
+from apscheduler.schedulers.asyncio import AsyncIOScheduler
 
 
 class Tracking():
@@ -40,6 +41,8 @@ class Tracking():
         connector = aiohttp.TCPConnector(limit=1200, ttl_dns_cache=300)
         timeout = aiohttp.ClientTimeout(total=1800)
         self.http_session = aiohttp.ClientSession(connector=connector, timeout=timeout)
+
+        self.scheduler = AsyncIOScheduler(timezone=pend.UTC)
 
 
 
