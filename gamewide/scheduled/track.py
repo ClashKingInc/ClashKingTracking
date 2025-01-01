@@ -12,29 +12,24 @@ from apscheduler.triggers.cron import CronTrigger
 from apscheduler.triggers.interval import IntervalTrigger
 from hashids import Hashids
 from pymongo import InsertOne, UpdateOne
-from redis import asyncio as redis
-
-from utility.classes import MongoDatabase
 from utility.constants import locations
 from utility.utils import fetch
 
-from .capital_lb import (
+'''from .capital_lb import (
     calculate_clan_capital_leaderboards,
     calculate_player_capital_looted_leaderboards,
     calculate_raid_medal_leaderboards,
 )
+'''
 
 
-
-from tracking import Tracking  # Assuming tracking.py is in the same directory or properly referenced
+from tracking import Tracking
 
 
 class ScheduledTracking(Tracking):
     def __init__(self, tracker_type: str):
         super().__init__()
         self.type = tracker_type
-        self.initialize()
-        self.setup_scheduler()
 
     def setup_scheduler(self):
         """
@@ -190,7 +185,7 @@ class ScheduledTracking(Tracking):
         try:
             hashids = Hashids(min_length=7)
             season = self.gen_games_season()
-
+            season = "2024-12"
             pipeline = [
                 {'$match': {'data.season': season}},
                 {'$group': {'_id': '$data.rounds.warTags'}},
@@ -202,7 +197,7 @@ class ScheduledTracking(Tracking):
             all_tags = list(all_tags)
             self.logger.info(f'{len(all_tags)} war tags total')
 
-            pipeline = [
+            '''pipeline = [
                 {'$match': {'data.season': season}},
                 {'$group': {'_id': '$data.tag'}},
             ]
@@ -217,10 +212,9 @@ class ScheduledTracking(Tracking):
                 ]
             )
             self.logger.info(f'{len(tags_already_found)} war tags already found')
-            all_tags = [t for t in all_tags if t not in tags_already_found]
+            all_tags = [t for t in all_tags if t not in tags_already_found]'''
 
             self.logger.info(f'{len(all_tags)} war tags to find')
-
             size_break = 60000
             all_tags = [
                 all_tags[i: i + size_break]
@@ -256,7 +250,7 @@ class ScheduledTracking(Tracking):
                 self.logger.info(
                     f'{len(responses)} valid responses | {time.time() - start_time} sec'
                 )
-
+                continue
                 for response, tag in responses:   # type: dict, str
                     try:
                         response['tag'] = tag
@@ -680,8 +674,10 @@ class ScheduledTracking(Tracking):
         Start the scheduler and keep the application running.
         """
         try:
-            await self.store_cwl_wars()  # Optionally run initial tasks
-            self.scheduler.start()
+            await self.initialize()
+            self.setup_scheduler()
+            await self.store_cwl_wars()
+            #self.scheduler.start()
             self.logger.info("Scheduler started. Running scheduled jobs...")
             # Keep the main thread alive
             while True:
