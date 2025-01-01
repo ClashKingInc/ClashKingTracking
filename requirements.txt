@@ -25,3 +25,5 @@ ujson==5.9.0
 uvicorn==0.29.0
 websockets==12.0
 sockets==1.0.0
+sentry_sdk==2.19.2
+requests==2.32.3

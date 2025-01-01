@@ -68,6 +68,7 @@ def initialize_scheduler():
 
 async def initialize_coc_client(config):
     """Initialize the coc.py client with the configured keys."""
+
     keys = await create_keys(
         [
             config.coc_email.format(x=x)
@@ -76,6 +77,6 @@ async def initialize_coc_client(config):
         [config.coc_password] * config.max_coc_email,
         as_list=True,
     )
-    coc_client = coc.Client(raw_attribute=True, key_count=10, throttle_limit=100)
+    coc_client = coc.Client(raw_attribute=True, key_count=10, throttle_limit=30)
     await coc_client.login_with_tokens(*keys)
     return coc_client
