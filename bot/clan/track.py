@@ -6,7 +6,7 @@ from sentry_sdk.integrations.asyncio import AsyncioIntegration
 from bot.dev.kafka_mock import MockKafkaProducer
 from utility.utils import initialize_coc_client, sentry_filter
 from utility.classes import MongoDatabase
-from config import BotClanTrackingConfig
+from utility.config import Config
 import pendulum as pend
 import ujson
 import time
@@ -26,20 +26,13 @@ class ClanTracker:
         self.clan_cache = {}  # Cache for tracking clan states
         self.last_private_warlog_warn = {}  # Cache for private war log warnings
         self.semaphore = asyncio.Semaphore(max_concurrent_requests)
-        self.max_requests_per_second = max_requests_per_second
-        self.last_request_time = time.time()  # Track last request time
         self.message_count = 0  # Initialize the message counter
 
     async def initialize(self):
         """Initialize the CoC client."""
-        self.coc_client = await initialize_coc_client(self.config)
-
-    async def throttle(self):
-        """Ensure requests are sent within the allowed rate limit."""
-        elapsed_time = time.time() - self.last_request_time
-        if elapsed_time < 1 / self.max_requests_per_second:
-            await asyncio.sleep(1 / self.max_requests_per_second - elapsed_time)
-        self.last_request_time = time.time()  # Update time after sending request
+        self.coc_client = self.config.coc_client
+        if not self.coc_client:
+            raise RuntimeError("CoC client is not initialized in config.")
 
     async def track_batch(self, batch):
         """Track a batch of clans."""
@@ -67,11 +60,9 @@ class ClanTracker:
 
     async def track_clan(self, clan_tag: str):
         """Track updates for a specific clan."""
-        await self.throttle()
         sentry_sdk.set_context("clan_tracking", {"clan_tag": clan_tag})
         try:
             async with self.semaphore:
-                await self.throttle()  # Ensure requests are sent within the rate limit
                 clan = await self.coc_client.get_clan(tag=clan_tag)
         except Exception as e:
             self._handle_exception(f"Error fetching clan {clan_tag}", e)
@@ -184,7 +175,10 @@ class ClanTracker:
 
 async def main():
     """Main function for clan tracking."""
-    config = BotClanTrackingConfig.from_remote_settings()
+    config = Config(config_type="bot_clan")
+
+    # Initialize the CoC client
+    await config.initialize()
 
     # Initialize Sentry for error tracking
     sentry_sdk.init(
@@ -199,7 +193,7 @@ async def main():
     producer = MockKafkaProducer() if config.is_beta else KafkaProducer(bootstrap_servers=["85.10.200.219:9092"])
 
     tracker = ClanTracker(config, producer=producer)
-    await tracker.initialize()
+    await tracker.initialize()  # Transfer the initialized coc_client
 
     try:
         clan_tags = await tracker.db_client.clans_db.distinct("tag")
