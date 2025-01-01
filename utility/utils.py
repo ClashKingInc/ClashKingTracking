@@ -21,21 +21,14 @@ def initialize_scheduler():
     scheduler.start()
     return scheduler
 
-
-async def initialize_coc_client(config):
-    """Initialize the coc.py client with the configured keys."""
-
-    keys = await create_keys(
-        [
-            config.coc_email.format(x=x)
-            for x in range(config.min_coc_email, config.max_coc_email + 1)
-        ],
-        [config.coc_password] * config.max_coc_email,
-        as_list=True,
-    )
-    coc_client = coc.Client(raw_attribute=True, key_count=10, throttle_limit=30)
-    await coc_client.login_with_tokens(*keys)
-    return coc_client
+def is_raid_tracking_time():
+    """
+    Check if the current time is within the raid tracking window (Friday 7:00 UTC to Monday 7:00 UTC).
+    """
+    now = pend.now("UTC")
+    friday_7am = now.start_of("week").add(days=4, hours=7)
+    monday_7am = now.start_of("week").add(days=7, hours=7)
+    return friday_7am <= now < monday_7am
 
 
 def sentry_filter(event, hint):

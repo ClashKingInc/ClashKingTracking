@@ -1,64 +1,19 @@
 import asyncio
 import sentry_sdk
-from kafka import KafkaProducer
-from sentry_sdk.integrations.asyncio import AsyncioIntegration
-
-from bot.dev.kafka_mock import MockKafkaProducer
-from utility.utils import initialize_coc_client, sentry_filter
-from utility.classes import MongoDatabase
-from utility.config import Config
 import pendulum as pend
-import ujson
-import time
+from utility.base_tracker import BaseTracker, main
 
 
-class ClanTracker:
+class ClanTracker(BaseTracker):
     """Class to manage clan tracking."""
 
-    def __init__(self, config, producer=None, max_concurrent_requests=1000, max_requests_per_second=1000):
-        self.config = config
-        self.producer = producer or KafkaProducer(bootstrap_servers=["85.10.200.219:9092"])
-        self.db_client = MongoDatabase(
-            stats_db_connection=config.stats_mongodb,
-            static_db_connection=config.static_mongodb,
-        )
-        self.coc_client = None
+    def __init__(self, config, producer=None, max_concurrent_requests=1000):
+        # Call the parent class constructor
+        super().__init__(config, producer, max_concurrent_requests)
         self.clan_cache = {}  # Cache for tracking clan states
         self.last_private_warlog_warn = {}  # Cache for private war log warnings
-        self.semaphore = asyncio.Semaphore(max_concurrent_requests)
-        self.message_count = 0  # Initialize the message counter
 
-    async def initialize(self):
-        """Initialize the CoC client."""
-        self.coc_client = self.config.coc_client
-        if not self.coc_client:
-            raise RuntimeError("CoC client is not initialized in config.")
-
-    async def track_batch(self, batch):
-        """Track a batch of clans."""
-        print(f"Tracking batch of {len(batch)} clans.")  # Added print
-        async with self.semaphore:
-            tasks = [self.track_clan(clan_tag) for clan_tag in batch]
-            results = await asyncio.gather(*tasks, return_exceptions=True)
-
-            for result in results:
-                if isinstance(result, Exception):
-                    self._handle_exception("Error in tracking task", result)
-        print(f"Finished tracking batch of {len(batch)} clans.")  # Added print
-
-    async def track(self, clan_tags):
-        """Track updates for all clans in batches."""
-        self.message_count = 0  # Reset message count
-        batch_size = 1000  # Adjust batch size based on available resources
-        for i in range(0, len(clan_tags), batch_size):
-            batch = clan_tags[i:i + batch_size]
-            print(f"Processing batch {i // batch_size + 1} of {len(clan_tags) // batch_size + 1}.")
-            await self.track_batch(batch)
-
-        sentry_sdk.add_breadcrumb(message="Finished tracking all clans.", level="info")
-        print("Finished tracking all clans.")
-
-    async def track_clan(self, clan_tag: str):
+    async def _track_item(self, clan_tag):
         """Track updates for a specific clan."""
         sentry_sdk.set_context("clan_tracking", {"clan_tag": clan_tag})
         try:
@@ -79,26 +34,6 @@ class ClanTracker:
         self._handle_attribute_changes(clan, previous_clan)
         self._handle_member_changes(clan, previous_clan)
         self._handle_donation_updates(clan, previous_clan)
-
-    def _send_to_kafka(self, topic, key, data):
-        """Helper to send data to Kafka."""
-        sentry_sdk.add_breadcrumb(
-            message=f"Sending data to Kafka: topic={topic}, key={key}",
-            data={"data_preview": data if self.config.is_beta else "Data suppressed in production"},
-            level="info",
-        )
-        self.producer.send(
-            topic=topic,
-            value=ujson.dumps(data).encode('utf-8'),
-            key=key.encode('utf-8'),
-            timestamp_ms=int(pend.now(tz=pend.UTC).timestamp() * 1000),
-        )
-        self.message_count += 1
-
-    def _handle_exception(self, message, exception):
-        """Handle exceptions by logging to Sentry and console."""
-        sentry_sdk.capture_exception(exception)
-        print(f"{message}: {exception}")
 
     def _handle_private_warlog(self, clan):
         """Handle cases where the war log is private."""
@@ -173,43 +108,6 @@ class ClanTracker:
                     break
 
 
-async def main():
-    """Main function for clan tracking."""
-    config = Config(config_type="bot_clan")
-
-    # Initialize the CoC client
-    await config.initialize()
-
-    # Initialize Sentry for error tracking
-    sentry_sdk.init(
-        dsn=config.sentry_dsn,
-        traces_sample_rate=1.0,
-        integrations=[AsyncioIntegration()],
-        profiles_sample_rate=1.0,
-        environment="production" if not config.is_beta else "beta",
-        before_send=sentry_filter,
-    )
-
-    producer = MockKafkaProducer() if config.is_beta else KafkaProducer(bootstrap_servers=["85.10.200.219:9092"])
-
-    tracker = ClanTracker(config, producer=producer)
-    await tracker.initialize()  # Transfer the initialized coc_client
-
-    try:
-        clan_tags = await tracker.db_client.clans_db.distinct("tag")
-        while True:
-            start_time = pend.now(tz=pend.UTC)
-            await tracker.track(clan_tags)
-            elapsed_time = pend.now(tz=pend.UTC) - start_time
-            print(f"Tracked all {len(clan_tags)} clans in {elapsed_time.in_seconds()} seconds.")
-            print(f"Total messages sent: {tracker.message_count} which is {tracker.message_count / elapsed_time.in_seconds()} messages per second.")
-            await asyncio.sleep(60 if config.is_beta else 0)
-    except KeyboardInterrupt:
-        print("Tracking interrupted by user.")
-    finally:
-        await tracker.coc_client.close()
-        print("Tracking completed.")
-
-
 if __name__ == "__main__":
-    asyncio.run(main())
+    asyncio.run(main(tracker_class=ClanTracker, config_type="bot_clan", loop_interval=20))
+
