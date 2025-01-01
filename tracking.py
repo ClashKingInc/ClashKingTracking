@@ -13,7 +13,9 @@ from apscheduler.schedulers.asyncio import AsyncIOScheduler
 class Tracking():
     def __init__(self):
         self.type: str = None
-        self.throttler: Throttler = Throttler(1000)
+        self.throttle_speed = 1000
+        self.throttler: Throttler = Throttler(self.throttle_speed)
+
         self.iterations = 0
         #maybe add different stats, and then a function that print them out or smthn
         self.batch_size = 50_000
@@ -22,6 +24,7 @@ class Tracking():
         self.config = Config(config_type=self.type)
         await self.config.initialize()
 
+        self.throttler: Throttler = Throttler(self.throttle_speed)
         self.db_client = MongoDatabase(
             stats_db_connection=self.config.stats_mongodb,
             static_db_connection=self.config.static_mongodb,
