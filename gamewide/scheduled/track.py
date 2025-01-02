@@ -13,7 +13,7 @@ from apscheduler.triggers.interval import IntervalTrigger
 from hashids import Hashids
 from pymongo import InsertOne, UpdateOne
 from utility.constants import locations
-
+from utility.config import TrackingType
 '''from .capital_lb import (
     calculate_clan_capital_leaderboards,
     calculate_player_capital_looted_leaderboards,
@@ -26,9 +26,8 @@ from tracking import Tracking
 
 
 class ScheduledTracking(Tracking):
-    def __init__(self, tracker_type: str):
-        super().__init__()
-        self.type = tracker_type
+    def __init__(self, tracker_type: TrackingType):
+        super().__init__(tracker_type=tracker_type)
 
     def setup_scheduler(self):
         """
@@ -655,6 +654,62 @@ class ScheduledTracking(Tracking):
             self.logger.exception(f"Unexpected error in store_clan_capital: {e}")
 
 
+    async def find_new_clans(self):
+        now = pend.now()
+        cutoff_date = now.subtract(days=30)
+
+        pipeline_1 = [
+            {"$match": {"endTime": {"$gte": int(cutoff_date.timestamp())}}},
+            {"$unwind": "$clans"},
+            {"$group": {"_id": "$clans"}}  # Keep unique clans as separate documents
+        ]
+        result_1 = await self.db_client.clan_wars.aggregate(pipeline_1).to_list(length=None)
+        unique_clans = {doc['_id'] for doc in result_1}
+
+        pipeline_2 = [
+            {"$match": {"data.endTime": {"$gte": cutoff_date.strftime('%Y%m%dT%H%M%S.000Z')}}},
+            {"$unwind": {"path": "$data.attackLog", "preserveNullAndEmptyArrays": True}},
+            {"$group": {"_id": "$data.attackLog.defender.tag"}}
+        ]
+        attack_tags = await self.db_client.raid_weekends.aggregate(pipeline_2).to_list(length=None)
+        attack_tags = {doc['_id'] for doc in attack_tags if doc['_id']}
+
+        pipeline_3 = [
+            {"$match": {"data.endTime": {"$gte": cutoff_date.strftime('%Y%m%dT%H%M%S.000Z')}}},
+            {"$unwind": {"path": "$data.defenseLog", "preserveNullAndEmptyArrays": True}},
+            {"$group": {"_id": "$data.defenseLog.attacker.tag"}}
+        ]
+        defense_tags = await self.db_client.raid_weekends.aggregate(pipeline_3).to_list(length=None)
+        defense_tags = {doc['_id'] for doc in defense_tags if doc['_id']}
+
+        unique_tags = attack_tags.union(defense_tags)
+
+        combined_set = unique_clans.union(unique_tags)
+
+        pipeline_4 = [{'$match': {}}, {'$group': {'_id': '$tag'}}]
+        existing_clans = [
+            x['_id']
+            for x in (
+                await self.db_client.global_clans.aggregate(pipeline_4).to_list(
+                    length=None
+                )
+            )
+        ]
+        existing_clans = set(existing_clans)
+        # Find clans in the combined set but not in existing_clans
+        new_clans = combined_set - existing_clans
+        print(len(new_clans))
+        tags_to_add = []
+        for clan in new_clans:
+            tags_to_add.append(
+                InsertOne({'tag': clan})
+            )
+        results = await self.db_client.global_clans.bulk_write(
+            tags_to_add, ordered=False
+        )
+        print(results.bulk_api_result)
+
+
     async def run(self):
         """
         Start the scheduler and keep the application running.
@@ -662,8 +717,8 @@ class ScheduledTracking(Tracking):
         try:
             await self.initialize()
             self.setup_scheduler()
-            await self.store_clan_capital()
-            #self.scheduler.start()
+            #await self.store_clan_capital()
+            self.scheduler.start()
             self.logger.info("Scheduler started. Running scheduled jobs...")
             # Keep the main thread alive
             while True:
@@ -674,5 +729,5 @@ class ScheduledTracking(Tracking):
 
 
 if __name__ == "__main__":
-    tracker = ScheduledTracking(tracker_type="global_scheduled")  # Replace with appropriate type
+    tracker = ScheduledTracking(tracker_type=TrackingType.GLOBAL_SCHEDULED)  # Replace with appropriate type
     asyncio.run(tracker.run())

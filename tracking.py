@@ -1,4 +1,4 @@
-from utility.config import Config
+from utility.config import Config, TrackingType
 from asyncio_throttle import Throttler
 from utility.classes import MongoDatabase
 import coc
@@ -12,8 +12,8 @@ import ujson
 from collections import defaultdict, deque
 
 class Tracking():
-    def __init__(self):
-        self.type: str = None
+    def __init__(self, tracker_type: TrackingType):
+        self.type = tracker_type
         self.throttle_speed = 1000
         self.throttler: Throttler = Throttler(self.throttle_speed)
 
