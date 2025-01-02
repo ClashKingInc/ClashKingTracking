@@ -1,10 +1,10 @@
 import asyncio
 import sentry_sdk
 import pendulum as pend
-from utility.base_tracker import BaseTracker, main
+from tracking import Tracking, main
 
 
-class ClanTracker(BaseTracker):
+class ClanTracker(Tracking):
     """Class to manage clan tracking."""
 
     def __init__(self, config, producer=None, max_concurrent_requests=1000):

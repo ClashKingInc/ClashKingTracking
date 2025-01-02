@@ -4,6 +4,9 @@ import coc
 from dotenv import load_dotenv
 from collections import deque
 
+from kafka import KafkaProducer
+
+from bot.dev.kafka_mock import MockKafkaProducer
 from .keycreation import create_keys
 
 # Load environment variables from .env file
@@ -20,6 +23,7 @@ MASTER_API_CONFIG = {
     'global_war': (31, 38),
     'global_war_store': (39, 40),
 }
+
 
 class Config():
     def __init__(self, config_type: str):
@@ -41,7 +45,6 @@ class Config():
         # Initialize other attributes
         self.coc_client = coc.Client()
         self.keys = deque()
-
 
     def _fetch_remote_settings(self):
         """
@@ -76,10 +79,9 @@ class Config():
         self.webhook_url = remote_settings.get("webhook_url")
 
         # Determine the account range based on config_type
-        self.__beta_range = (4,6)
+        self.__beta_range = (4, 6)
         self.account_range = MASTER_API_CONFIG.get(self.type, (0, 0)) if not self.is_beta else self.__beta_range
         self.min_coc_email, self.max_coc_email = self.account_range
-
 
     async def initialize(self):
         """
@@ -119,4 +121,10 @@ class Config():
         # Store the keys in a deque for future use
         self.keys = deque(keys)
 
-
+    def get_producer(self):
+        """Initialize the Kafka producer based on the environment."""
+        if self.is_main:
+            return KafkaProducer(bootstrap_servers=["85.10.200.219:9092"], api_version=(3, 6, 0))
+        else:
+            print("We are in beta mode, using MockKafkaProducer.")
+            return MockKafkaProducer()

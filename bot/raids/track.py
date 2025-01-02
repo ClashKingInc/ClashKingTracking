@@ -1,10 +1,10 @@
 import coc
 import asyncio
-from utility.base_tracker import BaseTracker, main
 from utility.utils import is_raid_tracking_time
+from tracking import Tracking, main
 
 
-class RaidTracker(BaseTracker):
+class RaidTracker(Tracking):
     """Class to manage raid weekend tracking."""
 
     def __init__(self, config, producer=None, max_concurrent_requests=1000):
@@ -14,7 +14,6 @@ class RaidTracker(BaseTracker):
         """Track updates for a specific clan's raid."""
         try:
             raid_log = await self.coc_client.get_raid_log(clan_tag=clan_tag, limit=1)
-            # Traitement spécifique au suivi des raids
             print(f"Tracking raid for clan: {clan_tag}")
         except Exception as e:
             self._handle_exception(f"Error tracking raid for clan {clan_tag}", e)
@@ -102,4 +101,4 @@ class RaidTracker(BaseTracker):
 
 
 if __name__ == "__main__":
-    asyncio.run(main(tracker_class=RaidTracker, config_type="bot_raid", is_tracking_allowed=is_raid_tracking_time, loop_interval=20))
+    asyncio.run(main(tracker_class=RaidTracker, config_type="bot_clan", is_tracking_allowed=is_raid_tracking_time, loop_interval=20))
