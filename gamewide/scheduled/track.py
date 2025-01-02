@@ -26,8 +26,8 @@ from tracking import Tracking
 
 
 class ScheduledTracking(Tracking):
-    def __init__(self, tracker_type: TrackingType):
-        super().__init__(tracker_type=tracker_type)
+    def __init__(self, tracker_type: TrackingType, max_concurrent_requests=1000, throttle_speed=1000):
+        super().__init__(max_concurrent_requests=max_concurrent_requests, tracker_type=tracker_type, throttle_speed=throttle_speed)
 
     def setup_scheduler(self):
         """

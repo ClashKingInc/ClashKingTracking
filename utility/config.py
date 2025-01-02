@@ -1,8 +1,15 @@
 from os import getenv
 import requests
 import coc
+from redis import asyncio as redis
 from dotenv import load_dotenv
 from collections import deque
+
+from kafka import KafkaProducer
+
+from bot.dev.kafka_mock import MockKafkaProducer
+from utility.classes import MongoDatabase
+from utility.keycreation import create_keys
 from enum import Enum
 from .keycreation import create_keys
 
@@ -20,6 +27,7 @@ MASTER_API_CONFIG = {
     'global_war': (31, 38),
     'global_war_store': (39, 40),
 }
+
 
 class TrackingType(Enum):
     BOT_CLAN = "bot_clan"
@@ -94,7 +102,6 @@ class Config():
         self.account_range = MASTER_API_CONFIG.get(self.type, (0, 0)) if not self.is_beta else self.__beta_range
         self.min_coc_email, self.max_coc_email = self.account_range
 
-
     async def initialize(self):
         """
         Asynchronously initialize the CoC client by generating keys and logging in.
@@ -133,4 +140,22 @@ class Config():
         # Store the keys in a deque for future use
         self.keys = deque(keys)
 
+    def get_kafka_producer(self):
+        if self.is_main:
+            return KafkaProducer(bootstrap_servers=["85.10.200.219:9092"], api_version=(3, 6, 0))
+        return MockKafkaProducer()
 
+    def get_mongo_database(self):
+        return MongoDatabase(
+            stats_db_connection=self.stats_mongodb,
+            static_db_connection=self.static_mongodb,
+        )
+
+    def get_redis_client(self):
+        return redis.Redis(
+            host=self.redis_ip, port=6379, db=0,
+            password=self.redis_pw, decode_responses=False,
+            max_connections=50, health_check_interval=10,
+            socket_connect_timeout=5, retry_on_timeout=True,
+            socket_keepalive=True,
+        )
