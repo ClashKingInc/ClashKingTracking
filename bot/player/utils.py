@@ -14,12 +14,8 @@ from msgspec.json import decode
 from pymongo import InsertOne, UpdateOne
 
 from utility.classes import MongoDatabase
-from utility.utils import (
-    gen_games_season,
-    gen_legend_date,
-    gen_raid_date,
-    gen_season_date,
-)
+from utility.utils import (gen_games_season, gen_legend_date, gen_raid_date,
+                           gen_season_date)
 
 
 async def get_clan_member_tags(db_client: MongoDatabase, keys: deque):

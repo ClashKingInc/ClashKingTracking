@@ -1,5 +1,6 @@
 import asyncio
 from typing import Dict, List
+
 import coc
 import pendulum as pend
 import ujson
@@ -9,6 +10,7 @@ from pymongo import UpdateOne
 from utility.classes import MongoDatabase
 
 CLAN_CACHE = {}
+
 
 async def raid_weekend_track(
     clan_tags: List[str],

@@ -9,13 +9,13 @@ async def produce_giveaway_event(producer, event_type, giveaway):
     """
     # Build the base message
     message = {
-        "type": event_type,
-        "giveaway": giveaway,
+        'type': event_type,
+        'giveaway': giveaway,
     }
 
-    logger.info(f"Sending Kafka event: {message}")
+    logger.info(f'Sending Kafka event: {message}')
     # Send the message to Kafka
     await producer.send_and_wait(
-        topic="giveaway",
+        topic='giveaway',
         value=orjson.dumps(message),
     )

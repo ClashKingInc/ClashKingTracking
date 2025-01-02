@@ -8,13 +8,14 @@ def initialize_scheduler():
     scheduler.start()
     return scheduler
 
+
 def is_raid_tracking_time():
     """
     Check if the current time is within the raid tracking window (Friday 7:00 UTC to Monday 7:00 UTC).
     """
-    now = pend.now("UTC")
-    friday_7am = now.start_of("week").add(days=4, hours=7)
-    monday_7am = now.start_of("week").add(days=7, hours=7)
+    now = pend.now('UTC')
+    friday_7am = now.start_of('week').add(days=4, hours=7)
+    monday_7am = now.start_of('week').add(days=7, hours=7)
     return friday_7am <= now < monday_7am
 
 
