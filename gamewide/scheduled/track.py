@@ -13,7 +13,6 @@ from apscheduler.triggers.interval import IntervalTrigger
 from hashids import Hashids
 from pymongo import InsertOne, UpdateOne
 from utility.constants import locations
-from utility.utils import fetch
 
 '''from .capital_lb import (
     calculate_clan_capital_leaderboards,
@@ -154,11 +153,13 @@ class ScheduledTracking(Tracking):
                             after_param = ''
                         headers = {
                             'Accept': 'application/json',
-                            'authorization': f'Bearer {next(self.coc_client.http.keys)}',
+                            'authorization': f'Bearer {self.keys[0]}',
                         }
-                        url = f'https://api.clashofclans.com/v1/leagues/29000022/seasons/{year}?limit=100000{after_param}'
+                        self.keys.rotate()
+                        url = f'https://api.clashofclans.com/v1/leagues/29000022/seasons/{year}?limit=25000{after_param}'
                         async with session.get(url, headers=headers) as response:
                             if response.status != 200:
+                                print(await response.json())
                                 self.logger.error(f"Failed to fetch legends for season {year}: {response.status}")
                                 break
                             items = await response.json()
@@ -225,19 +226,13 @@ class ScheduledTracking(Tracking):
                 start_time = time.time()
                 self.logger.info(f'GROUP {count} | {len(tag_group)} tags')
                 tasks = []
-                connector = aiohttp.TCPConnector(limit=1000, ttl_dns_cache=300)
-                timeout = aiohttp.ClientTimeout(total=1800)
-                async with aiohttp.ClientSession(connector=connector, timeout=timeout) as session:
-                    for tag in tag_group:
-                        tasks.append(
-                            fetch(
-                                url=f"https://api.clashofclans.com/v1/clanwarleagues/wars/{tag.replace('#', '%23')}",
-                                session=session,
-                                tag=tag,
-                                keys=self.keys,
-                                throttler=self.throttler
-                            )
+                for tag in tag_group:
+                    tasks.append(
+                        self.fetch(
+                            url=f"https://api.clashofclans.com/v1/clanwarleagues/wars/{tag.replace('#', '%23')}",
+                            tag=tag,
                         )
+                    )
                     self.logger.info(f'{len(tasks)} tasks')
                     responses = await asyncio.gather(*tasks)
 
@@ -599,12 +594,6 @@ class ScheduledTracking(Tracking):
         Store clan capital raid seasons data.
         """
         try:
-            async def fetch_capital(url, session: aiohttp.ClientSession, headers, tag):
-                async with session.get(url, headers=headers) as response:
-                    if response.status == 200:
-                        return ((await response.json()), tag)
-                    return (None, tag)
-
             pipeline = [{'$match': {}}, {'$group': {'_id': '$tag'}}]
             all_tags = [
                 x['_id']
@@ -614,31 +603,25 @@ class ScheduledTracking(Tracking):
                     )
                 )
             ]
-            size_break = 50000
             all_tags = [
-                all_tags[i: i + size_break]
-                for i in range(0, len(all_tags), size_break)
+                all_tags[i: i + self.batch_size]
+                for i in range(0, len(all_tags), self.batch_size)
             ]
+            now = pend.now()  # Current time in your system's timezone
+            start_of_week = now.start_of("week").subtract(days=1)
+            end_of_week = start_of_week.add(weeks=1)
 
             for tag_group in all_tags:
                 tasks = []
-                connector = aiohttp.TCPConnector(limit=250, ttl_dns_cache=300)
-                timeout = aiohttp.ClientTimeout(total=1800)
-                async with aiohttp.ClientSession(
-                    connector=connector, timeout=timeout, json_serialize=ujson.dumps
-                ) as session:
-                    for tag in tag_group:
-                        tasks.append(
-                            fetch_capital(
-                                f"https://api.clashofclans.com/v1/clans/{tag.replace('#', '%23')}/capitalraidseasons?limit=1",
-                                session,
-                                {
-                                    'Authorization': f'Bearer {next(self.coc_client.http.keys)}'
-                                },
-                                tag,
-                            )
+                for tag in tag_group:
+                    tasks.append(
+                        self.fetch(
+                            url=f"https://api.clashofclans.com/v1/clans/{tag.replace('#', '%23')}/capitalraidseasons?limit=1",
+                            tag=tag,
+                            json=True
                         )
-                    responses = await asyncio.gather(*tasks, return_exceptions=True)
+                    )
+                responses = await asyncio.gather(*tasks, return_exceptions=True)
 
                 changes = []
                 responses = [r for r in responses if isinstance(r, tuple) and r[0] is not None]
@@ -647,9 +630,8 @@ class ScheduledTracking(Tracking):
                         # We shouldn't have completely invalid tags, they all existed at some point
                         if not response['items']:
                             continue
-                        date = coc.Timestamp(data=response['items'][0]['endTime'])
-                        # -3600 * 24 * 4 = 4 days in seconds
-                        if 60 >= date.seconds_until >= -3600 * 24 * 4:
+                        date = pend.instance(coc.Timestamp(data=response['items'][0]['endTime']).time, tz=pend.UTC)
+                        if start_of_week <= date <= end_of_week:
                             changes.append(
                                 InsertOne(
                                     {'clan_tag': tag, 'data': response['items'][0]}
@@ -680,7 +662,7 @@ class ScheduledTracking(Tracking):
         try:
             await self.initialize()
             self.setup_scheduler()
-            await self.store_cwl_wars()
+            await self.store_clan_capital()
             #self.scheduler.start()
             self.logger.info("Scheduler started. Running scheduled jobs...")
             # Keep the main thread alive
