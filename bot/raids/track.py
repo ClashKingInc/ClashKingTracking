@@ -1,20 +1,30 @@
 import coc
 import asyncio
 from utility.utils import is_raid_tracking_time
-from tracking import Tracking, main
+from tracking import Tracking
+from pymongo import UpdateOne
+import pendulum as pend
+import ujson
 
+# Global cache for clans
+CLAN_CACHE = {}
 
 class RaidTracker(Tracking):
     """Class to manage raid weekend tracking."""
 
-    def __init__(self, config, producer=None, max_concurrent_requests=1000):
-        super().__init__(config, producer, max_concurrent_requests)
+    def __init__(self, tracker_type: str, max_concurrent_requests=1000):
+        # Call the parent class constructor
+        super().__init__(max_concurrent_requests=max_concurrent_requests, tracker_type=tracker_type)
 
     async def _track_item(self, clan_tag):
         """Track updates for a specific clan's raid."""
         try:
-            raid_log = await self.coc_client.get_raid_log(clan_tag=clan_tag, limit=1)
-            print(f"Tracking raid for clan: {clan_tag}")
+            current_raid = await self._get_current_raid(clan_tag)
+            if not current_raid:
+                return
+
+            previous_raid = await self._get_previous_raid(clan_tag)
+            await self._process_raid_changes(clan_tag, current_raid, previous_raid)
         except Exception as e:
             self._handle_exception(f"Error tracking raid for clan {clan_tag}", e)
 
@@ -51,6 +61,9 @@ class RaidTracker(Tracking):
             await self._detect_new_opponents(clan_tag, current_raid, previous_raid)
             await self._detect_raid_state_changes(clan_tag, current_raid, previous_raid)
             await self._detect_member_attacks(clan_tag, current_raid, previous_raid)
+
+        # Update the global clan cache
+        CLAN_CACHE[clan_tag] = current_raid
 
     async def _detect_new_opponents(self, clan_tag: str, current_raid: coc.RaidLogEntry,
                                     previous_raid: coc.RaidLogEntry):
@@ -99,6 +112,6 @@ class RaidTracker(Tracking):
             }
             self._send_to_kafka("capital", clan_tag, json_data)
 
-
 if __name__ == "__main__":
-    asyncio.run(main(tracker_class=RaidTracker, config_type="bot_clan", is_tracking_allowed=is_raid_tracking_time, loop_interval=20))
+    tracker = RaidTracker(tracker_type="bot_clan")
+    asyncio.run(tracker.run(tracker_class=RaidTracker, config_type="bot_clan", loop_interval=20, is_tracking_allowed=is_raid_tracking_time))

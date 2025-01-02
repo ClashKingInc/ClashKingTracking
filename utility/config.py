@@ -1,13 +1,15 @@
 from os import getenv
 import requests
 import coc
+from redis import asyncio as redis
 from dotenv import load_dotenv
 from collections import deque
 
 from kafka import KafkaProducer
 
 from bot.dev.kafka_mock import MockKafkaProducer
-from .keycreation import create_keys
+from utility.classes import MongoDatabase
+from utility.keycreation import create_keys
 
 # Load environment variables from .env file
 load_dotenv()
@@ -121,10 +123,22 @@ class Config():
         # Store the keys in a deque for future use
         self.keys = deque(keys)
 
-    def get_producer(self):
-        """Initialize the Kafka producer based on the environment."""
+    def get_kafka_producer(self):
         if self.is_main:
             return KafkaProducer(bootstrap_servers=["85.10.200.219:9092"], api_version=(3, 6, 0))
-        else:
-            print("We are in beta mode, using MockKafkaProducer.")
-            return MockKafkaProducer()
+        return MockKafkaProducer()
+
+    def get_mongo_database(self):
+        return MongoDatabase(
+            stats_db_connection=self.stats_mongodb,
+            static_db_connection=self.static_mongodb,
+        )
+
+    def get_redis_client(self):
+        return redis.Redis(
+            host=self.redis_ip, port=6379, db=0,
+            password=self.redis_pw, decode_responses=False,
+            max_connections=50, health_check_interval=10,
+            socket_connect_timeout=5, retry_on_timeout=True,
+            socket_keepalive=True,
+        )

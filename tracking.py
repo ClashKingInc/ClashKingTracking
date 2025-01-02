@@ -3,14 +3,10 @@ import asyncio
 import sentry_sdk
 from sentry_sdk.integrations.asyncio import AsyncioIntegration
 
-from bot.dev.kafka_mock import MockKafkaProducer
 from utility.config import Config
 from asyncio_throttle import Throttler
-from utility.classes import MongoDatabase
 import coc
 import pendulum as pend
-from redis import asyncio as redis
-from kafka import KafkaProducer
 from loguru import logger
 import aiohttp
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
@@ -20,9 +16,8 @@ from utility.utils import sentry_filter
 
 
 class Tracking():
-    def __init__(self, config, producer=None, max_concurrent_requests=1000, batch_size=500, throttle_speed=1000):
-        self.config = config
-        self.producer = producer or KafkaProducer(bootstrap_servers=["85.10.200.219:9092"])
+    def __init__(self, max_concurrent_requests=1000, batch_size=500, throttle_speed=1000, tracker_type="unknown"):
+        self.config = Config(config_type=tracker_type)
         self.db_client = None
         self.semaphore = asyncio.Semaphore(max_concurrent_requests)
         self.message_count = 0
@@ -35,39 +30,20 @@ class Tracking():
         self.http_session = None
         self.scheduler = None
         self.kafka = None
+        self.type = tracker_type
 
     async def initialize(self):
-        """Initialise the tracker."""
-        await self._initialize_config()
-        await self._initialize_connections()
-
-    async def _initialize_config(self):
-        """Initialise the configuration."""
-        self.db_client = MongoDatabase(
-            stats_db_connection=self.config.stats_mongodb,
-            static_db_connection=self.config.static_mongodb,
-        )
+        """Initialise the tracker with dependencies."""
+        await self.config.initialize()
+        self.db_client = self.config.get_mongo_database()
+        self.redis = self.config.get_redis_client()
         self.coc_client = self.config.coc_client
-        if not self.coc_client:
-            raise RuntimeError("CoC client is not initialized in config.")
-        self.keys = self.config.keys
-        self.redis = redis.Redis(
-            host=self.config.redis_ip, port=6379, db=0,
-            password=self.config.redis_pw, decode_responses=False,
-            max_connections=50, health_check_interval=10,
-            socket_connect_timeout=5, retry_on_timeout=True,
-            socket_keepalive=True,
-        )
 
-    async def _initialize_connections(self):
-        """Initialise the connections."""
+        self.kafka = self.config.get_kafka_producer()
+
         connector = aiohttp.TCPConnector(limit=1200, ttl_dns_cache=300)
         timeout = aiohttp.ClientTimeout(total=1800)
         self.http_session = aiohttp.ClientSession(connector=connector, timeout=timeout)
-        if self.config.is_main:
-            self.kafka = KafkaProducer(bootstrap_servers=["85.10.200.219:9092"], api_version=(3, 6, 0))
-        else:
-            self.kafka = MockKafkaProducer()  # Mock producer for beta
 
         self.scheduler = AsyncIOScheduler(timezone=pend.UTC)
 
@@ -104,7 +80,7 @@ class Tracking():
             data={"data_preview": data if self.config.is_beta else "Data suppressed in production"},
             level="info",
         )
-        self.producer.send(
+        self.kafka.send(
             topic=topic,
             value=ujson.dumps(data).encode('utf-8'),
             key=key.encode('utf-8'),
@@ -163,44 +139,39 @@ class Tracking():
                 or (current_dayofweek == 0 and now.hour < 9)  # Monday before 9 AM UTC
         )
 
+    async def run(self, tracker_class, config_type="bot_clan", loop_interval=60, is_tracking_allowed=None):
+        """Main function for generic tracking."""
+        tracker = tracker_class(self.type)
+        await tracker.initialize()
 
-async def main(tracker_class, config_type="bot_clan", loop_interval=60, is_tracking_allowed=None):
-    """Main function for generic tracking."""
-    # Initialize tracker
-    config = Config(config_type=config_type)
-    await config.initialize()
-    tracker = tracker_class(config, producer=config.get_producer())
-    await tracker.initialize()
+        sentry_sdk.init(
+            dsn=self.config.sentry_dsn,
+            traces_sample_rate=1.0,
+            integrations=[AsyncioIntegration()],
+            profiles_sample_rate=1.0,
+            environment="production" if self.config.is_main else "beta",
+            before_send=sentry_filter,
+        )
 
-    # Initialize Sentry for error tracking
-    sentry_sdk.init(
-        dsn=config.sentry_dsn,
-        traces_sample_rate=1.0,
-        integrations=[AsyncioIntegration()],
-        profiles_sample_rate=1.0,
-        environment="production" if not config.is_beta else "beta",
-        before_send=sentry_filter,
-    )
+        try:
+            async with tracker.http_session:
+                while True:
+                    if is_tracking_allowed is None or is_tracking_allowed():
+                        clan_tags = await tracker.db_client.clans_db.distinct("tag")
+                        start_time = pend.now(tz=pend.UTC)
+                        await tracker.track(clan_tags)
+                        elapsed_time = pend.now(tz=pend.UTC) - start_time
+                        tracker.logger.info(
+                            f"Tracked {len(clan_tags)} clans in {elapsed_time.in_seconds()} seconds. "
+                            f"Messages sent: {tracker.message_count} "
+                            f"({tracker.message_count / elapsed_time.in_seconds()} msg/s)."
+                        )
+                    else:
+                        tracker.logger.info("Tracking not allowed. Sleeping until the next interval.")
+                    await asyncio.sleep(loop_interval)
+        except KeyboardInterrupt:
+            tracker.logger.info("Tracking interrupted by user.")
+        finally:
+            await tracker.coc_client.close()
+            tracker.logger.info("Tracking completed.")
 
-    # Run tracking loop
-    try:
-        async with tracker.http_session:
-            while True:
-                if is_tracking_allowed is None or is_tracking_allowed():
-                    clan_tags = await tracker.db_client.clans_db.distinct("tag")
-                    start_time = pend.now(tz=pend.UTC)
-                    await tracker.track(clan_tags)
-                    elapsed_time = pend.now(tz=pend.UTC) - start_time
-                    tracker.logger.info(
-                        f"Tracked {len(clan_tags)} clans in {elapsed_time.in_seconds()} seconds. "
-                        f"Messages sent: {tracker.message_count} "
-                        f"({tracker.message_count / elapsed_time.in_seconds()} msg/s)."
-                    )
-                else:
-                    tracker.logger.info("Tracking not allowed. Sleeping until the next interval.")
-                await asyncio.sleep(loop_interval)
-    except KeyboardInterrupt:
-        tracker.logger.info("Tracking interrupted by user.")
-    finally:
-        await tracker.coc_client.close()
-        tracker.logger.info("Tracking completed.")

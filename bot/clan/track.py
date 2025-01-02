@@ -1,15 +1,15 @@
 import asyncio
 import sentry_sdk
 import pendulum as pend
-from tracking import Tracking, main
+from tracking import Tracking
 
 
 class ClanTracker(Tracking):
     """Class to manage clan tracking."""
 
-    def __init__(self, config, producer=None, max_concurrent_requests=1000):
+    def __init__(self, tracker_type: str, max_concurrent_requests=1000):
         # Call the parent class constructor
-        super().__init__(config, producer, max_concurrent_requests)
+        super().__init__(max_concurrent_requests=max_concurrent_requests, tracker_type=tracker_type)
         self.clan_cache = {}  # Cache for tracking clan states
         self.last_private_warlog_warn = {}  # Cache for private war log warnings
 
@@ -109,5 +109,6 @@ class ClanTracker(Tracking):
 
 
 if __name__ == "__main__":
-    asyncio.run(main(tracker_class=ClanTracker, config_type="bot_clan", loop_interval=20))
+    tracker = ClanTracker(tracker_type="bot_clan")
+    asyncio.run(tracker.run(tracker_class=ClanTracker, config_type="bot_clan", loop_interval=20))
 
