@@ -3,7 +3,6 @@ import asyncio
 import coc
 
 from tracking import Tracking
-from utility.utils import is_raid_tracking_time
 
 # Global cache for clans
 CLAN_CACHE = {}
@@ -168,8 +167,8 @@ if __name__ == '__main__':
     asyncio.run(
         tracker.run(
             tracker_class=RaidTracker,
-            config_type='bot_clan',
+            config_type='bot_raids',
             loop_interval=20,
-            is_tracking_allowed=is_raid_tracking_time,
+            is_tracking_allowed=tracker.is_raids,
         )
     )

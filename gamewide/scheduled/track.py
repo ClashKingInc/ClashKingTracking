@@ -873,28 +873,14 @@ class ScheduledTracking(Tracking):
         )
         print(results.bulk_api_result)
 
-    async def run(self):
-        """
-        Start the scheduler and keep the application running.
-        """
-        try:
-            await self.initialize()
-            self.setup_scheduler()
-            # await self.store_clan_capital()
-            self.scheduler.start()
-            self.logger.info('Scheduler started. Running scheduled jobs...')
-            # Keep the main thread alive
-            while True:
-                await asyncio.sleep(
-                    3600
-                )  # Sleep for an hour, adjust as needed
-        except (KeyboardInterrupt, SystemExit):
-            self.logger.info('Shutting down scheduler...')
-            self.scheduler.shutdown()
-
 
 if __name__ == '__main__':
-    tracker = ScheduledTracking(
-        tracker_type=TrackingType.GLOBAL_SCHEDULED
-    )  # Replace with appropriate type
-    asyncio.run(tracker.run())
+    tracker = ScheduledTracking(tracker_type=TrackingType.GLOBAL_SCHEDULED)
+    asyncio.run(
+        tracker.run(
+            tracker_class=ScheduledTracking,
+            config_type='global_scheduled',
+            use_scheduler=True,
+            setup_scheduler_method=lambda tracker: tracker.setup_scheduler(),
+        )
+    )

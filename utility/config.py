@@ -17,7 +17,9 @@ load_dotenv()
 
 # Configuration mapping for different types
 MASTER_API_CONFIG = {
-    'bot_clan': (41, 45),
+    'bot_clan': (41, 42),
+    'bot_raids': (43, 43),
+    'bot_war': (44, 45),
     'bot_player': (11, 15),
     'bot_legends': (16, 20),
     'global_clan_find': (21, 25),
