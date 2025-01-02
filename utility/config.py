@@ -3,7 +3,7 @@ import requests
 import coc
 from dotenv import load_dotenv
 from collections import deque
-
+from enum import Enum
 from .keycreation import create_keys
 
 # Load environment variables from .env file
@@ -21,14 +21,28 @@ MASTER_API_CONFIG = {
     'global_war_store': (39, 40),
 }
 
+class TrackingType(Enum):
+    BOT_CLAN = "bot_clan"
+    BOT_PLAYER = "bot_player"
+    BOT_LEGENDS = "bot_legends"
+    GLOBAL_CLAN_FIND = "global_clan_find"
+    GLOBAL_CLAN_VERIFY = "global_clan_verify"
+    GLOBAL_SCHEDULED = "global_scheduled"
+    GLOBAL_WAR = "global_war"
+    GLOBAL_WAR_STORE = "global_war_store"
+
+    def __str__(self):
+        return self.value
+
+
 class Config():
-    def __init__(self, config_type: str):
+    def __init__(self, config_type: TrackingType):
         """
         Initialize the Config object by fetching remote settings and setting up attributes.
 
         :param config_type: The type of configuration to load (e.g., 'bot_clan')
         """
-        self.type = config_type
+        self.type = str(config_type)
 
         # Load BOT_TOKEN from environment
         self.bot_token = getenv("BOT_TOKEN", "")
