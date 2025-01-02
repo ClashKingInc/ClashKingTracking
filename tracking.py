@@ -182,7 +182,6 @@ class Tracking:
     async def run(
         self,
         tracker_class,
-        config_type='bot_clan',
         loop_interval=60,
         is_tracking_allowed=None,
         use_scheduler=False,
@@ -198,7 +197,7 @@ class Tracking:
         :param use_scheduler: If True, use a scheduler-based execution flow.
         :param setup_scheduler_method: Method to set up the scheduler, required if `use_scheduler` is True.
         """
-        tracker = tracker_class(config_type)
+        tracker = tracker_class(self.type)
         await tracker.initialize()
 
         sentry_sdk.init(

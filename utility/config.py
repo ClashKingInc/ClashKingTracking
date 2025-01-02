@@ -32,6 +32,8 @@ MASTER_API_CONFIG = {
 
 class TrackingType(Enum):
     BOT_CLAN = 'bot_clan'
+    BOT_RAIDS = 'bot_raids'
+    BOT_WAR = 'bot_war'
     BOT_PLAYER = 'bot_player'
     BOT_LEGENDS = 'bot_legends'
     GLOBAL_CLAN_FIND = 'global_clan_find'

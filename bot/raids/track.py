@@ -3,6 +3,7 @@ import asyncio
 import coc
 
 from tracking import Tracking
+from utility.config import TrackingType
 
 # Global cache for clans
 CLAN_CACHE = {}
@@ -11,7 +12,7 @@ CLAN_CACHE = {}
 class RaidTracker(Tracking):
     """Class to manage raid weekend tracking."""
 
-    def __init__(self, tracker_type: str, max_concurrent_requests=1000):
+    def __init__(self, tracker_type: TrackingType, max_concurrent_requests=1000):
         # Call the parent class constructor
         super().__init__(
             max_concurrent_requests=max_concurrent_requests,
@@ -163,11 +164,10 @@ class RaidTracker(Tracking):
 
 
 if __name__ == '__main__':
-    tracker = RaidTracker(tracker_type='bot_clan')
+    tracker = RaidTracker(tracker_type=TrackingType.BOT_RAIDS)
     asyncio.run(
         tracker.run(
             tracker_class=RaidTracker,
-            config_type='bot_raids',
             loop_interval=20,
             is_tracking_allowed=tracker.is_raids,
         )

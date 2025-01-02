@@ -879,7 +879,6 @@ if __name__ == '__main__':
     asyncio.run(
         tracker.run(
             tracker_class=ScheduledTracking,
-            config_type='global_scheduled',
             use_scheduler=True,
             setup_scheduler_method=lambda tracker: tracker.setup_scheduler(),
         )
