@@ -4,6 +4,7 @@ import sentry_sdk
 from sentry_sdk.integrations.asyncio import AsyncioIntegration
 
 from utility.config import Config
+from utility.config import Config, TrackingType
 from asyncio_throttle import Throttler
 import coc
 import pendulum as pend
@@ -14,9 +15,11 @@ import ujson
 
 from utility.utils import sentry_filter
 
+import ujson
+from collections import defaultdict, deque
 
 class Tracking():
-    def __init__(self, max_concurrent_requests=1000, batch_size=500, throttle_speed=1000, tracker_type="unknown"):
+    def __init__(self, max_concurrent_requests=1000, batch_size=500, throttle_speed=1000, tracker_type=TrackingType):
         self.config = Config(config_type=tracker_type)
         self.db_client = None
         self.semaphore = asyncio.Semaphore(max_concurrent_requests)
@@ -31,6 +34,8 @@ class Tracking():
         self.scheduler = None
         self.kafka = None
         self.type = tracker_type
+        self.max_stats_size = 10_000
+        self.request_stats = defaultdict(lambda: deque(maxlen=self.max_stats_size))
 
     async def initialize(self):
         """Initialise the tracker with dependencies."""
@@ -43,7 +48,7 @@ class Tracking():
 
         connector = aiohttp.TCPConnector(limit=1200, ttl_dns_cache=300)
         timeout = aiohttp.ClientTimeout(total=1800)
-        self.http_session = aiohttp.ClientSession(connector=connector, timeout=timeout)
+        self.http_session = aiohttp.ClientSession(connector=connector, timeout=timeout, json_serialize=ujson.dumps)
 
         self.scheduler = AsyncIOScheduler(timezone=pend.UTC)
 
@@ -57,6 +62,18 @@ class Tracking():
 
         sentry_sdk.add_breadcrumb(message="Finished tracking all clans.", level="info")
         print("Finished tracking all clans.")
+
+
+    async def fetch(self, url: str, tag: str, json=False):
+        async with self.throttler:
+            self.keys.rotate(1)
+            self.request_stats[url].append({"time" : pend.now(tz=pend.UTC).timestamp()})
+            async with self.http_session.get(url, headers={'Authorization': f'Bearer {self.keys[0]}'}) as response:
+                if response.status == 200:
+                    if not json:
+                        return (await response.read(), tag)
+                    return (await response.json(), tag)
+                return (None, None)
 
     async def _track_batch(self, batch):
         """Track a batch of items."""

@@ -10,6 +10,8 @@ from kafka import KafkaProducer
 from bot.dev.kafka_mock import MockKafkaProducer
 from utility.classes import MongoDatabase
 from utility.keycreation import create_keys
+from enum import Enum
+from .keycreation import create_keys
 
 # Load environment variables from .env file
 load_dotenv()
@@ -27,14 +29,28 @@ MASTER_API_CONFIG = {
 }
 
 
+class TrackingType(Enum):
+    BOT_CLAN = "bot_clan"
+    BOT_PLAYER = "bot_player"
+    BOT_LEGENDS = "bot_legends"
+    GLOBAL_CLAN_FIND = "global_clan_find"
+    GLOBAL_CLAN_VERIFY = "global_clan_verify"
+    GLOBAL_SCHEDULED = "global_scheduled"
+    GLOBAL_WAR = "global_war"
+    GLOBAL_WAR_STORE = "global_war_store"
+
+    def __str__(self):
+        return self.value
+
+
 class Config():
-    def __init__(self, config_type: str):
+    def __init__(self, config_type: TrackingType):
         """
         Initialize the Config object by fetching remote settings and setting up attributes.
 
         :param config_type: The type of configuration to load (e.g., 'bot_clan')
         """
-        self.type = config_type
+        self.type = str(config_type)
 
         # Load BOT_TOKEN from environment
         self.bot_token = getenv("BOT_TOKEN", "")
@@ -47,6 +63,7 @@ class Config():
         # Initialize other attributes
         self.coc_client = coc.Client()
         self.keys = deque()
+
 
     def _fetch_remote_settings(self):
         """
@@ -81,7 +98,7 @@ class Config():
         self.webhook_url = remote_settings.get("webhook_url")
 
         # Determine the account range based on config_type
-        self.__beta_range = (4, 6)
+        self.__beta_range = (7,10)
         self.account_range = MASTER_API_CONFIG.get(self.type, (0, 0)) if not self.is_beta else self.__beta_range
         self.min_coc_email, self.max_coc_email = self.account_range
 

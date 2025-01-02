@@ -13,8 +13,7 @@ from apscheduler.triggers.interval import IntervalTrigger
 from hashids import Hashids
 from pymongo import InsertOne, UpdateOne
 from utility.constants import locations
-from utility.utils import fetch
-
+from utility.config import TrackingType
 '''from .capital_lb import (
     calculate_clan_capital_leaderboards,
     calculate_player_capital_looted_leaderboards,
@@ -27,8 +26,8 @@ from tracking import Tracking
 
 
 class ScheduledTracking(Tracking):
-    def __init__(self, tracker_type: str, max_concurrent_requests=1000, throttle_speed=1000):
-        super().__init__(max_concurrent_requests, tracker_type, throttle_speed)
+    def __init__(self, tracker_type: TrackingType, max_concurrent_requests=1000, throttle_speed=1000):
+        super().__init__(max_concurrent_requests=max_concurrent_requests, tracker_type=tracker_type, throttle_speed=throttle_speed)
 
     def setup_scheduler(self):
         """
@@ -153,11 +152,13 @@ class ScheduledTracking(Tracking):
                             after_param = ''
                         headers = {
                             'Accept': 'application/json',
-                            'authorization': f'Bearer {next(self.coc_client.http.keys)}',
+                            'authorization': f'Bearer {self.keys[0]}',
                         }
-                        url = f'https://api.clashofclans.com/v1/leagues/29000022/seasons/{year}?limit=100000{after_param}'
+                        self.keys.rotate()
+                        url = f'https://api.clashofclans.com/v1/leagues/29000022/seasons/{year}?limit=25000{after_param}'
                         async with session.get(url, headers=headers) as response:
                             if response.status != 200:
+                                print(await response.json())
                                 self.logger.error(f"Failed to fetch legends for season {year}: {response.status}")
                                 break
                             items = await response.json()
@@ -224,19 +225,13 @@ class ScheduledTracking(Tracking):
                 start_time = time.time()
                 self.logger.info(f'GROUP {count} | {len(tag_group)} tags')
                 tasks = []
-                connector = aiohttp.TCPConnector(limit=1000, ttl_dns_cache=300)
-                timeout = aiohttp.ClientTimeout(total=1800)
-                async with aiohttp.ClientSession(connector=connector, timeout=timeout) as session:
-                    for tag in tag_group:
-                        tasks.append(
-                            fetch(
-                                url=f"https://api.clashofclans.com/v1/clanwarleagues/wars/{tag.replace('#', '%23')}",
-                                session=session,
-                                tag=tag,
-                                keys=self.keys,
-                                throttler=self.throttler
-                            )
+                for tag in tag_group:
+                    tasks.append(
+                        self.fetch(
+                            url=f"https://api.clashofclans.com/v1/clanwarleagues/wars/{tag.replace('#', '%23')}",
+                            tag=tag,
                         )
+                    )
                     self.logger.info(f'{len(tasks)} tasks')
                     responses = await asyncio.gather(*tasks)
 
@@ -598,12 +593,6 @@ class ScheduledTracking(Tracking):
         Store clan capital raid seasons data.
         """
         try:
-            async def fetch_capital(url, session: aiohttp.ClientSession, headers, tag):
-                async with session.get(url, headers=headers) as response:
-                    if response.status == 200:
-                        return ((await response.json()), tag)
-                    return (None, tag)
-
             pipeline = [{'$match': {}}, {'$group': {'_id': '$tag'}}]
             all_tags = [
                 x['_id']
@@ -613,31 +602,25 @@ class ScheduledTracking(Tracking):
                     )
                 )
             ]
-            size_break = 50000
             all_tags = [
-                all_tags[i: i + size_break]
-                for i in range(0, len(all_tags), size_break)
+                all_tags[i: i + self.batch_size]
+                for i in range(0, len(all_tags), self.batch_size)
             ]
+            now = pend.now()  # Current time in your system's timezone
+            start_of_week = now.start_of("week").subtract(days=1)
+            end_of_week = start_of_week.add(weeks=1)
 
             for tag_group in all_tags:
                 tasks = []
-                connector = aiohttp.TCPConnector(limit=250, ttl_dns_cache=300)
-                timeout = aiohttp.ClientTimeout(total=1800)
-                async with aiohttp.ClientSession(
-                    connector=connector, timeout=timeout, json_serialize=ujson.dumps
-                ) as session:
-                    for tag in tag_group:
-                        tasks.append(
-                            fetch_capital(
-                                f"https://api.clashofclans.com/v1/clans/{tag.replace('#', '%23')}/capitalraidseasons?limit=1",
-                                session,
-                                {
-                                    'Authorization': f'Bearer {next(self.coc_client.http.keys)}'
-                                },
-                                tag,
-                            )
+                for tag in tag_group:
+                    tasks.append(
+                        self.fetch(
+                            url=f"https://api.clashofclans.com/v1/clans/{tag.replace('#', '%23')}/capitalraidseasons?limit=1",
+                            tag=tag,
+                            json=True
                         )
-                    responses = await asyncio.gather(*tasks, return_exceptions=True)
+                    )
+                responses = await asyncio.gather(*tasks, return_exceptions=True)
 
                 changes = []
                 responses = [r for r in responses if isinstance(r, tuple) and r[0] is not None]
@@ -646,9 +629,8 @@ class ScheduledTracking(Tracking):
                         # We shouldn't have completely invalid tags, they all existed at some point
                         if not response['items']:
                             continue
-                        date = coc.Timestamp(data=response['items'][0]['endTime'])
-                        # -3600 * 24 * 4 = 4 days in seconds
-                        if 60 >= date.seconds_until >= -3600 * 24 * 4:
+                        date = pend.instance(coc.Timestamp(data=response['items'][0]['endTime']).time, tz=pend.UTC)
+                        if start_of_week <= date <= end_of_week:
                             changes.append(
                                 InsertOne(
                                     {'clan_tag': tag, 'data': response['items'][0]}
@@ -672,6 +654,62 @@ class ScheduledTracking(Tracking):
             self.logger.exception(f"Unexpected error in store_clan_capital: {e}")
 
 
+    async def find_new_clans(self):
+        now = pend.now()
+        cutoff_date = now.subtract(days=30)
+
+        pipeline_1 = [
+            {"$match": {"endTime": {"$gte": int(cutoff_date.timestamp())}}},
+            {"$unwind": "$clans"},
+            {"$group": {"_id": "$clans"}}  # Keep unique clans as separate documents
+        ]
+        result_1 = await self.db_client.clan_wars.aggregate(pipeline_1).to_list(length=None)
+        unique_clans = {doc['_id'] for doc in result_1}
+
+        pipeline_2 = [
+            {"$match": {"data.endTime": {"$gte": cutoff_date.strftime('%Y%m%dT%H%M%S.000Z')}}},
+            {"$unwind": {"path": "$data.attackLog", "preserveNullAndEmptyArrays": True}},
+            {"$group": {"_id": "$data.attackLog.defender.tag"}}
+        ]
+        attack_tags = await self.db_client.raid_weekends.aggregate(pipeline_2).to_list(length=None)
+        attack_tags = {doc['_id'] for doc in attack_tags if doc['_id']}
+
+        pipeline_3 = [
+            {"$match": {"data.endTime": {"$gte": cutoff_date.strftime('%Y%m%dT%H%M%S.000Z')}}},
+            {"$unwind": {"path": "$data.defenseLog", "preserveNullAndEmptyArrays": True}},
+            {"$group": {"_id": "$data.defenseLog.attacker.tag"}}
+        ]
+        defense_tags = await self.db_client.raid_weekends.aggregate(pipeline_3).to_list(length=None)
+        defense_tags = {doc['_id'] for doc in defense_tags if doc['_id']}
+
+        unique_tags = attack_tags.union(defense_tags)
+
+        combined_set = unique_clans.union(unique_tags)
+
+        pipeline_4 = [{'$match': {}}, {'$group': {'_id': '$tag'}}]
+        existing_clans = [
+            x['_id']
+            for x in (
+                await self.db_client.global_clans.aggregate(pipeline_4).to_list(
+                    length=None
+                )
+            )
+        ]
+        existing_clans = set(existing_clans)
+        # Find clans in the combined set but not in existing_clans
+        new_clans = combined_set - existing_clans
+        print(len(new_clans))
+        tags_to_add = []
+        for clan in new_clans:
+            tags_to_add.append(
+                InsertOne({'tag': clan})
+            )
+        results = await self.db_client.global_clans.bulk_write(
+            tags_to_add, ordered=False
+        )
+        print(results.bulk_api_result)
+
+
     async def run(self):
         """
         Start the scheduler and keep the application running.
@@ -679,8 +717,8 @@ class ScheduledTracking(Tracking):
         try:
             await self.initialize()
             self.setup_scheduler()
-            await self.store_cwl_wars()
-            #self.scheduler.start()
+            #await self.store_clan_capital()
+            self.scheduler.start()
             self.logger.info("Scheduler started. Running scheduled jobs...")
             # Keep the main thread alive
             while True:
@@ -691,5 +729,5 @@ class ScheduledTracking(Tracking):
 
 
 if __name__ == "__main__":
-    tracker = ScheduledTracking(tracker_type="global_scheduled")
+    tracker = ScheduledTracking(tracker_type=TrackingType.GLOBAL_SCHEDULED)  # Replace with appropriate type
     asyncio.run(tracker.run())
