@@ -12,7 +12,9 @@ CLAN_CACHE = {}
 class RaidTracker(Tracking):
     """Class to manage raid weekend tracking."""
 
-    def __init__(self, tracker_type: TrackingType, max_concurrent_requests=1000):
+    def __init__(
+        self, tracker_type: TrackingType, max_concurrent_requests=1000
+    ):
         # Call the parent class constructor
         super().__init__(
             max_concurrent_requests=max_concurrent_requests,

@@ -1,5 +1,6 @@
 import asyncio
 from collections import defaultdict, deque
+from enum import Enum
 
 import aiohttp
 import coc
@@ -23,11 +24,13 @@ class Tracking:
         throttle_speed=1000,
         tracker_type=TrackingType,
     ):
+        self.keys = None
         self.config = Config(config_type=tracker_type)
         self.db_client = None
         self.semaphore = asyncio.Semaphore(max_concurrent_requests)
         self.message_count = 0
         self.iterations = 0
+        self.is_first_iteration = True
         self.batch_size = batch_size
         self.throttler = Throttler(throttle_speed)
         self.coc_client = None
@@ -64,7 +67,7 @@ class Tracking:
         self.message_count = 0  # Reset message count
         for i in range(0, len(items), self.batch_size):
             batch = items[i : i + self.batch_size]
-            print(
+            self.logger.info(
                 f'Processing batch {i // self.batch_size + 1} of {len(items) // self.batch_size + 1}.'
             )
             await self._track_batch(batch)
@@ -72,7 +75,7 @@ class Tracking:
         sentry_sdk.add_breadcrumb(
             message='Finished tracking all clans.', level='info'
         )
-        print('Finished tracking all clans.')
+        self.logger.info('Finished tracking all clans.')
 
     async def fetch(self, url: str, tag: str, json=False):
         async with self.throttler:
@@ -98,7 +101,7 @@ class Tracking:
             for result in results:
                 if isinstance(result, Exception):
                     self._handle_exception('Error in tracking task', result)
-        print(f'Finished tracking batch of {len(batch)} clans.')  # Added print
+        self.logger.info(f'Finished tracking batch of {len(batch)} clans.')
 
     async def _track_item(self, item):
         """Override this method in child classes."""
@@ -107,19 +110,31 @@ class Tracking:
         )
 
     def _send_to_kafka(self, topic, key, data):
-        """Helper to send data to Kafka."""
+        """Helper to send data to Kafka, handling non-JSON-serializable objects like enums."""
+
+        def serialize(obj):
+            """Convert objects like Enums to JSON-serializable values."""
+            if isinstance(obj, Enum):
+                return obj.value  # Use the value of the Enum
+            return obj  # Return the object as-is if it's already serializable
+
+        # Serialize the data dictionary
+        serialized_data = {k: serialize(v) for k, v in data.items()}
+
         sentry_sdk.add_breadcrumb(
             message=f'Sending data to Kafka: topic={topic}, key={key}',
             data={
-                'data_preview': data
+                'data_preview': serialized_data
                 if self.config.is_beta
                 else 'Data suppressed in production'
             },
             level='info',
         )
+
+        # Send the serialized data to Kafka
         self.kafka.send(
             topic=topic,
-            value=ujson.dumps(data).encode('utf-8'),
+            value=ujson.dumps(serialized_data).encode('utf-8'),
             key=key.encode('utf-8'),
             timestamp_ms=int(pend.now(tz=pend.UTC).timestamp() * 1000),
         )
@@ -251,11 +266,23 @@ class Tracking:
                             tracker.logger.info(
                                 'Tracking not allowed. Sleeping until the next interval.'
                             )
+
+                        if tracker.is_first_iteration:
+                            tracker.is_first_iteration = False
+
                         await asyncio.sleep(loop_interval)
         except KeyboardInterrupt:
             tracker.logger.info('Execution interrupted by user.')
         except SystemExit:
             tracker.logger.info('Shutting down...')
         finally:
-            await tracker.coc_client.close()
-            tracker.logger.info('Execution completed.')
+            # Clean up resources
+            if tracker.db_client and hasattr(tracker.db_client, 'close'):
+                await tracker.db_client.close()  # Ferme la connexion MongoDB
+            if tracker.coc_client:
+                await tracker.coc_client.close()
+            if tracker.http_session and not tracker.http_session.closed:
+                await tracker.http_session.close()
+            if tracker.scheduler.running:
+                tracker.scheduler.shutdown()
+            tracker.logger.info('Resources cleaned up. Exiting...')

@@ -102,7 +102,7 @@ class Config:
         self.webhook_url = remote_settings.get('webhook_url')
 
         # Determine the account range based on config_type
-        self.__beta_range = (7, 10)
+        self.__beta_range = (4, 6)
         self.account_range = (
             MASTER_API_CONFIG.get(self.type, (0, 0))
             if not self.is_beta
