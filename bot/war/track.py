@@ -1,7 +1,9 @@
 import asyncio
+import json
 
 import coc
 import pendulum as pend
+import ujson
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
 from expiring_dict import ExpiringDict
 
@@ -204,7 +206,8 @@ class WarTracker(Tracking):
         )
 
         # Schedule reminders for the war
-        await self._schedule_reminders(clan_tag, current_war)
+        if current_war:
+            await self._schedule_reminders(clan_tag, current_war)
 
     async def _process_cwl_changes(self, war, previous_war):
         """Handle changes specific to CWL wars."""
@@ -258,8 +261,8 @@ class WarTracker(Tracking):
                     },
                 )
 
-    async def _schedule_reminders(self, clan_tag, war):
-        """Schedule reminders for the war end time."""
+    """async def _schedule_reminders(self, clan_tag, war):
+        ""Schedule reminders for the war end time.""
         try:
             # Query the database for predefined reminders for this clan and war type
             set_times = await self.db_client.reminders.distinct(
@@ -334,8 +337,86 @@ class WarTracker(Tracking):
                     run_date=reminder_time,  # Explicitly set the `run_date` to match `reminder_time`
                     misfire_grace_time=600,
                 )
+                # self.logger.info(
+                #     f'Scheduled reminder for clan {clan_tag} at {reminder_time} ({time_seconds} sec).'
+                #)
+
+        except Exception as e:
+            self.logger.error(
+                f'Error scheduling reminders for clan {clan_tag}: {e}'
+            )"""
+
+    async def _schedule_reminders(self, clan_tag, war):
+        """Schedule reminders for the war end time using Redis."""
+        try:
+            # Query the database for predefined reminders for this clan and war type
+            set_times = await self.db_client.reminders.distinct(
+                'time',
+                filter={'$and': [{'clan': clan_tag}, {'type': 'War'}]},
+            )
+
+            if not set_times:
+                return
+
+            # Convert reminder times to seconds
+            set_times_in_seconds = [
+                int(float(r_time.replace(' hr', '')) * 3600)
+                for r_time in set_times
+            ]
+
+            # Iterate through all reminder times
+            for time_seconds in set_times_in_seconds:
+                # Calculate the reminder time (X seconds before war.end_time)
+                reminder_time = (
+                    pend.instance(war.end_time.time)
+                    .subtract(seconds=time_seconds)
+                    .int_timestamp
+                )
+                if war.war_tag:
+                    job_id = (
+                        f'war_reminder_{clan_tag}_{war.war_tag}_{time_seconds}'
+                    )
+                else:
+                    job_id = f'war_reminder_{clan_tag}_{time_seconds}'
+
+                # Skip past reminders
+                if reminder_time <= pend.now(tz=pend.UTC).int_timestamp:
+                    # Delete the outdated reminder from Redis if it exists
+                    if await self.redis.get(job_id):
+                        self.logger.info(
+                            f'Deleting outdated reminder for job {job_id}. Reminder time: {pend.from_timestamp(reminder_time)}'
+                        )
+                        await self.redis.delete(job_id)
+                    continue
+
+                # Retrieve the existing reminder from Redis
+                existing_reminder = await self.redis.get(job_id)
+                if existing_reminder:
+                    existing_reminder = ujson.loads(existing_reminder)
+                    if existing_reminder['run_date'] == reminder_time:
+                        # Skip if the reminder is up-to-date
+                        continue
+                    else:
+                        self.logger.info(
+                            f"Updating reminder for job {job_id}: old run_date={existing_reminder['run_date']}, new run_date={reminder_time}"
+                        )
+
+                # Prepare the reminder data
+                reminder_data = {
+                    'type': 'war_reminder',
+                    'job_id': job_id,
+                    'clan_tag': clan_tag,
+                    'run_date': reminder_time,
+                    'war_data': war._raw_data,
+                }
+
+                # Add or update the reminder in Redis
+                await self.redis.set(job_id, ujson.dumps(reminder_data))
+                # Set the expiration to 5 minutes after the `reminder_time`
+                await self.redis.expireat(job_id, reminder_time + 300)
+
                 self.logger.info(
-                    f'Scheduled reminder for clan {clan_tag} at {reminder_time} ({time_seconds} sec).'
+                    f'Scheduled reminder for clan {clan_tag} at {pend.from_timestamp(reminder_time)} ({time_seconds} sec).'
                 )
 
         except Exception as e:
