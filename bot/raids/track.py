@@ -32,6 +32,7 @@ class RaidTracker(Tracking):
             await self._process_raid_changes(
                 clan_tag, current_raid, previous_raid
             )
+
         except Exception as e:
             self._handle_exception(
                 f'Error tracking raid for clan {clan_tag}', e

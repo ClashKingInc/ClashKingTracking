@@ -14,13 +14,9 @@ from utility.keycreation import create_keys
 from utility.utils import gen_games_season, gen_raid_date, gen_season_date
 
 from .config import BotPlayerTrackingConfig
-from .utils import (
-    find_and_list_changes,
-    get_clan_member_tags,
-    get_player_changes,
-    get_player_responses,
-    update_autocomplete,
-)
+from .utils import (find_and_list_changes, get_clan_member_tags,
+                    get_player_changes, get_player_responses,
+                    update_autocomplete)
 
 
 async def main():

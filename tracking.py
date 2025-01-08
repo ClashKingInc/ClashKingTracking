@@ -14,8 +14,9 @@ from loguru import logger
 from pymongo import ReturnDocument
 from sentry_sdk.integrations.asyncio import AsyncioIntegration
 
+from utility.classes_utils.config_utils import sentry_filter
+from utility.classes_utils.database_utils import generate_custom_id
 from utility.config import Config
-from utility.utils import generate_custom_id, sentry_filter
 
 
 class Tracking:
@@ -106,9 +107,9 @@ class Tracking:
         self.logger.info(f'Finished tracking batch of {len(batch)} clans.')
 
     async def _track_item(self, item):
-        """Override this method in child classes."""
+        """Override this method in child classes_utils."""
         raise NotImplementedError(
-            'This method should be overridden in child classes.'
+            'This method should be overridden in child classes_utils.'
         )
 
     async def _schedule_reminder(self, job_id, reminder_document):

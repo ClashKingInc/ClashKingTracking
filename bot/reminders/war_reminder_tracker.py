@@ -10,13 +10,20 @@ from pymongo.errors import PyMongoError
 from utility.config import Config
 
 
-class ReminderDispatcher:
+class WarReminderTracker:
     def __init__(self):
         """Initialize the ReminderDispatcher."""
         self.logger = logger
         self.db_client = None
         self.kafka_producer = None
         self.config = Config()
+
+    async def initialize(self):
+        """Initialize dependencies."""
+        await self.config.initialize()
+        self.db_client = self.config.get_mongo_database()
+        self.kafka_producer = self.config.get_kafka_producer()
+        logger.info('Dependencies initialized.')
 
     async def fetch_due_reminders(self, lookahead_minutes=10):
         """Fetch reminders that are due for execution, including those due in the next few minutes.
@@ -140,10 +147,9 @@ class ReminderDispatcher:
         """Run the ReminderDispatcher."""
         try:
             # Initialize configuration and dependencies
-            await self.config.initialize()
-            self.kafka_producer = self.config.get_kafka_producer()
-            self.db_client = self.config.get_mongo_database()
+            await self.initialize()
 
+            # Main loop to dispatch reminders every 10 seconds
             while True:
                 await self.dispatch_reminders()
                 await asyncio.sleep(10)
@@ -152,5 +158,5 @@ class ReminderDispatcher:
 
 
 if __name__ == '__main__':
-    dispatcher = ReminderDispatcher()
+    dispatcher = WarReminderTracker()
     asyncio.run(dispatcher.run())
