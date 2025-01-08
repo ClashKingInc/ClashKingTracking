@@ -48,13 +48,12 @@ class TrackingType(Enum):
 
 
 class Config:
-    def __init__(self, config_type: TrackingType):
+    def __init__(self, config_type: TrackingType = None):
         """
         Initialize the Config object by fetching remote settings and setting up attributes.
 
         :param config_type: The type of configuration to load (e.g., 'bot_clan')
         """
-        self.type = str(config_type)
 
         # Load BOT_TOKEN from environment
         self.bot_token = getenv('BOT_TOKEN', '')
@@ -67,8 +66,10 @@ class Config:
         self._fetch_remote_settings()
 
         # Initialize other attributes
-        self.coc_client = coc.Client()
-        self.keys = deque()
+        if config_type:
+            self.type = str(config_type)
+            self.coc_client = coc.Client()
+            self.keys = deque()
 
     def _fetch_remote_settings(self):
         """

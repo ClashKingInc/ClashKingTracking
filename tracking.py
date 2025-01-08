@@ -9,20 +9,22 @@ import sentry_sdk
 import ujson
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
 from asyncio_throttle import Throttler
+from bson import ObjectId
 from loguru import logger
+from pymongo import ReturnDocument
 from sentry_sdk.integrations.asyncio import AsyncioIntegration
 
-from utility.config import Config, TrackingType
-from utility.utils import sentry_filter
+from utility.config import Config
+from utility.utils import generate_custom_id, sentry_filter
 
 
 class Tracking:
     def __init__(
         self,
+        tracker_type,
         max_concurrent_requests=1000,
         batch_size=500,
         throttle_speed=1000,
-        tracker_type=TrackingType,
     ):
         self.keys = None
         self.config = Config(config_type=tracker_type)
@@ -109,6 +111,153 @@ class Tracking:
             'This method should be overridden in child classes.'
         )
 
+    async def _schedule_reminder(self, job_id, reminder_document):
+        """Schedule a new reminder by inserting it into MongoDB.
+
+        Args:
+            job_id (str): Unique ID for the reminder.
+            reminder_document (dict): Document data for the reminder.
+        """
+        try:
+            result = await self.db_client.active_reminders.insert_one(
+                reminder_document
+            )
+            self.logger.info(
+                f'New reminder scheduled: {job_id}, Inserted ID: {result.inserted_id}'
+            )
+        except Exception as e:
+            self.logger.error(f'Error scheduling reminder {job_id}: {e}')
+
+    async def _update_reminder(self, job_id, reminder_document):
+        """Update an existing reminder in MongoDB.
+
+        Args:
+            job_id (str): Unique ID for the reminder.
+            reminder_document (dict): Document data for the reminder.
+        """
+        try:
+            self.logger.info(f'Updating existing reminder: {job_id}')
+            # Update the reminder in the `active_reminders` collection
+            result = await self.db_client.active_reminders.find_one_and_update(
+                {'job_id': job_id},
+                {'$set': reminder_document},
+                upsert=True,
+                return_document=ReturnDocument.AFTER,
+            )
+            if result:
+                self.logger.info(
+                    f'Reminder successfully updated: {job_id}, Result: {result}'
+                )
+            else:
+                self.logger.warning(
+                    f'No document updated for job_id: {job_id}'
+                )
+            return result
+        except Exception as e:
+            self.logger.error(f'Error updating reminder {job_id}: {e}')
+
+    async def _schedule_reminders(
+        self, clan_tag, war_tag, reminder_data, reminder_type
+    ):
+        """Schedule reminders for various entities using MongoDB.
+
+        Args:
+            clan_tag (str): Clan tag.
+            war_tag (str): War tag.
+            reminder_data (dict): Data specific to the entity (e.g., war data).
+            reminder_type (str): Type of the reminder (e.g., 'war_reminder', 'raid_reminder').
+        """
+        try:
+            # Query the database for predefined reminder settings
+            reminders = await self.db_client.reminders.find(
+                {'$and': [{'clan': clan_tag}, {'type': reminder_type}]},
+                {'time': 1, '_id': 1},  # Only retrieve 'time' and '_id'
+            ).to_list(length=None)
+
+            if not reminders:
+                return
+
+            # Convert reminder times to seconds and pair with their respective `_id`
+            set_times_with_ids = [
+                (
+                    int(float(reminder['time'].replace(' hr', '')) * 3600),
+                    str(reminder['_id']),
+                )
+                for reminder in reminders
+            ]
+
+            if war_tag:
+                entity_tag = f'{clan_tag}_{war_tag}'
+            else:
+                entity_tag = clan_tag
+
+            # Iterate through all reminder times
+            for time_seconds, reminder_id in set_times_with_ids:
+                # Calculate the reminder time
+                target_time = pend.from_timestamp(
+                    reminder_data['end_time'], tz=pend.UTC
+                ).subtract(seconds=time_seconds)
+                reminder_time = target_time.int_timestamp
+
+                job_id = f'{reminder_type}_{entity_tag}_{time_seconds}'
+
+                # Skip past reminders
+                if reminder_time <= pend.now(tz=pend.UTC).int_timestamp:
+                    # Delete outdated reminders
+                    deleted = await self.db_client.active_reminders.find_one_and_delete(
+                        {'job_id': job_id}
+                    )
+                    if deleted:
+                        self.logger.info(
+                            f'Deleted outdated reminder: {job_id}'
+                        )
+                    continue
+
+                # Check if the reminder already exists
+                existing_reminder = (
+                    await self.db_client.active_reminders.find_one(
+                        {'job_id': job_id}
+                    )
+                )
+                if existing_reminder:
+                    # Prepare the reminder document
+                    reminder_document = {
+                        'job_id': job_id,
+                        'type': reminder_type,
+                        'run_date': reminder_time,
+                        'reminder_id': ObjectId(reminder_id),
+                    }
+                    # Update the reminder
+                    await self._update_reminder(job_id, reminder_document)
+                else:
+                    # Prepare the reminder document
+                    reminder_document = {
+                        '_id': generate_custom_id(reminder_time),
+                        'job_id': job_id,
+                        'type': reminder_type,
+                        'run_date': reminder_time,
+                        'reminder_id': ObjectId(reminder_id),
+                    }
+                    # Schedule a new reminder
+                    await self._schedule_reminder(job_id, reminder_document)
+
+                # Set an expiration time (5 minutes after the `run_date`)
+                await self.db_client.active_reminders.update_one(
+                    {'job_id': job_id},
+                    {
+                        '$set': {
+                            'expireAt': pend.from_timestamp(
+                                reminder_time + 300
+                            ).isoformat()
+                        }
+                    },
+                )
+
+        except Exception as e:
+            self.logger.error(
+                f'Error scheduling reminders for {clan_tag} and {war_tag}: {e}'
+            )
+
     def _send_to_kafka(self, topic, key, data):
         """Helper to send data to Kafka, handling non-JSON-serializable objects like enums."""
 
@@ -144,7 +293,6 @@ class Tracking:
     def _handle_exception(message, exception):
         """Handle exceptions by logging to Sentry and console."""
         sentry_sdk.capture_exception(exception)
-        print(f'{message}: {exception}')
 
     @staticmethod
     def gen_raid_date():
@@ -206,7 +354,6 @@ class Tracking:
         Main function for generic tracking or scheduling.
 
         :param tracker_class: The tracker class to instantiate (e.g., ClanTracker, RaidTracker).
-        :param config_type: The configuration type (default: "bot_clan").
         :param loop_interval: The interval in seconds between tracking loops.
         :param is_tracking_allowed: A function that returns True if tracking should run, False otherwise.
         :param use_scheduler: If True, use a scheduler-based execution flow.

@@ -2,84 +2,155 @@ import asyncio
 
 import pendulum as pend
 import ujson
-from aioredis import Redis
-from kafka import KafkaProducer
+from bson import ObjectId
+from kafka.errors import KafkaError
+from loguru import logger
+from pymongo.errors import PyMongoError
+
+from utility.config import Config
 
 
 class ReminderDispatcher:
-    """Class to fetch reminders from Redis and send them to Kafka."""
+    def __init__(self):
+        """Initialize the ReminderDispatcher."""
+        self.logger = logger
+        self.db_client = None
+        self.kafka_producer = None
+        self.config = Config()
 
-    def __init__(self, redis_url: str, kafka_config: dict):
-        self.redis_client: Redis = None
-        self.redis_url = redis_url
-        self.kafka_producer = KafkaProducer(**kafka_config)
+    async def fetch_due_reminders(self, lookahead_minutes=10):
+        """Fetch reminders that are due for execution, including those due in the next few minutes.
 
-    async def connect_redis(self):
-        """Connect to Redis."""
-        self.redis_client = await Redis.from_url(self.redis_url)
+        Args:
+            lookahead_minutes (int): Number of minutes ahead to include in the due reminders.
 
-    async def close_redis(self):
-        """Close Redis connection."""
-        if self.redis_client:
-            await self.redis_client.close()
+        Returns:
+            List[dict]: A list of reminders due for execution.
+        """
+        now_timestamp = pend.now(tz=pend.UTC).int_timestamp
+        lookbehind_timestamp = (
+            pend.now(tz=pend.UTC).subtract(minutes=10).int_timestamp
+        )
 
-    async def get_due_reminders(self):
-        """Retrieve all due reminders from Redis."""
-        keys = await self.redis_client.keys('war_reminder_*')
-        due_reminders = []
-        for key in keys:
-            data = await self.redis_client.get(key)
-            if data:
-                reminder = ujson.loads(data)
-                if reminder['run_date'] <= pend.now(tz=pend.UTC).int_timestamp:
-                    due_reminders.append(reminder)
-        return due_reminders
+        try:
+            # Fetch reminders that are due now or within the lookahead period
+            reminders = await self.db_client.active_reminders.find(
+                {
+                    'run_date': {
+                        '$gte': lookbehind_timestamp,
+                        '$lt': now_timestamp,
+                    }
+                }
+            ).to_list(length=None)
+
+            return reminders
+        except PyMongoError as e:
+            print(f'Error fetching reminders from MongoDB: {e}')
+            return []
 
     async def send_to_kafka(self, reminder):
-        """Send reminder to Kafka."""
-        topic = 'reminders'
-        job_id = reminder['job_id']
-        try:
-            self.kafka_producer.send(
-                topic=topic,
-                key=job_id.encode('utf-8'),
-                value=ujson.dumps(reminder).encode('utf-8'),
-                timestamp_ms=int(pend.now(tz=pend.UTC).timestamp() * 1000),
-            )
-            print(f'Sent reminder to Kafka: {job_id}')
-        except Exception as e:
-            print(f'Failed to send reminder {job_id} to Kafka: {e}')
+        """Send a reminder to Kafka and remove it from MongoDB.
 
-    async def process_reminders(self):
-        """Process due reminders by sending them to Kafka and removing them."""
-        due_reminders = await self.get_due_reminders()
-        for reminder in due_reminders:
-            await self.send_to_kafka(reminder)
-            await self.redis_client.delete(reminder['job_id'])
-            print(f"Processed and deleted reminder: {reminder['job_id']}")
+        Args:
+            reminder: The reminder document to send.
+        """
+        try:
+            # Convert the _id back to ObjectId if it's a string
+            reminder_id_object = reminder['_id']
+
+            # Serialize the reminder data and send to Kafka
+            topic = reminder.get('type', 'reminders')
+            key = reminder.get('job_id', 'unknown').encode('utf-8')
+            value = ujson.dumps(reminder).encode('utf-8')
+            run_date = pend.from_timestamp(reminder['run_date'], tz=pend.UTC)
+
+            self.kafka_producer.send(
+                topic,
+                key=key,
+                value=value,
+                timestamp_ms=run_date.int_timestamp,
+            )
+            self.logger.info(
+                f"Sent reminder {reminder_id_object} ({reminder['job_id']}) to Kafka. Run date: {run_date}"
+            )
+
+            try:
+                # Delete the reminder from the `active_reminders` collection
+                result = await self.db_client.active_reminders.delete_one(
+                    {'reminder_id': ObjectId(reminder_id_object)}
+                )
+                if result.deleted_count > 0:
+                    self.logger.info(
+                        f"Removed reminder {reminder['job_id']} from MongoDB."
+                    )
+                else:
+                    self.logger.warning(
+                        f"Failed to remove reminder {reminder_id_object} ({reminder['job_id']}) from MongoDB: Not found."
+                    )
+            except Exception as e:
+                self.logger.error(
+                    f"Error while removing reminder {reminder['job_id']} from MongoDB: {e}"
+                )
+
+        except KafkaError as e:
+            self.logger.error(
+                f"Error sending reminder {reminder['job_id']} to Kafka: {e}"
+            )
+        except PyMongoError as e:
+            self.logger.error(
+                f"Error removing reminder {reminder['job_id']} from MongoDB: {e}"
+            )
+
+    async def dispatch_reminders(self):
+        """Fetch and send reminders to Kafka."""
+        reminders = await self.fetch_due_reminders()
+        if reminders:
+            for reminder in reminders:
+                try:
+                    # Fetch detailed reminder information from the `reminders` collection
+                    reminder_details = await self.db_client.reminders.find_one(
+                        {'_id': reminder.get('reminder_id')}
+                    )
+
+                    if not reminder_details:
+                        self.logger.warning(
+                            f"Reminder details not found for reminder_id: {reminder.get('reminder_id')}"
+                        )
+                        continue
+
+                    # Merge additional details into the reminder before sending to Kafka
+                    enriched_reminder = {**reminder, **reminder_details}
+
+                    # Convert ObjectId fields to strings for JSON serialization, except for '_id'
+                    for key, value in enriched_reminder.items():
+                        if isinstance(value, ObjectId):
+                            enriched_reminder[key] = str(value)
+
+                    # Send the enriched reminder to Kafka
+                    await self.send_to_kafka(enriched_reminder)
+
+                except Exception as e:
+                    self.logger.error(
+                        f"Error processing reminder {reminder.get('job_id')}: {e}"
+                    )
+        else:
+            self.logger.info('No reminders due for dispatch.')
 
     async def run(self):
-        """Main loop to process reminders continuously."""
-        await self.connect_redis()
+        """Run the ReminderDispatcher."""
         try:
+            # Initialize configuration and dependencies
+            await self.config.initialize()
+            self.kafka_producer = self.config.get_kafka_producer()
+            self.db_client = self.config.get_mongo_database()
+
             while True:
-                await self.process_reminders()
-                await asyncio.sleep(10)  # Check every 10 seconds
-        finally:
-            await self.close_redis()
-
-
-async def main():
-    redis_url = 'redis://localhost'
-    kafka_config = {
-        'bootstrap_servers': ['localhost:9092'],
-        'value_serializer': lambda v: ujson.dumps(v).encode('utf-8'),
-        'key_serializer': lambda k: k.encode('utf-8'),
-    }
-    dispatcher = ReminderDispatcher(redis_url, kafka_config)
-
-    await dispatcher.run()
+                await self.dispatch_reminders()
+                await asyncio.sleep(10)
+        except Exception as e:
+            self.logger.error(f'An error occurred in ReminderDispatcher: {e}')
 
 
 if __name__ == '__main__':
-    asyncio.run(main())
+    dispatcher = ReminderDispatcher()
+    asyncio.run(dispatcher.run())
