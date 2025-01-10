@@ -1,11 +1,13 @@
 import asyncio
 
 from bot.clan.track import main as bot_clan_main
+from bot.giveaway.track import main as bot_giveaway_main
 from bot.legends.track import main as bot_legend_main
 from bot.player.track import main as bot_player_main
+from bot.raids.track import main as bot_raids_main
 from bot.reddit.track import main as bot_reddit_main
+from bot.war.track import main as bot_war_main
 from bot.websockets.server import main as websocket_server
-from bot.giveaway.track import main as bot_giveaway_main
 from gamewide.clan_verify.track import main as clan_verify_main
 from gamewide.players.track import broadcast as global_player_main
 from gamewide.scheduled.track import main as global_scheduled_main
@@ -20,6 +22,10 @@ if __name__ == '__main__':
         task = bot_player_main
     elif config.tracking_type == 'BOTCLAN':
         task = bot_clan_main
+    elif config.tracking_type == 'BOTRAIDS':
+        task = bot_raids_main
+    elif config.tracking_type == 'BOTWAR':
+        task = bot_war_main
     elif config.tracking_type == 'CLANVERIFY':
         task = clan_verify_main
     elif config.tracking_type == 'BOTREDDIT':

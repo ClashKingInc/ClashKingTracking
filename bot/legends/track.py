@@ -228,17 +228,23 @@ class Tracker:
                 )
             )
             if attack_change == 1:
-                self.db_changes.extend(self.create_attack_update(trophy_change, player, equipment))
+                self.db_changes.extend(
+                    self.create_attack_update(trophy_change, player, equipment)
+                )
                 streak_update = (
                     {'$inc': {f'legends.streak': 1}}
                     if trophy_change == 40
                     else {'$set': {f'legends.streak': 0}}
                 )
-                self.db_changes.append(UpdateOne({'tag': player.tag}, streak_update))
+                self.db_changes.append(
+                    UpdateOne({'tag': player.tag}, streak_update)
+                )
 
             elif attack_change > 1 and trophy_change == attack_change * 40:
                 for _ in range(attack_change):
-                    self.db_changes.extend(self.create_attack_update(40, player, equipment))
+                    self.db_changes.extend(
+                        self.create_attack_update(40, player, equipment)
+                    )
                 self.db_changes.append(
                     UpdateOne(
                         {'tag': player.tag},
@@ -247,7 +253,9 @@ class Tracker:
                 )
 
             else:
-                self.db_changes.extend(self.create_attack_update(trophy_change, player, equipment))
+                self.db_changes.extend(
+                    self.create_attack_update(trophy_change, player, equipment)
+                )
                 self.db_changes.append(
                     UpdateOne(
                         {'tag': player.tag},
@@ -261,7 +269,6 @@ class Tracker:
             diff_defenses = player.defenseWins - previous_player.defenseWins
             for _ in range(diff_defenses):
                 self.db_changes.extend(self.create_defense_update(0, player))
-
 
     async def insert_db_changes(self):
         logger.info(f'{len(self.db_changes)} db changes')
@@ -286,16 +293,24 @@ async def main():
             logger.info(f'{len(tracker.tracked_tags)} players to track')
 
             for count, group in enumerate(tracker.split_tags(), 1):
-                logger.info(f'LOOP {loop_count} | Group {count}/{len(tracker.split_tags())}: {len(group)} tags')
-                current_player_responses = await tracker.get_player_responses(tags=group)
-                logger.info(f'LOOP {loop_count} | Group {count}: Pulled Responses')
+                logger.info(
+                    f'LOOP {loop_count} | Group {count}/{len(tracker.split_tags())}: {len(group)} tags'
+                )
+                current_player_responses = await tracker.get_player_responses(
+                    tags=group
+                )
+                logger.info(
+                    f'LOOP {loop_count} | Group {count}: Pulled Responses'
+                )
 
                 for tag, response in current_player_responses:
                     if response is None:
                         continue
 
                     if response == 'delete':
-                        await tracker.db_client.player_stats.delete_one({'tag': tag})
+                        await tracker.db_client.player_stats.delete_one(
+                            {'tag': tag}
+                        )
                         tracker.cache.pop(tag, 'gone')
                         continue
 

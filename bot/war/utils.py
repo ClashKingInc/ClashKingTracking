@@ -1,7 +1,4 @@
-import asyncio
-import datetime
 from datetime import timedelta
-from typing import Dict, List
 
 import coc
 import pendulum as pend
@@ -9,13 +6,10 @@ import ujson
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
 from expiring_dict import ExpiringDict
 from kafka import KafkaProducer
-from pymongo import UpdateOne
 
 from utility.classes import MongoDatabase
 
 WAR_CACHE = ExpiringDict()
-CLAN_CACHE = {}
-LAST_PRIVATE_WARLOG_WARN: dict[str, datetime.datetime] = {}
 
 reminder_times = [
     f'{int(time)}hr' if time.is_integer() else f'{time}hr'
@@ -43,9 +37,6 @@ def send_reminder(
         key=clan_tag.encode('utf-8'),
         timestamp_ms=int(pend.now(tz=pend.UTC).timestamp() * 1000),
     )
-
-
-ONLY_KEEP = None
 
 
 async def clan_war_track(
@@ -248,222 +239,3 @@ async def clan_war_track(
                 key=clan_tag.encode('utf-8'),
                 timestamp_ms=int(pend.now(tz=pend.UTC).timestamp() * 1000),
             )
-
-
-async def raid_weekend_track(
-    clan_tags: List[str],
-    db_client: MongoDatabase,
-    coc_client: coc.Client,
-    producer: KafkaProducer,
-):
-    cached_raids = await db_client.capital_cache.find(
-        {'tag': {'$in': clan_tags}}
-    ).to_list(length=None)
-    cached_raids = {r.get('tag'): r.get('data') for r in cached_raids}
-
-    tasks = []
-    for clan_tag in clan_tags:
-        tasks.append(coc_client.get_raid_log(clan_tag=clan_tag, limit=1))
-    current_raids = await asyncio.gather(*tasks, return_exceptions=True)
-
-    current_raids: Dict[str, coc.RaidLogEntry] = {
-        r[0].clan_tag: r[0]
-        for r in current_raids
-        if r and not isinstance(r, BaseException)
-    }
-
-    db_updates = []
-    for clan_tag in clan_tags:
-        current_raid = current_raids.get(clan_tag)
-        previous_raid = cached_raids.get(clan_tag)
-
-        if current_raid is None:
-            continue
-
-        if current_raid._raw_data != previous_raid:
-            db_updates.append(
-                UpdateOne(
-                    {'tag': clan_tag},
-                    {'$set': {'data': current_raid._raw_data}},
-                    upsert=True,
-                )
-            )
-
-            if previous_raid is None:
-                continue
-
-            previous_raid = coc.RaidLogEntry(
-                data=previous_raid, client=coc_client, clan_tag=clan_tag
-            )
-
-            if previous_raid.attack_log:
-                new_clans = (
-                    clan
-                    for clan in current_raid.attack_log
-                    if clan not in previous_raid.attack_log
-                )
-            else:
-                new_clans = current_raid.attack_log
-
-            for clan in new_clans:
-                json_data = {
-                    'type': 'new_offensive_opponent',
-                    'clan': clan._raw_data,
-                    'clan_tag': clan_tag,
-                    'raid': current_raid._raw_data,
-                }
-                producer.send(
-                    'capital',
-                    ujson.dumps(json_data).encode('utf-8'),
-                    key=clan_tag.encode('utf-8'),
-                    timestamp_ms=int(pend.now(tz=pend.UTC).timestamp() * 1000),
-                )
-
-            attacked = []
-            for member in current_raid.members:
-                old_member = coc.utils.get(
-                    previous_raid.members, tag=member.tag
-                )
-                if old_member is None or (
-                    old_member.attack_count != member.attack_count
-                ):
-                    attacked.append(member.tag)
-
-            clan_data = CLAN_CACHE.get(clan_tag)
-
-            if clan_data:
-                json_data = {
-                    'type': 'raid_attacks',
-                    'clan_tag': current_raid.clan_tag,
-                    'attacked': attacked,
-                    'raid': current_raid._raw_data,
-                    'old_raid': previous_raid._raw_data,
-                    'clan': clan_data._raw_data,
-                }
-                producer.send(
-                    'capital',
-                    ujson.dumps(json_data).encode('utf-8'),
-                    key=clan_tag.encode('utf-8'),
-                    timestamp_ms=int(pend.now(tz=pend.UTC).timestamp() * 1000),
-                )
-
-            if current_raid.state != previous_raid.state:
-                json_data = {
-                    'type': 'raid_state',
-                    'clan_tag': current_raid.clan_tag,
-                    'old_raid': previous_raid._raw_data,
-                    'raid': current_raid._raw_data,
-                }
-                producer.send(
-                    'capital',
-                    ujson.dumps(json_data).encode('utf-8'),
-                    key=clan_tag.encode('utf-8'),
-                    timestamp_ms=int(pend.now(tz=pend.UTC).timestamp() * 1000),
-                )
-
-    if db_updates:
-        await db_client.capital_cache.bulk_write(db_updates, ordered=False)
-
-
-async def clan_track(
-    clan_tag: str, coc_client: coc.Client, producer: KafkaProducer
-):
-    try:
-        clan = await coc_client.get_clan(tag=clan_tag)
-    except Exception:
-        return
-
-    previous_clan: coc.Clan = CLAN_CACHE.get(clan.tag)
-    CLAN_CACHE[clan.tag] = clan
-
-    if previous_clan is None:
-        return None
-
-    if not clan.public_war_log:
-        if LAST_PRIVATE_WARLOG_WARN.get(clan.tag) is None:
-            LAST_PRIVATE_WARLOG_WARN[clan.tag] = pend.now(tz=pend.UTC)
-        elif (
-            pend.now(tz=pend.UTC) - LAST_PRIVATE_WARLOG_WARN.get(clan.tag)
-        ).hours >= 12:
-            LAST_PRIVATE_WARLOG_WARN[clan.tag] = pend.now(tz=pend.UTC)
-            json_data = {'type': 'war_log_closed', 'clan': clan._raw_data}
-            producer.send(
-                'clan',
-                value=ujson.dumps(json_data).encode('utf-8'),
-                key=clan_tag.encode('utf-8'),
-                timestamp_ms=int(pend.now(tz=pend.UTC).timestamp() * 1000),
-            )
-
-    attributes = [
-        'level',
-        'type',
-        'description',
-        'location',
-        'capital_league',
-        'required_townhall',
-        'required_trophies',
-        'war_win_streak',
-        'war_league',
-        'member_count',
-    ]
-    changed_attributes = []
-    for attribute in attributes:
-        if getattr(clan, attribute) != getattr(previous_clan, attribute):
-            changed_attributes.append(attribute)
-    if changed_attributes:
-        json_data = {
-            'types': changed_attributes,
-            'old_clan': previous_clan._raw_data,
-            'new_clan': clan._raw_data,
-        }
-        producer.send(
-            'clan',
-            value=ujson.dumps(json_data).encode('utf-8'),
-            key=clan_tag.encode('utf-8'),
-            timestamp_ms=int(pend.now(tz=pend.UTC).timestamp() * 1000),
-        )
-
-    members_joined = [
-        n._raw_data
-        for n in clan.members
-        if n.tag not in set(n.tag for n in previous_clan.members)
-    ]
-    members_left = [
-        n._raw_data
-        for n in previous_clan.members
-        if n.tag not in set(n.tag for n in clan.members)
-    ]
-    if members_joined or members_left:
-        json_data = {
-            'type': 'members_join_leave',
-            'old_clan': previous_clan._raw_data,
-            'new_clan': clan._raw_data,
-            'joined': members_joined,
-            'left': members_left,
-        }
-        producer.send(
-            'clan',
-            ujson.dumps(json_data).encode('utf-8'),
-            key=clan_tag.encode('utf-8'),
-            timestamp_ms=int(pend.now(tz=pend.UTC).timestamp() * 1000),
-        )
-
-    previous_donations = {
-        n.tag: (n.donations, n.received) for n in previous_clan.members
-    }
-    for member in clan.members:
-        if (member_donated := previous_donations.get(member.tag)) is not None:
-            mem_donos, mem_received = member_donated
-            if mem_donos < member.donations or mem_received < member.received:
-                json_data = {
-                    'type': 'all_member_donations',
-                    'old_clan': previous_clan._raw_data,
-                    'new_clan': clan._raw_data,
-                }
-                producer.send(
-                    'clan',
-                    ujson.dumps(json_data).encode('utf-8'),
-                    key=clan_tag.encode('utf-8'),
-                    timestamp_ms=int(pend.now(tz=pend.UTC).timestamp() * 1000),
-                )
-                break
