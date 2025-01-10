@@ -187,7 +187,6 @@ class ScheduledTracking(Tracking):
         try:
             hashids = Hashids(min_length=7)
             season = self.gen_games_season()
-            season = "2024-12"
             pipeline = [
                 {'$match': {'data.season': season}},
                 {'$group': {'_id': '$data.rounds.warTags'}},
@@ -593,7 +592,7 @@ class ScheduledTracking(Tracking):
         Store clan capital raid seasons data.
         """
         try:
-            pipeline = [{'$match': {}}, {'$group': {'_id': '$tag'}}]
+            pipeline = [{'$match': {"capitalLeague" : {"$ne" : "Unranked"}, "isValid" : True, "clanCapitalHallLevel" : {"$gte" : 5}}}, {'$group': {'_id': '$tag'}}]
             all_tags = [
                 x['_id']
                 for x in (
@@ -716,9 +715,9 @@ class ScheduledTracking(Tracking):
         """
         try:
             await self.initialize()
-            self.setup_scheduler()
-            #await self.store_clan_capital()
-            self.scheduler.start()
+            #self.setup_scheduler()
+            await self.store_clan_capital()
+            #self.scheduler.start()
             self.logger.info("Scheduler started. Running scheduled jobs...")
             # Keep the main thread alive
             while True:
