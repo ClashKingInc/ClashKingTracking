@@ -112,43 +112,49 @@ class Config:
         )
         self.min_coc_email, self.max_coc_email = self.account_range
 
-    async def initialize(self):
+    async def get_coc_client(self):
         """
         Asynchronously initialize the CoC client by generating keys and logging in.
         """
-        if not self.coc_email or not self.coc_password:
-            raise ValueError(
-                'CoC email or password is not set in the configuration.'
+        try:
+            if not self.coc_email or not self.coc_password:
+                raise ValueError(
+                    'CoC email or password is not set in the configuration.'
+                )
+
+            # Generate list of emails based on the account range
+            emails = [
+                self.coc_email.format(x=x)
+                for x in range(self.min_coc_email, self.max_coc_email + 1)
+            ]
+
+            # Generate matching passwords
+            passwords = [self.coc_password] * len(emails)
+
+            # Create keys using the provided utility function
+            try:
+                keys = await create_keys(emails, passwords, as_list=True)
+            except Exception as e:
+                raise RuntimeError(f'Failed to create keys: {e}')
+
+            # Initialize the CoC client with desired parameters
+            self.coc_client = coc.Client(
+                throttle_limit=30, cache_max_size=0, raw_attribute=True
             )
 
-        # Generate list of emails based on the account range
-        emails = [
-            self.coc_email.format(x=x)
-            for x in range(self.min_coc_email, self.max_coc_email + 1)
-        ]
+            # Log in to the CoC client using the generated keys
+            try:
+                await self.coc_client.login_with_tokens(*keys)
+            except Exception as e:
+                raise ConnectionError(f'Failed to log in to CoC client: {e}')
 
-        # Generate matching passwords
-        passwords = [self.coc_password] * len(emails)
-
-        # Create keys using the provided utility function
-        try:
-            keys = await create_keys(emails, passwords, as_list=True)
+            # Store the keys in a deque for future use
+            self.keys = deque(keys)
         except Exception as e:
-            raise RuntimeError(f'Failed to create keys: {e}')
+            if hasattr(self, 'coc_client') and self.coc_client:
+                await self.coc_client.close()
+            raise e
 
-        # Initialize the CoC client with desired parameters
-        self.coc_client = coc.Client(
-            throttle_limit=30, cache_max_size=0, raw_attribute=True
-        )
-
-        # Log in to the CoC client using the generated keys
-        try:
-            await self.coc_client.login_with_tokens(*keys)
-        except Exception as e:
-            raise ConnectionError(f'Failed to log in to CoC client: {e}')
-
-        # Store the keys in a deque for future use
-        self.keys = deque(keys)
 
     def get_kafka_producer(self):
         if self.is_main:

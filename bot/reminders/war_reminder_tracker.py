@@ -11,19 +11,13 @@ from utility.config import Config
 
 
 class WarReminderTracker:
-    def __init__(self):
+    def __init__(self, config, db_client, kafka_producer):
         """Initialize the ReminderDispatcher."""
         self.logger = logger
-        self.db_client = None
-        self.kafka_producer = None
-        self.config = Config()
-
-    async def initialize(self):
-        """Initialize dependencies."""
-        await self.config.initialize()
-        self.db_client = self.config.get_mongo_database()
-        self.kafka_producer = self.config.get_kafka_producer()
-        logger.info('Dependencies initialized.')
+        self.config = config
+        self.db_client = db_client
+        self.kafka_producer = kafka_producer
+        self.coc_client = self.config.coc_client
 
     async def fetch_due_reminders(self, lookahead_minutes=10):
         """Fetch reminders that are due for execution, including those due in the next few minutes.
@@ -50,9 +44,11 @@ class WarReminderTracker:
                 }
             ).to_list(length=None)
 
+            print(now_timestamp, lookbehind_timestamp, reminders)
+
             return reminders
         except PyMongoError as e:
-            print(f'Error fetching reminders from MongoDB: {e}')
+            self.logger.error(f'Error fetching reminders from MongoDB: {e}')
             return []
 
     async def send_to_kafka(self, reminder):
@@ -120,8 +116,11 @@ class WarReminderTracker:
                     )
 
                     if not reminder_details:
+                        await self.db_client.reminders.find_one_and_delete(
+                            {'_id': reminder.get('reminder_id')}
+                        )
                         self.logger.warning(
-                            f"Reminder details not found for reminder_id: {reminder.get('reminder_id')}"
+                            f"Reminder details not found for reminder_id: {reminder.get('reminder_id')} : Removing reminder from MongoDB."
                         )
                         continue
 
@@ -146,17 +145,10 @@ class WarReminderTracker:
     async def run(self):
         """Run the ReminderDispatcher."""
         try:
-            # Initialize configuration and dependencies
-            await self.initialize()
-
             # Main loop to dispatch reminders every 10 seconds
+            self.logger.info('War Tracker: Starting reminder dispatch loop.')
             while True:
                 await self.dispatch_reminders()
                 await asyncio.sleep(10)
         except Exception as e:
             self.logger.error(f'An error occurred in ReminderDispatcher: {e}')
-
-
-if __name__ == '__main__':
-    dispatcher = WarReminderTracker()
-    asyncio.run(dispatcher.run())

@@ -1,6 +1,5 @@
 import asyncio
 from collections import defaultdict, deque
-from enum import Enum
 
 import aiohttp
 import coc
@@ -16,6 +15,7 @@ from sentry_sdk.integrations.asyncio import AsyncioIntegration
 
 from utility.classes_utils.config_utils import sentry_filter
 from utility.classes_utils.database_utils import generate_custom_id
+from utility.utils import serialize
 from utility.config import Config
 
 
@@ -50,7 +50,7 @@ class Tracking:
 
     async def initialize(self):
         """Initialise the tracker with dependencies."""
-        await self.config.initialize()
+        await self.config.get_coc_client()
         self.db_client = self.config.get_mongo_database()
         self.redis = self.config.get_redis_client()
         self.coc_client = self.config.coc_client
@@ -172,7 +172,7 @@ class Tracking:
             # Query the database for predefined reminder settings
             reminders = await self.db_client.reminders.find(
                 {'$and': [{'clan': clan_tag}, {'type': reminder_type}]},
-                {'time': 1, '_id': 1},  # Only retrieve 'time' and '_id'
+                {'time': 1, '_id': 1, 'server': 1},  # Only retrieve 'time' and '_id'
             ).to_list(length=None)
 
             if not reminders:
@@ -183,6 +183,7 @@ class Tracking:
                 (
                     int(float(reminder['time'].replace(' hr', '')) * 3600),
                     str(reminder['_id']),
+                    str(reminder['server']),
                 )
                 for reminder in reminders
             ]
@@ -193,25 +194,17 @@ class Tracking:
                 entity_tag = clan_tag
 
             # Iterate through all reminder times
-            for time_seconds, reminder_id in set_times_with_ids:
+            for time_seconds, reminder_id, reminder_server in set_times_with_ids:
                 # Calculate the reminder time
                 target_time = pend.from_timestamp(
                     reminder_data['end_time'], tz=pend.UTC
                 ).subtract(seconds=time_seconds)
                 reminder_time = target_time.int_timestamp
 
-                job_id = f'{reminder_type}_{entity_tag}_{time_seconds}'
+                job_id = f'{reminder_type}_{reminder_server}_{entity_tag}_{time_seconds}'
 
                 # Skip past reminders
                 if reminder_time <= pend.now(tz=pend.UTC).int_timestamp:
-                    # Delete outdated reminders
-                    deleted = await self.db_client.active_reminders.find_one_and_delete(
-                        {'job_id': job_id}
-                    )
-                    if deleted:
-                        self.logger.info(
-                            f'Deleted outdated reminder: {job_id}'
-                        )
                     continue
 
                 # Check if the reminder already exists
@@ -220,16 +213,21 @@ class Tracking:
                         {'job_id': job_id}
                     )
                 )
+
                 if existing_reminder:
-                    # Prepare the reminder document
-                    reminder_document = {
-                        'job_id': job_id,
-                        'type': reminder_type,
-                        'run_date': reminder_time,
-                        'reminder_id': ObjectId(reminder_id),
-                    }
-                    # Update the reminder
-                    await self._update_reminder(job_id, reminder_document)
+                    # Check if the run_date in the database is different from the new reminder_time
+                    if existing_reminder.get('run_date') != reminder_time:
+                        # Prepare the new reminder document with updated information
+                        new_reminder_document = {
+                            'job_id': job_id,
+                            'type': reminder_type,
+                            'run_date': reminder_time,
+                            'reminder_id': ObjectId(reminder_id),
+                        }
+                        # Update the reminder document in the database
+                        await self._update_reminder(job_id, new_reminder_document)
+                    else:
+                        pass  # Reminder already exists with the same run_date
                 else:
                     # Prepare the reminder document
                     reminder_document = {
@@ -242,18 +240,6 @@ class Tracking:
                     # Schedule a new reminder
                     await self._schedule_reminder(job_id, reminder_document)
 
-                # Set an expiration time (5 minutes after the `run_date`)
-                await self.db_client.active_reminders.update_one(
-                    {'job_id': job_id},
-                    {
-                        '$set': {
-                            'expireAt': pend.from_timestamp(
-                                reminder_time + 300
-                            ).isoformat()
-                        }
-                    },
-                )
-
         except Exception as e:
             self.logger.error(
                 f'Error scheduling reminders for {clan_tag} and {war_tag}: {e}'
@@ -261,12 +247,6 @@ class Tracking:
 
     def _send_to_kafka(self, topic, key, data):
         """Helper to send data to Kafka, handling non-JSON-serializable objects like enums."""
-
-        def serialize(obj):
-            """Convert objects like Enums to JSON-serializable values."""
-            if isinstance(obj, Enum):
-                return obj.value  # Use the value of the Enum
-            return obj  # Return the object as-is if it's already serializable
 
         # Serialize the data dictionary
         serialized_data = {k: serialize(v) for k, v in data.items()}
