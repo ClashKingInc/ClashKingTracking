@@ -1,5 +1,10 @@
 name: CI/CD Pipeline
 
+permissions:
+  actions: read
+  contents: read
+  security-events: write
+
 on:
   push:
     branches: [ master ]
@@ -9,7 +14,7 @@ on:
 
 jobs:
   test:
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-22.04
     steps:
       - name: Checkout code
         uses: actions/checkout@v2
@@ -43,5 +48,6 @@ jobs:
     needs: test  # Ensure that tests are successful before deploying
     if: github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v')
     uses: ./.github/workflows/deploy-job.yml
+    secrets: inherit  # Pass secrets to the called workflow
     with:
       docker_tag: latest
