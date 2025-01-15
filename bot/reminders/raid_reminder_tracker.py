@@ -35,12 +35,6 @@ class RaidReminderTracker:
     ):
         """Fetch members who haven't attacked yet from the Clash of Clans API."""
         try:
-            # Initialize mutable defaults if None
-            if townhall_levels is None:
-                townhall_levels = []
-            if roles is None:
-                roles = []
-
             clan = await self._get_clan(clan_tag)
             if not clan:
                 return []

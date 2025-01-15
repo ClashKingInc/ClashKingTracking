@@ -25,7 +25,8 @@ class InactivityReminderTracker:
         ).to_list(length=None)
         return reminders
 
-    async def parse_time(self, reminder_setting):
+    @staticmethod
+    async def parse_time(reminder_setting):
         if 'time' in reminder_setting:
             # Parse the hours from the format 'XX hr'
             hours = int(reminder_setting['time'].replace(' hr', ''))
