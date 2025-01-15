@@ -44,8 +44,6 @@ class WarReminderTracker:
                 }
             ).to_list(length=None)
 
-            print(now_timestamp, lookbehind_timestamp, reminders)
-
             return reminders
         except PyMongoError as e:
             self.logger.error(f'Error fetching reminders from MongoDB: {e}')
@@ -67,7 +65,7 @@ class WarReminderTracker:
             value = ujson.dumps(reminder).encode('utf-8')
             run_date = pend.from_timestamp(reminder['run_date'], tz=pend.UTC)
 
-            self.kafka_producer.send(
+            await self.kafka_producer.send(
                 topic,
                 key=key,
                 value=value,
@@ -106,41 +104,68 @@ class WarReminderTracker:
 
     async def dispatch_reminders(self):
         """Fetch and send reminders to Kafka."""
-        reminders = await self.fetch_due_reminders()
-        if reminders:
+        try:
+            reminders = await self.fetch_due_reminders()
+            if not reminders:
+                self.logger.info('No reminders due for dispatch.')
+                return
+
             for reminder in reminders:
-                try:
-                    # Fetch detailed reminder information from the `reminders` collection
-                    reminder_details = await self.db_client.reminders.find_one(
-                        {'_id': reminder.get('reminder_id')}
-                    )
+                await self._process_single_reminder(reminder)
+        except Exception as e:
+            self.logger.error(f'Error in dispatching reminders: {e}')
 
-                    if not reminder_details:
-                        await self.db_client.reminders.find_one_and_delete(
-                            {'_id': reminder.get('reminder_id')}
-                        )
-                        self.logger.warning(
-                            f"Reminder details not found for reminder_id: {reminder.get('reminder_id')} : Removing reminder from MongoDB."
-                        )
-                        continue
+    async def _process_single_reminder(self, reminder):
+        """Process a single reminder and send it to Kafka."""
+        try:
+            reminder_details = await self._fetch_reminder_details(reminder)
+            if not reminder_details:
+                await self._delete_invalid_reminder(reminder)
+                return
 
-                    # Merge additional details into the reminder before sending to Kafka
-                    enriched_reminder = {**reminder, **reminder_details}
+            enriched_reminder = self._enrich_reminder(
+                reminder, reminder_details
+            )
+            await self.send_to_kafka(enriched_reminder)
+        except Exception as e:
+            self.logger.error(
+                f"Error processing reminder {reminder.get('job_id')}: {e}"
+            )
 
-                    # Convert ObjectId fields to strings for JSON serialization, except for '_id'
-                    for key, value in enriched_reminder.items():
-                        if isinstance(value, ObjectId):
-                            enriched_reminder[key] = str(value)
+    async def _fetch_reminder_details(self, reminder):
+        """Fetch detailed reminder information from the database."""
+        try:
+            return await self.db_client.reminders.find_one(
+                {'_id': reminder.get('reminder_id')}
+            )
+        except Exception as e:
+            self.logger.error(
+                f"Error fetching details for reminder {reminder.get('reminder_id')}: {e}"
+            )
+            return None
 
-                    # Send the enriched reminder to Kafka
-                    await self.send_to_kafka(enriched_reminder)
+    async def _delete_invalid_reminder(self, reminder):
+        """Delete a reminder with missing details from the database."""
+        try:
+            await self.db_client.reminders.find_one_and_delete(
+                {'_id': reminder.get('reminder_id')}
+            )
+            self.logger.warning(
+                f"Reminder details not found for reminder_id: {reminder.get('reminder_id')} : Removing reminder from MongoDB."
+            )
+        except Exception as e:
+            self.logger.error(
+                f"Error deleting invalid reminder {reminder.get('reminder_id')}: {e}"
+            )
 
-                except Exception as e:
-                    self.logger.error(
-                        f"Error processing reminder {reminder.get('job_id')}: {e}"
-                    )
-        else:
-            self.logger.info('No reminders due for dispatch.')
+    @staticmethod
+    def _enrich_reminder(reminder, reminder_details):
+        """Merge additional details into the reminder and prepare it for Kafka."""
+        enriched_reminder = {**reminder, **reminder_details}
+        for key, value in enriched_reminder.items():
+            if isinstance(value, ObjectId):
+                enriched_reminder[key] = str(value)
+        return enriched_reminder
 
     async def run(self):
         """Run the ReminderDispatcher."""

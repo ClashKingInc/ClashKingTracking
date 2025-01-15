@@ -1,10 +1,11 @@
 import asyncio
-import pendulum as pend
-from loguru import logger
-from bot.war.utils import reminder_times
-from utility.config import Config, TrackingType
 import json
 
+import pendulum as pend
+from loguru import logger
+
+from bot.war.utils import reminder_times
+from utility.config import Config, TrackingType
 from utility.utils import serialize
 
 
@@ -17,10 +18,11 @@ class InactivityReminderTracker:
         self.kafka_producer = kafka_producer
         self.coc_client = self.config.coc_client
 
-
     async def fetch_reminders(self):
         """Fetch all inactive reminders from the database."""
-        reminders = await self.db_client.reminders.find({'type': 'inactivity'}).to_list(length=None)
+        reminders = await self.db_client.reminders.find(
+            {'type': 'inactivity'}
+        ).to_list(length=None)
         return reminders
 
     async def parse_time(self, reminder_setting):
@@ -37,32 +39,48 @@ class InactivityReminderTracker:
         upper_bound = now.subtract(seconds=inactive_threshold)
 
         # Fetch all members from the database asynchronously
-        inactive_members = await self.db_client.player_stats.find({
-            'tag': {'$in': clan_members},
-            'last_online': {'$gte': lower_bound.int_timestamp, '$lt': upper_bound.int_timestamp}
-        }).to_list(length=None)
+        inactive_members = await self.db_client.player_stats.find(
+            {
+                'tag': {'$in': clan_members},
+                'last_online': {
+                    '$gte': lower_bound.int_timestamp,
+                    '$lt': upper_bound.int_timestamp,
+                },
+            }
+        ).to_list(length=None)
 
         return inactive_members
 
     async def send_to_kafka(self, inactive_members, reminder):
         """Send notifications about inactive members."""
-        sanitized_reminder = json.loads(json.dumps(reminder, default=serialize))
+        sanitized_reminder = json.loads(
+            json.dumps(reminder, default=serialize)
+        )
         for member in inactive_members:
             try:
-                message = json.dumps({
-                    "name": member["name"],
-                    "last_online": member["last_online"],
-                    "status": "inactive",
-                    "type": "inactivity_notification",
-                    "reminder": sanitized_reminder  # Include the sanitized reminder document
-                }).encode('utf-8')
+                message = json.dumps(
+                    {
+                        'name': member['name'],
+                        'last_online': member['last_online'],
+                        'status': 'inactive',
+                        'type': 'inactivity_notification',
+                        'reminder': sanitized_reminder,  # Include the sanitized reminder document
+                    }
+                ).encode('utf-8')
                 topic = 'member_notifications'
                 key = str(member['_id']).encode('utf-8')
 
                 # Calculate for how many time the member has been inactive (timestamp difference)
-                inactive_time = pend.now('UTC').int_timestamp - member['last_online']
+                inactive_time = (
+                    pend.now('UTC').int_timestamp - member['last_online']
+                )
 
-                await self.kafka_producer.send(topic, key=key, value=message, timestamp_ms=inactive_time * 1000)
+                await self.kafka_producer.send(
+                    topic,
+                    key=key,
+                    value=message,
+                    timestamp_ms=inactive_time * 1000,
+                )
                 # self.logger.info(f'Sent notification to Kafka for inactive member: {member["name"]}')
             except Exception as e:
                 self.logger.error(f'Error sending notification to Kafka: {e}')
@@ -77,7 +95,9 @@ class InactivityReminderTracker:
 
                 # Check for inactive members per threshold
                 for threshold in thresholds:
-                    inactive_members = await self.fetch_inactive_members(threshold, clan_members)
+                    inactive_members = await self.fetch_inactive_members(
+                        threshold, clan_members
+                    )
                     if inactive_members:
                         await self.send_to_kafka(inactive_members, reminder)
         except Exception as e:
@@ -99,23 +119,33 @@ class InactivityReminderTracker:
                         clan_tag = reminder['clan']
                         if clan_tag not in clans_to_thresholds:
                             clans_to_thresholds[clan_tag] = []
-                        clans_to_thresholds[clan_tag].append((threshold, reminder))
+                        clans_to_thresholds[clan_tag].append(
+                            (threshold, reminder)
+                        )
                 except Exception as e:
                     self.logger.error(f'Error parsing reminder: {e}')
 
             # Process each clan concurrently
             tasks = [
-                self.process_clan(clan_tag, [t[0] for t in thresholds], thresholds[0][1])
+                self.process_clan(
+                    clan_tag, [t[0] for t in thresholds], thresholds[0][1]
+                )
                 for clan_tag, thresholds in clans_to_thresholds.items()
             ]
             await asyncio.gather(*tasks)
             total_time = (pend.now('UTC') - start_time).total_seconds()
-            self.logger.info('Inactivity tracking: Finished processing in {:.2f} seconds.'.format(total_time))
+            self.logger.info(
+                'Inactivity tracking: Finished processing in {:.2f} seconds.'.format(
+                    total_time
+                )
+            )
 
         except Exception as e:
-            self.logger.error(f'General error in inactivity tracking loop: {e}')
+            self.logger.error(
+                f'General error in inactivity tracking loop: {e}'
+            )
+
 
 async def main():
     tracker = InactivityReminderTracker()
     await tracker.run()
-

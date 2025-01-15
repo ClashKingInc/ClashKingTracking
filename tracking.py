@@ -15,8 +15,8 @@ from sentry_sdk.integrations.asyncio import AsyncioIntegration
 
 from utility.classes_utils.config_utils import sentry_filter
 from utility.classes_utils.database_utils import generate_custom_id
-from utility.utils import serialize
 from utility.config import Config
+from utility.utils import serialize
 
 
 class Tracking:
@@ -172,7 +172,11 @@ class Tracking:
             # Query the database for predefined reminder settings
             reminders = await self.db_client.reminders.find(
                 {'$and': [{'clan': clan_tag}, {'type': reminder_type}]},
-                {'time': 1, '_id': 1, 'server': 1},  # Only retrieve 'time' and '_id'
+                {
+                    'time': 1,
+                    '_id': 1,
+                    'server': 1,
+                },  # Only retrieve 'time' and '_id'
             ).to_list(length=None)
 
             if not reminders:
@@ -194,7 +198,11 @@ class Tracking:
                 entity_tag = clan_tag
 
             # Iterate through all reminder times
-            for time_seconds, reminder_id, reminder_server in set_times_with_ids:
+            for (
+                time_seconds,
+                reminder_id,
+                reminder_server,
+            ) in set_times_with_ids:
                 # Calculate the reminder time
                 target_time = pend.from_timestamp(
                     reminder_data['end_time'], tz=pend.UTC
@@ -225,7 +233,9 @@ class Tracking:
                             'reminder_id': ObjectId(reminder_id),
                         }
                         # Update the reminder document in the database
-                        await self._update_reminder(job_id, new_reminder_document)
+                        await self._update_reminder(
+                            job_id, new_reminder_document
+                        )
                     else:
                         pass  # Reminder already exists with the same run_date
                 else:

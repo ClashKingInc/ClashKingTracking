@@ -3,12 +3,14 @@ import asyncio
 import pendulum as pend
 from loguru import logger
 
-from utility.config import Config
 from utility.classes_utils.clan_games_utils import is_clan_games
+from utility.config import Config
 
 
 class ClanGamesReminderTracker:
-    def __init__(self, config, db_client, kafka_producer, is_clan_games_func=None):
+    def __init__(
+        self, config, db_client, kafka_producer, is_clan_games_func=None
+    ):
         """Initialize the Clan Games Reminder Tracker."""
         self.logger = logger
         self.config = config
@@ -20,7 +22,9 @@ class ClanGamesReminderTracker:
     async def track_clan_games_reminders(self):
         """Track and process clan games reminders."""
         now = pend.now(tz=pend.UTC)
-        clan_games_end_time = now.start_of('month').add(days=28, hours=9)  # 28th 9:00 UTC
+        clan_games_end_time = now.start_of('month').add(
+            days=28, hours=9
+        )  # 28th 9:00 UTC
         remaining_hours = (clan_games_end_time - now).in_hours()
 
         if remaining_hours <= 0:
@@ -60,16 +64,21 @@ class ClanGamesReminderTracker:
         await self.initialize()
 
         try:
-            logger.info('Clan Games tracking: Clan Games event has started. Start tracking.')
+            logger.info(
+                'Clan Games tracking: Clan Games event has started. Start tracking.'
+            )
             while self.is_clan_games_func():
                 start_time = pend.now(tz=pend.UTC)
                 await self.track_clan_games_reminders()
                 now = pend.now(tz=pend.UTC)
                 next_hour = now.add(hours=1).start_of('hour')
                 sleep_time = (next_hour - now).total_seconds()
-                total_time = (pend.now(tz=pend.UTC) - start_time).total_seconds()
+                total_time = (
+                    pend.now(tz=pend.UTC) - start_time
+                ).total_seconds()
                 logger.info(
-                    f'Processed clan games reminders in {total_time:.2f} seconds. Next execution scheduled at {next_hour}.')
+                    f'Processed clan games reminders in {total_time:.2f} seconds. Next execution scheduled at {next_hour}.'
+                )
                 await asyncio.sleep(sleep_time)
             logger.info(
                 'Clan Games tracking: Clan Games event has ended. Stop tracking.'
@@ -77,4 +86,3 @@ class ClanGamesReminderTracker:
 
         except Exception as e:
             logger.error(f'Error in clan games tracking loop: {e}')
-

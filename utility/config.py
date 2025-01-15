@@ -155,7 +155,6 @@ class Config:
                 await self.coc_client.close()
             raise e
 
-
     def get_kafka_producer(self):
         if self.is_main:
             return KafkaProducer(

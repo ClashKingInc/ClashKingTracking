@@ -1,6 +1,9 @@
 import asyncio
 import json
 
+from loguru import logger
+
+
 class MockKafkaProducer:
     """Mock KafkaProducer for testing purposes with async methods."""
 

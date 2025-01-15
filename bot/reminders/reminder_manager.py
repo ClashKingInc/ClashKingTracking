@@ -1,14 +1,20 @@
 import asyncio
+
 import pendulum
+from inactivity_reminder_tracker import InactivityReminderTracker
+from loguru import logger
+from raid_reminder_tracker import RaidReminderTracker
+from war_reminder_tracker import WarReminderTracker
 
 from bot.reminders.clan_games_reminder_tracker import ClanGamesReminderTracker
-from raid_reminder_tracker import RaidReminderTracker
-from utility.classes_utils.clan_games_utils import get_time_until_next_clan_games
-from utility.classes_utils.raids_utils import get_time_until_next_raid, format_seconds_as_date
-from war_reminder_tracker import WarReminderTracker
-from inactivity_reminder_tracker import InactivityReminderTracker
+from utility.classes_utils.clan_games_utils import (
+    get_time_until_next_clan_games,
+)
+from utility.classes_utils.raids_utils import (
+    format_seconds_as_date,
+    get_time_until_next_raid,
+)
 from utility.config import Config, TrackingType
-from loguru import logger
 
 
 class ReminderManager:
@@ -29,16 +35,24 @@ class ReminderManager:
         self.kafka_producer = self.config.get_kafka_producer()
 
         self.raid_tracker = RaidReminderTracker(
-            config=self.config, db_client=self.db_client, kafka_producer=self.kafka_producer
+            config=self.config,
+            db_client=self.db_client,
+            kafka_producer=self.kafka_producer,
         )
         self.war_tracker = WarReminderTracker(
-            config=self.config, db_client=self.db_client, kafka_producer=self.kafka_producer
+            config=self.config,
+            db_client=self.db_client,
+            kafka_producer=self.kafka_producer,
         )
         self.clan_games_tracker = ClanGamesReminderTracker(
-            config=self.config, db_client=self.db_client, kafka_producer=self.kafka_producer
+            config=self.config,
+            db_client=self.db_client,
+            kafka_producer=self.kafka_producer,
         )
         self.inactivity_tracker = InactivityReminderTracker(
-            config=self.config, db_client=self.db_client, kafka_producer=self.kafka_producer
+            config=self.config,
+            db_client=self.db_client,
+            kafka_producer=self.kafka_producer,
         )
 
     async def cleanup(self):
@@ -58,13 +72,13 @@ class ReminderManager:
                 asyncio.create_task(self.run_raid_tracker()),
                 asyncio.create_task(self.run_war_tracker()),
                 asyncio.create_task(self.run_inactivity_tracker()),
-                asyncio.create_task(self.run_clan_games_tracker())
+                asyncio.create_task(self.run_clan_games_tracker()),
             ]
             await asyncio.gather(*tasks)
         except asyncio.CancelledError:
-            self.logger.info("Tasks were cancelled.")
+            self.logger.info('Tasks were cancelled.')
         except Exception as e:
-            self.logger.error(f"Error in ReminderManager: {e}")
+            self.logger.error(f'Error in ReminderManager: {e}')
         finally:
             await self.cleanup()
 
@@ -74,7 +88,9 @@ class ReminderManager:
         else:
             sleep_time = get_time_until_next_raid()
             date = format_seconds_as_date(sleep_time)
-            self.logger.info(f'Raid tracker: Sleeping until raids start at {date}...')
+            self.logger.info(
+                f'Raid tracker: Sleeping until raids start at {date}...'
+            )
             await asyncio.sleep(sleep_time)
 
     async def run_clan_games_tracker(self):
@@ -83,7 +99,9 @@ class ReminderManager:
         else:
             sleep_time = get_time_until_next_clan_games()
             date = format_seconds_as_date(sleep_time)
-            self.logger.info(f'Clan games tracker: Sleeping until clan games start at {date}...')
+            self.logger.info(
+                f'Clan games tracker: Sleeping until clan games start at {date}...'
+            )
             await asyncio.sleep(sleep_time)
 
     async def run_war_tracker(self):
@@ -95,12 +113,15 @@ class ReminderManager:
             minutes_to_wait = 60 - current_time.minute
             seconds_to_wait = (minutes_to_wait * 60) - current_time.second
             date = format_seconds_as_date(seconds_to_wait)
-            self.logger.info(f'Inactivity tracker: Sleeping until next hour at {date}...')
+            self.logger.info(
+                f'Inactivity tracker: Sleeping until next hour at {date}...'
+            )
             await asyncio.sleep(seconds_to_wait)
             await self.inactivity_tracker.run()
 
 
-if __name__ == "__main__":
+if __name__ == '__main__':
+
     async def main():
         config = Config(TrackingType.BOT_CLAN)
         manager = ReminderManager(reminder_config=config)

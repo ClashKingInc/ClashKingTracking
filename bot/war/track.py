@@ -28,148 +28,114 @@ class WarTracker(Tracking):
     async def _track_item(self, clan_tag):
         """Track updates for a specific clan's war, including CWL."""
         try:
-            # Fetch the current war for the clan
-            try:
-                war = await self.coc_client.get_current_war(clan_tag=clan_tag)
-            except coc.errors.PrivateWarLog:
-                # Search the database for the latest war involving the clan
-                try:
-                    result = (
-                        await self.db_client.clan_wars.find(
-                            {
-                                '$and': [
-                                    {
-                                        'clans': {'$in': [clan_tag]}
-                                    },  # Clan tag is in the list of clans
-                                    {
-                                        'endTime': {
-                                            '$gte': pend.now(
-                                                tz=pend.UTC
-                                            ).int_timestamp
-                                        }
-                                    },
-                                    # War is ongoing or in prep
-                                ]
-                            }
-                        )
-                        .sort([('endTime', -1)])  # Last war first
-                        .to_list(length=None)
-                    )
-
-                    if result:
-                        clans = result[0].get(
-                            'clans', []
-                        )  # Get the list of clans for the last war
-                        if not clans:
-                            self.logger.warning(
-                                f'No clans found in the result for clan {clan_tag}. Skipping.'
-                            )
-                            return
-
-                        opponent_tag = [
-                            tag for tag in clans if tag != clan_tag
-                        ]  # Get the opponent's tag
-                        if not opponent_tag:
-                            self.logger.warning(
-                                f'No opponent tag found for clan {clan_tag}. Skipping.'
-                            )
-                            return
-
-                        opponent_tag = opponent_tag[
-                            0
-                        ]  # Safe to access the first element now
-                        try:
-                            war = await self.coc_client.get_current_war(
-                                clan_tag=opponent_tag
-                            )
-                            # self.logger.info(f"Fetched opponent's war for clan {clan_tag} with opponent {opponent_tag}.")
-                        except coc.errors.PrivateWarLog:
-                            self.logger.warning(
-                                f'Opponent {opponent_tag} also has a private war log. Skipping.'
-                            )
-                            return
-                    else:
-                        # self.logger.info(f"No recent wars found in the database for clan {clan_tag}. Skipping.")
-                        return
-
-                except Exception as e:
-                    self.logger.error(
-                        f"Error fetching opponent's war for clan {clan_tag}: {e}"
-                    )
-                    return
-
-            # Handle CWL wars
-            cwl_next_round = None
-            if war and war.is_cwl:
-                try:
-                    cwl_next_round = await self.coc_client.get_current_war(
-                        clan_tag=clan_tag,
-                        cwl_round=coc.WarRound.current_preparation,
-                    )
-                except Exception as e:
-                    self.logger.error(
-                        f'Error fetching CWL next round for clan {clan_tag}: {e}'
-                    )
-
-            # Combine regular war and CWL next round
+            war = await self._fetch_current_war(clan_tag)
+            cwl_next_round = await self._fetch_cwl_next_round(clan_tag, war)
             wars_to_track = [w for w in [war, cwl_next_round] if w is not None]
 
             for war in wars_to_track:
-                # Handle cases where the API returns None
-                if war is None:
-                    continue
-
-                # Check if the clan is not in war
-                if war.state == 'notInWar':
-                    continue
-
-                # Check for incomplete war data
-                if war.preparation_start_time is None or war.end_time is None:
-                    self.logger.error(
-                        f'Incomplete war data for clan {clan_tag}. Preparation or end time missing. Skipping.'
-                    )
-                    continue
-
-                # Generate a unique war ID for CWL wars
-                war_unique_id = (
-                    (
-                        '-'.join([war.clan.tag, war.opponent.tag])
-                        + f'-{int(war.preparation_start_time.time.timestamp())}'
-                    )
-                    if war.is_cwl
-                    else clan_tag
-                )
-
-                # Retrieve the previously cached war data
-                previous_war = self.war_cache.get(war_unique_id)
-
-                # Cache the current war data
-                self.war_cache[war_unique_id] = war
-
-                if self.is_first_iteration:
-                    continue
-
-                # Process changes if this is the first time or if the war data has changed
-                if (
-                    previous_war is None
-                    or war._raw_data != previous_war._raw_data
-                ):
-                    await self._process_war_changes(
-                        clan_tag, war, previous_war
-                    )
-
-                # Handle CWL-specific changes
-                if war.is_cwl and previous_war:
-                    await self._process_cwl_changes(war, previous_war)
-
-        except coc.errors.PrivateWarLog:
-            pass
-        except coc.errors.NotFound:
+                if self._is_valid_war(war, clan_tag):
+                    await self._process_war_data(clan_tag, war)
+        except (coc.errors.PrivateWarLog, coc.errors.NotFound):
             pass
         except Exception as e:
             self._handle_exception(
                 f'Error tracking war for clan {clan_tag}', e
             )
+
+    async def _fetch_current_war(self, clan_tag):
+        try:
+            return await self.coc_client.get_current_war(clan_tag=clan_tag)
+        except coc.errors.PrivateWarLog:
+            return await self._fetch_opponent_war(clan_tag)
+
+    async def _fetch_opponent_war(self, clan_tag):
+        try:
+            result = (
+                await self.db_client.clan_wars.find(
+                    {
+                        '$and': [
+                            {'clans': {'$in': [clan_tag]}},
+                            {
+                                'endTime': {
+                                    '$gte': pend.now(tz=pend.UTC).int_timestamp
+                                }
+                            },
+                        ]
+                    }
+                )
+                .sort([('endTime', -1)])
+                .to_list(length=None)
+            )
+
+            if not result:
+                return None
+
+            opponent_tag = next(
+                (tag for tag in result[0].get('clans', []) if tag != clan_tag),
+                None,
+            )
+            if not opponent_tag:
+                return None
+
+            try:
+                return await self.coc_client.get_current_war(
+                    clan_tag=opponent_tag
+                )
+            except coc.errors.PrivateWarLog:
+                return None
+            except coc.errors.NotFound:
+                self.logger.error(
+                    f'Opponent {opponent_tag} not found or no active war. Skipping.'
+                )
+                return None
+        except Exception as e:
+            self.logger.error(
+                f"Error fetching opponent's war for clan {clan_tag}: {e}"
+            )
+            return None
+
+    async def _fetch_cwl_next_round(self, clan_tag, war):
+        if war and war.is_cwl:
+            try:
+                return await self.coc_client.get_current_war(
+                    clan_tag=clan_tag,
+                    cwl_round=coc.WarRound.current_preparation,
+                )
+            except Exception as e:
+                self.logger.error(
+                    f'Error fetching CWL next round for clan {clan_tag}: {e}'
+                )
+        return None
+
+    def _is_valid_war(self, war, clan_tag):
+        if war.state == 'notInWar':
+            return False
+        if not war.preparation_start_time or not war.end_time:
+            self.logger.error(
+                f'Incomplete war data for clan {clan_tag}. Preparation or end time missing. Skipping.'
+            )
+            return False
+        return True
+
+    async def _process_war_data(self, clan_tag, war):
+        war_unique_id = self._generate_war_unique_id(war, clan_tag)
+        previous_war = self.war_cache.get(war_unique_id)
+        self.war_cache[war_unique_id] = war
+
+        if self.is_first_iteration:
+            return
+
+        if previous_war is None or war._raw_data != previous_war._raw_data:
+            await self._process_war_changes(clan_tag, war, previous_war)
+
+        if war.is_cwl and previous_war:
+            await self._process_cwl_changes(war, previous_war)
+
+    @staticmethod
+    def _generate_war_unique_id(war, clan_tag):
+        if war.is_cwl:
+            return f"{'-'.join([war.clan.tag, war.opponent.tag])}-{int(war.preparation_start_time.time.timestamp())}"
+        return clan_tag
 
     async def _process_war_changes(self, clan_tag, current_war, previous_war):
         """Process changes between the current and previous wars."""
