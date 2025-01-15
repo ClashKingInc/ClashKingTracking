@@ -29,8 +29,7 @@ jobs:
         run: echo "PYTHONPATH=$PYTHONPATH:$(pwd)" >> $GITHUB_ENV
 
       - name: Run tests
-        run: |
-          pytest --maxfail=0 --disable-warnings --tb=short
+        run: pytest --maxfail=0 --disable-warnings --tb=short
 
       - name: Initialize CodeQL
         uses: github/codeql-action/init@v3
@@ -43,25 +42,6 @@ jobs:
   deploy:
     needs: test  # Ensure that tests are successful before deploying
     if: github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v')
-    runs-on: ubuntu-latest
-    steps:
-      - name: Checkout code
-        uses: actions/checkout@v2
-
-      - name: Set up QEMU
-        uses: docker/setup-qemu-action@v3
-
-      - name: Set up Docker Buildx
-        uses: docker/setup-buildx-action@v3
-
-      - name: Login to Docker Hub
-        uses: docker/login-action@v3
-        with:
-          username: ${{ secrets.DOCKERHUB_USERNAME }}
-          password: ${{ secrets.DOCKERHUB_TOKEN }}
-
-      - name: Build and push
-        uses: docker/build-push-action@v5
-        with:
-          push: true
-          tags: matthewvanderson/clashkingtracking:latest
+    uses: ./.github/workflows/deploy-job.yml
+    with:
+      docker_tag: latest

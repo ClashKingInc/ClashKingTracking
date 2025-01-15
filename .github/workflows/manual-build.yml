@@ -1,0 +1,10 @@
+name: Manual Docker Build
+
+on:
+  workflow_dispatch:  # Allow manual triggering
+
+jobs:
+  manual-build:
+    uses: ./.github/workflows/deploy-job.yml
+    with:
+      docker_tag: manual
