@@ -79,3 +79,13 @@ class MongoDatabase:
         self.server_db: collection_class = self.usafam.server
         self.player_autocomplete: collection_class = self.usafam.player_search
         self.reminders: collection_class = self.usafam.reminders
+        self.active_reminders: collection_class = (
+            self.clashking.active_reminders
+        )
+
+    async def close(self):
+        """Close all MongoDB clients."""
+        if self.stats_client:
+            self.stats_client.close()
+        if self.static_client:
+            self.static_client.close()

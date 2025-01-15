@@ -12,7 +12,9 @@ CLAN_CACHE = {}
 class RaidTracker(Tracking):
     """Class to manage raid weekend tracking."""
 
-    def __init__(self, tracker_type: TrackingType, max_concurrent_requests=1000):
+    def __init__(
+        self, tracker_type: TrackingType, max_concurrent_requests=1000
+    ):
         # Call the parent class constructor
         super().__init__(
             max_concurrent_requests=max_concurrent_requests,
@@ -30,6 +32,7 @@ class RaidTracker(Tracking):
             await self._process_raid_changes(
                 clan_tag, current_raid, previous_raid
             )
+
         except Exception as e:
             self._handle_exception(
                 f'Error tracking raid for clan {clan_tag}', e

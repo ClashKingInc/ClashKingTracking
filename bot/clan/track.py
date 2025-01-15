@@ -10,7 +10,9 @@ from utility.config import TrackingType
 class ClanTracker(Tracking):
     """Class to manage clan tracking."""
 
-    def __init__(self, tracker_type: TrackingType, max_concurrent_requests=1000):
+    def __init__(
+        self, tracker_type: TrackingType, max_concurrent_requests=1000
+    ):
         # Call the parent class constructor
         super().__init__(
             max_concurrent_requests=max_concurrent_requests,
@@ -135,8 +137,4 @@ class ClanTracker(Tracking):
 
 if __name__ == '__main__':
     tracker = ClanTracker(tracker_type=TrackingType.BOT_CLAN)
-    asyncio.run(
-        tracker.run(
-            tracker_class=ClanTracker, loop_interval=20
-        )
-    )
+    asyncio.run(tracker.run(tracker_class=ClanTracker, loop_interval=20))

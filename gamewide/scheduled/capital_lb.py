@@ -1,5 +1,4 @@
 import pendulum as pend
-from pymongo import UpdateOne
 
 from utility.classes import MongoDatabase
 from utility.constants import leagues

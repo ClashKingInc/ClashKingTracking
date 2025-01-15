@@ -1,0 +1,53 @@
+name: CI/CD Pipeline
+
+permissions:
+  actions: read
+  contents: read
+  security-events: write
+
+on:
+  push:
+    branches: [ master ]
+    tags: [ 'v*' ]  # Trigger deployment only for tags starting with v
+  pull_request:
+    branches: [ master ]
+
+jobs:
+  test:
+    runs-on: ubuntu-22.04
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v2
+
+      - name: Set up Python
+        uses: actions/setup-python@v4
+        with:
+          python-version: '3.11'
+
+      - name: Install dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libsnappy-dev
+          pip install -r requirements-test.txt
+
+      - name: Set PYTHONPATH
+        run: echo "PYTHONPATH=$PYTHONPATH:$(pwd)" >> $GITHUB_ENV
+
+      - name: Run tests
+        run: pytest --maxfail=0 --disable-warnings --tb=short
+
+      - name: Initialize CodeQL
+        uses: github/codeql-action/init@v3
+        with:
+          languages: 'python'
+
+      - name: Perform CodeQL Analysis
+        uses: github/codeql-action/analyze@v3
+
+  deploy:
+    needs: test  # Ensure that tests are successful before deploying
+    if: github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v')
+    uses: ./.github/workflows/deploy-job.yml
+    secrets: inherit  # Pass secrets to the called workflow
+    with:
+      docker_tag: latest
