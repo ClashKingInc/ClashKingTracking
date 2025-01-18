@@ -30,11 +30,12 @@ jobs:
           sudo apt-get install -y libsnappy-dev
           pip install -r requirements-test.txt
 
+      - name: Run tests and generate coverage report
+        run: |
+          pytest --maxfail=0 --disable-warnings --tb=short --cov=. --cov-report=xml:coverage.xml
+
       - name: Set PYTHONPATH
         run: echo "PYTHONPATH=$PYTHONPATH:$(pwd)" >> $GITHUB_ENV
-
-      - name: Run tests
-        run: pytest --maxfail=0 --disable-warnings --tb=short
 
       - name: Initialize CodeQL
         uses: github/codeql-action/init@v3
@@ -43,6 +44,14 @@ jobs:
 
       - name: Perform CodeQL Analysis
         uses: github/codeql-action/analyze@v3
+
+      - name: SonarQube Scan
+        uses: SonarSource/sonarqube-scan-action@v4.2.1
+        env:
+          SONAR_TOKEN: ${{ secrets.SONAR_TOKEN }}
+          SONAR_HOST_URL: ${{ secrets.SONAR_HOST_URL }}
+          extraProperties: |
+            sonar.python.coverage.reportPaths=coverage.xml
 
   deploy:
     needs: test  # Ensure that tests are successful before deploying
