@@ -30,13 +30,13 @@ jobs:
           sudo apt-get install -y libsnappy-dev
           pip install -r requirements-test.txt
 
-      - name: Run tests and generate coverage report
-        run: |
-          pytest --maxfail=0 --disable-warnings --tb=short --cov=. --cov-report=xml:coverage.xml
-
       - name: Set PYTHONPATH
         run: echo "PYTHONPATH=$PYTHONPATH:$(pwd)" >> $GITHUB_ENV
 
+      - name: Run tests and generate coverage report
+        run: |
+          pytest --maxfail=0 --disable-warnings --tb=short --cov=. --cov-report=xml:coverage.xml
+          
       - name: Initialize CodeQL
         uses: github/codeql-action/init@v3
         with:
