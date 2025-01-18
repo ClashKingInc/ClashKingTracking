@@ -1,4 +1,4 @@
-aiohttp==3.9.3
+aiohttp==3.10.11
 aiokafka==0.10.0
 APScheduler==3.10.4
 asyncio-throttle==1.0.2
