@@ -3,6 +3,7 @@ from unittest.mock import AsyncMock, MagicMock, patch
 import pytest
 from freezegun import freeze_time
 from loguru import logger
+import pendulum as pend
 
 from bot.reminders.raid_reminder_tracker import RaidReminderTracker
 
@@ -183,3 +184,46 @@ async def test_send_to_kafka():
 
     # Verify Kafka producer behavior
     mock_kafka_producer.send.assert_awaited_once()
+
+
+@pytest.mark.asyncio
+async def test_run_raid_weekend_loop():
+    tracker = RaidReminderTracker(
+        config=MagicMock(),
+        db_client=MagicMock(),
+        kafka_producer=AsyncMock()
+    )
+
+    # Mock methods and functions that should not run real logic
+    tracker.track_raid_reminders = AsyncMock()
+
+    # Control the loop by mocking is_raids_func()
+    # We'll run exactly two iterations, then return False
+    loop_side_effects = [True, True, False]
+    tracker.is_raids_func = MagicMock(side_effect=loop_side_effects)
+
+    # Patch asyncio.sleep so it doesn't block
+    with patch("asyncio.sleep", new=AsyncMock()) as mock_sleep:
+        # Patch pendulum.now for each iteration
+        mock_times = [
+            # First iteration
+            pend.datetime(2025, 1, 10, 6, 0, tz="UTC"),  # start_time
+            pend.datetime(2025, 1, 10, 6, 30, tz="UTC"), # now
+            pend.datetime(2025, 1, 10, 6, 30, tz="UTC"), # end_time of 1st iteration
+
+            # Second iteration
+            pend.datetime(2025, 1, 10, 7, 0, tz="UTC"),  # start_time
+            pend.datetime(2025, 1, 10, 7, 30, tz="UTC"), # now
+            pend.datetime(2025, 1, 10, 7, 30, tz="UTC"), # end_time of 2nd iteration
+        ]
+        with patch("pendulum.now", side_effect=mock_times):
+            await tracker.run()
+
+    # track_raid_reminders should be awaited exactly twice
+    assert tracker.track_raid_reminders.await_count == 2
+
+    # is_raids_func called 3 times: two returns True, last is False
+    assert tracker.is_raids_func.call_count == 3
+
+    # asyncio.sleep was awaited twice, once per iteration
+    assert mock_sleep.await_count == 2

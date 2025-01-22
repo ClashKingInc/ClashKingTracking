@@ -1,10 +1,10 @@
 import asyncio
 
 import pendulum
-from inactivity_reminder_tracker import InactivityReminderTracker
+from bot.reminders.inactivity_reminder_tracker import InactivityReminderTracker
 from loguru import logger
-from raid_reminder_tracker import RaidReminderTracker
-from war_reminder_tracker import WarReminderTracker
+from bot.reminders.raid_reminder_tracker import RaidReminderTracker
+from bot.reminders.war_reminder_tracker import WarReminderTracker
 
 from bot.reminders.clan_games_reminder_tracker import ClanGamesReminderTracker
 from utility.classes_utils.clan_games_utils import (

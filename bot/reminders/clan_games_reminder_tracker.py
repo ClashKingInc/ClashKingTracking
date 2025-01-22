@@ -36,8 +36,6 @@ class ClanGamesReminderTracker:
                 pend.now(tz=pend.UTC).start_of("month").format("YYYY-MM")
             )
 
-            print(clan_members[0].name)
-
             eligible_members = [
                 member.tag
                 for member in clan_members
@@ -74,8 +72,6 @@ class ClanGamesReminderTracker:
                             "role": member.role,
                             "points": points,
                         }
-
-            print(missing_clan_members)
 
             return missing_clan_members
         except Exception as e:

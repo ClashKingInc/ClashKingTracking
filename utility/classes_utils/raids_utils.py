@@ -67,8 +67,9 @@ async def get_raid_log_entry(
     Args:
         clan (coc.Clan): The clan for which the raid log is being retrieved.
         weekend (str): The weekend identifier.
-        bot: The bot instance containing the client and database connections.
         limit (int, optional): The limit on the number of raid logs to fetch. Defaults to 0.
+        coc_client (coc.Clients, optional): The Clash of Clans API client. Defaults to None.
+        db_client (AsyncIOMotorClient, optional): The MongoDB database client. Defaults to None.
 
     Returns:
         RaidLogEntry or None: The raid log entry if found, otherwise None.

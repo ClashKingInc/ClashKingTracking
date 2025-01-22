@@ -1,6 +1,6 @@
 import pytest
 import json
-from unittest.mock import AsyncMock, MagicMock
+from unittest.mock import AsyncMock, MagicMock, patch
 import pendulum as pend
 from bot.reminders.clan_games_reminder_tracker import ClanGamesReminderTracker
 from utility.utils import serialize
@@ -139,3 +139,41 @@ async def test_track_clan_games_reminders():
     tracker.process_reminder.assert_awaited_once()
     mock_db_client.reminders.find.return_value.to_list.assert_awaited_once()  # Correct the assertion
 
+@pytest.mark.asyncio
+async def test_run_clan_games_loop():
+    logger.disable("bot.reminders.clan_games_reminder_tracker")
+    tracker = ClanGamesReminderTracker(
+        config=MagicMock(), db_client=MagicMock(), kafka_producer=AsyncMock()
+    )
+    tracker.track_clan_games_reminders = AsyncMock()
+
+    # Let's say we want 2 iterations before returning False so that the loop ends.
+    loop_side_effects = [True, True, False]
+    tracker.is_clan_games_func = MagicMock(side_effect=loop_side_effects)
+
+    # Patch asyncio.sleep so it doesn't really sleep
+    with patch("asyncio.sleep", new=AsyncMock()) as mock_sleep:
+        # Patch pendulum.now for each iteration, if desired
+        # For 2 iterations + final check, we need 3 calls
+        mock_now_values = [
+            # First iteration
+            pend.datetime(2025, 1, 22, 7, 0, tz="UTC"),  # start_time
+            pend.datetime(2025, 1, 22, 7, 30, tz="UTC"), # now
+            pend.datetime(2025, 1, 22, 7, 30, tz="UTC"), # end_time of first iteration
+
+            # Second iteration
+            pend.datetime(2025, 1, 22, 8, 0, tz="UTC"),  # start_time
+            pend.datetime(2025, 1, 22, 8, 30, tz="UTC"), # now
+            pend.datetime(2025, 1, 22, 8, 30, tz="UTC"), # end_time of second iteration
+        ]
+        with patch("pendulum.now", side_effect=mock_now_values):
+            await tracker.run()
+
+    # Check that track_clan_games_reminders was called exactly 2 times
+    assert tracker.track_clan_games_reminders.await_count == 2
+
+    # is_clan_games_func should have been called 3 times: True, True, then False
+    assert tracker.is_clan_games_func.call_count == 3
+
+    # asyncio.sleep should have been awaited 2 times (one for each loop iteration)
+    assert mock_sleep.await_count == 2
