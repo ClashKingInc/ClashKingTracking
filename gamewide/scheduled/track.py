@@ -12,33 +12,22 @@ from apscheduler.triggers.cron import CronTrigger
 from apscheduler.triggers.interval import IntervalTrigger
 from hashids import Hashids
 from pymongo import InsertOne, UpdateOne
-
-from utility.config import TrackingType
 from utility.constants import locations
-
-"""from .capital_lb import (
+from utility.config import TrackingType
+'''from .capital_lb import (
     calculate_clan_capital_leaderboards,
     calculate_player_capital_looted_leaderboards,
     calculate_raid_medal_leaderboards,
 )
-"""
+'''
 
 
 from tracking import Tracking
 
 
 class ScheduledTracking(Tracking):
-    def __init__(
-        self,
-        tracker_type: TrackingType,
-        max_concurrent_requests=1000,
-        throttle_speed=1000,
-    ):
-        super().__init__(
-            max_concurrent_requests=max_concurrent_requests,
-            tracker_type=tracker_type,
-            throttle_speed=throttle_speed,
-        )
+    def __init__(self, tracker_type: TrackingType):
+        super().__init__(tracker_type=tracker_type)
 
     def setup_scheduler(self):
         """
@@ -47,45 +36,46 @@ class ScheduledTracking(Tracking):
         self.scheduler.add_job(
             self.store_all_leaderboards,
             CronTrigger(hour=4, minute=56),
-            name='Store All Leaderboards',
+            name="Store All Leaderboards",
             misfire_grace_time=300,
         )
         self.scheduler.add_job(
             self.store_legends,
             CronTrigger(day='*', hour=5, minute=56),
-            name='Store Legends',
+            name="Store Legends",
             misfire_grace_time=300,
         )
         self.scheduler.add_job(
             self.store_cwl_wars,
             CronTrigger(day='13', hour=19, minute=37),
-            name='Store CWL Wars',
+            name="Store CWL Wars",
             misfire_grace_time=300,
         )
         self.scheduler.add_job(
             self.store_cwl_groups,
             CronTrigger(day='9-12', hour='*', minute=35),
-            name='Store CWL Groups',
+            name="Store CWL Groups",
             misfire_grace_time=300,
         )
         self.scheduler.add_job(
             self.update_autocomplete,
             IntervalTrigger(minutes=30),
-            name='Update Autocomplete',
+            name="Update Autocomplete",
             misfire_grace_time=300,
         )
         self.scheduler.add_job(
             self.update_region_leaderboards,
             IntervalTrigger(minutes=15),
-            name='Update Region Leaderboards',
+            name="Update Region Leaderboards",
             misfire_grace_time=300,
         )
         self.scheduler.add_job(
-            self.store_clan_capital,
-            CronTrigger(day_of_week='mon', hour=10),
-            name='Store Clan Capital',
-            misfire_grace_time=300,
+             self.store_clan_capital,
+             CronTrigger(day_of_week="mon", hour=10),
+             name="Store Clan Capital",
+             misfire_grace_time=300,
         )
+
 
     async def store_all_leaderboards(self):
         """
@@ -114,15 +104,11 @@ class ScheduledTracking(Tracking):
                     for location in locations
                 ]
 
-                responses = await asyncio.gather(
-                    *tasks, return_exceptions=True
-                )
+                responses = await asyncio.gather(*tasks, return_exceptions=True)
                 store_tasks = []
                 for index, response in enumerate(responses):
                     if isinstance(response, Exception):
-                        self.logger.error(
-                            f'Error fetching data for location {locations[index]}: {response}'
-                        )
+                        self.logger.error(f"Error fetching data for location {locations[index]}: {response}")
                         continue
                     location = locations[index]
                     store_tasks.append(
@@ -130,9 +116,7 @@ class ScheduledTracking(Tracking):
                             {
                                 'location': location,
                                 'date': str(pend.now(tz=pend.UTC).date()),
-                                'data': {
-                                    'items': [x._raw_data for x in response]
-                                },
+                                'data': {'items': [x._raw_data for x in response]},
                             }
                         )
                     )
@@ -140,15 +124,12 @@ class ScheduledTracking(Tracking):
                 if store_tasks:
                     try:
                         await database.bulk_write(store_tasks)
-                        self.logger.info(
-                            f'Stored leaderboards for locations batch.'
-                        )
+                        self.logger.info(f"Stored leaderboards for locations batch.")
                     except Exception as e:
-                        self.logger.error(f'Error storing leaderboards: {e}')
+                        self.logger.error(f"Error storing leaderboards: {e}")
         except Exception as e:
-            self.logger.exception(
-                f'Unexpected error in store_all_leaderboards: {e}'
-            )
+            self.logger.exception(f"Unexpected error in store_all_leaderboards: {e}")
+
 
     async def store_legends(self):
         """
@@ -157,9 +138,7 @@ class ScheduledTracking(Tracking):
         try:
             seasons = await self.coc_client.get_seasons(league_id=29000022)
 
-            seasons_present = await self.db_client.legend_history.distinct(
-                'season'
-            )
+            seasons_present = await self.db_client.legend_history.distinct('season')
             missing = set(seasons) - set(seasons_present)
 
             for year in missing:
@@ -177,40 +156,29 @@ class ScheduledTracking(Tracking):
                         }
                         self.keys.rotate()
                         url = f'https://api.clashofclans.com/v1/leagues/29000022/seasons/{year}?limit=25000{after_param}'
-                        async with session.get(
-                            url, headers=headers
-                        ) as response:
+                        async with session.get(url, headers=headers) as response:
                             if response.status != 200:
                                 print(await response.json())
-                                self.logger.error(
-                                    f'Failed to fetch legends for season {year}: {response.status}'
-                                )
+                                self.logger.error(f"Failed to fetch legends for season {year}: {response.status}")
                                 break
                             items = await response.json()
                             players = items.get('items', [])
                             for player in players:
                                 player['season'] = year
                                 changes.append(InsertOne(player))
-                            after = (
-                                items.get('paging', {})
-                                .get('cursors', {})
-                                .get('after', None)
-                            )
+                            after = items.get('paging', {}).get('cursors', {}).get('after', None)
 
                     if changes:
                         try:
                             await self.db_client.legend_history.bulk_write(
                                 changes, ordered=False
                             )
-                            self.logger.info(
-                                f'Inserted {len(changes)} legend records for season {year}'
-                            )
+                            self.logger.info(f"Inserted {len(changes)} legend records for season {year}")
                         except Exception as e:
-                            self.logger.error(
-                                f'Error inserting legends for season {year}: {e}'
-                            )
+                            self.logger.error(f"Error inserting legends for season {year}: {e}")
         except Exception as e:
-            self.logger.exception(f'Unexpected error in store_legends: {e}')
+            self.logger.exception(f"Unexpected error in store_legends: {e}")
+
 
     async def store_cwl_wars(self):
         """
@@ -219,18 +187,13 @@ class ScheduledTracking(Tracking):
         try:
             hashids = Hashids(min_length=7)
             season = self.gen_games_season()
-            season = '2024-12'
             pipeline = [
                 {'$match': {'data.season': season}},
                 {'$group': {'_id': '$data.rounds.warTags'}},
             ]
-            result = await self.db_client.cwl_group.aggregate(
-                pipeline
-            ).to_list(length=None)
+            result = await self.db_client.cwl_group.aggregate(pipeline).to_list(length=None)
             done_for_this_season = [x['_id'] for x in result]
-            done_for_this_season = [
-                j for sub in done_for_this_season for j in sub
-            ]
+            done_for_this_season = [j for sub in done_for_this_season for j in sub]
             all_tags = set([j for sub in done_for_this_season for j in sub])
             self.logger.info(f'{len(all_tags)} war tags total')
 
@@ -242,20 +205,18 @@ class ScheduledTracking(Tracking):
                 [
                     x['_id']
                     for x in (
-                        await self.db_client.clan_wars.aggregate(
-                            pipeline
-                        ).to_list(length=None)
+                    await self.db_client.clan_wars.aggregate(pipeline).to_list(
+                        length=None
                     )
+                )
                 ]
             )
-            self.logger.info(
-                f'{len(tags_already_found)} war tags already found'
-            )
+            self.logger.info(f'{len(tags_already_found)} war tags already found')
             all_tags = [t for t in all_tags if t not in tags_already_found]
 
             self.logger.info(f'{len(all_tags)} war tags to find')
             all_tags = [
-                all_tags[i : i + self.batch_size]
+                all_tags[i: i + self.batch_size]
                 for i in range(0, len(all_tags), self.batch_size)
             ]
 
@@ -273,15 +234,11 @@ class ScheduledTracking(Tracking):
                     self.logger.info(f'{len(tasks)} tasks')
                     responses = await asyncio.gather(*tasks)
 
-                self.logger.info(
-                    f'{len(responses)} responses | {time.time() - start_time} sec'
-                )
+                self.logger.info(f'{len(responses)} responses | {time.time() - start_time} sec')
 
                 add_war = []
                 responses = [
-                    (orjson.loads(r), tag)
-                    for r, tag in responses
-                    if r is not None
+                    (orjson.loads(r), tag) for r, tag in responses if r is not None
                 ]
                 self.logger.info(
                     f'{len(responses)} valid responses | {time.time() - start_time} sec'
@@ -290,9 +247,7 @@ class ScheduledTracking(Tracking):
                     try:
                         response['tag'] = tag
                         response['season'] = season
-                        war = coc.ClanWar(
-                            data=response, client=self.coc_client
-                        )
+                        war = coc.ClanWar(data=response, client=self.coc_client)
                         if war.preparation_start_time is None:
                             continue
                         custom_id = hashids.encode(
@@ -318,13 +273,9 @@ class ScheduledTracking(Tracking):
                             }
                         )
                     except Exception as e:
-                        self.logger.error(
-                            f'Error processing war data for tag {tag}: {e}'
-                        )
+                        self.logger.error(f"Error processing war data for tag {tag}: {e}")
 
-                self.logger.info(
-                    f'Working on adding | {time.time() - start_time} sec'
-                )
+                self.logger.info(f'Working on adding | {time.time() - start_time} sec')
                 if add_war:
                     try:
                         await self.db_client.clan_wars.insert_many(
@@ -334,9 +285,10 @@ class ScheduledTracking(Tracking):
                             f'{len(add_war)} Wars Updated/Inserted | {time.time() - start_time} sec'
                         )
                     except Exception as e:
-                        self.logger.error(f'Error inserting wars: {e}')
+                        self.logger.error(f"Error inserting wars: {e}")
         except Exception as e:
-            self.logger.exception(f'Unexpected error in store_cwl_wars: {e}')
+            self.logger.exception(f"Unexpected error in store_cwl_wars: {e}")
+
 
     async def store_cwl_groups(self):
         """
@@ -345,9 +297,7 @@ class ScheduledTracking(Tracking):
         try:
             season = self.gen_games_season()
 
-            async def fetch_group(
-                url, session: aiohttp.ClientSession, headers, tag
-            ):
+            async def fetch_group(url, session: aiohttp.ClientSession, headers, tag):
                 async with session.get(url, headers=headers) as response:
                     if response.status == 200:
                         return ((await response.json()), tag)
@@ -357,19 +307,14 @@ class ScheduledTracking(Tracking):
             all_tags = [
                 x['_id']
                 for x in (
-                    await self.db_client.basic_clan.aggregate(
-                        pipeline
-                    ).to_list(length=None)
+                    await self.db_client.basic_clan.aggregate(pipeline).to_list(length=None)
                 )
             ]
 
             pipeline = [
                 {
                     '$match': {
-                        '$and': [
-                            {'data.season': season},
-                            {'data.state': 'ended'},
-                        ]
+                        '$and': [{'data.season': season}, {'data.state': 'ended'}]
                     }
                 },
                 {'$group': {'_id': '$data.clans.tag'}},
@@ -377,22 +322,18 @@ class ScheduledTracking(Tracking):
             done_for_this_season = [
                 x['_id']
                 for x in (
-                    await self.db_client.cwl_group.aggregate(pipeline).to_list(
-                        length=None
-                    )
+                    await self.db_client.cwl_group.aggregate(pipeline).to_list(length=None)
                 )
             ]
             done_for_this_season = set(
                 [j for sub in done_for_this_season for j in sub]
             )
 
-            all_tags = [
-                tag for tag in all_tags if tag not in done_for_this_season
-            ]
+            all_tags = [tag for tag in all_tags if tag not in done_for_this_season]
 
             size_break = 50000
             all_tags = [
-                all_tags[i : i + size_break]
+                all_tags[i: i + size_break]
                 for i in range(0, len(all_tags), size_break)
             ]
 
@@ -402,9 +343,7 @@ class ScheduledTracking(Tracking):
                 connector = aiohttp.TCPConnector(limit=250, ttl_dns_cache=300)
                 timeout = aiohttp.ClientTimeout(total=1800)
                 async with aiohttp.ClientSession(
-                    connector=connector,
-                    timeout=timeout,
-                    json_serialize=ujson.dumps,
+                    connector=connector, timeout=timeout, json_serialize=ujson.dumps
                 ) as session:
                     for tag in tag_group:
                         if tag in was_found_in_a_previous_group:
@@ -419,16 +358,10 @@ class ScheduledTracking(Tracking):
                                 tag,
                             )
                         )
-                    responses = await asyncio.gather(
-                        *tasks, return_exceptions=True
-                    )
+                    responses = await asyncio.gather(*tasks, return_exceptions=True)
 
                 changes = []
-                responses = [
-                    r
-                    for r in responses
-                    if isinstance(r, tuple) and r[0] is not None
-                ]
+                responses = [r for r in responses if isinstance(r, tuple) and r[0] is not None]
                 for response, tag in responses:
                     try:
                         season = response.get('season')
@@ -449,19 +382,16 @@ class ScheduledTracking(Tracking):
                             )
                         )
                     except Exception as e:
-                        self.logger.error(
-                            f'Error processing cwl_group data for tag {tag}: {e}'
-                        )
+                        self.logger.error(f"Error processing cwl_group data for tag {tag}: {e}")
                 if changes:
                     try:
                         await self.db_client.cwl_group.bulk_write(changes)
-                        self.logger.info(
-                            f'{len(changes)} Changes Updated/Inserted'
-                        )
+                        self.logger.info(f'{len(changes)} Changes Updated/Inserted')
                     except Exception as e:
-                        self.logger.error(f'Error writing cwl_group: {e}')
+                        self.logger.error(f"Error writing cwl_group: {e}")
         except Exception as e:
-            self.logger.exception(f'Unexpected error in store_cwl_groups: {e}')
+            self.logger.exception(f"Unexpected error in store_cwl_groups: {e}")
+
 
     async def update_autocomplete(self):
         """
@@ -479,15 +409,15 @@ class ScheduledTracking(Tracking):
             all_player_tags = [
                 x['tag']
                 for x in (
-                    await self.db_client.player_stats.aggregate(
-                        pipeline
-                    ).to_list(length=None)
+                    await self.db_client.player_stats.aggregate(pipeline).to_list(
+                        length=None
+                    )
                 )
             ]
 
             split_size = 50_000
             split_tags = [
-                all_player_tags[i : i + split_size]
+                all_player_tags[i: i + split_size]
                 for i in range(0, len(all_player_tags), split_size)
             ]
 
@@ -499,14 +429,10 @@ class ScheduledTracking(Tracking):
                 for response in previous_player_responses:
                     if response is not None:
                         try:
-                            response = orjson.loads(
-                                snappy.decompress(response)
-                            )
+                            response = orjson.loads(snappy.decompress(response))
                             d = {
                                 'name': response.get('name'),
-                                'clan': response.get('clan', {}).get(
-                                    'tag', 'No Clan'
-                                ),
+                                'clan': response.get('clan', {}).get('tag', 'No Clan'),
                                 'league': response.get('league', {}).get(
                                     'name', 'Unranked'
                                 ),
@@ -519,32 +445,21 @@ class ScheduledTracking(Tracking):
                             }
                             tasks.append(
                                 UpdateOne(
-                                    {'tag': response.get('tag')},
-                                    {'$set': d},
-                                    upsert=True,
+                                    {'tag': response.get('tag')}, {'$set': d}, upsert=True
                                 )
                             )
                         except Exception as e:
-                            self.logger.error(
-                                f'Error processing player data: {e}'
-                            )
-                self.logger.info(
-                    f'Starting bulk write: took {time.time() - t} secs'
-                )
+                            self.logger.error(f"Error processing player data: {e}")
+                self.logger.info(f'Starting bulk write: took {time.time() - t} secs')
                 if tasks:
                     try:
-                        await self.db_client.player_autocomplete.bulk_write(
-                            tasks, ordered=False
-                        )
-                        self.logger.info(
-                            f'Updated autocomplete for {len(tasks)} players'
-                        )
+                        await self.db_client.player_autocomplete.bulk_write(tasks, ordered=False)
+                        self.logger.info(f"Updated autocomplete for {len(tasks)} players")
                     except Exception as e:
-                        self.logger.error(f'Error updating autocomplete: {e}')
+                        self.logger.error(f"Error updating autocomplete: {e}")
         except Exception as e:
-            self.logger.exception(
-                f'Unexpected error in update_autocomplete: {e}'
-            )
+            self.logger.exception(f"Unexpected error in update_autocomplete: {e}")
+
 
     async def update_region_leaderboards(self):
         """
@@ -566,20 +481,14 @@ class ScheduledTracking(Tracking):
 
             for index, response in enumerate(responses):
                 if isinstance(response, Exception):
-                    self.logger.error(
-                        f'Error fetching players for location {locations[index]}: {response}'
-                    )
+                    self.logger.error(f"Error fetching players for location {locations[index]}: {response}")
                     continue
                 location = locations[index]
                 if location != 'global':
                     try:
-                        location_obj = await self.coc_client.get_location(
-                            location
-                        )
+                        location_obj = await self.coc_client.get_location(location)
                     except Exception as e:
-                        self.logger.error(
-                            f'Error fetching location details for {location}: {e}'
-                        )
+                        self.logger.error(f"Error fetching location details for {location}: {e}")
                         continue
                 for player in response:
                     if not isinstance(player, coc.RankedPlayer):
@@ -609,33 +518,19 @@ class ScheduledTracking(Tracking):
 
             if lb_changes:
                 try:
-                    await self.db_client.region_leaderboard.bulk_write(
-                        lb_changes
-                    )
-                    self.logger.info(
-                        f'Updated region leaderboards with {len(lb_changes)} changes'
-                    )
+                    await self.db_client.region_leaderboard.bulk_write(lb_changes)
+                    self.logger.info(f"Updated region leaderboards with {len(lb_changes)} changes")
                 except Exception as e:
-                    self.logger.error(
-                        f'Error updating region leaderboards: {e}'
-                    )
+                    self.logger.error(f"Error updating region leaderboards: {e}")
 
             # Reset builder ranks
             await self.db_client.region_leaderboard.update_many(
-                {},
-                {
-                    '$set': {
-                        'builder_global_rank': None,
-                        'builder_local_rank': None,
-                    }
-                },
+                {}, {'$set': {'builder_global_rank': None, 'builder_local_rank': None}}
             )
             lb_changes = []
             tasks = [
                 asyncio.create_task(
-                    self.coc_client.get_location_players_builder_base(
-                        location_id=location
-                    )
+                    self.coc_client.get_location_players_builder_base(location_id=location)
                 )
                 for location in locations
             ]
@@ -643,20 +538,14 @@ class ScheduledTracking(Tracking):
 
             for index, response in enumerate(responses):
                 if isinstance(response, Exception):
-                    self.logger.error(
-                        f'Error fetching builder players for location {locations[index]}: {response}'
-                    )
+                    self.logger.error(f"Error fetching builder players for location {locations[index]}: {response}")
                     continue
                 location = locations[index]
                 if location != 'global':
                     try:
-                        location_obj = await self.coc_client.get_location(
-                            location
-                        )
+                        location_obj = await self.coc_client.get_location(location)
                     except Exception as e:
-                        self.logger.error(
-                            f'Error fetching location details for {location}: {e}'
-                        )
+                        self.logger.error(f"Error fetching location details for {location}: {e}")
                         continue
                 for player in response:
                     if not isinstance(player, coc.RankedPlayer):
@@ -690,41 +579,34 @@ class ScheduledTracking(Tracking):
 
             if lb_changes:
                 try:
-                    await self.db_client.region_leaderboard.bulk_write(
-                        lb_changes
-                    )
-                    self.logger.info(
-                        f'Updated builder leaderboards with {len(lb_changes)} changes'
-                    )
+                    await self.db_client.region_leaderboard.bulk_write(lb_changes)
+                    self.logger.info(f"Updated builder leaderboards with {len(lb_changes)} changes")
                 except Exception as e:
-                    self.logger.error(
-                        f'Error updating builder leaderboards: {e}'
-                    )
+                    self.logger.error(f"Error updating builder leaderboards: {e}")
         except Exception as e:
-            self.logger.exception(
-                f'Unexpected error in update_region_leaderboards: {e}'
-            )
+            self.logger.exception(f"Unexpected error in update_region_leaderboards: {e}")
+
 
     async def store_clan_capital(self):
         """
         Store clan capital raid seasons data.
         """
         try:
-            pipeline = [{'$match': {}}, {'$group': {'_id': '$tag'}}]
+            pipeline = [{'$match': {"capitalLeague" : {"$ne" : "Unranked"}, "isValid" : True, "clanCapitalHallLevel" : {"$gte" : 5}}}, {'$group': {'_id': '$tag'}}]
             all_tags = [
                 x['_id']
                 for x in (
-                    await self.db_client.global_clans.aggregate(
-                        pipeline
-                    ).to_list(length=None)
+                    await self.db_client.global_clans.aggregate(pipeline).to_list(
+                        length=None
+                    )
                 )
             ]
             all_tags = [
-                all_tags[i : i + self.batch_size]
+                all_tags[i: i + self.batch_size]
                 for i in range(0, len(all_tags), self.batch_size)
             ]
             now = pend.now()  # Current time in your system's timezone
-            start_of_week = now.start_of('week').subtract(days=1)
+            start_of_week = now.start_of("week").subtract(days=1)
             end_of_week = start_of_week.add(weeks=1)
 
             for tag_group in all_tags:
@@ -734,118 +616,69 @@ class ScheduledTracking(Tracking):
                         self.fetch(
                             url=f"https://api.clashofclans.com/v1/clans/{tag.replace('#', '%23')}/capitalraidseasons?limit=1",
                             tag=tag,
-                            json=True,
+                            json=True
                         )
                     )
-                responses = await asyncio.gather(
-                    *tasks, return_exceptions=True
-                )
+                responses = await asyncio.gather(*tasks, return_exceptions=True)
 
                 changes = []
-                responses = [
-                    r
-                    for r in responses
-                    if isinstance(r, tuple) and r[0] is not None
-                ]
+                responses = [r for r in responses if isinstance(r, tuple) and r[0] is not None]
                 for response, tag in responses:
                     try:
                         # We shouldn't have completely invalid tags, they all existed at some point
                         if not response['items']:
                             continue
-                        date = pend.instance(
-                            coc.Timestamp(
-                                data=response['items'][0]['endTime']
-                            ).time,
-                            tz=pend.UTC,
-                        )
+                        date = pend.instance(coc.Timestamp(data=response['items'][0]['endTime']).time, tz=pend.UTC)
                         if start_of_week <= date <= end_of_week:
                             changes.append(
                                 InsertOne(
-                                    {
-                                        'clan_tag': tag,
-                                        'data': response['items'][0],
-                                    }
+                                    {'clan_tag': tag, 'data': response['items'][0]}
                                 )
                             )
                     except Exception as e:
-                        self.logger.error(
-                            f'Error processing clan capital data for tag {tag}: {e}'
-                        )
+                        self.logger.error(f"Error processing clan capital data for tag {tag}: {e}")
 
                 try:
-                    self.logger.info(f'{len(changes)} CHANGES')
+                    self.logger.info(f"{len(changes)} CHANGES")
                     if changes:
-                        await self.db_client.raid_weekends.bulk_write(
-                            changes, ordered=False
-                        )
+                        await self.db_client.raid_weekends.bulk_write(changes, ordered=False)
                 except Exception as e:
-                    self.logger.error(f'Error writing raid_weekends: {e}')
+                    self.logger.error(f"Error writing raid_weekends: {e}")
 
             # Uncomment if needed
             # await calculate_player_capital_looted_leaderboards(db_client=self.db_client)
             # await calculate_clan_capital_leaderboards(db_client=self.db_client)
             # await calculate_raid_medal_leaderboards(db_client=self.db_client)
         except Exception as e:
-            self.logger.exception(
-                f'Unexpected error in store_clan_capital: {e}'
-            )
+            self.logger.exception(f"Unexpected error in store_clan_capital: {e}")
+
 
     async def find_new_clans(self):
         now = pend.now()
         cutoff_date = now.subtract(days=30)
 
         pipeline_1 = [
-            {'$match': {'endTime': {'$gte': int(cutoff_date.timestamp())}}},
-            {'$unwind': '$clans'},
-            {
-                '$group': {'_id': '$clans'}
-            },  # Keep unique clans as separate documents
+            {"$match": {"endTime": {"$gte": int(cutoff_date.timestamp())}}},
+            {"$unwind": "$clans"},
+            {"$group": {"_id": "$clans"}}  # Keep unique clans as separate documents
         ]
-        result_1 = await self.db_client.clan_wars.aggregate(
-            pipeline_1
-        ).to_list(length=None)
+        result_1 = await self.db_client.clan_wars.aggregate(pipeline_1).to_list(length=None)
         unique_clans = {doc['_id'] for doc in result_1}
 
         pipeline_2 = [
-            {
-                '$match': {
-                    'data.endTime': {
-                        '$gte': cutoff_date.strftime('%Y%m%dT%H%M%S.000Z')
-                    }
-                }
-            },
-            {
-                '$unwind': {
-                    'path': '$data.attackLog',
-                    'preserveNullAndEmptyArrays': True,
-                }
-            },
-            {'$group': {'_id': '$data.attackLog.defender.tag'}},
+            {"$match": {"data.endTime": {"$gte": cutoff_date.strftime('%Y%m%dT%H%M%S.000Z')}}},
+            {"$unwind": {"path": "$data.attackLog", "preserveNullAndEmptyArrays": True}},
+            {"$group": {"_id": "$data.attackLog.defender.tag"}}
         ]
-        attack_tags = await self.db_client.raid_weekends.aggregate(
-            pipeline_2
-        ).to_list(length=None)
+        attack_tags = await self.db_client.raid_weekends.aggregate(pipeline_2).to_list(length=None)
         attack_tags = {doc['_id'] for doc in attack_tags if doc['_id']}
 
         pipeline_3 = [
-            {
-                '$match': {
-                    'data.endTime': {
-                        '$gte': cutoff_date.strftime('%Y%m%dT%H%M%S.000Z')
-                    }
-                }
-            },
-            {
-                '$unwind': {
-                    'path': '$data.defenseLog',
-                    'preserveNullAndEmptyArrays': True,
-                }
-            },
-            {'$group': {'_id': '$data.defenseLog.attacker.tag'}},
+            {"$match": {"data.endTime": {"$gte": cutoff_date.strftime('%Y%m%dT%H%M%S.000Z')}}},
+            {"$unwind": {"path": "$data.defenseLog", "preserveNullAndEmptyArrays": True}},
+            {"$group": {"_id": "$data.defenseLog.attacker.tag"}}
         ]
-        defense_tags = await self.db_client.raid_weekends.aggregate(
-            pipeline_3
-        ).to_list(length=None)
+        defense_tags = await self.db_client.raid_weekends.aggregate(pipeline_3).to_list(length=None)
         defense_tags = {doc['_id'] for doc in defense_tags if doc['_id']}
 
         unique_tags = attack_tags.union(defense_tags)
@@ -856,9 +689,9 @@ class ScheduledTracking(Tracking):
         existing_clans = [
             x['_id']
             for x in (
-                await self.db_client.global_clans.aggregate(
-                    pipeline_4
-                ).to_list(length=None)
+                await self.db_client.global_clans.aggregate(pipeline_4).to_list(
+                    length=None
+                )
             )
         ]
         existing_clans = set(existing_clans)
@@ -867,19 +700,33 @@ class ScheduledTracking(Tracking):
         print(len(new_clans))
         tags_to_add = []
         for clan in new_clans:
-            tags_to_add.append(InsertOne({'tag': clan}))
+            tags_to_add.append(
+                InsertOne({'tag': clan})
+            )
         results = await self.db_client.global_clans.bulk_write(
             tags_to_add, ordered=False
         )
         print(results.bulk_api_result)
 
 
-if __name__ == '__main__':
-    tracker = ScheduledTracking(tracker_type=TrackingType.GLOBAL_SCHEDULED)
-    asyncio.run(
-        tracker.run(
-            tracker_class=ScheduledTracking,
-            use_scheduler=True,
-            setup_scheduler_method=lambda tracker: tracker.setup_scheduler(),
-        )
-    )
+    async def run(self):
+        """
+        Start the scheduler and keep the application running.
+        """
+        try:
+            await self.initialize()
+            #self.setup_scheduler()
+            await self.store_clan_capital()
+            #self.scheduler.start()
+            self.logger.info("Scheduler started. Running scheduled jobs...")
+            # Keep the main thread alive
+            while True:
+                await asyncio.sleep(3600)  # Sleep for an hour, adjust as needed
+        except (KeyboardInterrupt, SystemExit):
+            self.logger.info("Shutting down scheduler...")
+            self.scheduler.shutdown()
+
+
+if __name__ == "__main__":
+    tracker = ScheduledTracking(tracker_type=TrackingType.GLOBAL_SCHEDULED)  # Replace with appropriate type
+    asyncio.run(tracker.run())
