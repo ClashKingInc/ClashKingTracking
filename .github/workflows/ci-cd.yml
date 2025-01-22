@@ -8,11 +8,9 @@ permissions:
 on:
   push:
     branches: [ master ]
-    tags: [ 'v*' ]  # Trigger deployment only for tags starting with 'v'
+    tags: [ 'v*' ]  # Trigger deployment only for tags starting with v
   pull_request:
     branches: [ master ]
-  schedule:
-    - cron: '41 7 * * 6'  # Run every Saturday at 7:41 UTC
 
 jobs:
   test:
@@ -39,37 +37,23 @@ jobs:
         run: |
           pytest --maxfail=0 --disable-warnings --tb=short --cov=. --cov-report=xml:coverage.xml
 
-  codeql:
-    runs-on: ubuntu-22.04
-    permissions:
-      security-events: write
-    strategy:
-      fail-fast: false
-      matrix:
-        include:
-        - language: python
-          build-mode: none
-    steps:
-      - name: Checkout repository
-        uses: actions/checkout@v4
-
-      - name: Initialize CodeQL
-        uses: github/codeql-action/init@v3
+      - name: Upload coverage.xml as artifact
+        uses: actions/upload-artifact@v3
         with:
-          languages: ${{ matrix.language }}
-          build-mode: ${{ matrix.build-mode }}
-
-      - name: Perform CodeQL Analysis
-        uses: github/codeql-action/analyze@v3
-        with:
-          category: "/language:${{ matrix.language }}"
+          name: coverage-report
+          path: coverage.xml
 
   sonarqube:
-    needs: test  # Need the test job to succeed
+    needs: test  # Ensure the test job finishes before starting this one
     runs-on: ubuntu-22.04
     steps:
       - name: Checkout code
         uses: actions/checkout@v2
+
+      - name: Download coverage.xml artifact
+        uses: actions/download-artifact@v3
+        with:
+          name: coverage-report
 
       - name: SonarQube Scan
         uses: SonarSource/sonarqube-scan-action@v4.2.1
@@ -80,7 +64,7 @@ jobs:
             sonar.python.coverage.reportPaths=coverage.xml
 
   deploy:
-    needs: [test, codeql, sonarqube]  # Need all previous jobs to succeed
+    needs: [test, sonarqube, codeql]  # Ensure all previous jobs succeed
     if: github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v')
     uses: ./.github/workflows/deploy-job.yml
     secrets: inherit
