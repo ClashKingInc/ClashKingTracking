@@ -3,12 +3,17 @@ import pendulum as pend
 
 def is_clan_games():
     """
-    Check if the current time is within the clan games tracking window (22th 7:00 UTC to 28th 9:00 UTC).
+    Check if the current time is within the clan games tracking window (22nd 7:00 UTC to 28th 9:00 UTC).
     """
+    # Calculate the start and end times for clan games
     now = pend.now('UTC')
-    start_time = now.start_of('month').add(days=22, hours=7)  # 22th 7:00 UTC
-    end_time = now.start_of('month').add(days=28, hours=9)  # 28th 9:00 UTC
-    return start_time <= now < end_time
+    start_time = now.replace(
+        day=22, hour=7, minute=0, second=0
+    )  # 22nd 7:00 UTC
+    end_time = now.replace(day=28, hour=9, minute=0, second=0)  # 28th 9:00 UTC
+    # Check if now is within the range
+    is_within = start_time <= now < end_time
+    return is_within
 
 
 def get_time_until_next_clan_games():

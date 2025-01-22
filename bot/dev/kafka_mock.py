@@ -35,7 +35,8 @@ class MockKafkaProducer:
         # Print the full message details
         print(f'[MOCK PRODUCER] Message sent: {self.messages[-1]}')
 
-    async def stop(self):
+    @staticmethod
+    async def close():
         """Asynchronously mock stopping the producer."""
         await asyncio.sleep(0.1)  # Sleep to simulate async behavior
         print('[MOCK PRODUCER] Stopped Kafka producer.')
