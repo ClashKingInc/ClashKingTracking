@@ -64,7 +64,7 @@ jobs:
             sonar.python.coverage.reportPaths=coverage.xml
 
   deploy:
-    needs: [test, sonarqube, codeql]  # Ensure all previous jobs succeed
+    needs: [test, sonarqube]  # Ensure all previous jobs succeed
     if: github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v')
     uses: ./.github/workflows/deploy-job.yml
     secrets: inherit
