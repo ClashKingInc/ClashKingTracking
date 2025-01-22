@@ -198,7 +198,7 @@ class RaidReminderTracker:
         """Send a reminder to Kafka."""
         try:
             topic = reminder.get('type', 'reminders')
-            key = reminder.get('clan', 'unknown').encode('utf-8')  #
+            key = reminder.get('clan', 'unknown').encode('utf-8')
             sanitized_reminder = json.loads(
                 json.dumps(reminder, default=serialize)
             )

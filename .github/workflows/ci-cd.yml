@@ -8,9 +8,11 @@ permissions:
 on:
   push:
     branches: [ master ]
-    tags: [ 'v*' ]  # Trigger deployment only for tags starting with v
+    tags: [ 'v*' ]  # Trigger deployment only for tags starting with 'v'
   pull_request:
     branches: [ master ]
+  schedule:
+    - cron: '41 7 * * 6'  # Run every Saturday at 7:41 UTC
 
 jobs:
   test:
@@ -36,14 +38,38 @@ jobs:
       - name: Run tests and generate coverage report
         run: |
           pytest --maxfail=0 --disable-warnings --tb=short --cov=. --cov-report=xml:coverage.xml
-          
+
+  codeql:
+    runs-on: ubuntu-22.04
+    permissions:
+      security-events: write
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+        - language: python
+          build-mode: none
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
       - name: Initialize CodeQL
         uses: github/codeql-action/init@v3
         with:
-          languages: 'python'
+          languages: ${{ matrix.language }}
+          build-mode: ${{ matrix.build-mode }}
 
       - name: Perform CodeQL Analysis
         uses: github/codeql-action/analyze@v3
+        with:
+          category: "/language:${{ matrix.language }}"
+
+  sonarqube:
+    needs: test  # Need the test job to succeed
+    runs-on: ubuntu-22.04
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v2
 
       - name: SonarQube Scan
         uses: SonarSource/sonarqube-scan-action@v4.2.1
@@ -54,9 +80,9 @@ jobs:
             sonar.python.coverage.reportPaths=coverage.xml
 
   deploy:
-    needs: test  # Ensure that tests are successful before deploying
+    needs: [test, codeql, sonarqube]  # Need all previous jobs to succeed
     if: github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v')
     uses: ./.github/workflows/deploy-job.yml
-    secrets: inherit  # Pass secrets to the called workflow
+    secrets: inherit
     with:
       docker_tag: latest
