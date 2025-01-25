@@ -36,6 +36,8 @@ jobs:
       - name: Run tests and generate coverage report
         run: |
           pytest --maxfail=0 --disable-warnings --tb=short --cov=. --cov-report=xml:coverage.xml
+        env:
+          BOT_TOKEN: ${{ secrets.FAKE_BETA_BOT_TOKEN }}
 
       - name: Upload coverage.xml as artifact
         uses: actions/upload-artifact@v3

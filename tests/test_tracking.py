@@ -1,3 +1,5 @@
+import os
+
 import pytest
 import asyncio
 import pendulum as pend
@@ -5,7 +7,6 @@ from unittest.mock import MagicMock, AsyncMock, patch
 from tracking import Tracking
 from pymongo import ReturnDocument
 from bson import ObjectId
-
 
 @pytest.mark.asyncio
 async def test_initialize():
