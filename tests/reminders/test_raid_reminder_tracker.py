@@ -1,9 +1,9 @@
 from unittest.mock import AsyncMock, MagicMock, patch
 
+import pendulum as pend
 import pytest
 from freezegun import freeze_time
 from loguru import logger
-import pendulum as pend
 
 from bot.reminders.raid_reminder_tracker import RaidReminderTracker
 
@@ -189,9 +189,7 @@ async def test_send_to_kafka():
 @pytest.mark.asyncio
 async def test_run_raid_weekend_loop():
     tracker = RaidReminderTracker(
-        config=MagicMock(),
-        db_client=MagicMock(),
-        kafka_producer=AsyncMock()
+        config=MagicMock(), db_client=MagicMock(), kafka_producer=AsyncMock()
     )
 
     # Mock methods and functions that should not run real logic
@@ -203,20 +201,23 @@ async def test_run_raid_weekend_loop():
     tracker.is_raids_func = MagicMock(side_effect=loop_side_effects)
 
     # Patch asyncio.sleep so it doesn't block
-    with patch("asyncio.sleep", new=AsyncMock()) as mock_sleep:
+    with patch('asyncio.sleep', new=AsyncMock()) as mock_sleep:
         # Patch pendulum.now for each iteration
         mock_times = [
             # First iteration
-            pend.datetime(2025, 1, 10, 6, 0, tz="UTC"),  # start_time
-            pend.datetime(2025, 1, 10, 6, 30, tz="UTC"), # now
-            pend.datetime(2025, 1, 10, 6, 30, tz="UTC"), # end_time of 1st iteration
-
+            pend.datetime(2025, 1, 10, 6, 0, tz='UTC'),  # start_time
+            pend.datetime(2025, 1, 10, 6, 30, tz='UTC'),  # now
+            pend.datetime(
+                2025, 1, 10, 6, 30, tz='UTC'
+            ),  # end_time of 1st iteration
             # Second iteration
-            pend.datetime(2025, 1, 10, 7, 0, tz="UTC"),  # start_time
-            pend.datetime(2025, 1, 10, 7, 30, tz="UTC"), # now
-            pend.datetime(2025, 1, 10, 7, 30, tz="UTC"), # end_time of 2nd iteration
+            pend.datetime(2025, 1, 10, 7, 0, tz='UTC'),  # start_time
+            pend.datetime(2025, 1, 10, 7, 30, tz='UTC'),  # now
+            pend.datetime(
+                2025, 1, 10, 7, 30, tz='UTC'
+            ),  # end_time of 2nd iteration
         ]
-        with patch("pendulum.now", side_effect=mock_times):
+        with patch('pendulum.now', side_effect=mock_times):
             await tracker.run()
 
     # track_raid_reminders should be awaited exactly twice

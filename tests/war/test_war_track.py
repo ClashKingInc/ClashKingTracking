@@ -1,273 +1,182 @@
-import asyncio
+from unittest.mock import AsyncMock, MagicMock
 
+import coc
 import pytest
-import pendulum
-import ujson
-from unittest.mock import AsyncMock, MagicMock, patch
-from bson import ObjectId
-from pymongo.errors import PyMongoError
-from kafka.errors import KafkaError
-from bot.reminders.war_reminder_tracker import WarReminderTracker
+
+from bot.war.track import WAR_CACHE, WarTracker
+from utility.config import TrackingType
 
 
-@pytest.mark.asyncio
-async def test_fetch_due_reminders():
-    """
-    Test that fetch_due_reminders retrieves reminders correctly from MongoDB.
-    Note: The 'find' call typically isn't awaited by itself (the cursor is awaited
-    when calling to_list()). So we can do assert_called_once() for 'find'.
-    """
-    mock_config = MagicMock()
-    mock_db_client = MagicMock()
-    mock_kafka_producer = AsyncMock()
-
-    # Make active_reminders an object whose methods are AsyncMock
-    mock_active_reminders = MagicMock()
-    mock_active_reminders.find = MagicMock()  # 'find' usually returns a cursor
-
-    # The cursor has an async method to_list(), which we mock as AsyncMock
-    mock_cursor = MagicMock()
-    mock_cursor.to_list = AsyncMock(return_value=[{"_id": "reminder_1"}, {"_id": "reminder_2"}])
-    mock_active_reminders.find.return_value = mock_cursor
-
-    mock_db_client.active_reminders = mock_active_reminders
-
-    tracker = WarReminderTracker(config=mock_config, db_client=mock_db_client, kafka_producer=mock_kafka_producer)
-
-    reminders = await tracker.fetch_due_reminders()
-    assert len(reminders) == 2
-
-    mock_db_client.active_reminders.find.assert_called_once()
-    # The to_list() method is awaited
-    mock_cursor.to_list.assert_awaited_once()
+@pytest.fixture
+def mock_coc_client():
+    """Fixture to mock the Clash of Clans client."""
+    mock_client = AsyncMock(spec=coc.Client)
+    return mock_client
 
 
-@pytest.mark.asyncio
-async def test_fetch_due_reminders_db_error():
-    """Test that fetch_due_reminders handles a PyMongoError gracefully."""
-    mock_config = MagicMock()
-    mock_db_client = MagicMock()
-    mock_kafka_producer = AsyncMock()
-
-    # Make the find call raise an error
-    mock_active_reminders = MagicMock()
-    mock_active_reminders.find.side_effect = PyMongoError("DB Error")
-    mock_db_client.active_reminders = mock_active_reminders
-
-    tracker = WarReminderTracker(config=mock_config, db_client=mock_db_client, kafka_producer=mock_kafka_producer)
-
-    reminders = await tracker.fetch_due_reminders()
-    # Should return an empty list on error
-    assert reminders == []
+@pytest.fixture
+def mock_db_client():
+    """Fixture to mock the database client."""
+    mock_client = MagicMock()
+    return mock_client
 
 
-@pytest.mark.asyncio
-async def test_send_to_kafka():
-    """Test that send_to_kafka sends the reminder to Kafka and removes it from MongoDB."""
-    mock_config = MagicMock()
-    mock_db_client = MagicMock()
-    mock_kafka_producer = AsyncMock()
-
-    # Set up delete_one as an AsyncMock
-    mock_delete_one = AsyncMock()
-    mock_delete_one.deleted_count = 1
-
-    # So active_reminders is an object, and delete_one is an AsyncMock
-    mock_db_client.active_reminders = MagicMock()
-    mock_db_client.active_reminders.delete_one = mock_delete_one
-
-    tracker = WarReminderTracker(config=mock_config, db_client=mock_db_client, kafka_producer=mock_kafka_producer)
-
-    reminder = {
-        "_id": "507f1f77bcf86cd799439011",
-        "job_id": "test_job",
-        "type": "War Reminder",
-        "run_date": pendulum.now("UTC").int_timestamp,
-    }
-
-    await tracker.send_to_kafka(reminder)
-
-    # Check Kafka call
-    mock_kafka_producer.send.assert_awaited_once()
-    args, kwargs = mock_kafka_producer.send.call_args
-    assert args[0] == "War Reminder"  # Topic
-    assert kwargs["key"] == b"test_job"
-
-    sent_value = ujson.loads(kwargs["value"].decode("utf-8"))
-    assert sent_value["_id"] == "507f1f77bcf86cd799439011"
-
-    # Check MongoDB removal
-    mock_db_client.active_reminders.delete_one.assert_awaited_once_with(
-        {"reminder_id": ObjectId("507f1f77bcf86cd799439011")}
+@pytest.fixture
+def war_tracker(mock_coc_client, mock_db_client):
+    """Fixture to initialize the WarTracker class."""
+    return WarTracker(
+        tracker_type=TrackingType.BOT_WAR, max_concurrent_requests=1000
     )
 
+
 @pytest.mark.asyncio
-async def test_send_to_kafka_kafka_error():
-    mock_config = MagicMock()
-    mock_kafka_producer = AsyncMock()
+async def test_fetch_current_war_private_log(war_tracker, mock_coc_client):
+    """Test fetching a current war with a private war log."""
+    # Simulate a private war log
+    mock_coc_client.get_current_war.side_effect = coc.errors.PrivateWarLog()
+    war_tracker.coc_client = mock_coc_client
 
-    # Use AsyncMock for the db client so methods are recognized as async
-    mock_db_client = AsyncMock()
-    mock_db_client.active_reminders = AsyncMock()
-    mock_db_client.active_reminders.delete_one = AsyncMock()
+    result = await war_tracker._fetch_current_war(clan_tag='#12345')
+    assert result is None
+    mock_coc_client.get_current_war.assert_called_once_with(clan_tag='#12345')
 
-    mock_kafka_producer.send.side_effect = KafkaError("Kafka fail")
 
-    tracker = WarReminderTracker(
-        config=mock_config,
-        db_client=mock_db_client,
-        kafka_producer=mock_kafka_producer,
+@pytest.mark.asyncio
+async def test_process_war_data_first_iteration(war_tracker):
+    """Test processing war data during the first iteration."""
+    mock_war = MagicMock()
+    # Configure mock data
+    mock_war.is_cwl = False
+    mock_war.clan.tag = '#12345'
+    mock_war.opponent.tag = '#67890'
+    mock_war.preparation_start_time = MagicMock()
+    mock_war.preparation_start_time.time.timestamp.return_value = 1234567890
+
+    war_tracker.is_first_iteration = True
+
+    await war_tracker._process_war_data(clan_tag='#12345', war=mock_war)
+
+    # Verify the war was added to the cache
+    assert WAR_CACHE.get('#12345') == mock_war
+
+
+@pytest.mark.asyncio
+async def test_process_war_data_changes_detected_minimal(war_tracker):
+    """Minimal test to check state change."""
+    # Mock current and previous wars
+    mock_current_war = MagicMock(
+        state='inWar',
+        _raw_data={'state': 'inWar'},
+        is_cwl=False,  # Ensure it is not CWL for simplicity
+    )
+    mock_current_war.clan.tag = '#12345'  # Define as valid string
+    mock_current_war.opponent.tag = '#67890'  # Define as valid string
+    mock_current_war.preparation_start_time = MagicMock()
+    mock_current_war.preparation_start_time.time.timestamp.return_value = (
+        1234567890
     )
 
-    reminder = {
-        "_id": "507f1f77bcf86cd799439011",
-        "job_id": "test_job",
-        "type": "War Reminder",
-        "run_date": pendulum.now("UTC").int_timestamp,
-    }
+    mock_previous_war = MagicMock(
+        state='preparation',
+        _raw_data={'state': 'preparation'},
+        is_cwl=False,  # Ensure it is not CWL for simplicity
+    )
+    mock_previous_war.clan.tag = '#12345'  # Define as valid string
 
-    await tracker.send_to_kafka(reminder)
+    # Add previous war to the cache
+    war_tracker.war_cache['#12345'] = mock_previous_war
 
-    mock_kafka_producer.send.assert_awaited_once()
-    mock_db_client.active_reminders.delete_one.assert_not_awaited()
+    # Mock _send_to_kafka
+    war_tracker._send_to_kafka = MagicMock()
 
+    # Ensure is_first_iteration is False
+    war_tracker.is_first_iteration = False
 
-@pytest.mark.asyncio
-async def test_dispatch_reminders():
-    """Test that dispatch_reminders fetches reminders and processes them."""
-    mock_config = MagicMock()
-    mock_db_client = MagicMock()
-    mock_kafka_producer = AsyncMock()
+    # Call the method
+    await war_tracker._process_war_data(
+        clan_tag='#12345', war=mock_current_war
+    )
 
-    # Mock fetch_due_reminders
-    # We'll patch it on the tracker object so we don't rely on the real method
-    tracker = WarReminderTracker(config=mock_config, db_client=mock_db_client, kafka_producer=mock_kafka_producer)
-    tracker.fetch_due_reminders = AsyncMock(return_value=[{"_id": "reminder_1"}, {"_id": "reminder_2"}])
-    tracker._process_single_reminder = AsyncMock()
-
-    await tracker.dispatch_reminders()
-    tracker.fetch_due_reminders.assert_awaited_once()
-    assert tracker._process_single_reminder.await_count == 2
-
-
-@pytest.mark.asyncio
-async def test_dispatch_reminders_no_reminders():
-    """Test dispatch_reminders with no due reminders."""
-    mock_config = MagicMock()
-    mock_db_client = MagicMock()
-    mock_kafka_producer = AsyncMock()
-
-    tracker = WarReminderTracker(config=mock_config, db_client=mock_db_client, kafka_producer=mock_kafka_producer)
-    tracker.fetch_due_reminders = AsyncMock(return_value=[])
-    tracker._process_single_reminder = AsyncMock()
-
-    await tracker.dispatch_reminders()
-    tracker.fetch_due_reminders.assert_awaited_once()
-    tracker._process_single_reminder.assert_not_awaited()
+    # Assert Kafka messages are sent correctly
+    war_tracker._send_to_kafka.assert_called_with(
+        'war',
+        '#12345',
+        {
+            'type': 'war_state_change',
+            'clan_tag': '#12345',
+            'old_state': 'preparation',
+            'new_state': 'inWar',
+        },
+    )
 
 
 @pytest.mark.asyncio
-async def test_process_single_reminder_valid():
-    """Test _process_single_reminder with a valid reminder."""
-    mock_config = MagicMock()
-    mock_db_client = MagicMock()
-    mock_kafka_producer = AsyncMock()
+async def test_fetch_opponent_war_no_result(war_tracker, mock_db_client):
+    """Test fetching an opponent's war when no results are found."""
+    war_tracker.db_client = mock_db_client
+    mock_db_client.clan_wars.find.return_value.sort.return_value.to_list.return_value = (
+        []
+    )
 
-    tracker = WarReminderTracker(config=mock_config, db_client=mock_db_client, kafka_producer=mock_kafka_producer)
-    tracker._fetch_reminder_details = AsyncMock(return_value={"extra_info": "details"})
-    tracker.send_to_kafka = AsyncMock()
-
-    reminder = {"_id": "reminder_id", "reminder_id": "details_id"}
-    await tracker._process_single_reminder(reminder)
-
-    tracker._fetch_reminder_details.assert_awaited_once_with(reminder)
-    tracker.send_to_kafka.assert_awaited_once()
-    sent_reminder = tracker.send_to_kafka.call_args[0][0]
-    assert sent_reminder["_id"] == "reminder_id"
-    assert sent_reminder["extra_info"] == "details"
+    result = await war_tracker._fetch_opponent_war(clan_tag='#12345')
+    assert result is None
+    mock_db_client.clan_wars.find.assert_called_once()
 
 
 @pytest.mark.asyncio
-async def test_process_single_reminder_invalid():
-    """Test _process_single_reminder with invalid or missing details."""
-    mock_config = MagicMock()
-    mock_db_client = MagicMock()
-    mock_kafka_producer = AsyncMock()
+async def test_is_valid_war(war_tracker):
+    """Test validating war data."""
+    mock_war = MagicMock()
+    mock_war.state = 'inWar'
+    mock_war.preparation_start_time = MagicMock()
+    mock_war.end_time = MagicMock()
 
-    tracker = WarReminderTracker(config=mock_config, db_client=mock_db_client, kafka_producer=mock_kafka_producer)
-    tracker._fetch_reminder_details = AsyncMock(return_value=None)
-    tracker._delete_invalid_reminder = AsyncMock()
-    tracker.send_to_kafka = AsyncMock()
+    result = war_tracker._is_valid_war(mock_war, '#12345')
+    assert result is True
 
-    reminder = {"_id": "reminder_id", "reminder_id": "details_id"}
-    await tracker._process_single_reminder(reminder)
-
-    tracker._fetch_reminder_details.assert_awaited_once_with(reminder)
-    tracker._delete_invalid_reminder.assert_awaited_once_with(reminder)
-    tracker.send_to_kafka.assert_not_awaited()
+    # Test invalid war case
+    mock_war.state = 'notInWar'
+    result = war_tracker._is_valid_war(mock_war, '#12345')
+    assert result is False
 
 
 @pytest.mark.asyncio
-async def test_fetch_reminder_details():
-    """Test _fetch_reminder_details retrieves details from the DB."""
-    mock_config = MagicMock()
-    mock_db_client = MagicMock()
-    mock_kafka_producer = AsyncMock()
+async def test_process_cwl_changes(war_tracker):
+    """Test processing CWL changes."""
+    mock_war = MagicMock()
+    mock_previous_war = MagicMock()
 
-    tracker = WarReminderTracker(config=mock_config, db_client=mock_db_client, kafka_producer=mock_kafka_producer)
-    mock_db_client.reminders.find_one = AsyncMock(return_value={"_id": "some_id", "detail": "info"})
-    reminder = {"reminder_id": "some_id"}
+    # Mock clan members with proper attributes
+    mock_member_1 = MagicMock()
+    mock_member_1.tag = '#12345'
+    mock_member_1._raw_data = {'tag': '#12345'}
 
-    result = await tracker._fetch_reminder_details(reminder)
-    assert result["detail"] == "info"
-    mock_db_client.reminders.find_one.assert_awaited_once_with({"_id": "some_id"})
+    mock_member_2 = MagicMock()
+    mock_member_2.tag = '#67890'
+    mock_member_2._raw_data = {'tag': '#67890'}
 
+    mock_previous_member = MagicMock()
+    mock_previous_member.tag = '#67890'
+    mock_previous_member._raw_data = {'tag': '#67890'}
 
-@pytest.mark.asyncio
-async def test_delete_invalid_reminder():
-    """Test _delete_invalid_reminder deletes a reminder from the DB."""
-    mock_config = MagicMock()
-    mock_db_client = MagicMock()
-    mock_kafka_producer = AsyncMock()
+    # Set up mock data
+    mock_war.clan.members = [mock_member_1, mock_member_2]
+    mock_previous_war.clan.members = [mock_previous_member]
 
-    tracker = WarReminderTracker(config=mock_config, db_client=mock_db_client, kafka_producer=mock_kafka_producer)
+    # Mock Kafka sender
+    war_tracker._send_to_kafka = MagicMock()
 
-    # Make find_one_and_delete an AsyncMock
-    mock_db_client.reminders.find_one_and_delete = AsyncMock()
-    reminder = {"_id": "reminder_id", "reminder_id": "some_id"}
+    # Call the method
+    await war_tracker._process_cwl_changes(mock_war, mock_previous_war)
 
-    await tracker._delete_invalid_reminder(reminder)
-    mock_db_client.reminders.find_one_and_delete.assert_awaited_once_with({"_id": "some_id"})
-
-
-@pytest.mark.asyncio
-async def test_run_single_iteration():
-    """
-    Test a single iteration of run by artificially stopping after one iteration.
-    We patch asyncio.sleep so it doesn't really wait.
-    """
-    mock_config = MagicMock()
-    mock_db_client = MagicMock()
-    mock_kafka_producer = AsyncMock()
-
-    tracker = WarReminderTracker(config=mock_config, db_client=mock_db_client, kafka_producer=mock_kafka_producer)
-    # Mock dispatch_reminders so we can see how often it's called
-    tracker.dispatch_reminders = AsyncMock()
-
-    # We'll patch 'run' to only execute once
-    # A simpler approach is to patch 'asyncio.sleep' to raise an exception
-    # that breaks the loop in an actual infinite scenario.
-    with patch("asyncio.sleep", new=AsyncMock()) as mock_sleep:
-        # Manually cause an exception or some condition after first iteration
-        async def stop_after_once():
-            await tracker.dispatch_reminders()
-            raise asyncio.CancelledError("Stopping after one iteration")
-
-        with patch.object(tracker, "run", side_effect=stop_after_once):
-            try:
-                await tracker.run()
-            except asyncio.CancelledError:
-                pass
-
-    tracker.dispatch_reminders.assert_awaited_once()
-    mock_sleep.assert_not_awaited()
+    # Assert Kafka messages are sent correctly
+    war_tracker._send_to_kafka.assert_called_with(
+        'cwl_changes',
+        mock_war.clan.tag,
+        {
+            'type': 'cwl_lineup_change',
+            'added': [{'tag': '#12345'}],  # Member added
+            'removed': [],  # Member removed
+            'war': mock_war._raw_data,
+        },
+    )

@@ -42,12 +42,12 @@ class ClanTracker(Tracking):
         sentry_sdk.add_breadcrumb(
             message=f'Tracking clan: {clan_tag}', level='info'
         )
-        self._handle_private_warlog(clan)
-        self._handle_attribute_changes(clan, previous_clan)
-        self._handle_member_changes(clan, previous_clan)
-        self._handle_donation_updates(clan, previous_clan)
+        await self._handle_private_warlog(clan)
+        await self._handle_attribute_changes(clan, previous_clan)
+        await self._handle_member_changes(clan, previous_clan)
+        await self._handle_donation_updates(clan, previous_clan)
 
-    def _handle_private_warlog(self, clan):
+    async def _handle_private_warlog(self, clan):
         """Handle cases where the war log is private."""
         now = pend.now(tz=pend.UTC)
         last_warn = self.last_private_warlog_warn.get(clan.tag)
@@ -59,9 +59,9 @@ class ClanTracker(Tracking):
             ):
                 self.last_private_warlog_warn[clan.tag] = now
                 json_data = {'type': 'war_log_closed', 'clan': clan._raw_data}
-                self._send_to_kafka('clan', clan.tag, json_data)
+                await self._send_to_kafka('clan', clan.tag, json_data)
 
-    def _handle_attribute_changes(self, clan, previous_clan):
+    async def _handle_attribute_changes(self, clan, previous_clan):
         """Handle changes in clan attributes."""
         attributes = [
             'level',
@@ -87,9 +87,9 @@ class ClanTracker(Tracking):
                 'old_clan': previous_clan._raw_data,
                 'new_clan': clan._raw_data,
             }
-            self._send_to_kafka('clan', clan.tag, json_data)
+            await self._send_to_kafka('clan', clan.tag, json_data)
 
-    def _handle_member_changes(self, clan, previous_clan):
+    async def _handle_member_changes(self, clan, previous_clan):
         """Handle changes in clan membership."""
         current_members = clan.members_dict
         previous_members = previous_clan.members_dict
@@ -111,9 +111,9 @@ class ClanTracker(Tracking):
                 'joined': members_joined,
                 'left': members_left,
             }
-            self._send_to_kafka('clan', clan.tag, json_data)
+            await self._send_to_kafka('clan', clan.tag, json_data)
 
-    def _handle_donation_updates(self, clan, previous_clan):
+    async def _handle_donation_updates(self, clan, previous_clan):
         """Handle updates to member donations."""
         previous_donations = {
             n.tag: (n.donations, n.received) for n in previous_clan.members
@@ -131,7 +131,7 @@ class ClanTracker(Tracking):
                         'old_clan': previous_clan._raw_data,
                         'new_clan': clan._raw_data,
                     }
-                    self._send_to_kafka('clan', clan.tag, json_data)
+                    await self._send_to_kafka('clan', clan.tag, json_data)
                     break
 
 

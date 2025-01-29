@@ -1,9 +1,12 @@
-import pytest
 import asyncio
-import pendulum
 from unittest.mock import AsyncMock, MagicMock, patch
-from bot.reminders.reminder_manager import ReminderManager
+
+import pendulum
+import pytest
 from loguru import logger
+
+from bot.reminders.reminder_manager import ReminderManager
+
 
 @pytest.mark.asyncio
 async def test_init():
@@ -35,9 +38,11 @@ async def test_cleanup():
     """
     Test that the cleanup method closes all relevant resources.
     """
-    logger.disable("bot.reminders.reminder_manager")
+    logger.disable('bot.reminders.reminder_manager')
     mock_config = MagicMock()
-    mock_config.coc_client = AsyncMock()  # Ensure there's a closable coc_client
+    mock_config.coc_client = (
+        AsyncMock()
+    )  # Ensure there's a closable coc_client
     mock_db_client = AsyncMock()
     mock_kafka_producer = AsyncMock()
 
@@ -61,7 +66,9 @@ async def test_run():
     manager = ReminderManager(reminder_config=mock_config)
 
     # We don't want real concurrency, so we patch create_task and gather
-    with patch("asyncio.create_task") as mock_create_task, patch("asyncio.gather", new=AsyncMock()) as mock_gather:
+    with patch('asyncio.create_task') as mock_create_task, patch(
+        'asyncio.gather', new=AsyncMock()
+    ) as mock_gather:
         # Patch manager's cleanup to avoid real resource closures
         manager.cleanup = AsyncMock()
 
@@ -89,10 +96,12 @@ async def test_run_raid_tracker_raid_active():
     """
     mock_config = MagicMock()
     manager = ReminderManager(reminder_config=mock_config)
-    manager.raid_tracker = MagicMock(is_raids_func=MagicMock(return_value=True), run=AsyncMock())
+    manager.raid_tracker = MagicMock(
+        is_raids_func=MagicMock(return_value=True), run=AsyncMock()
+    )
 
     # Patch time-based methods
-    with patch("asyncio.sleep", new=AsyncMock()) as mock_sleep:
+    with patch('asyncio.sleep', new=AsyncMock()) as mock_sleep:
         await manager.run_raid_tracker()
         # run_raid_tracker calls raid_tracker.run
         manager.raid_tracker.run.assert_awaited_once()
@@ -105,15 +114,23 @@ async def test_run_raid_tracker_raid_inactive():
     If raid is not active, run_raid_tracker should compute sleep_time
     and call sleep before returning.
     """
-    logger.disable("bot.reminders.reminder_manager")
+    logger.disable('bot.reminders.reminder_manager')
     mock_config = MagicMock()
     manager = ReminderManager(reminder_config=mock_config)
-    manager.raid_tracker = MagicMock(is_raids_func=MagicMock(return_value=False))
+    manager.raid_tracker = MagicMock(
+        is_raids_func=MagicMock(return_value=False)
+    )
 
     # We'll patch get_time_until_next_raid to return 3600 (1 hour)
-    with patch("utility.classes_utils.raids_utils.get_time_until_next_raid", return_value=3600), \
-         patch("utility.classes_utils.raids_utils.format_seconds_as_date", return_value="2025-01-10 07:00:00"), \
-         patch("asyncio.sleep", new=AsyncMock()) as mock_sleep:
+    with patch(
+        'utility.classes_utils.raids_utils.get_time_until_next_raid',
+        return_value=3600,
+    ), patch(
+        'utility.classes_utils.raids_utils.format_seconds_as_date',
+        return_value='2025-01-10 07:00:00',
+    ), patch(
+        'asyncio.sleep', new=AsyncMock()
+    ) as mock_sleep:
         await manager.run_raid_tracker()
         # No call to raid_tracker.run
         manager.raid_tracker.run.assert_not_called()
@@ -127,9 +144,11 @@ async def test_run_clan_games_tracker_active():
     """
     mock_config = MagicMock()
     manager = ReminderManager(reminder_config=mock_config)
-    manager.clan_games_tracker = MagicMock(is_clan_games_func=MagicMock(return_value=True), run=AsyncMock())
+    manager.clan_games_tracker = MagicMock(
+        is_clan_games_func=MagicMock(return_value=True), run=AsyncMock()
+    )
 
-    with patch("asyncio.sleep", new=AsyncMock()) as mock_sleep:
+    with patch('asyncio.sleep', new=AsyncMock()) as mock_sleep:
         await manager.run_clan_games_tracker()
         manager.clan_games_tracker.run.assert_awaited_once()
         mock_sleep.assert_not_awaited()
@@ -143,11 +162,19 @@ async def test_run_raid_tracker_raid_inactive():
     """
     mock_config = MagicMock()
     manager = ReminderManager(reminder_config=mock_config)
-    manager.raid_tracker = MagicMock(is_raids_func=MagicMock(return_value=False))
+    manager.raid_tracker = MagicMock(
+        is_raids_func=MagicMock(return_value=False)
+    )
 
-    with patch("bot.reminders.reminder_manager.get_time_until_next_raid", return_value=3600), \
-         patch("bot.reminders.reminder_manager.format_seconds_as_date", return_value="2025-01-10 07:00:00"), \
-         patch("asyncio.sleep", new=AsyncMock()) as mock_sleep:
+    with patch(
+        'bot.reminders.reminder_manager.get_time_until_next_raid',
+        return_value=3600,
+    ), patch(
+        'bot.reminders.reminder_manager.format_seconds_as_date',
+        return_value='2025-01-10 07:00:00',
+    ), patch(
+        'asyncio.sleep', new=AsyncMock()
+    ) as mock_sleep:
         await manager.run_raid_tracker()
         # Assert that raid_tracker.run was never called
         manager.raid_tracker.run.assert_not_called()
@@ -180,9 +207,15 @@ async def test_run_inactivity_tracker_single_iteration():
 
     # We'll patch pendulum.now to simulate the current time
     # and then cause an exception or break after the first iteration
-    with patch("pendulum.now", return_value=pendulum.datetime(2025, 1, 12, 12, 30, tz="UTC")), \
-         patch("utility.classes_utils.raids_utils.format_seconds_as_date", return_value="2025-01-12 13:00:00"), \
-         patch("asyncio.sleep", new=AsyncMock()) as mock_sleep:
+    with patch(
+        'pendulum.now',
+        return_value=pendulum.datetime(2025, 1, 12, 12, 30, tz='UTC'),
+    ), patch(
+        'utility.classes_utils.raids_utils.format_seconds_as_date',
+        return_value='2025-01-12 13:00:00',
+    ), patch(
+        'asyncio.sleep', new=AsyncMock()
+    ) as mock_sleep:
 
         # We want to break out after one iteration
         async def run_once():
@@ -192,9 +225,11 @@ async def test_run_inactivity_tracker_single_iteration():
             seconds_to_wait = (minutes_to_wait * 60) - current_time.second
             await asyncio.sleep(seconds_to_wait)  # mocked, returns immediately
             await manager.inactivity_tracker.run()
-            raise asyncio.CancelledError("Stop after 1 iteration")
+            raise asyncio.CancelledError('Stop after 1 iteration')
 
-        with patch.object(manager, "run_inactivity_tracker", side_effect=run_once):
+        with patch.object(
+            manager, 'run_inactivity_tracker', side_effect=run_once
+        ):
             try:
                 await manager.run_inactivity_tracker()
             except asyncio.CancelledError:

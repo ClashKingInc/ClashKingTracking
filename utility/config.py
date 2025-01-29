@@ -6,8 +6,10 @@ import coc
 import requests
 from dotenv import load_dotenv
 from kafka import KafkaProducer
+from loguru import logger
 from redis import asyncio as redis
 
+from bot.dev.kafka_beta_producer import TestKafkaProducer
 from bot.dev.kafka_mock import MockKafkaProducer
 from bot.dev.redis_mock import MockRedis
 from utility.classes import MongoDatabase
@@ -157,9 +159,11 @@ class Config:
 
     def get_kafka_producer(self):
         if self.is_main:
+            logger.warning('Using KafkaProducer')
             return KafkaProducer(
                 bootstrap_servers=['85.10.200.219:9092'], api_version=(3, 6, 0)
             )
+        logger.warning('Using MockKafkaProducer')
         return MockKafkaProducer()
 
     def get_mongo_database(self):

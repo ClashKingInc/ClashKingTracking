@@ -141,28 +141,47 @@ class WarTracker(Tracking):
         """Process changes between the current and previous wars."""
         if previous_war is None:
             # First-time war tracking
-            self._send_to_kafka(
-                'war',
-                clan_tag,
-                {
-                    'type': 'new_war',
-                    'clan_tag': clan_tag,
-                    'war': current_war._raw_data,
-                },
-            )
-        else:
-            # Detect changes in the war state
-            if current_war.state != previous_war.state:
-                self._send_to_kafka(
+            logs_settings = await self._check_war_db_settings(clan_tag)
+
+            for logs_setting in logs_settings:
+                await self._send_to_kafka(
                     'war',
                     clan_tag,
                     {
-                        'type': 'war_state_change',
+                        'type': 'new_war',
                         'clan_tag': clan_tag,
-                        'old_state': previous_war.state,
-                        'new_state': current_war.state,
+                        'war': current_war._raw_data,
+                        'war_panel_webhook_id': logs_setting[
+                            'war_panel_webhook_id'
+                        ],
+                        'war_log_webhook_id': logs_setting[
+                            'war_log_webhook_id'
+                        ],
+                        'server': logs_setting['server'],
                     },
                 )
+        else:
+            # Detect changes in the war state
+            if current_war.state != previous_war.state:
+                logs_settings = await self._check_war_db_settings(clan_tag)
+                for logs_setting in logs_settings:
+                    await self._send_to_kafka(
+                        'war',
+                        clan_tag,
+                        {
+                            'type': 'war_state_change',
+                            'clan_tag': clan_tag,
+                            'old_state': previous_war.state,
+                            'new_state': current_war.state,
+                            'war_panel_webhook_id': logs_setting[
+                                'war_panel_webhook_id'
+                            ],
+                            'war_log_webhook_id': logs_setting[
+                                'war_log_webhook_id'
+                            ],
+                            'server': logs_setting['server'],
+                        },
+                    )
 
         # Detect new attacks or contributions
         await self._detect_member_contributions(
@@ -186,55 +205,219 @@ class WarTracker(Tracking):
 
     async def _process_cwl_changes(self, war, previous_war):
         """Handle changes specific to CWL wars."""
-        # Detect lineup changes
+        # Extract tags for clarity in logs and debugging
+        current_member_tags = [member.tag for member in war.clan.members]
+        previous_member_tags = [
+            member.tag for member in previous_war.clan.members
+        ]
+
+        # Detect added members
         added_members = [
             member._raw_data
             for member in war.clan.members
-            if member.tag not in {m.tag for m in previous_war.clan.members}
+            if member.tag not in previous_member_tags
         ]
+
+        # Detect removed members
         removed_members = [
             member._raw_data
             for member in previous_war.clan.members
-            if member.tag not in {m.tag for m in war.clan.members}
+            if member.tag not in current_member_tags
         ]
 
         if added_members or removed_members:
-            self._send_to_kafka(
-                'cwl_changes',
-                war.clan.tag,
-                {
-                    'type': 'cwl_lineup_change',
-                    'added': added_members,
-                    'removed': removed_members,
-                    'war': war._raw_data,
-                },
-            )
+            logs_settings = await self._check_cwl_db_settings(war.clan.tag)
+            for logs_setting in logs_settings:
+                await self._send_to_kafka(
+                    'cwl_changes',
+                    war.clan.tag,
+                    {
+                        'type': 'cwl_lineup_change',
+                        'added': added_members,
+                        'removed': removed_members,
+                        'war': war._raw_data,
+                        'cwl_lineup_change_webhook_id': logs_setting[
+                            'cwl_lineup_change_webhook_id'
+                        ],
+                        'server': logs_setting['server'],
+                    },
+                )
 
     async def _detect_member_contributions(
         self, clan_tag, current_war, previous_war
     ):
         """Detect member contributions in the war and send updates to Kafka."""
-        if current_war.attacks:
-            # Compare attacks to find new ones
-            new_attacks = [
-                attack
-                for attack in current_war.attacks
-                if previous_war is None or attack not in previous_war.attacks
-            ]
+        try:
+            if current_war.attacks:
+                clan_member_tags = [
+                    member.tag for member in current_war.clan.members
+                ]
+                # Compare attacks to find new ones
+                new_attacks = [
+                    attack
+                    for attack in current_war.attacks
+                    if previous_war is None
+                    or attack not in previous_war.attacks
+                ]
 
-            if new_attacks:
-                # Send new attacks to Kafka
-                self._send_to_kafka(
-                    'war',
-                    clan_tag,
-                    {
-                        'type': 'new_attacks',
-                        'clan_tag': clan_tag,
-                        'attacks': [
-                            attack._raw_data for attack in new_attacks
-                        ],
-                    },
-                )
+                if new_attacks:
+                    logs_settings = await self._check_war_db_settings(clan_tag)
+                    clan_member_tags = [
+                        member.tag for member in current_war.clan.members
+                    ]
+
+                    # Annotate each attack with its attack_type
+                    for attack in new_attacks:
+                        if attack.attacker_tag in clan_member_tags:
+                            attack._raw_data['attack_type'] = 'offense'
+                        elif attack.defender_tag in clan_member_tags:
+                            attack._raw_data['attack_type'] = 'defense'
+
+                        # Find the best previous attack on the same defender
+                        best_previous_attack = None
+
+                        # Look for the best previous attack in the clan
+                        for member in previous_war.clan.members:
+                            if member.tag == attack.defender_tag:
+                                best_previous_attack = member._raw_data.get(
+                                    'bestOpponentAttack'
+                                )
+                                break
+
+                        # If not found, look for the best previous attack in the opponent clan
+                        if not best_previous_attack:
+                            for member in previous_war.opponent.members:
+                                if member.tag == attack.defender_tag:
+                                    best_previous_attack = (
+                                        member._raw_data.get(
+                                            'bestOpponentAttack'
+                                        )
+                                    )
+                                    break
+
+                        attack._raw_data['best_previous_attack'] = (
+                            best_previous_attack
+                            if best_previous_attack
+                            else None
+                        )
+
+                    # Send new attacks to Kafka
+                    for logs_setting in logs_settings:
+                        await self._send_to_kafka(
+                            'war',
+                            clan_tag,
+                            {
+                                'type': 'new_attacks',
+                                'clan_tag': clan_tag,
+                                'attacks': [
+                                    attack._raw_data for attack in new_attacks
+                                ],
+                                'war_panel_webhook_id': logs_setting[
+                                    'war_panel_webhook_id'
+                                ],
+                                'war_log_webhook_id': logs_setting[
+                                    'war_log_webhook_id'
+                                ],
+                                'server': logs_setting['server'],
+                            },
+                        )
+        except Exception as e:
+            self._handle_exception(
+                f'Error detecting member contributions for clan {clan_tag}', e
+            )
+
+    async def _check_war_db_settings(self, clan_tag):
+        """Check the war database settings."""
+        result = await self.db_client.clans_db.aggregate(
+            [
+                {
+                    '$match': {
+                        'tag': clan_tag,
+                        'server': {'$exists': True},
+                        'logs': {'$exists': True},
+                    }
+                },
+                {
+                    '$project': {
+                        '_id': 0,  # Exclude the default MongoDB `_id` field
+                        'server': '$server',
+                        # Include war_panel_webhook only if it exists
+                        'war_panel_webhook_id': {
+                            '$cond': {
+                                'if': {
+                                    '$and': [
+                                        {'$ne': ['$logs.war_panel', None]},
+                                        {
+                                            '$ne': [
+                                                '$logs.war_panel.webhook',
+                                                None,
+                                            ]
+                                        },
+                                    ]
+                                },
+                                'then': '$logs.war_panel.webhook',
+                                'else': None,
+                            }
+                        },
+                        # Include war_log_webhook only if it exists
+                        'war_log_webhook_id': {
+                            '$cond': {
+                                'if': {
+                                    '$and': [
+                                        {'$ne': ['$logs.war_log', None]},
+                                        {
+                                            '$ne': [
+                                                '$logs.war_log.webhook',
+                                                None,
+                                            ]
+                                        },
+                                    ]
+                                },
+                                'then': '$logs.war_log.webhook',
+                                'else': None,
+                            }
+                        },
+                    }
+                },
+                {
+                    '$match': {
+                        # Ensure at least one webhook exists
+                        '$or': [
+                            {'war_panel_webhook_id': {'$ne': None}},
+                            {'war_log_webhook_id': {'$ne': None}},
+                        ]
+                    }
+                },
+            ]
+        ).to_list(length=None)
+        return result
+
+    async def _check_cwl_db_settings(self, clan_tag):
+        """Check the CWL database settings."""
+        result = await self.db_client.clans_db.aggregate(
+            [
+                {
+                    '$match': {
+                        'tag': clan_tag,
+                        'server': {'$exists': True},
+                        'logs': {'$exists': True},
+                        'logs.cwl_lineup_change': {'$exists': True},
+                        'logs.cwl_lineup_change.webhook': {
+                            '$exists': True,
+                            '$ne': None,
+                        },
+                    }
+                },
+                {
+                    '$project': {
+                        '_id': 0,  # Exclude the default MongoDB `_id` field
+                        'server': '$server',
+                        'cwl_lineup_change_webhook_id': '$logs.cwl_lineup_change.webhook',
+                    }
+                },
+            ]
+        ).to_list(length=None)
+        return result
 
 
 if __name__ == '__main__':

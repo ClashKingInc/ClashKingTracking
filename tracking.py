@@ -255,7 +255,7 @@ class Tracking:
                 f'Error scheduling reminders for {clan_tag} and {war_tag}: {e}'
             )
 
-    def _send_to_kafka(self, topic, key, data):
+    async def _send_to_kafka(self, topic, key, data):
         """Helper to send data to Kafka, handling non-JSON-serializable objects like enums."""
 
         # Serialize the data dictionary
@@ -270,9 +270,8 @@ class Tracking:
             },
             level='info',
         )
-
         # Send the serialized data to Kafka
-        self.kafka.send(
+        await self.kafka.send(
             topic=topic,
             value=ujson.dumps(serialized_data).encode('utf-8'),
             key=key.encode('utf-8'),
