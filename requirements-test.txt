@@ -1,0 +1,7 @@
+-r requirements.txt  # Include the requirements from the main file
+
+pytest>=7.0
+pytest-asyncio>=0.20
+freezegun>=1.2
+mock>=5.0
+pytest-cov>=6.0.0

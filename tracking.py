@@ -8,26 +8,32 @@ import sentry_sdk
 import ujson
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
 from asyncio_throttle import Throttler
+from bson import ObjectId
 from loguru import logger
+from pymongo import ReturnDocument
 from sentry_sdk.integrations.asyncio import AsyncioIntegration
 
-from utility.config import Config, TrackingType
-from utility.utils import sentry_filter
+from utility.classes_utils.config_utils import sentry_filter
+from utility.classes_utils.database_utils import generate_custom_id
+from utility.config import Config
+from utility.utils import serialize
 
 
 class Tracking:
     def __init__(
         self,
+        tracker_type,
         max_concurrent_requests=1000,
         batch_size=500,
         throttle_speed=1000,
-        tracker_type=TrackingType,
     ):
+        self.keys = None
         self.config = Config(config_type=tracker_type)
         self.db_client = None
         self.semaphore = asyncio.Semaphore(max_concurrent_requests)
         self.message_count = 0
         self.iterations = 0
+        self.is_first_iteration = True
         self.batch_size = batch_size
         self.throttler = Throttler(throttle_speed)
         self.coc_client = None
@@ -44,7 +50,7 @@ class Tracking:
 
     async def initialize(self):
         """Initialise the tracker with dependencies."""
-        await self.config.initialize()
+        await self.config.get_coc_client()
         self.db_client = self.config.get_mongo_database()
         self.redis = self.config.get_redis_client()
         self.coc_client = self.config.coc_client
@@ -64,7 +70,7 @@ class Tracking:
         self.message_count = 0  # Reset message count
         for i in range(0, len(items), self.batch_size):
             batch = items[i : i + self.batch_size]
-            print(
+            self.logger.info(
                 f'Processing batch {i // self.batch_size + 1} of {len(items) // self.batch_size + 1}.'
             )
             await self._track_batch(batch)
@@ -72,7 +78,7 @@ class Tracking:
         sentry_sdk.add_breadcrumb(
             message='Finished tracking all clans.', level='info'
         )
-        print('Finished tracking all clans.')
+        self.logger.info('Finished tracking all clans.')
 
     async def fetch(self, url: str, tag: str, json=False):
         async with self.throttler:
@@ -98,28 +104,176 @@ class Tracking:
             for result in results:
                 if isinstance(result, Exception):
                     self._handle_exception('Error in tracking task', result)
-        print(f'Finished tracking batch of {len(batch)} clans.')  # Added print
+        self.logger.info(f'Finished tracking batch of {len(batch)} clans.')
 
     async def _track_item(self, item):
-        """Override this method in child classes."""
+        """Override this method in child classes_utils."""
         raise NotImplementedError(
-            'This method should be overridden in child classes.'
+            'This method should be overridden in child classes_utils.'
         )
 
-    def _send_to_kafka(self, topic, key, data):
-        """Helper to send data to Kafka."""
+    async def _schedule_reminder(self, job_id, reminder_document):
+        """Schedule a new reminder by inserting it into MongoDB.
+
+        Args:
+            job_id (str): Unique ID for the reminder.
+            reminder_document (dict): Document data for the reminder.
+        """
+        try:
+            result = await self.db_client.active_reminders.insert_one(
+                reminder_document
+            )
+            self.logger.info(
+                f'New reminder scheduled: {job_id}, Inserted ID: {result.inserted_id}'
+            )
+        except Exception as e:
+            self.logger.error(f'Error scheduling reminder {job_id}: {e}')
+
+    async def _update_reminder(self, job_id, reminder_document):
+        """Update an existing reminder in MongoDB.
+
+        Args:
+            job_id (str): Unique ID for the reminder.
+            reminder_document (dict): Document data for the reminder.
+        """
+        try:
+            self.logger.info(f'Updating existing reminder: {job_id}')
+            # Update the reminder in the `active_reminders` collection
+            result = await self.db_client.active_reminders.find_one_and_update(
+                {'job_id': job_id},
+                {'$set': reminder_document},
+                upsert=True,
+                return_document=ReturnDocument.AFTER,
+            )
+            if result:
+                self.logger.info(
+                    f'Reminder successfully updated: {job_id}, Result: {result}'
+                )
+            else:
+                self.logger.warning(
+                    f'No document updated for job_id: {job_id}'
+                )
+            return result
+        except Exception as e:
+            self.logger.error(f'Error updating reminder {job_id}: {e}')
+
+    async def _schedule_reminders(
+        self, clan_tag, war_tag, reminder_data, reminder_type
+    ):
+        """Schedule reminders for various entities using MongoDB.
+
+        Args:
+            clan_tag (str): Clan tag.
+            war_tag (str): War tag.
+            reminder_data (dict): Data specific to the entity (e.g., war data).
+            reminder_type (str): Type of the reminder (e.g., 'war_reminder', 'raid_reminder').
+        """
+        try:
+            # Query the database for predefined reminder settings
+            reminders = await self.db_client.reminders.find(
+                {'$and': [{'clan': clan_tag}, {'type': reminder_type}]},
+                {
+                    'time': 1,
+                    '_id': 1,
+                    'server': 1,
+                },  # Only retrieve 'time' and '_id'
+            ).to_list(length=None)
+
+            if not reminders:
+                return
+
+            # Convert reminder times to seconds and pair with their respective `_id`
+            set_times_with_ids = [
+                (
+                    int(float(reminder['time'].replace(' hr', '')) * 3600),
+                    str(reminder['_id']),
+                    str(reminder['server']),
+                )
+                for reminder in reminders
+            ]
+
+            if war_tag:
+                entity_tag = f'{clan_tag}_{war_tag}'
+            else:
+                entity_tag = clan_tag
+
+            # Iterate through all reminder times
+            for (
+                time_seconds,
+                reminder_id,
+                reminder_server,
+            ) in set_times_with_ids:
+                # Calculate the reminder time
+                target_time = pend.from_timestamp(
+                    reminder_data['end_time'], tz=pend.UTC
+                ).subtract(seconds=time_seconds)
+                reminder_time = target_time.int_timestamp
+
+                job_id = f'{reminder_type}_{reminder_server}_{entity_tag}_{time_seconds}'
+
+                # Skip past reminders
+                if reminder_time <= pend.now(tz=pend.UTC).int_timestamp:
+                    continue
+
+                # Check if the reminder already exists
+                existing_reminder = (
+                    await self.db_client.active_reminders.find_one(
+                        {'job_id': job_id}
+                    )
+                )
+
+                if existing_reminder:
+                    # Check if the run_date in the database is different from the new reminder_time
+                    if existing_reminder.get('run_date') != reminder_time:
+                        # Prepare the new reminder document with updated information
+                        new_reminder_document = {
+                            'job_id': job_id,
+                            'type': reminder_type,
+                            'run_date': reminder_time,
+                            'reminder_id': ObjectId(reminder_id),
+                        }
+                        # Update the reminder document in the database
+                        await self._update_reminder(
+                            job_id, new_reminder_document
+                        )
+                    else:
+                        pass  # Reminder already exists with the same run_date
+                else:
+                    # Prepare the reminder document
+                    reminder_document = {
+                        '_id': generate_custom_id(reminder_time),
+                        'job_id': job_id,
+                        'type': reminder_type,
+                        'run_date': reminder_time,
+                        'reminder_id': ObjectId(reminder_id),
+                    }
+                    # Schedule a new reminder
+                    await self._schedule_reminder(job_id, reminder_document)
+
+        except Exception as e:
+            self.logger.error(
+                f'Error scheduling reminders for {clan_tag} and {war_tag}: {e}'
+            )
+
+    async def _send_to_kafka(self, topic, key, data):
+        """Helper to send data to Kafka, handling non-JSON-serializable objects like enums."""
+
+        # Serialize the data dictionary
+        serialized_data = {k: serialize(v) for k, v in data.items()}
+
         sentry_sdk.add_breadcrumb(
             message=f'Sending data to Kafka: topic={topic}, key={key}',
             data={
-                'data_preview': data
+                'data_preview': serialized_data
                 if self.config.is_beta
                 else 'Data suppressed in production'
             },
             level='info',
         )
-        self.kafka.send(
+        # Send the serialized data to Kafka
+        await self.kafka.send(
             topic=topic,
-            value=ujson.dumps(data).encode('utf-8'),
+            value=ujson.dumps(serialized_data).encode('utf-8'),
             key=key.encode('utf-8'),
             timestamp_ms=int(pend.now(tz=pend.UTC).timestamp() * 1000),
         )
@@ -129,7 +283,6 @@ class Tracking:
     def _handle_exception(message, exception):
         """Handle exceptions by logging to Sentry and console."""
         sentry_sdk.capture_exception(exception)
-        print(f'{message}: {exception}')
 
     @staticmethod
     def gen_raid_date():
@@ -191,7 +344,6 @@ class Tracking:
         Main function for generic tracking or scheduling.
 
         :param tracker_class: The tracker class to instantiate (e.g., ClanTracker, RaidTracker).
-        :param config_type: The configuration type (default: "bot_clan").
         :param loop_interval: The interval in seconds between tracking loops.
         :param is_tracking_allowed: A function that returns True if tracking should run, False otherwise.
         :param use_scheduler: If True, use a scheduler-based execution flow.
@@ -251,11 +403,23 @@ class Tracking:
                             tracker.logger.info(
                                 'Tracking not allowed. Sleeping until the next interval.'
                             )
+
+                        if tracker.is_first_iteration:
+                            tracker.is_first_iteration = False
+
                         await asyncio.sleep(loop_interval)
         except KeyboardInterrupt:
             tracker.logger.info('Execution interrupted by user.')
         except SystemExit:
             tracker.logger.info('Shutting down...')
         finally:
-            await tracker.coc_client.close()
-            tracker.logger.info('Execution completed.')
+            # Clean up resources
+            if tracker.db_client and hasattr(tracker.db_client, 'close'):
+                await tracker.db_client.close()  # Ferme la connexion MongoDB
+            if tracker.coc_client:
+                await tracker.coc_client.close()
+            if tracker.http_session and not tracker.http_session.closed:
+                await tracker.http_session.close()
+            if tracker.scheduler.running:
+                tracker.scheduler.shutdown()
+            tracker.logger.info('Resources cleaned up. Exiting...')

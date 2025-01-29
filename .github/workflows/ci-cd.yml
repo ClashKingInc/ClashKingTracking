@@ -1,0 +1,74 @@
+name: CI/CD Pipeline
+
+permissions:
+  actions: read
+  contents: read
+  security-events: write
+
+on:
+  push:
+    branches: [ master ]
+    tags: [ 'v*' ]  # Trigger deployment only for tags starting with v
+  pull_request:
+    branches: [ master ]
+
+jobs:
+  test:
+    runs-on: ubuntu-22.04
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v2
+
+      - name: Set up Python
+        uses: actions/setup-python@v4
+        with:
+          python-version: '3.11'
+
+      - name: Install dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libsnappy-dev
+          pip install -r requirements-test.txt
+
+      - name: Set PYTHONPATH
+        run: echo "PYTHONPATH=$PYTHONPATH:$(pwd)" >> $GITHUB_ENV
+
+      - name: Run tests and generate coverage report
+        run: |
+          pytest --maxfail=0 --disable-warnings --tb=short --cov=. --cov-report=xml:coverage.xml
+        env:
+          BOT_TOKEN: ${{ secrets.FAKE_BETA_BOT_TOKEN }}
+
+      - name: Upload coverage.xml as artifact
+        uses: actions/upload-artifact@v3
+        with:
+          name: coverage-report
+          path: coverage.xml
+
+  sonarqube:
+    needs: test  # Ensure the test job finishes before starting this one
+    runs-on: ubuntu-22.04
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v2
+
+      - name: Download coverage.xml artifact
+        uses: actions/download-artifact@v3
+        with:
+          name: coverage-report
+
+      - name: SonarQube Scan
+        uses: SonarSource/sonarqube-scan-action@v4.2.1
+        env:
+          SONAR_TOKEN: ${{ secrets.SONAR_TOKEN }}
+          SONAR_HOST_URL: ${{ secrets.SONAR_HOST_URL }}
+          extraProperties: |
+            sonar.python.coverage.reportPaths=coverage.xml
+
+  deploy:
+    needs: [test, sonarqube]  # Ensure all previous jobs succeed
+    if: github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v')
+    uses: ./.github/workflows/deploy-job.yml
+    secrets: inherit
+    with:
+      docker_tag: latest

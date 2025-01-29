@@ -1,7 +1,7 @@
 import asyncio
 import time
 from collections import defaultdict, deque
-from typing import List, Optional, Union
+from typing import Optional
 
 import aiohttp
 import orjson

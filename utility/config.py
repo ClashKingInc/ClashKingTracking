@@ -6,9 +6,12 @@ import coc
 import requests
 from dotenv import load_dotenv
 from kafka import KafkaProducer
+from loguru import logger
 from redis import asyncio as redis
 
+from bot.dev.kafka_beta_producer import TestKafkaProducer
 from bot.dev.kafka_mock import MockKafkaProducer
+from bot.dev.redis_mock import MockRedis
 from utility.classes import MongoDatabase
 from utility.keycreation import create_keys
 
@@ -47,13 +50,12 @@ class TrackingType(Enum):
 
 
 class Config:
-    def __init__(self, config_type: TrackingType):
+    def __init__(self, config_type: TrackingType = None):
         """
         Initialize the Config object by fetching remote settings and setting up attributes.
 
         :param config_type: The type of configuration to load (e.g., 'bot_clan')
         """
-        self.type = str(config_type)
 
         # Load BOT_TOKEN from environment
         self.bot_token = getenv('BOT_TOKEN', '')
@@ -66,8 +68,10 @@ class Config:
         self._fetch_remote_settings()
 
         # Initialize other attributes
-        self.coc_client = coc.Client()
-        self.keys = deque()
+        if config_type:
+            self.type = str(config_type)
+            self.coc_client = coc.Client()
+            self.keys = deque()
 
     def _fetch_remote_settings(self):
         """
@@ -102,7 +106,7 @@ class Config:
         self.webhook_url = remote_settings.get('webhook_url')
 
         # Determine the account range based on config_type
-        self.__beta_range = (7, 10)
+        self.__beta_range = (4, 6)
         self.account_range = (
             MASTER_API_CONFIG.get(self.type, (0, 0))
             if not self.is_beta
@@ -110,49 +114,56 @@ class Config:
         )
         self.min_coc_email, self.max_coc_email = self.account_range
 
-    async def initialize(self):
+    async def get_coc_client(self):
         """
         Asynchronously initialize the CoC client by generating keys and logging in.
         """
-        if not self.coc_email or not self.coc_password:
-            raise ValueError(
-                'CoC email or password is not set in the configuration.'
+        try:
+            if not self.coc_email or not self.coc_password:
+                raise ValueError(
+                    'CoC email or password is not set in the configuration.'
+                )
+
+            # Generate list of emails based on the account range
+            emails = [
+                self.coc_email.format(x=x)
+                for x in range(self.min_coc_email, self.max_coc_email + 1)
+            ]
+
+            # Generate matching passwords
+            passwords = [self.coc_password] * len(emails)
+
+            # Create keys using the provided utility function
+            try:
+                keys = await create_keys(emails, passwords, as_list=True)
+            except Exception as e:
+                raise RuntimeError(f'Failed to create keys: {e}')
+
+            # Initialize the CoC client with desired parameters
+            self.coc_client = coc.Client(
+                throttle_limit=30, cache_max_size=0, raw_attribute=True
             )
 
-        # Generate list of emails based on the account range
-        emails = [
-            self.coc_email.format(x=x)
-            for x in range(self.min_coc_email, self.max_coc_email + 1)
-        ]
+            # Log in to the CoC client using the generated keys
+            try:
+                await self.coc_client.login_with_tokens(*keys)
+            except Exception as e:
+                raise ConnectionError(f'Failed to log in to CoC client: {e}')
 
-        # Generate matching passwords
-        passwords = [self.coc_password] * len(emails)
-
-        # Create keys using the provided utility function
-        try:
-            keys = await create_keys(emails, passwords, as_list=True)
+            # Store the keys in a deque for future use
+            self.keys = deque(keys)
         except Exception as e:
-            raise RuntimeError(f'Failed to create keys: {e}')
-
-        # Initialize the CoC client with desired parameters
-        self.coc_client = coc.Client(
-            throttle_limit=30, cache_max_size=0, raw_attribute=True
-        )
-
-        # Log in to the CoC client using the generated keys
-        try:
-            await self.coc_client.login_with_tokens(*keys)
-        except Exception as e:
-            raise ConnectionError(f'Failed to log in to CoC client: {e}')
-
-        # Store the keys in a deque for future use
-        self.keys = deque(keys)
+            if hasattr(self, 'coc_client') and self.coc_client:
+                await self.coc_client.close()
+            raise e
 
     def get_kafka_producer(self):
         if self.is_main:
+            logger.warning('Using KafkaProducer')
             return KafkaProducer(
                 bootstrap_servers=['85.10.200.219:9092'], api_version=(3, 6, 0)
             )
+        logger.warning('Using MockKafkaProducer')
         return MockKafkaProducer()
 
     def get_mongo_database(self):
@@ -162,15 +173,17 @@ class Config:
         )
 
     def get_redis_client(self):
-        return redis.Redis(
-            host=self.redis_ip,
-            port=6379,
-            db=0,
-            password=self.redis_pw,
-            decode_responses=False,
-            max_connections=50,
-            health_check_interval=10,
-            socket_connect_timeout=5,
-            retry_on_timeout=True,
-            socket_keepalive=True,
-        )
+        if self.is_main:
+            return redis.Redis(
+                host=self.redis_ip,
+                port=6379,
+                db=0,
+                password=self.redis_pw,
+                decode_responses=False,
+                max_connections=50,
+                health_check_interval=10,
+                socket_connect_timeout=5,
+                retry_on_timeout=True,
+                socket_keepalive=True,
+            )
+        return MockRedis()
