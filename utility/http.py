@@ -7,11 +7,10 @@ class HTTPClient:
     async def request(self, route, **kwargs):
         method = route.method
         url = route.url
-        kwargs['headers'] = kwargs.get('headers')
-        if 'json' in kwargs:
-            kwargs['headers']['Content-Type'] = 'application/json'
+        kwargs["headers"] = kwargs.get("headers")
+        if "json" in kwargs:
+            kwargs["headers"]["Content-Type"] = "application/json"
         async with aiohttp.ClientSession() as session:
-
             async with session.request(method, url, **kwargs) as response:
                 try:
                     if response.status != 200:
@@ -19,7 +18,7 @@ class HTTPClient:
                     data = await response.json()
                     await session.close()
                     return data
-                except Exception as e:
+                except Exception:
                     await session.close()
                     return None
 
@@ -27,7 +26,7 @@ class HTTPClient:
 class Route:
     """Helper class to create endpoint URLs."""
 
-    BASE = 'https://api.clashofclans.com/v1'
+    BASE = "https://api.clashofclans.com/v1"
 
     def __init__(self, method: str, path: str, **kwargs: dict):
         """
@@ -46,19 +45,14 @@ class Route:
             :class:`dict`: Optional options used to concatenate into the final
             URL
         """
-        if '#' in path:
-            path = path.replace('#', '%23')
+        if "#" in path:
+            path = path.replace("#", "%23")
 
         self.method = method
         self.path = path
         url = self.BASE + self.path
 
         if kwargs:
-            self.url = '{}?{}'.format(
-                url,
-                urlencode(
-                    {k: v for k, v in kwargs.items() if v is not None}, True
-                ),
-            )
+            self.url = "{}?{}".format(url, urlencode({k: v for k, v in kwargs.items() if v is not None}, True))
         else:
             self.url = url
