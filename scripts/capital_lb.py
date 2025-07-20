@@ -1,6 +1,6 @@
 import pendulum as pend
 
-from utility.classes import MongoDatabase
+from utility.mongo import MongoDatabase
 from utility.constants import leagues
 from utility.utils import gen_raid_date
 

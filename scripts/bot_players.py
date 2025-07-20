@@ -87,7 +87,6 @@ class PlayerTracking(Tracking):
         self.base_changes = []
 
         self.last_run = pend.now(tz=pend.UTC)
-        self.cycle_count = 1
 
     async def _get_clan_member_tags(self):
         clan_tags = self.mongo.clans_db.distinct("tag")
@@ -333,35 +332,13 @@ class PlayerTracking(Tracking):
 
         self.tracked_tags = player_tags
 
-    def _submit_stats(self, players_tracked: int):
-        now = pend.now(tz=pend.UTC)
-        time_since_last_run = (now - self.last_run).total_seconds()
-        result = self.mongo.tracking_stats.update_one(
-            filter={"type": str(self.tracker_type)},
-            update={
-            "$set": {
-                "last_cycle": now.int_timestamp,
-                "current_cycle": self.cycle_count,
-                "number_tracked": players_tracked,
-            },
-            "$inc": {
-                "total_cycles_run": 1,
-                "total_api_requests_made": players_tracked
-            },
-            "$push": {
-                "cycles": {"$each": [time_since_last_run], "$slice": -1000}
-            }
-        }, upsert=True)
-        self.last_run = now
-        self.cycle_count += 1
-
     async def run(self):
         await self.initialize()
         while True:
             player_tags = await self._get_clan_member_tags()
             self._clean_cache(player_tags=player_tags)
             await self._batch(player_tags=player_tags)
-            self._submit_stats(players_tracked=len(player_tags))
+            self._submit_stats()
 
 
 asyncio.run(PlayerTracking().run())

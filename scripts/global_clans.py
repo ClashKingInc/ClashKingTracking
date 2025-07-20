@@ -244,8 +244,10 @@ class GlobalClanTracking(Tracking):
 
     async def run(self):
         await self.initialize()
+
         while True:
             await self.track_clans()
+            self._submit_stats()
             # LETS STORE THE CWL & RAID LEAGUE CHANGES ELSEWHERE, SCHEDULED
 
 

@@ -245,6 +245,7 @@ class LegendTracking(Tracking):
             self.player_tags = self._player_tags()
             self.logger.info(f"{len(self.player_tags)} players in base player")
             await self._track()
+            self._submit_stats()
 
 
 

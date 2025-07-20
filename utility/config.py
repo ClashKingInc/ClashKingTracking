@@ -9,7 +9,7 @@ from kafka import KafkaProducer
 from redis import Redis
 
 from kafka_mock import MockKafkaProducer
-from utility.classes import MongoDatabase
+from utility.mongo import MongoDatabase
 from utility.keycreation import create_keys
 
 # Load environment variables from .env file

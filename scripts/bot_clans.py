@@ -13,7 +13,7 @@ class ClanTracker(Tracking):
     """Class to manage clan tracking."""
 
     def __init__(self):
-        super().__init__(tracker_type=TrackingType.BOT_CLAN, batch_size=1000)
+        super().__init__(tracker_type=TrackingType.BOT_CLAN, batch_size=10_000)
         self.clan_cache = {}
         self.war_cache = {}
 
@@ -39,7 +39,7 @@ class ClanTracker(Tracking):
 
     async def _get_previous_raid(self, clan_tag: str):
         """Get the previous raid for a clan from the database."""
-        cached_raid = await self.db_client.capital_cache.find_one({"tag": clan_tag})
+        cached_raid = await self.async_mongo.capital_cache.find_one({"tag": clan_tag})
         if cached_raid and "data" in cached_raid:
             return coc.RaidLogEntry(data=cached_raid["data"], client=self.coc_client, clan_tag=clan_tag)
         return None
@@ -52,7 +52,7 @@ class ClanTracker(Tracking):
             return  # No changes
 
         # Update the database with the current raid
-        await self.db_client.capital_cache.update_one(
+        await self.async_mongo.capital_cache.update_one(
             {"tag": clan_tag}, {"$set": {"data": current_raid._raw_data}}, upsert=True
         )
 
@@ -270,6 +270,7 @@ class ClanTracker(Tracking):
             }
             self._send_to_kafka("war", json_data, clan.tag)
 
+
     # CLAN UPDATES
     def _handle_private_warlog(self, clan):
         """Handle cases where the war log is private."""
@@ -336,6 +337,7 @@ class ClanTracker(Tracking):
                     self._send_to_kafka("clan", json_data, clan.tag)
                     break
 
+
     # PROCESSING
     def clan_list(self) -> list[str]:
         return self.mongo.clans_db.distinct("tag")
@@ -385,7 +387,6 @@ class ClanTracker(Tracking):
             tasks = []
             for clan_tag in self.clan_list():
                 tasks.append(self._track_clan(clan_tag=clan_tag))
-
             await self._batch_tasks(tasks=tasks)
             print(f"Finished tracking clans in {time.time() - t} seconds")
 

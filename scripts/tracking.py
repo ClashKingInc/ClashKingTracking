@@ -13,7 +13,7 @@ from loguru import logger
 import loguru
 from redis import Redis
 
-from utility.classes import MongoDatabase
+from utility.mongo import MongoDatabase
 from utility.config import Config, TrackingType
 
 
@@ -45,6 +45,10 @@ class Tracking:
         self.max_stats_size = 10_000
         self.request_stats = defaultdict(lambda: deque(maxlen=self.max_stats_size))
         self.keys = deque()
+
+        self._api_requests_made = 0
+        self._cycle_count = 0
+        self._last_run = pend.now(tz=pend.UTC)
 
     async def initialize(self):
         """Initialise the tracker with dependencies."""
@@ -79,6 +83,7 @@ class Tracking:
         async with self.throttler:
             self.keys.rotate(1)
             self.request_stats["all"].append({"time": pend.now(tz=pend.UTC).timestamp()})
+            self._api_requests_made += 1
             async with self.http_session.get(url, headers={"Authorization": f"Bearer {self.keys[0]}"}) as response:
                 if response.status != 200 or json:
                     data = await response.json()
@@ -100,6 +105,30 @@ class Tracking:
                 elif response.status == 503:
                     raise coc.Maintenance(503, data)
 
+
+    def _submit_stats(self):
+        now = pend.now(tz=pend.UTC)
+        time_since_last_run = (now - self._last_run).total_seconds()
+        result = self.mongo.tracking_stats.update_one(
+            filter={"type": str(self.tracker_type)},
+            update={
+            "$set": {
+                "last_cycle": now.int_timestamp,
+                "current_cycle": self._cycle_count,
+                "number_tracked": self._api_requests_made,
+            },
+            "$inc": {
+                "total_cycles_run": 1,
+                "total_api_requests_made": self._api_requests_made
+            },
+            "$push": {
+                "cycles": {"$each": [time_since_last_run], "$slice": -1000}
+            }
+        }, upsert=True)
+        self._last_run = now
+        self._cycle_count += 1
+        self._api_requests_made = 0
+
     async def _check_maintenance(self) -> float:
         start = pend.now(tz=pend.UTC)
         is_maintenance = False
@@ -118,6 +147,7 @@ class Tracking:
         downtime = int((pend.now(tz=pend.UTC) - start).total_seconds())
         return downtime
 
+
     async def _run_tasks(self, tasks: list, return_exceptions: bool, wrapped: bool):
         async def wrap(coro):
             async with self.semaphore:
@@ -129,19 +159,14 @@ class Tracking:
         results = await asyncio.gather(*tasks, return_exceptions=return_exceptions)
         return results
 
-    async def _batch_tasks(self, tasks: list, return_results: bool = False):
+    async def _batch_tasks(self, tasks: list):
         """Track a batch of items."""
         full_results = []
         for i in range(0, len(tasks), self.batch_size):
             batch = tasks[i : i + self.batch_size]
             results = await self._run_tasks(tasks=batch, return_exceptions=True, wrapped=True)
-            for result in results:
-                if isinstance(result, Exception):
-                    self._handle_exception("Error in tracking task", result)
-            if return_results:
-                full_results.extend(results)
-        logger.info(f"Finished {len(tasks)} tracking tasks")  # Added print
-
+            full_results.extend(results)
+        logger.info(f"Finished {len(tasks)} tracking tasks")
         return full_results
 
     def _split_into_batch(self, items: list):
