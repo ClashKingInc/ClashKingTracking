@@ -55,11 +55,16 @@ class LegendTracking(Tracking):
         """
 
         tasks = []
-        for tag in self.bot_clan_tags | self.other_clan_tags:
+        all_tags = self.bot_clan_tags | self.other_clan_tags
+        for tag in all_tags:
             tasks.append(
                 self.fetch(url=f"https://api.clashofclans.com/v1/clans/{tag.replace('#', '%23')}", tag=tag, json=True)
             )
-        clan_data: list[tuple[dict, str]] = await self._run_tasks(tasks=tasks, return_exceptions=True, wrapped=True)
+        batches = self._split_into_batch(items=tasks)
+        clan_data: list[tuple[dict, str]] = []
+        for batch in batches:
+            responses = await self._run_tasks(tasks=batch, return_exceptions=True, wrapped=True)
+            clan_data.extend(responses)
 
         self.logger.info(f"FETCHED {len(clan_data)} clan data")
 
@@ -89,25 +94,29 @@ class LegendTracking(Tracking):
         return members_that_changed
 
 
-    async def _find_changes(self, tags: list[str]) -> set[str]:
+    async def _find_changes(self, tags: list[str]):
         self.logger.info(f"fetching {len(tags)} tags")
         tasks = []
         for tag in tags:
             tasks.append(
                 self.fetch(url=f"https://api.clashofclans.com/v1/players/{tag.replace('#', '%23')}", tag=tag, json=True)
             )
-        player_data: list[tuple[dict, str]] = await self._run_tasks(tasks=tasks, return_exceptions=True, wrapped=True)
+        responses: list[tuple[dict, str]] = await self._run_tasks(tasks=tasks, return_exceptions=True, wrapped=True)
 
         legend_stats = []
         base_player = []
 
         legend_date = gen_legend_date()
         
-        for player, tag in player_data:
-            if isinstance(player, coc.NotFound):
-                self.mongo.base_player.delete_one({"tag": tag})
-            elif isinstance(player, coc.Maintenance):
+        for player_data in responses:
+            if isinstance(player_data, coc.NotFound):
+                self.mongo.base_player.delete_one({"tag": player_data})
+            elif isinstance(player_data, coc.Maintenance):
                 break
+            elif isinstance(player_data, Exception):
+                continue
+
+            player, tag = player_data
 
             if "league" not in player or player["league"]["name"] != "Legend League":
                 self.tried_to_find_in_legends[tag] += 1
@@ -205,7 +214,6 @@ class LegendTracking(Tracking):
         if base_player:
             self.mongo.base_player.bulk_write(base_player, ordered=False)
         
-
 
     async def _track(self):
         clan_members_changed_trophies = await self._get_legend_clan_members_to_check()
