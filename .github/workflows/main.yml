@@ -33,5 +33,5 @@ jobs:
           context: .
           push: true
           tags: |
-            ghcr.io/clashkinginc/clashkingbot:${{ github.event.release.tag_name }}
-            ghcr.io/clashkinginc/clashkingbot:latest
+            ghcr.io/clashkinginc/clashkingtracking:${{ github.event.release.tag_name }}
+            ghcr.io/clashkinginc/clashkingtracking:latest
