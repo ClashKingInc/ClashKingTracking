@@ -30,7 +30,7 @@ class MongoDatabase:
         self.player_stats: collection_class = self.new_looper.player_stats
         self.clan_stats: collection_class = self.new_looper.clan_stats
         self.player_history = self.new_looper.get_collection("player_history")
-        self.clan_wars: collection_class = self.looper.clan_war
+        self.clan_wars: collection_class = self.looper.get_collection("clan_war")
         self.cwl_group: collection_class = self.looper.cwl_group
         self.basic_clan: collection_class = self.looper.clan_tags
 

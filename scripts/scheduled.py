@@ -618,66 +618,6 @@ class ScheduledTracking(Tracking):
         if batch:
             process_batch(batch)
 
-    async def move_redis(self):
-        from itertools import islice
-
-        import redis
-
-        def chunked_iterable(iterable, size):
-            it = iter(iterable)
-            while True:
-                chunk = list(islice(it, size))
-                if not chunk:
-                    break
-                yield chunk
-
-        config = self.config
-
-        cache = redis.Redis(
-            host=config.redis_ip,
-            port=6379,
-            db=0,
-            password=config.redis_pw,
-            decode_responses=False,
-            max_connections=50,
-            health_check_interval=10,
-            socket_connect_timeout=5,
-            socket_keepalive=True,
-        )
-
-        new_cache = redis.Redis(
-            host=config.redis_ip,
-            port=6379,
-            db=1,
-            password=config.redis_pw,
-            decode_responses=False,
-            max_connections=50,
-            health_check_interval=10,
-            socket_connect_timeout=5,
-            socket_keepalive=True,
-        )
-
-        # Flush DB 0 before copying
-        cache.flushdb()
-
-        keys = new_cache.keys()
-
-        for chunk in chunked_iterable(keys, 10_000):
-            # Pipeline read from DB 1
-            read_pipe = new_cache.pipeline()
-            for key in chunk:
-                read_pipe.hgetall(key)
-            results = read_pipe.execute()
-
-            # Pipeline write to DB 0
-            write_pipe = cache.pipeline()
-            for key, data in zip(chunk, results):
-                if data:
-                    write_pipe.hset(key, mapping=data)
-            write_pipe.execute()
-
-        print("Copied DB 1 to DB 0 in chunks of 10,000 keys.")
-
     async def better_clan_tracking(self):
         self.mongo.global_clans.update_many(
             {"$or": [{"members": {"$lt": 10}}, {"level": {"$lt": 3}}, {"capitalLeague": "Unranked"}]},
