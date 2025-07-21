@@ -22,7 +22,7 @@ from utility.time import gen_games_season
 
 class ScheduledTracking(Tracking):
     def __init__(self):
-        super().__init__(tracker_type=TrackingType.GLOBAL_SCHEDULED, batch_size=50_000)
+        super().__init__(tracker_type=TrackingType.GLOBAL_SCHEDULED, batch_size=25_000)
 
     async def store_cwl_wars(self):
         """
@@ -276,7 +276,7 @@ class ScheduledTracking(Tracking):
         for count, group in enumerate(player_tag_batches, 1):
             t = time.time()
             self.logger.info(f"Group {count}/{len(player_tag_batches)}")
-            previous_player_responses = await self.redis_raw.mget(keys=group)
+            previous_player_responses = self.redis_raw.mget(keys=group)
             pipeline = self.aredis_decoded.pipeline()
             for response, tag in zip(previous_player_responses, group):
                 if not response:
@@ -304,14 +304,13 @@ class ScheduledTracking(Tracking):
             except Exception as e:
                 self.logger.error(f"Error updating autocomplete: {e}")
 
-
     async def update_region_leaderboards(self):
         """
         Update regional leaderboards every 15 minutes.
         """
         try:
             # Reset ranks
-            await self.db_client.region_leaderboard.update_many({}, {"$set": {"global_rank": None, "local_rank": None}})
+            await self.async_mongo.region_leaderboard.update_many({}, {"$set": {"global_rank": None, "local_rank": None}})
             lb_changes = []
             tasks = [
                 asyncio.create_task(self.coc_client.get_location_players(location_id=location))
@@ -354,13 +353,13 @@ class ScheduledTracking(Tracking):
 
             if lb_changes:
                 try:
-                    await self.db_client.region_leaderboard.bulk_write(lb_changes)
+                    await self.async_mongo.region_leaderboard.bulk_write(lb_changes)
                     self.logger.info(f"Updated region leaderboards with {len(lb_changes)} changes")
                 except Exception as e:
                     self.logger.error(f"Error updating region leaderboards: {e}")
 
             # Reset builder ranks
-            await self.db_client.region_leaderboard.update_many(
+            await self.async_mongo.region_leaderboard.update_many(
                 {}, {"$set": {"builder_global_rank": None, "builder_local_rank": None}}
             )
             lb_changes = []
@@ -409,7 +408,7 @@ class ScheduledTracking(Tracking):
 
             if lb_changes:
                 try:
-                    await self.db_client.region_leaderboard.bulk_write(lb_changes)
+                    await self.async_mongo.region_leaderboard.bulk_write(lb_changes)
                     self.logger.info(f"Updated builder leaderboards with {len(lb_changes)} changes")
                 except Exception as e:
                     self.logger.error(f"Error updating builder leaderboards: {e}")
@@ -421,53 +420,45 @@ class ScheduledTracking(Tracking):
         Store clan capital raid seasons data.
         """
         try:
-            pipeline = [
-                {
-                    "$match": {
-                        "capitalLeague": {"$ne": "Unranked"},
-                        "isValid": True,
-                        "clanCapitalHallLevel": {"$gte": 5},
-                    }
-                },
-                {"$group": {"_id": "$tag"}},
-            ]
-            all_tags = [x["_id"] for x in (await self.db_client.global_clans.aggregate(pipeline).to_list(length=None))]
-            all_tags = [all_tags[i : i + self.batch_size] for i in range(0, len(all_tags), self.batch_size)]
+            bot_clans = await self.async_mongo.clans_db.distinct("tag")
+            bookmarked_clans = await self.async_mongo.user_settings.distinct("search.clan.bookmarked")
+
+            all_clans = list(set(bot_clans + bookmarked_clans))
+
             now = pend.now()  # Current time in your system's timezone
             start_of_week = now.start_of("week").subtract(days=1)
             end_of_week = start_of_week.add(weeks=1)
 
-            for tag_group in all_tags:
-                tasks = []
-                for tag in tag_group:
-                    tasks.append(
-                        self.fetch(
-                            url=f"https://api.clashofclans.com/v1/clans/{tag.replace('#', '%23')}/capitalraidseasons?limit=1",
-                            tag=tag,
-                            json=True,
-                        )
+            tasks = []
+            for tag in all_clans:
+                tasks.append(
+                    self.fetch(
+                        url=f"https://api.clashofclans.com/v1/clans/{tag.replace('#', '%23')}/capitalraidseasons?limit=1",
+                        tag=tag,
+                        json=True,
                     )
-                responses = await asyncio.gather(*tasks, return_exceptions=True)
+                )
+            responses = await asyncio.gather(*tasks, return_exceptions=True)
 
-                changes = []
-                responses = [r for r in responses if isinstance(r, tuple) and r[0] is not None]
-                for response, tag in responses:
-                    try:
-                        # We shouldn't have completely invalid tags, they all existed at some point
-                        if not response["items"]:
-                            continue
-                        date = pend.instance(coc.Timestamp(data=response["items"][0]["endTime"]).time, tz=pend.UTC)
-                        if start_of_week <= date <= end_of_week:
-                            changes.append(InsertOne({"clan_tag": tag, "data": response["items"][0]}))
-                    except Exception as e:
-                        self.logger.error(f"Error processing clan capital data for tag {tag}: {e}")
-
+            changes = []
+            responses = [r for r in responses if isinstance(r, tuple) and r[0] is not None]
+            for response, tag in responses:
                 try:
-                    self.logger.info(f"{len(changes)} CHANGES")
-                    if changes:
-                        await self.db_client.raid_weekends.bulk_write(changes, ordered=False)
+                    # We shouldn't have completely invalid tags, they all existed at some point
+                    if not response["items"]:
+                        continue
+                    date = pend.instance(coc.Timestamp(data=response["items"][0]["endTime"]).time, tz=pend.UTC)
+                    if start_of_week <= date <= end_of_week:
+                        changes.append(InsertOne({"clan_tag": tag, "data": response["items"][0]}))
                 except Exception as e:
-                    self.logger.error(f"Error writing raid_weekends: {e}")
+                    self.logger.error(f"Error processing clan capital data for tag {tag}: {e}")
+
+            try:
+                self.logger.info(f"{len(changes)} CHANGES")
+                if changes:
+                    await self.async_mongo.raid_weekends.bulk_write(changes, ordered=False)
+            except Exception as e:
+                self.logger.error(f"Error writing raid_weekends: {e}")
 
             # Uncomment if needed
             # await calculate_player_capital_looted_leaderboards(db_client=self.db_client)
@@ -485,7 +476,8 @@ class ScheduledTracking(Tracking):
             {"$unwind": "$clans"},
             {"$group": {"_id": "$clans"}},  # Keep unique clans as separate documents
         ]
-        result_1 = await self.db_client.clan_wars.aggregate(pipeline_1).to_list(length=None)
+        result_1 = await self.async_mongo.clan_wars.aggregate(pipeline_1)
+        result_1 = await result_1.to_list(length=None)
         unique_clans = {doc["_id"] for doc in result_1}
 
         pipeline_2 = [
@@ -493,7 +485,8 @@ class ScheduledTracking(Tracking):
             {"$unwind": {"path": "$data.attackLog", "preserveNullAndEmptyArrays": True}},
             {"$group": {"_id": "$data.attackLog.defender.tag"}},
         ]
-        attack_tags = await self.db_client.raid_weekends.aggregate(pipeline_2).to_list(length=None)
+        attack_tags = await self.async_mongo.raid_weekends.aggregate(pipeline_2)
+        attack_tags = await attack_tags.to_list(length=None)
         attack_tags = {doc["_id"] for doc in attack_tags if doc["_id"]}
 
         pipeline_3 = [
@@ -501,7 +494,8 @@ class ScheduledTracking(Tracking):
             {"$unwind": {"path": "$data.defenseLog", "preserveNullAndEmptyArrays": True}},
             {"$group": {"_id": "$data.defenseLog.attacker.tag"}},
         ]
-        defense_tags = await self.db_client.raid_weekends.aggregate(pipeline_3).to_list(length=None)
+        defense_tags = await self.async_mongo.raid_weekends.aggregate(pipeline_3)
+        defense_tags = await defense_tags.to_list(length=None)
         defense_tags = {doc["_id"] for doc in defense_tags if doc["_id"]}
 
         unique_tags = attack_tags.union(defense_tags)
@@ -510,17 +504,20 @@ class ScheduledTracking(Tracking):
 
         pipeline_4 = [{"$match": {}}, {"$group": {"_id": "$tag"}}]
         existing_clans = [
-            x["_id"] for x in (await self.db_client.global_clans.aggregate(pipeline_4).to_list(length=None))
+            x["_id"] for x in (await self.async_mongo.global_clans.aggregate(pipeline_4).to_list(length=None))
         ]
         existing_clans = set(existing_clans)
         # Find clans in the combined set but not in existing_clans
         new_clans = combined_set - existing_clans
         print(len(new_clans))
+        return
         tags_to_add = []
         for clan in new_clans:
             tags_to_add.append(InsertOne({"tag": clan}))
-        results = await self.db_client.global_clans.bulk_write(tags_to_add, ordered=False)
+        results = await self.async_mongo.global_clans.bulk_write(tags_to_add, ordered=False)
         print(results.bulk_api_result)
+
+
 
     async def migrate_clan_stats(self):
         clan_stats = self.db_client.clan_stats
@@ -785,9 +782,9 @@ class ScheduledTracking(Tracking):
     async def run(self):
         try:
             await self.initialize()
-            print(list(await self._get_cache_tags())[:10])
-            #await self.add_permanent_schedules()
+            #await self.update_autocomplete()
 
+            await self.find_new_clans()
             self.logger.info("Scheduler started. Running scheduled jobs...")
             # Keep the main thread alive
             while True:
