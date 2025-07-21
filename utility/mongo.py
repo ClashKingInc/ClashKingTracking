@@ -71,3 +71,4 @@ class MongoDatabase:
         self.server_db: collection_class = self.usafam.server
         self.player_autocomplete: collection_class = self.usafam.player_search
         self.reminders: collection_class = self.usafam.reminders
+        self.user_settings = self.usafam.get_collection('user_settings')

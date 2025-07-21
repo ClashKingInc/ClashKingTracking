@@ -7,8 +7,9 @@ import requests
 from dotenv import load_dotenv
 from kafka import KafkaProducer
 from redis import Redis
+from redis.asyncio import Redis as AsyncRedis
 
-from kafka_mock import MockKafkaProducer
+from utility.kafka_mock import MockKafkaProducer
 from utility.mongo import MongoDatabase
 from utility.keycreation import create_keys
 
@@ -147,13 +148,16 @@ class Config:
             stats_db_connection=self.stats_mongodb, static_db_connection=self.static_mongodb, sync=sync
         )
 
-    def get_redis_client(self):
-        return Redis(
+    async def get_redis_client(self, decode_responses: bool, sync: bool = True):
+        cls = Redis
+        if not sync:
+            cls = AsyncRedis
+        return cls(
             host=self.redis_ip,
             port=6379,
             db=0,
             password=self.redis_pw,
-            decode_responses=False,
+            decode_responses=decode_responses,
             max_connections=50,
             health_check_interval=10,
             socket_connect_timeout=5,

@@ -110,7 +110,7 @@ class LegendTracking(Tracking):
         
         for player_data in responses:
             if isinstance(player_data, coc.NotFound):
-                self.mongo.base_player.delete_one({"tag": player_data})
+                self.mongo.base_player.delete_one({"tag": player_data.__notes__[0]})
             elif isinstance(player_data, coc.Maintenance):
                 break
             elif isinstance(player_data, Exception):

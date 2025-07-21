@@ -14,7 +14,7 @@ class ClanTracker(Tracking):
 
     def __init__(self):
         super().__init__(tracker_type=TrackingType.BOT_CLAN, batch_size=10_000)
-        self.clan_cache = {}
+        self.clan_cache: dict[str, coc.Clan] = {}
         self.war_cache = {}
 
         self.cwl_round_cache = {}
@@ -378,6 +378,7 @@ class ClanTracker(Tracking):
                 previous_raid = await self._get_previous_raid(clan_tag)
                 await self._process_raid_changes(clan_tag, current_raid, previous_raid)
 
+
     async def run(self):
         import time
 
@@ -388,6 +389,7 @@ class ClanTracker(Tracking):
             for clan_tag in self.clan_list():
                 tasks.append(self._track_clan(clan_tag=clan_tag))
             await self._batch_tasks(tasks=tasks)
+
             print(f"Finished tracking clans in {time.time() - t} seconds")
 
 

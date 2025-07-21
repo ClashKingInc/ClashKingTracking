@@ -3,6 +3,7 @@ import asyncio
 import pendulum as pend
 from loguru import logger
 from pymongo import DeleteOne, InsertOne, UpdateOne
+from utility.time import gen_season_date
 
 from tracking import Tracking, TrackingType
 
@@ -11,8 +12,10 @@ class GlobalClanTracking(Tracking):
     def __init__(self):
         super().__init__(tracker_type=TrackingType.GLOBAL_CLAN_VERIFY, batch_size=25_000)
 
+        self.season = gen_season_date()
         self.inactive_clans = []
-
+        self.priority_clans = self._priority_clans()
+        self.priority_players = self._priority_players()
         self.clan_cache = {}
 
     def _clans(self, active: bool):
@@ -22,6 +25,13 @@ class GlobalClanTracking(Tracking):
             bot_clan_tags = self.mongo.clans_db.distinct("tag")
             all_tags = list(set(all_tags + bot_clan_tags))
         return all_tags
+
+    def _priority_clans(self) -> set[str]:
+        return set(self.mongo.clans_db.distinct("tag"))
+
+    def _priority_players(self) -> set[str]:
+        return set(self.mongo.user_settings.distinct("search.player.bookmarked"))
+
 
     def _batches(self):
         if not self.inactive_clans:
@@ -52,46 +62,75 @@ class GlobalClanTracking(Tracking):
 
         return stats
 
-    def _find_join_leaves(self, previous_clan: dict, current_clan: dict):
+
+    def _find_join_leaves_and_donos(self, previous_clan: dict, current_clan: dict):
         changes = []
         clan_tag = current_clan.get("tag")
+        now = pend.now(tz=pend.UTC)
 
-        current_members = current_clan.get("memberList", [])
-        previous_members = previous_clan.get("memberList", [])
+        # Build lookup dicts keyed by player tag
+        current_members = {m["tag"]: m for m in current_clan.get("memberList", [])}
+        previous_members = {m["tag"]: m for m in previous_clan.get("memberList", [])}
 
-        new_joins = [
-            player for player in current_members if player.get("tag") not in set(p.get("tag") for p in previous_members)
-        ]
-        new_leaves = [
-            player for player in previous_members if player.get("tag") not in set(p.get("tag") for p in current_members)
-        ]
-        for join in new_joins:
+        # Tags for comparison
+        current_tags = set(current_members)
+        previous_tags = set(previous_members)
+
+        joined_tags = current_tags - previous_tags
+        left_tags = previous_tags - current_tags
+
+        # Joins
+        for tag in joined_tags:
+            member = current_members[tag]
             changes.append(
-                InsertOne(
-                    {
-                        "type": "join",
-                        "clan": clan_tag,
-                        "time": pend.now(tz=pend.UTC),
-                        "tag": join.get("tag"),
-                        "name": join.get("name"),
-                        "th": join.get("townHallLevel"),
-                    }
-                )
+                InsertOne({
+                    "type": "join",
+                    "clan": clan_tag,
+                    "time": now,
+                    "tag": tag,
+                    "name": member.get("name"),
+                    "th": member.get("townHallLevel"),
+                })
             )
 
-        for leave in new_leaves:
+        # Leaves
+        for tag in left_tags:
+            member = previous_members[tag]
             changes.append(
-                InsertOne(
-                    {
-                        "type": "leave",
-                        "clan": clan_tag,
-                        "time": pend.now(tz=pend.UTC),
-                        "tag": leave.get("tag"),
-                        "name": leave.get("name"),
-                        "th": leave.get("townHallLevel"),
-                    }
-                )
+                InsertOne({
+                    "type": "leave",
+                    "clan": clan_tag,
+                    "time": now,
+                    "tag": tag,
+                    "name": member.get("name"),
+                    "th": member.get("townHallLevel"),
+                })
             )
+
+        '''if clan_tag not in self.priority_clans:
+            # Donation changes
+            for tag, curr in current_members.items():
+                if tag in self.priority_players:
+                    continue
+                prev = previous_members.get(tag, {})
+
+                donation_change = curr.get("donations", 0) - prev.get("donations", 0)
+                received_change = curr.get("donationsReceived", 0) - prev.get("donationsReceived", 0)
+
+                if donation_change > 0 or received_change > 0:
+                    season_stats.append(
+                        UpdateOne(
+                            {"tag": tag, "season": self.season, "clan_tag": clan_tag},
+                            {
+                                "$inc": {
+                                    "donations": donation_change,
+                                    "donationsReceived": received_change,
+                                }
+                            },
+                            upsert=True
+                        )
+                    )'''
+
         return changes
 
     def _find_clan_changes(self, previous_clan: dict, current_clan: dict):
@@ -171,6 +210,7 @@ class GlobalClanTracking(Tracking):
         if to_set:
             return UpdateOne({"data.tag": new_clan.get("tag")}, {"$set": to_set}, upsert=True)
 
+
     async def track_clans(self):
         import time
 
@@ -185,13 +225,14 @@ class GlobalClanTracking(Tracking):
                 )
 
             print(f"pull clans API: START {time.time() - t} seconds")
-            clan_data: list[dict] = await self._run_tasks(tasks=tasks, return_exceptions=True, wrapped=True)
+            responses: list[dict] = await self._run_tasks(tasks=tasks, return_exceptions=True, wrapped=True)
             print(f"pull clans API: STOP {time.time() - t} seconds")
-            print(len([c for c in clan_data if c is not None]), "VALID CLANS")
 
             changes = []
             join_leave_changes = []
+            season_stat_changes = []
             changes_history = []
+            pipeline = self.redis_decoded.pipeline()
 
             print(f"pull clans DB: START {time.time() - t} seconds")
             previous_clan_batch = await self._get_previous_clans(clan_tags=batch)
@@ -199,17 +240,24 @@ class GlobalClanTracking(Tracking):
 
             print(f"clan data loop: START {time.time() - t} seconds")
 
-            for clan, clan_tag in clan_data:
-                if clan is None:
-                    continue
+            self.season = gen_season_date()
+            self.priority_clans = self._priority_clans()
+            self.priority_players = self._priority_players()
 
+            for clan_data in responses:
+                if not isinstance(clan_data, tuple):
+                    continue
+                clan, clan_tag = clan_data
                 if clan.get("members") == 0:
                     changes.append(DeleteOne({"_id": clan.get("tag")}))
                     continue
 
-                previous_clan, clan_records = previous_clan_batch.get(clan_tag, (None, None))
+                previous_clan, clan_records = previous_clan_batch.get(clan_tag, ({}, {}))
                 if previous_clan:
-                    join_leave_changes.extend(self._find_join_leaves(previous_clan, clan))
+                    join_leave, season_stats = self._find_join_leaves_and_donos(previous_clan, clan)
+                    join_leave_changes.extend(join_leave)
+                    season_stat_changes.extend(season_stats)
+
                     changes_history.extend(self._find_clan_changes(previous_clan=previous_clan, current_clan=clan))
                     changes.extend(self._find_new_records(current_clan=clan, clan_records=clan_records))
 

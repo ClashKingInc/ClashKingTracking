@@ -12,6 +12,7 @@ from kafka import KafkaProducer
 from loguru import logger
 import loguru
 from redis import Redis
+from redis.asyncio import Redis as AsyncRedis
 
 from utility.mongo import MongoDatabase
 from utility.config import Config, TrackingType
@@ -36,7 +37,10 @@ class Tracking:
         self.throttler = Throttler(self.throttle_speed)
 
         self.coc_client: coc.Client = ...
-        self.redis: Redis = ...
+        self.redis_raw: Redis = ...
+        self.redis_decoded: Redis = ...
+        self.aredis_decoded: AsyncRedis = ...
+
         self.logger = logger
         self.http_session = None
         self.scheduler: AsyncIOScheduler = ...
@@ -55,14 +59,17 @@ class Tracking:
         await self.config.initialize()
         self.mongo = self.config.get_mongo_database()
         self.async_mongo = self.config.get_mongo_database(sync=False)
-        self.redis = self.config.get_redis_client()
+        self.redis_raw = await self.config.get_redis_client(decode_responses=False)
+        self.redis_decoded = await self.config.get_redis_client(decode_responses=True)
+        self.aredis_decoded = await self.config.get_redis_client(decode_responses=True, sync=False)
+
         self.coc_client = self.config.coc_client
         self.keys = self.config.keys
         self.kafka = self.config.get_kafka_producer()
 
         connector = aiohttp.TCPConnector(limit=1200, ttl_dns_cache=300)
         timeout = aiohttp.ClientTimeout(total=1800)
-        self.http_session = aiohttp.ClientSession(connector=connector, timeout=timeout, json_serialize=orjson.dumps)
+        self.http_session = aiohttp.ClientSession(connector=connector, timeout=timeout, json_serialize=orjson.loads)
 
         self.scheduler = AsyncIOScheduler(timezone=pend.UTC)
 
@@ -105,7 +112,6 @@ class Tracking:
                 elif response.status == 503:
                     raise coc.Maintenance(503, data)
 
-
     def _submit_stats(self):
         now = pend.now(tz=pend.UTC)
         time_since_last_run = (now - self._last_run).total_seconds()
@@ -146,7 +152,6 @@ class Tracking:
 
         downtime = int((pend.now(tz=pend.UTC) - start).total_seconds())
         return downtime
-
 
     async def _run_tasks(self, tasks: list, return_exceptions: bool, wrapped: bool):
         async def wrap(coro):

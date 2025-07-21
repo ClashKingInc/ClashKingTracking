@@ -88,7 +88,10 @@ class PlayerTracking(Tracking):
 
         self.last_run = pend.now(tz=pend.UTC)
 
-    async def _get_clan_member_tags(self):
+    def _priority_players(self) -> set[str]:
+        return set(self.mongo.user_settings.distinct("search.player.bookmarked"))
+
+    async def _get_clan_member_tags(self) -> list[str]:
         clan_tags = self.mongo.clans_db.distinct("tag")
 
         tasks = [self.coc_client.get_clan(tag=tag) for tag in clan_tags]
@@ -103,13 +106,15 @@ class PlayerTracking(Tracking):
                 continue
             clan_members.extend([member.tag for member in clan.members if member.town_hall >= 4])
 
-        return clan_members
+        clan_members = self._priority_players() | set(clan_members)
+        return list(clan_members)
 
     def _get_cache_tags(self):
         cursor = 0
         keys = []
         while True:
-            cursor, batch = self.redis.scan(cursor=cursor, match="player-cache:*", count=25_000)
+            cursor, batch = self.redis_decoded.scan(cursor=cursor, match="player-cache:*", count=25_000)
+            batch = [b.split(":")[-1] for b in batch]
             keys.extend(batch)
             if cursor == 0:
                 break
@@ -176,10 +181,10 @@ class PlayerTracking(Tracking):
 
         results = await self._run_tasks(tasks=tasks, return_exceptions=True, wrapped=True)
 
-        previous_player_responses = self.redis.mget(keys=[f"player-cache:{tag}" for tag in player_tags])
+        previous_player_responses = self.redis_raw.mget(keys=[f"player-cache:{tag}" for tag in player_tags])
         previous_player_responses = {tag: response
                                      for tag, response in zip(player_tags, previous_player_responses)}
-        pipe = self.redis.pipeline()
+        pipe = self.redis_raw.pipeline()
         season = gen_season_date()
 
         for result in results:  # type: bytes, str
@@ -208,7 +213,7 @@ class PlayerTracking(Tracking):
             if previous_response == compressed_response:
                 continue
 
-            pipe.set(tag, compressed_response)
+            pipe.set(f"player-cache:{tag}", compressed_response)
             response = orjson.loads(player_data)
             previous_response = orjson.loads(snappy.decompress(previous_response))
 
@@ -325,7 +330,7 @@ class PlayerTracking(Tracking):
         keys_to_delete = [f"player-cache:{tag}" for tag in stale_tags]
 
         if keys_to_delete:
-            pipe = self.redis.pipeline()
+            pipe = self.redis_raw.pipeline()
             for key in keys_to_delete:
                 pipe.delete(key)
             pipe.execute()

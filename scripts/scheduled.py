@@ -12,159 +12,17 @@ from apscheduler.triggers.interval import IntervalTrigger
 from hashids import Hashids
 from pymongo import InsertOne, UpdateOne
 
-from utility.config import TrackingType
 from utility.constants import locations
 
-"""from .capital_lb import (
-    calculate_clan_capital_leaderboards,
-    calculate_player_capital_looted_leaderboards,
-    calculate_raid_medal_leaderboards,
-)
-"""
 import math
 
-from tracking import Tracking
+from tracking import Tracking, TrackingType
 from utility.time import gen_games_season
 
 
 class ScheduledTracking(Tracking):
-    def __init__(self, tracker_type: TrackingType):
-        super().__init__(tracker_type=tracker_type, batch_size=50_000)
-
-    def setup_scheduler(self):
-        """
-        Set up all scheduled jobs with the scheduler.
-        """
-        self.scheduler.add_job(
-            self.store_all_leaderboards,
-            CronTrigger(hour=4, minute=56),
-            name="Store All Leaderboards",
-            misfire_grace_time=300,
-        )
-        self.scheduler.add_job(
-            self.store_legends, CronTrigger(day="*", hour=5, minute=56), name="Store Legends", misfire_grace_time=300
-        )
-        self.scheduler.add_job(
-            self.store_cwl_wars,
-            CronTrigger(day="13", hour=19, minute=37),
-            name="Store CWL Wars",
-            misfire_grace_time=300,
-        )
-        self.scheduler.add_job(
-            self.store_cwl_groups,
-            CronTrigger(day="9-12", hour="*", minute=35),
-            name="Store CWL Groups",
-            misfire_grace_time=300,
-        )
-        self.scheduler.add_job(
-            self.update_autocomplete, IntervalTrigger(minutes=30), name="Update Autocomplete", misfire_grace_time=300
-        )
-        self.scheduler.add_job(
-            self.update_region_leaderboards,
-            IntervalTrigger(minutes=15),
-            name="Update Region Leaderboards",
-            misfire_grace_time=300,
-        )
-        self.scheduler.add_job(
-            self.store_clan_capital,
-            CronTrigger(day_of_week="mon", hour=10),
-            name="Store Clan Capital",
-            misfire_grace_time=300,
-        )
-
-    async def store_all_leaderboards(self):
-        """
-        Store all leaderboards data at scheduled times.
-        """
-        try:
-            for database, function in zip(
-                [
-                    self.db_client.clan_trophies,
-                    self.db_client.clan_versus_trophies,
-                    self.db_client.capital,
-                    self.db_client.player_trophies,
-                    self.db_client.player_versus_trophies,
-                ],
-                [
-                    self.coc_client.get_location_clans,
-                    self.coc_client.get_location_clans_builder_base,
-                    self.coc_client.get_location_clans_capital,
-                    self.coc_client.get_location_players,
-                    self.coc_client.get_location_players_builder_base,
-                ],
-            ):
-                tasks = [asyncio.create_task(function(location_id=location)) for location in locations]
-
-                responses = await asyncio.gather(*tasks, return_exceptions=True)
-                store_tasks = []
-                for index, response in enumerate(responses):
-                    if isinstance(response, Exception):
-                        self.logger.error(f"Error fetching data for location {locations[index]}: {response}")
-                        continue
-                    location = locations[index]
-                    store_tasks.append(
-                        InsertOne(
-                            {
-                                "location": location,
-                                "date": str(pend.now(tz=pend.UTC).date()),
-                                "data": {"items": [x._raw_data for x in response]},
-                            }
-                        )
-                    )
-
-                if store_tasks:
-                    try:
-                        await database.bulk_write(store_tasks)
-                        self.logger.info("Stored leaderboards for locations batch.")
-                    except Exception as e:
-                        self.logger.error(f"Error storing leaderboards: {e}")
-        except Exception as e:
-            self.logger.exception(f"Unexpected error in store_all_leaderboards: {e}")
-
-    async def store_legends(self):
-        """
-        Store legends data at scheduled times.
-        """
-        try:
-            seasons = await self.coc_client.get_seasons(league_id=29000022)
-
-            seasons_present = await self.db_client.legend_history.distinct("season")
-            missing = set(seasons) - set(seasons_present)
-
-            for year in missing:
-                after = ""
-                while after is not None:
-                    changes = []
-                    async with aiohttp.ClientSession() as session:
-                        if after:
-                            after_param = f"&after={after}"
-                        else:
-                            after_param = ""
-                        headers = {"Accept": "application/json", "authorization": f"Bearer {self.keys[0]}"}
-                        self.keys.rotate()
-                        url = (
-                            f"https://api.clashofclans.com/v1/leagues/29000022/seasons/{year}?limit=25000{after_param}"
-                        )
-                        async with session.get(url, headers=headers) as response:
-                            if response.status != 200:
-                                print(await response.json())
-                                self.logger.error(f"Failed to fetch legends for season {year}: {response.status}")
-                                break
-                            items = await response.json()
-                            players = items.get("items", [])
-                            for player in players:
-                                player["season"] = year
-                                changes.append(InsertOne(player))
-                            after = items.get("paging", {}).get("cursors", {}).get("after", None)
-
-                    if changes:
-                        try:
-                            await self.db_client.legend_history.bulk_write(changes, ordered=False)
-                            self.logger.info(f"Inserted {len(changes)} legend records for season {year}")
-                        except Exception as e:
-                            self.logger.error(f"Error inserting legends for season {year}: {e}")
-        except Exception as e:
-            self.logger.exception(f"Unexpected error in store_legends: {e}")
+    def __init__(self):
+        super().__init__(tracker_type=TrackingType.GLOBAL_SCHEDULED, batch_size=50_000)
 
     async def store_cwl_wars(self):
         """
@@ -174,7 +32,7 @@ class ScheduledTracking(Tracking):
             hashids = Hashids(min_length=7)
             season = gen_games_season()
             pipeline = [{"$match": {"data.season": season}}, {"$group": {"_id": "$data.rounds.warTags"}}]
-            result = self.mongo.cwl_group.aggregate(pipeline).to_list(length=None)
+            result = await self.async_mongo.cwl_group.aggregate(pipeline).to_list(length=None)
             done_for_this_season = [x["_id"] for x in result]
             done_for_this_season = [j for sub in done_for_this_season for j in sub]
             all_tags = set([j for sub in done_for_this_season for j in sub])
@@ -182,15 +40,15 @@ class ScheduledTracking(Tracking):
 
             pipeline = [{"$match": {"data.season": season}}, {"$group": {"_id": "$data.tag"}}]
             tags_already_found = set(
-                [x["_id"] for x in (self.mongo.clan_wars.aggregate(pipeline).to_list(length=None))]
+                [x["_id"] for x in (await self.async_mongo.clan_wars.aggregate(pipeline).to_list(length=None))]
             )
             self.logger.info(f"{len(tags_already_found)} war tags already found")
             all_tags = [t for t in all_tags if t not in tags_already_found]
 
             self.logger.info(f"{len(all_tags)} war tags to find")
-            all_tags = [all_tags[i : i + self.batch_size] for i in range(0, len(all_tags), self.batch_size)]
 
-            for count, tag_group in enumerate(all_tags, 1):
+            batches = self._split_into_batch(items=all_tags)
+            for count, tag_group in enumerate(batches, 1):
                 start_time = time.time()
                 self.logger.info(f"GROUP {count} | {len(tag_group)} tags")
                 tasks = []
@@ -202,14 +60,13 @@ class ScheduledTracking(Tracking):
                         )
                     )
                 self.logger.info(f"{len(tasks)} tasks")
-                responses = await asyncio.gather(*tasks)
-
-                self.logger.info(f"{len(responses)} responses | {time.time() - start_time} sec")
-
+                responses = await self._run_tasks(tasks=tasks, return_exceptions=True, wrapped=True)
                 add_war = []
-                responses = [(orjson.loads(r), tag) for r, tag in responses if r is not None]
-                self.logger.info(f"{len(responses)} valid responses | {time.time() - start_time} sec")
-                for response, tag in responses:  # type: dict, str
+
+                for response in responses:  # type: dict, str
+                    if not isinstance(response, tuple):
+                        continue
+                    response, tag = response
                     try:
                         response["tag"] = tag
                         response["season"] = season
@@ -270,55 +127,42 @@ class ScheduledTracking(Tracking):
         Store Clan War League groups data at scheduled times.
         """
         try:
-            season = self.gen_games_season()
-
-            async def fetch_group(url, session: aiohttp.ClientSession, headers, tag):
-                async with session.get(url, headers=headers) as response:
-                    if response.status == 200:
-                        return ((await response.json()), tag)
-                    return (None, tag)
+            season = gen_games_season()
 
             pipeline = [{"$match": {}}, {"$group": {"_id": "$tag"}}]
-            all_tags = [x["_id"] for x in (await self.db_client.basic_clan.aggregate(pipeline).to_list(length=None))]
+            all_tags = [x["_id"] for x in (await self.async_mongo.basic_clan.aggregate(pipeline).to_list(length=None))]
 
             pipeline = [
                 {"$match": {"$and": [{"data.season": season}, {"data.state": "ended"}]}},
                 {"$group": {"_id": "$data.clans.tag"}},
             ]
             done_for_this_season = [
-                x["_id"] for x in (await self.db_client.cwl_group.aggregate(pipeline).to_list(length=None))
+                x["_id"] for x in (await self.async_mongo.cwl_group.aggregate(pipeline).to_list(length=None))
             ]
             done_for_this_season = set([j for sub in done_for_this_season for j in sub])
 
             all_tags = [tag for tag in all_tags if tag not in done_for_this_season]
 
-            size_break = 50000
-            all_tags = [all_tags[i : i + size_break] for i in range(0, len(all_tags), size_break)]
-
+            tag_batches = self._split_into_batch(items=all_tags)
             was_found_in_a_previous_group = set()
-            for tag_group in all_tags:
+            for tag_group in tag_batches:
                 tasks = []
-                connector = aiohttp.TCPConnector(limit=250, ttl_dns_cache=300)
-                timeout = aiohttp.ClientTimeout(total=1800)
-                async with aiohttp.ClientSession(
-                    connector=connector, timeout=timeout, json_serialize=orjson.dumps
-                ) as session:
-                    for tag in tag_group:
-                        if tag in was_found_in_a_previous_group:
-                            continue
-                        tasks.append(
-                            fetch_group(
-                                f"https://api.clashofclans.com/v1/clans/{tag.replace('#', '%23')}/currentwar/leaguegroup",
-                                session,
-                                {"Authorization": f"Bearer {next(self.coc_client.http.keys)}"},
-                                tag,
-                            )
+                for tag in tag_group:
+                    if tag in was_found_in_a_previous_group:
+                        continue
+                    tasks.append(
+                        self.fetch(
+                            url=f"https://api.clashofclans.com/v1/clans/{tag.replace('#', '%23')}/currentwar/leaguegroup",
+                            tag=tag, json=True
                         )
-                    responses = await asyncio.gather(*tasks, return_exceptions=True)
+                    )
+                responses = await self._run_tasks(tasks=tasks, return_exceptions=True, wrapped=True)
 
                 changes = []
-                responses = [r for r in responses if isinstance(r, tuple) and r[0] is not None]
-                for response, tag in responses:
+                for response in responses:
+                    if not isinstance(response, tuple):
+                        continue
+                    response, tag = response
                     try:
                         season = response.get("season")
                         for clan in response.get("clans", []):
@@ -330,63 +174,136 @@ class ScheduledTracking(Tracking):
                         self.logger.error(f"Error processing cwl_group data for tag {tag}: {e}")
                 if changes:
                     try:
-                        await self.db_client.cwl_group.bulk_write(changes)
+                        await self.async_mongo.cwl_group.bulk_write(changes)
                         self.logger.info(f"{len(changes)} Changes Updated/Inserted")
                     except Exception as e:
                         self.logger.error(f"Error writing cwl_group: {e}")
+
         except Exception as e:
             self.logger.exception(f"Unexpected error in store_cwl_groups: {e}")
+
+    async def store_all_leaderboards(self):
+        """
+        Store all leaderboards data at scheduled times.
+        """
+        try:
+            for database, function in zip(
+                [
+                    self.async_mongo.clan_trophies,
+                    self.async_mongo.clan_versus_trophies,
+                    self.async_mongo.capital,
+                    self.async_mongo.player_trophies,
+                    self.async_mongo.player_versus_trophies,
+                ],
+                [
+                    self.coc_client.get_location_clans,
+                    self.coc_client.get_location_clans_builder_base,
+                    self.coc_client.get_location_clans_capital,
+                    self.coc_client.get_location_players,
+                    self.coc_client.get_location_players_builder_base,
+                ],
+            ):
+                tasks = [
+                    function(location_id=location) for location in locations
+                ]
+                responses = await asyncio.gather(*tasks, return_exceptions=True)
+                store_tasks = []
+                for index, response in enumerate(responses):
+                    if isinstance(response, Exception):
+                        self.logger.error(f"Error fetching data for location {locations[index]}: {response}")
+                        continue
+                    location = locations[index]
+                    store_tasks.append(
+                        InsertOne(
+                            {
+                                "location": location,
+                                "date": str(pend.now(tz=pend.UTC).date()),
+                                "data": {"items": [x._raw_data for x in response]},
+                            }
+                        )
+                    )
+
+                if store_tasks:
+                    try:
+                        await database.bulk_write(store_tasks)
+                        self.logger.info("Stored leaderboards for locations batch.")
+                    except Exception as e:
+                        self.logger.error(f"Error storing leaderboards: {e}")
+        except Exception as e:
+            self.logger.exception(f"Unexpected error in store_all_leaderboards: {e}")
+
+    async def store_legends(self):
+        """
+        Store legends data at scheduled times.
+        """
+        seasons = await self.coc_client.get_seasons(league_id=29000022)
+
+        seasons_present = await self.async_mongo.legend_history.distinct("season")
+        missing = set(seasons) - set(seasons_present)
+
+        for season_id in missing:
+            rankings = await self.coc_client.get_season_rankings(
+                league_id=29000022,
+                season_id=season_id, limit=25_000
+            )
+            changes = []
+            async for ranking in rankings:
+                data = ranking._raw_data | {"season" : season_id}
+                changes.append(InsertOne(data))
+
+            if changes:
+                await self.async_mongo.legend_history.bulk_write(changes, ordered=False)
+                self.logger.info(f"Inserted {len(changes)} legend records for season {season_id}")
+
+    async def _get_cache_tags(self):
+        cursor = 0
+        keys = []
+        while True:
+            cursor, batch = await self.aredis_decoded.scan(cursor=cursor, match="player-cache:*", count=25_000)
+            keys.extend(batch)
+            if cursor == 0:
+                break
+        return set(keys)
 
     async def update_autocomplete(self):
         """
         Update the autocomplete data for players every 30 minutes.
         """
-        try:
-            current_time = pend.now(tz=pend.UTC)
-            one_hour_ago = current_time.subtract(hours=1).timestamp()
-            # Any players that had an update in the last hour
-            pipeline = [
-                {"$match": {"last_updated": {"$gte": one_hour_ago}}},
-                {"$project": {"tag": "$tag"}},
-                {"$unset": "_id"},
-            ]
-            all_player_tags = [
-                x["tag"] for x in (await self.db_client.player_stats.aggregate(pipeline).to_list(length=None))
-            ]
+        # Any players that had an update in the last hour
+        all_player_tags = await self._get_cache_tags()
+        player_tag_batches = self._split_into_batch(items=list(all_player_tags))
 
-            split_size = 50_000
-            split_tags = [all_player_tags[i : i + split_size] for i in range(0, len(all_player_tags), split_size)]
+        for count, group in enumerate(player_tag_batches, 1):
+            t = time.time()
+            self.logger.info(f"Group {count}/{len(player_tag_batches)}")
+            previous_player_responses = await self.redis_raw.mget(keys=group)
+            pipeline = self.aredis_decoded.pipeline()
+            for response, tag in zip(previous_player_responses, group):
+                if not response:
+                    continue
+                try:
+                    response = orjson.loads(snappy.decompress(response))
+                    d = {
+                        "name": response.get("name"),
+                        "clan": response.get("clan", {}).get("tag", "No Clan"),
+                        "league": response.get("league", {}).get("name", "Unranked"),
+                        "tag": response.get("tag"),
+                        "th": response.get("townHallLevel"),
+                        "clan_name": response.get("clan", {}).get("name", "No Clan"),
+                        "trophies": response.get("trophies"),
+                    }
+                    pipeline.hset(f"search:{tag}", mapping=d)
+                    pipeline.expire(f"search:{tag}", 86400)
+                except Exception as e:
+                    self.logger.error(f"Error processing player data: {e}")
 
-            for count, group in enumerate(split_tags, 1):
-                t = time.time()
-                self.logger.info(f"Group {count}/{len(split_tags)}")
-                tasks = []
-                previous_player_responses = await self.redis.mget(keys=group)
-                for response in previous_player_responses:
-                    if response is not None:
-                        try:
-                            response = orjson.loads(snappy.decompress(response))
-                            d = {
-                                "name": response.get("name"),
-                                "clan": response.get("clan", {}).get("tag", "No Clan"),
-                                "league": response.get("league", {}).get("name", "Unranked"),
-                                "tag": response.get("tag"),
-                                "th": response.get("townHallLevel"),
-                                "clan_name": response.get("clan", {}).get("name", "No Clan"),
-                                "trophies": response.get("trophies"),
-                            }
-                            tasks.append(UpdateOne({"tag": response.get("tag")}, {"$set": d}, upsert=True))
-                        except Exception as e:
-                            self.logger.error(f"Error processing player data: {e}")
-                self.logger.info(f"Starting bulk write: took {time.time() - t} secs")
-                if tasks:
-                    try:
-                        await self.db_client.player_autocomplete.bulk_write(tasks, ordered=False)
-                        self.logger.info(f"Updated autocomplete for {len(tasks)} players")
-                    except Exception as e:
-                        self.logger.error(f"Error updating autocomplete: {e}")
-        except Exception as e:
-            self.logger.exception(f"Unexpected error in update_autocomplete: {e}")
+            self.logger.info(f"Starting bulk write: took {time.time() - t} secs")
+            try:
+                await pipeline.execute()
+                self.logger.info(f"Updated autocomplete for {len(group)} players")
+            except Exception as e:
+                self.logger.error(f"Error updating autocomplete: {e}")
+
 
     async def update_region_leaderboards(self):
         """
@@ -798,26 +715,45 @@ class ScheduledTracking(Tracking):
         result = self.mongo.clan_wars.aggregate(pipeline).to_list(length=None)
         print(result)
 
-    async def run(self):
-        """
-        Start the scheduler and keep the application running.
-        """
-
-        try:
-            await self.initialize()
-
-            # self.setup_scheduler()
-            # await self.test_name_search()
-            # await self.better_clan_tracking()
-            await self.store_cwl_wars()
-            # self.scheduler.start()
-            self.logger.info("Scheduler started. Running scheduled jobs...")
-            # Keep the main thread alive
-            while True:
-                await asyncio.sleep(3600)  # Sleep for an hour, adjust as needed
-        except (KeyboardInterrupt, SystemExit):
-            self.logger.info("Shutting down scheduler...")
-            self.scheduler.shutdown()
+    async def add_permanent_schedules(self):
+        self.scheduler.add_job(
+            self.store_all_leaderboards,
+            CronTrigger(hour=4, minute=56),
+            name="Store All Leaderboards",
+            misfire_grace_time=300,
+        )
+        self.scheduler.add_job(
+            self.store_legends, CronTrigger(day="*", hour=5, minute=56), name="Store Legends",
+            misfire_grace_time=300
+        )
+        self.scheduler.add_job(
+            self.store_cwl_wars,
+            CronTrigger(day="13", hour=19, minute=37),
+            name="Store CWL Wars",
+            misfire_grace_time=300,
+        )
+        self.scheduler.add_job(
+            self.store_cwl_groups,
+            CronTrigger(day="9-12", hour="*", minute=35),
+            name="Store CWL Groups",
+            misfire_grace_time=300,
+        )
+        self.scheduler.add_job(
+            self.update_autocomplete, IntervalTrigger(minutes=30), name="Update Autocomplete",
+            misfire_grace_time=300
+        )
+        self.scheduler.add_job(
+            self.update_region_leaderboards,
+            IntervalTrigger(minutes=15),
+            name="Update Region Leaderboards",
+            misfire_grace_time=300,
+        )
+        self.scheduler.add_job(
+            self.store_clan_capital,
+            CronTrigger(day_of_week="mon", hour=10),
+            name="Store Clan Capital",
+            misfire_grace_time=300,
+        )
 
     async def build_ranking(self):
         ranking_pipeline = [
@@ -846,7 +782,20 @@ class ScheduledTracking(Tracking):
         ]
         await self.mongo.global_clans.aggregate(ranking_pipeline).to_list(length=None)
 
+    async def run(self):
+        try:
+            await self.initialize()
+            print(list(await self._get_cache_tags())[:10])
+            #await self.add_permanent_schedules()
 
-if __name__ == "__main__":
-    tracker = ScheduledTracking(tracker_type=TrackingType.GLOBAL_SCHEDULED)  # Replace with appropriate type
-    asyncio.run(tracker.run())
+            self.logger.info("Scheduler started. Running scheduled jobs...")
+            # Keep the main thread alive
+            while True:
+                await asyncio.sleep(3600)  # Sleep for an hour, adjust as needed
+        except (KeyboardInterrupt, SystemExit):
+            self.logger.info("Shutting down scheduler...")
+            self.scheduler.shutdown()
+
+
+
+asyncio.run(ScheduledTracking().run())
