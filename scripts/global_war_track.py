@@ -50,10 +50,11 @@ class GlobalWarTrack(Tracking):
         return active_clans
 
     def _open_war_log_clans(self):
-        pipeline = [{"$match": {"openWarLog": True}}, {"$group": {"_id": "$tag"}}]
+        pipeline = [{"$match": {"data.isWarLogPublic": True}}, {"$group": {"_id": "$tag"}}]
         all_tags = [
             x["_id"]
-            for x in self.mongo.global_clans.aggregate(pipeline, hint={"openWarLog": 1, "tag": 1}).to_list(length=None)
+            for x in self.mongo.all_clans.aggregate(pipeline,
+                                                    hint={"data.isWarLogPublic": 1, "tag": 1}).to_list(length=None)
         ]
         return all_tags
 

@@ -20,7 +20,14 @@ class GlobalClanTracking(Tracking):
 
     def _clans(self, active: bool):
         pipeline = [{"$match": {"active": active}}, {"$group": {"_id": "$tag"}}]
-        all_tags = [x["_id"] for x in self.mongo.global_clans.aggregate(pipeline).to_list(length=None)]
+        if active:
+            pipeline = [
+                {"$match" : {}},
+                {"$group": {"_id": "$tag"}},
+            ]
+        else:
+            return []
+        all_tags = [x["_id"] for x in self.mongo.all_clans.aggregate(pipeline).to_list(length=None)]
         if active:
             bot_clan_tags = self.mongo.clans_db.distinct("tag")
             all_tags = list(set(all_tags + bot_clan_tags))
@@ -31,7 +38,6 @@ class GlobalClanTracking(Tracking):
 
     def _priority_players(self) -> set[str]:
         return set(self.mongo.user_settings.distinct("search.player.bookmarked"))
-
 
     def _batches(self):
         if not self.inactive_clans:
@@ -49,9 +55,9 @@ class GlobalClanTracking(Tracking):
         stats = {}
 
         async def fetch_batch(batch):
-            cursor = self.async_mongo.all_clans.find({"data.tag": {"$in": batch}})
+            cursor = self.async_mongo.all_clans.find({"tag": {"$in": batch}})
             docs = await cursor.to_list(length=None)
-            return {d["_id"]: (d["data"], d.get("records", {})) for d in docs}
+            return {d["tag"]: (d["data"], d.get("records", {})) for d in docs}
 
         # split into 1k batches
         batches = [clan_tags[i : i + 500] for i in range(0, len(clan_tags), 500)]
@@ -62,9 +68,9 @@ class GlobalClanTracking(Tracking):
 
         return stats
 
-
     def _find_join_leaves_and_donos(self, previous_clan: dict, current_clan: dict):
         changes = []
+        season_stats = []
         clan_tag = current_clan.get("tag")
         now = pend.now(tz=pend.UTC)
 
@@ -107,7 +113,7 @@ class GlobalClanTracking(Tracking):
                 })
             )
 
-        '''if clan_tag not in self.priority_clans:
+        if clan_tag not in self.priority_clans:
             # Donation changes
             for tag, curr in current_members.items():
                 if tag in self.priority_players:
@@ -129,9 +135,9 @@ class GlobalClanTracking(Tracking):
                             },
                             upsert=True
                         )
-                    )'''
+                    )
 
-        return changes
+        return changes, season_stats
 
     def _find_clan_changes(self, previous_clan: dict, current_clan: dict):
         changes = []
@@ -210,7 +216,6 @@ class GlobalClanTracking(Tracking):
         if to_set:
             return UpdateOne({"data.tag": new_clan.get("tag")}, {"$set": to_set}, upsert=True)
 
-
     async def track_clans(self):
         import time
 
@@ -232,7 +237,6 @@ class GlobalClanTracking(Tracking):
             join_leave_changes = []
             season_stat_changes = []
             changes_history = []
-            pipeline = self.redis_decoded.pipeline()
 
             print(f"pull clans DB: START {time.time() - t} seconds")
             previous_clan_batch = await self._get_previous_clans(clan_tags=batch)
@@ -268,27 +272,22 @@ class GlobalClanTracking(Tracking):
             print(f"clan data loop: END {time.time() - t} seconds")
 
             if changes:
-                try:
-                    self.mongo.all_clans.bulk_write(changes, ordered=False)
-                except Exception as e:
-                    print(e)
+                self.mongo.all_clans.bulk_write(changes, ordered=False)
                 logger.info(f"Made {len(changes)} clan changes")
 
             if changes_history:
                 self.mongo.clan_change_history.bulk_write(changes_history, ordered=False)
                 logger.info(f"Made {len(changes_history)} clan change history")
 
-            print("batch time: ", time.time() - t, " seconds")
-            """if join_leave_changes:
-                await db_client.join_leave_history.bulk_write(
-                    join_leave_changes, ordered=False
-                )
-                logger.info(
-                    f'Made {len(join_leave_changes)} join/leave changes'
-                )"""
+            if join_leave_changes:
+                self.mongo.join_leave_history.bulk_write(join_leave_changes, ordered=False)
+                logger.info(f'Made {len(join_leave_changes)} join/leave changes')
 
-    async def update_mongo_cache(self):
-        pass
+            if season_stat_changes:
+                self.mongo.new_player_stats.bulk_write(season_stat_changes, ordered=False)
+                logger.info(f'Made {len(join_leave_changes)} donation changes')
+
+            print("batch time: ", time.time() - t, " seconds")
 
     async def run(self):
         await self.initialize()

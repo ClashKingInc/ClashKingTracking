@@ -504,7 +504,7 @@ class ScheduledTracking(Tracking):
 
         pipeline_4 = [{"$match": {}}, {"$group": {"_id": "$tag"}}]
         existing_clans = [
-            x["_id"] for x in (await self.async_mongo.global_clans.aggregate(pipeline_4).to_list(length=None))
+            x["_id"] for x in (await (await self.async_mongo.global_clans.aggregate(pipeline_4)).to_list(length=None))
         ]
         existing_clans = set(existing_clans)
         # Find clans in the combined set but not in existing_clans
@@ -517,7 +517,82 @@ class ScheduledTracking(Tracking):
         results = await self.async_mongo.global_clans.bulk_write(tags_to_add, ordered=False)
         print(results.bulk_api_result)
 
+    async def set_active_clans(self):
+        ninety_days = pend.now(tz=pend.UTC).subtract(days=90).int_timestamp
 
+        pipeline = [
+            {"$match": {"$and": [{"endTime": {"$gte": ninety_days}}, {"type": {"$ne": "cwl"}}]}},
+            {"$unwind": "$clans"},
+            {"$group": {"_id": "$clans"}},
+        ]
+        active_clans = [
+            x["_id"] for x in
+            await (await self.async_mongo.clan_wars.aggregate(pipeline)).to_list(length=None)
+        ]
+
+        self.logger.info(f"ACTIVE CLANS: {len(active_clans)}")
+        await self.async_mongo.all_clans.update_many(
+            {"$or": [
+                {"data.members": {"$lt": 5}},
+                {"data.clanLevel": {"$lt": 3}},
+                {"data.capitalLeague.name": None}
+            ]},
+            {"$set": {"active": False}},
+        )
+
+        await self.async_mongo.all_clans.update_many(
+            {"$nor": [
+                {"data.members": {"$lt": 5}},
+                {"data.clanLevel": {"$lt": 3}},
+                {"data.capitalLeague.name": None}
+            ]},
+            {"$set": {"active": True}},
+        )
+        batches = self._split_into_batch(items=active_clans)
+        for clans in batches:
+            await self.async_mongo.all_clans.update_many(
+                {"tag": {"$in": clans}},
+                {"$set": {"active": True}},
+            )
+
+    async def remove_dead_clans(self):
+        thirty_five_days = pend.now(tz=pend.UTC).subtract(days=35).int_timestamp
+
+        pipeline = [
+            {"$match": {"$and": [{"endTime": {"$gte": thirty_five_days}}]}},
+            {"$unwind": "$clans"},
+            {"$group": {"_id": "$clans"}},
+        ]
+        active_clans = [
+            x["_id"] for x in
+            await (await self.async_mongo.clan_wars.aggregate(pipeline)).to_list(length=None)
+        ]
+
+        active_clans = set(active_clans)
+        self.logger.info(f"ACTIVE CLANS: {len(active_clans)}")
+
+        pipeline = [
+            {"$match": {"$or": [
+                {"members": {"$lt": 5}},
+                {"level": {"$lt": 3}},
+                {"capitalLeague": "Unranked"}
+            ]}},
+            {"$group": {"_id": "$tag"}},
+        ]
+        pipeline = await self.async_mongo.global_clans.aggregate(pipeline)
+        dead_clans = await pipeline.to_list(length=None)
+        dead_clans = [x["_id"] for x in dead_clans]
+        clans_to_delete = []
+        for clan in dead_clans:
+            if clan not in active_clans:
+                clans_to_delete.append(clan)
+
+        batches = await self._split_into_batch(items=clans_to_delete)
+        for batch in batches:
+            await self.async_mongo.all_clans.update_many(
+                {"data.tag" : {"$in": batch}},
+                {"$unset": {"data": ""}})
+        self.logger.info(f"DELETING {len(clans_to_delete)} DEAD CLANS")
 
     async def migrate_clan_stats(self):
         clan_stats = self.db_client.clan_stats
@@ -620,27 +695,14 @@ class ScheduledTracking(Tracking):
 
     async def better_clan_tracking(self):
         self.mongo.global_clans.update_many(
-            {"$or": [{"members": {"$lt": 10}}, {"level": {"$lt": 3}}, {"capitalLeague": "Unranked"}]},
+            {"$or": [{"members": {"$lt": 5}}, {"level": {"$lt": 3}}, {"capitalLeague": "Unranked"}]},
             {"$set": {"active": False}},
         )
 
         self.mongo.global_clans.update_many(
-            {"$nor": [{"members": {"$lt": 10}}, {"level": {"$lt": 3}}, {"capitalLeague": "Unranked"}]},
+            {"$nor": [{"members": {"$lt": 5}}, {"level": {"$lt": 3}}, {"capitalLeague": "Unranked"}]},
             {"$set": {"active": True}},
         )
-
-    async def better_war_tracking(self):
-        right_now = pend.now(tz=pend.UTC).timestamp()
-        one_week_ago = int(right_now) - (604800 * 2)
-
-        pipeline = [
-            {"$match": {"$and": [{"endTime": {"$gte": one_week_ago}}, {"type": {"$ne": "cwl"}}]}},
-            {"$group": {"_id": "$clans"}},
-        ]
-        results = self.mongo.clan_wars.aggregate(pipeline).to_list(length=None)
-        clan_tags = []
-        for result in results:
-            clan_tags.extend(result.get("_id", []))
 
     async def count_range(self):
         past = pend.now(tz=pend.UTC).subtract(days=7).int_timestamp
@@ -717,14 +779,14 @@ class ScheduledTracking(Tracking):
             # 7) write results out to your new collection
             {"$out": {"db": "new_looper", "coll": "legend_rankings"}},
         ]
-        await self.mongo.global_clans.aggregate(ranking_pipeline).to_list(length=None)
+        await self.mongo.all_clans.aggregate(ranking_pipeline).to_list(length=None)
 
     async def run(self):
         try:
             await self.initialize()
             #await self.update_autocomplete()
 
-            await self.find_new_clans()
+            await self.migrate_clan_db()
             self.logger.info("Scheduler started. Running scheduled jobs...")
             # Keep the main thread alive
             while True:
