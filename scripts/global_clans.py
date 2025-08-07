@@ -166,6 +166,7 @@ class GlobalClanTracking(Tracking):
                     }
                 )
             )
+
         return changes
 
     def _find_new_records(self, current_clan: dict, clan_records: dict):

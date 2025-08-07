@@ -58,6 +58,7 @@ class MongoDatabase:
         self.clan_trophies: collection_class = self.ranking_history.clan_trophies
         self.clan_versus_trophies: collection_class = self.ranking_history.clan_versus_trophies
         self.capital: collection_class = self.ranking_history.capital
+        self.league_history = self.ranking_history.get_collection("league_history")
 
         self.capital_cache: collection_class = self.cache.capital_raids
 

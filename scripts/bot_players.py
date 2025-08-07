@@ -15,30 +15,18 @@ class PlayerTracking(Tracking):
         super().__init__(batch_size=25_000, tracker_type=TrackingType.BOT_PLAYER)
         self.tracked_tags = set()
 
-        self.skip_store_types = {
-            "clan",
-            "War League Legend",
-            "Wall Buster",
-            "Aggressive Capitalism",
-            "Baby Dragon",
-            "Elixir Escapade",
-            "Gold Grab",
-            "Heroic Heist",
-            "Nice and Tidy",
-            "Well Seasoned",
-            "attackWins",
-            "builderBaseTrophies",
-            "donations",
-            "donationsReceived",
-            "trophies",
-            "versusBattleWins",
-            "versusTrophies",
-            "defenseWins",
-            "Games Champion",
-            "league",
-            "role",
-            "clanCapitalContributions",
-            "builderBaseLeague",
+        self.store_types = {
+            "name",
+            "troops",
+            "heroes",
+            "spells",
+            "heroEquipment",
+            "townHallLevel",
+            "warStars",
+            "warPreference",
+            "bestBuilderBaseTrophies",
+            "bestTrophies",
+            "expLevel"
         }
 
         self.online_types = {
@@ -57,6 +45,9 @@ class PlayerTracking(Tracking):
             "warStars",
             "Nice and Tidy",
             "builderBaseTrophies",
+            "Anti-Artillery",
+            "Firefighter",
+            "X-Bow Exterminator"
         }
         self.ws_types = {
             "clanCapitalContributions",
@@ -68,7 +59,7 @@ class PlayerTracking(Tracking):
             "townHallLevel",
             "league",
             "Most Valuable Clanmate",
-            "role",
+            "role"
         }
         self.seasonal_inc = {
             "donations": "donated",
@@ -79,6 +70,9 @@ class PlayerTracking(Tracking):
             "Heroic Heist": "dark_elixir_looted",
             "Well Seasoned": "season_pass",
             "Games Champion": "clan_games",
+            "Nice and Tidy" : "obstacles_removed",
+            "Superb Work" : "boosted_super_troops",
+            "Wall Buster": "walls_destroyed",
         }
         self.seasonal_set = {"attackWins": "attack_wins", "trophies": "trophies"}
 
@@ -122,17 +116,7 @@ class PlayerTracking(Tracking):
 
     def get_player_changes(self, previous_response: dict, response: dict):
         changes = {}
-        ok_achievements = {
-            "Gold Grab",
-            "Elixir Escapade",
-            "Heroic Heist",
-            "Games Champion",
-            "Aggressive Capitalism",
-            "Well Seasoned",
-            "Nice and Tidy",
-            "War League Legend",
-            "Wall Buster",
-        }
+
         not_ok_fields = {"labels", "legendStatistics", "playerHouse", "versusBattleWinCount"}
 
         for key, value in response.items():
@@ -155,9 +139,6 @@ class PlayerTracking(Tracking):
             for list_item in value:  # type: dict
                 # all list items in clash have a name
                 fixed_name = list_item["name"].replace(".", "")
-
-                if key == "achievements" and list_item["name"] not in ok_achievements:
-                    continue
 
                 old_list_item = next((item for item in previous_value if item["name"] == list_item["name"]), {})
 
@@ -232,7 +213,7 @@ class PlayerTracking(Tracking):
                 if isinstance(old_value, int) and isinstance(new_value, int):
                     change = new_value - old_value
 
-                if item_key not in self.skip_store_types:
+                if item_key in self.store_types or key in self.store_types:
                     self.historical_changes.append(
                         InsertOne(
                             {

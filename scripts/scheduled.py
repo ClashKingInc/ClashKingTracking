@@ -1,6 +1,7 @@
 import asyncio
 import random
 import time
+from collections import defaultdict
 
 import aiohttp
 import coc
@@ -17,7 +18,7 @@ from utility.constants import locations
 import math
 
 from tracking import Tracking, TrackingType
-from utility.time import gen_games_season
+from utility.time import gen_games_season, gen_raid_date, gen_season_date
 
 
 class ScheduledTracking(Tracking):
@@ -594,37 +595,6 @@ class ScheduledTracking(Tracking):
                 {"$unset": {"data": ""}})
         self.logger.info(f"DELETING {len(clans_to_delete)} DEAD CLANS")
 
-    async def migrate_clan_stats(self):
-        clan_stats = self.db_client.clan_stats
-
-        new_clan_stats = self.db_client.looper.get_collection("player_stats")
-
-        docs_to_insert = []
-        total_inserted = 0
-        for doc in clan_stats.find({}, {"_id": 0}):
-            doc: dict
-            clan_tag = doc.pop("tag")
-            for season, clan_season_stats in doc.items():
-                season: str
-                member_stats: dict
-                for member_tag, member_stats in clan_season_stats.items():
-                    member_tag: str
-                    member_stats: dict
-                    member_stats.pop("name", None)
-                    member_stats.pop("townhall", None)
-                    new_member_stats = member_stats | {"clan_tag": clan_tag, "season": season, "tag": member_tag}
-                    docs_to_insert.append(InsertOne(new_member_stats))
-
-            if len(docs_to_insert) > 25000:
-                total_inserted += 25000
-                print(f"TOTAL INSERTED: {total_inserted}")
-                new_clan_stats.bulk_write(docs_to_insert, ordered=False)
-                docs_to_insert = []
-
-        if docs_to_insert:
-            print(f"DONE ||| TOTAL INSERTED: {total_inserted}")
-            new_clan_stats.bulk_write(docs_to_insert, ordered=False)
-
     async def test_name_search(self):
         import redis
         import snappy
@@ -704,15 +674,116 @@ class ScheduledTracking(Tracking):
             {"$set": {"active": True}},
         )
 
-    async def count_range(self):
-        past = pend.now(tz=pend.UTC).subtract(days=7).int_timestamp
-        pipeline = [
-            {"$match": {"$and": [{"endTime": {"$gte": past}}, {"type": {"$ne": "cwl"}}]}},
-            {"$group": {"_id": "$clans"}},
-            {"$count": "count"},
-        ]
-        result = self.mongo.clan_wars.aggregate(pipeline).to_list(length=None)
-        print(result)
+
+    async def store_league_changes(self, league_type: str):
+
+        if league_type == "capitalLeague":
+            timestamp = gen_raid_date()
+            spot = "clanCapital"
+        elif league_type == "warLeague":
+            timestamp = gen_games_season()
+            spot = "clanWarLeague"
+
+        updates = []
+
+        async for clan in self.async_mongo.all_clans.find({}, {"_id": 0, "tag": 1, f"data.{league_type}": 1, "data.clanCapitalPoints" : 1}):
+            league = clan.get("data").get(league_type).get("name", "Unranked")
+            history = {
+                "league" : league
+            }
+            if league_type == "capitalLeague":
+                history["trophies"] = clan.get("data").get("clanCapitalPoints", 0)
+
+            updates.append(
+                UpdateOne(
+                    {"tag" : clan.get("tag")},
+                    {"$set" : {f"changes.{spot}.{timestamp}" : history}},
+
+                ))
+
+            if len(updates) >= 25_000:
+                await self.async_mongo.clan_change_history.bulk_write(updates, ordered=False)
+                updates.clear()
+
+        if updates:
+            await self.async_mongo.clan_change_history.bulk_write(updates, ordered=False)
+
+
+    async def create_leaderboards(self):
+        server_to_clans = defaultdict(list)
+        default_stats_data = {
+            "donated" : 0,
+            "received" : 0,
+            "activity" : 0,
+            "dark_elixir_looted": 0,
+            "gold_looted" : 0,
+            "elixir_looted" : 0,
+            "capital_gold_dono" : 0,
+            "obstacles_removed" : 0,
+            "attack_wins" : 0,
+            "boosted_super_troops" : 0,
+            "walls_destroyed" : 0
+        }
+        async for clan in self.async_mongo.clans_db.find({}, {"_id": 0, "tag": 1, "server": 1}):
+            tag = clan.get("tag")
+            server_to_clans[clan.get("server")].append(tag)
+
+        season = gen_season_date()
+
+        for field in default_stats_data.keys():
+            clan_pipeline = [
+                {"$match": {"season": season}},
+                {"$group": {
+                    "_id": "$clan_tag",
+                    "value": {"$sum": f"${field}"},
+                }},
+                {"$sort": {"value": -1}},
+                {"$limit": 1000}
+            ]
+            field_leaderboard = await self.async_mongo.new_player_stats.aggregate(pipeline=clan_pipeline)
+            field_leaderboard = await field_leaderboard.to_list(length=None)
+
+            field_leaderboard = [f for f in field_leaderboard if f.get("value") != 0]
+            for count, data in enumerate(field_leaderboard, 1):
+                data["type"] = field
+                data["season"] = season
+                data["tag"] = data["_id"]
+                data["rank"] = count
+                del data["_id"]
+
+            if field_leaderboard:
+                await self.async_mongo.ranking_history.get_collection("clan_leaderboard").insert_many(field_leaderboard)
+
+        for field in default_stats_data.keys():
+            player_pipeline = [
+                {"$match": {"season": season}},
+                {"$group": {
+                    "_id": "$tag",
+                    "value": {"$sum": f"${field}"},
+                }},
+                {"$sort": {"value": -1}},
+                {"$limit": 1000}
+            ]
+            field_leaderboard = await self.async_mongo.new_player_stats.aggregate(pipeline=player_pipeline)
+            field_leaderboard = await field_leaderboard.to_list(length=None)
+
+            field_leaderboard = [f for f in field_leaderboard if f.get("value") != 0]
+            for count, data in enumerate(field_leaderboard, 1):
+                data["type"] = field
+                data["season"] = season
+                data["tag"] = data["_id"]
+                data["rank"] = count
+                del data["_id"]
+
+            if field_leaderboard:
+                await self.async_mongo.ranking_history.get_collection("player_leaderboard").insert_many(field_leaderboard)
+
+
+
+
+
+
+
 
     async def add_permanent_schedules(self):
         self.scheduler.add_job(
@@ -722,23 +793,15 @@ class ScheduledTracking(Tracking):
             misfire_grace_time=300,
         )
         self.scheduler.add_job(
-            self.store_legends, CronTrigger(day="*", hour=5, minute=56), name="Store Legends",
+            self.store_legends,
+            CronTrigger(day="*", hour=5, minute=56),
+            name="Store Legends",
             misfire_grace_time=300
         )
         self.scheduler.add_job(
-            self.store_cwl_wars,
-            CronTrigger(day="13", hour=19, minute=37),
-            name="Store CWL Wars",
-            misfire_grace_time=300,
-        )
-        self.scheduler.add_job(
-            self.store_cwl_groups,
-            CronTrigger(day="9-12", hour="*", minute=35),
-            name="Store CWL Groups",
-            misfire_grace_time=300,
-        )
-        self.scheduler.add_job(
-            self.update_autocomplete, IntervalTrigger(minutes=30), name="Update Autocomplete",
+            self.update_autocomplete,
+            IntervalTrigger(minutes=30),
+            name="Update Autocomplete",
             misfire_grace_time=300
         )
         self.scheduler.add_job(
@@ -753,6 +816,23 @@ class ScheduledTracking(Tracking):
             name="Store Clan Capital",
             misfire_grace_time=300,
         )
+
+        self.scheduler.add_job(
+            self.store_league_changes,
+            CronTrigger(day_of_week="mon", hour=12),
+            args=["capitalLeague"],
+            name="Store Capital League Changes",
+            misfire_grace_time=300,
+        )
+
+        self.scheduler.add_job(
+            self.store_league_changes,
+            CronTrigger(day="13", hour="2"),
+            args=["warLeague"],
+            name="Store War League Changes",
+            misfire_grace_time=300,
+        )
+
 
     async def build_ranking(self):
         ranking_pipeline = [
@@ -781,12 +861,13 @@ class ScheduledTracking(Tracking):
         ]
         await self.mongo.all_clans.aggregate(ranking_pipeline).to_list(length=None)
 
+
     async def run(self):
         try:
             await self.initialize()
             #await self.update_autocomplete()
 
-            await self.migrate_clan_db()
+            await self.create_leaderboards()
             self.logger.info("Scheduler started. Running scheduled jobs...")
             # Keep the main thread alive
             while True:
