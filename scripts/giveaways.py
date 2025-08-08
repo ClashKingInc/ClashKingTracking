@@ -12,7 +12,7 @@ class GiveawayTracking(Tracking):
     def __init__(self):
         super().__init__(tracker_type=TrackingType.GIVEAWAY)
 
-    async def _send_giveaway_event(self, producer, event_type, giveaway):
+    async def _send_giveaway_event(self, event_type, giveaway):
         """
         Send a Kafka event for the given giveaway.
         """
@@ -49,12 +49,12 @@ class GiveawayTracking(Tracking):
             for giveaway in giveaways_to_start:
                 logger.info(f"Scheduling giveaway start: {giveaway['_id']}")
                 self.scheduler.add_job(
-                    produce_giveaway_event,
+                    self._send_giveaway_event,
                     "date",
                     run_date=giveaway["start_time"],
                     args=["giveaway_start", giveaway],  # Call Kafka producer
                     id=f"start-{giveaway['_id']}",
-                    misfire_grace_time=300,  # 5 minuteS grace period
+                    misfire_grace_time=600,  # 5 minuteS grace period
                 )
                 # Update database status
                 self.mongo.giveaways.update_one({"_id": giveaway["_id"]}, {"$set": {"status": "ongoing"}})
@@ -63,12 +63,12 @@ class GiveawayTracking(Tracking):
             for giveaway in giveaways_to_update:
                 logger.info(f"Scheduling giveaway update: {giveaway['_id']}")
                 self.scheduler.add_job(
-                    produce_giveaway_event,
+                    self._send_giveaway_event,
                     "date",
-                    run_date=datetime.utcnow(),
-                    args=["giveaway_update", giveaway],  # Call Kafka producer
+                    run_date=pend.now(tz=pend.UTC),
+                    args=["giveaway_update", giveaway],
                     id=f"update-{giveaway['_id']}",
-                    misfire_grace_time=300,  # 5 minutes grace period
+                    misfire_grace_time=600,
                 )
                 # Update database status
                 await self.mongo.giveaways.update_one({"_id": giveaway["_id"]}, {"$set": {"updated": "no"}})
@@ -77,12 +77,12 @@ class GiveawayTracking(Tracking):
             for giveaway in giveaways_to_end:
                 logger.info(f"Scheduling giveaway end: {giveaway['_id']}")
                 self.scheduler.add_job(
-                    produce_giveaway_event,
+                    self._send_giveaway_event,
                     "date",
                     run_date=giveaway["end_time"],
-                    args=["giveaway_end", giveaway],  # Call Kafka producer
+                    args=["giveaway_end", giveaway],
                     id=f"end-{giveaway['_id']}",
-                    misfire_grace_time=None,  # 5 minutes grace period
+                    misfire_grace_time=None,
                 )
                 # Update database status
                 await self.mongo.giveaways.update_one({"_id": giveaway["_id"]}, {"$set": {"status": "ended"}})
