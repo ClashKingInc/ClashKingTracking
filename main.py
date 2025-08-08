@@ -20,6 +20,5 @@ class_script_map = {
     "reddit": scripts.RedditTracking,
     "scheduled": scripts.ScheduledTracking,
 }
-print(SCRIPT_NAME, class_script_map[SCRIPT_NAME])
 run_class = class_script_map[SCRIPT_NAME]
 asyncio.run(run_class().run())
