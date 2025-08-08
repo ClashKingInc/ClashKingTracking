@@ -167,7 +167,7 @@ class GlobalClanTracking(Tracking):
         if current_clan.get("warWinStreak") > clan_records.get("warWinStreak", {}).get("value", 0):
             changes.append(
                 UpdateOne(
-                    {"data.tag": current_clan.get("tag")},
+                    {"tag": current_clan.get("tag")},
                     {
                         "$set": {
                             "records.warWinStreak": {
@@ -182,7 +182,7 @@ class GlobalClanTracking(Tracking):
         if current_clan.get("clanPoints") > clan_records.get("clanPoints", {}).get("value", 0):
             changes.append(
                 UpdateOne(
-                    {"data.tag": current_clan.get("tag")},
+                    {"tag": current_clan.get("tag")},
                     {
                         "$set": {
                             "records.clanPoints": {
@@ -197,7 +197,7 @@ class GlobalClanTracking(Tracking):
 
     def _find_clan_updates(self, previous_clan: dict, new_clan: dict):
         if not previous_clan:
-            return InsertOne({"_id": new_clan.get("tag"), "data": new_clan, "records": {}})
+            return UpdateOne({"tag": new_clan.get("tag"), "data": new_clan, "records": {}}, upsert=True)
 
         to_set = {}
 
@@ -208,7 +208,7 @@ class GlobalClanTracking(Tracking):
                 to_set[f"data.{key}"] = new_val
 
         if to_set:
-            return UpdateOne({"data.tag": new_clan.get("tag")}, {"$set": to_set}, upsert=True)
+            return UpdateOne({"tag": new_clan.get("tag")}, {"$set": to_set}, upsert=True)
 
     async def track_clans(self):
         self.logger.info("Started Loop")
