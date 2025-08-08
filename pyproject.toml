@@ -1,0 +1,22 @@
+[tool.ruff]
+line-length    = 120
+target-version = "py312"
+exclude        = ["venv", ".venv", "build", "dist", "old_commands"]
+
+[tool.ruff.lint]
+extend-select = [
+  "F",  # Pyflakes (unused imports, etc.)
+  "E",  # pycodestyle errors
+  "W",  # pycodestyle warnings
+  "I",  # isort rules
+]
+[tool.ruff.lint.isort]
+split-on-trailing-comma = false
+
+[tool.ruff.format]
+docstring-code-format     = false
+quote-style               = "preserve"
+indent-style              = "space"
+skip-magic-trailing-comma = true
+
+
