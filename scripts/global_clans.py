@@ -122,8 +122,8 @@ class GlobalClanTracking(Tracking):
                             {"tag": tag, "season": self.season, "clan_tag": clan_tag},
                             {
                                 "$inc": {
-                                    "donations": donation_change,
-                                    "donationsReceived": received_change,
+                                    "donated": donation_change,
+                                    "received": received_change,
                                 }
                             },
                             upsert=True
