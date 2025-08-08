@@ -262,7 +262,7 @@ class GlobalClanTracking(Tracking):
                     if clan_update:
                         changes.append(clan_update)
 
-            print(f"clan data loop: END {time.time() - t} seconds")
+            self.logger.debug(f"clan data loop: END {time.time() - t} seconds")
 
             if changes:
                 self.mongo.all_clans.bulk_write(changes, ordered=False)
