@@ -50,7 +50,7 @@ class GlobalClanTracking(Tracking):
         async def fetch_batch(batch):
             cursor = self.async_mongo.all_clans.find({"tag": {"$in": batch}})
             docs = await cursor.to_list(length=None)
-            return {d["tag"]: (d["data"], d.get("records", {})) for d in docs}
+            return {d["tag"]: (d["data"], d.get("records", {})) for d in docs if "data" in d}
 
         # split into 1k batches
         batches = [clan_tags[i : i + 500] for i in range(0, len(clan_tags), 500)]
