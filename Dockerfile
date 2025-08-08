@@ -31,6 +31,4 @@ RUN uv pip install -r requirements.txt --system \
 # Copy the rest of the application code into the container
 COPY . .
 
-HEALTHCHECK --interval=30s --timeout=5s --start-period=5s CMD curl -f http://127.0.0.1:8027/health || exit 1
-
 CMD ["python3", "main.py"]
