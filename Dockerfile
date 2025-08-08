@@ -31,4 +31,6 @@ RUN uv pip install -r requirements.txt --system \
 # Copy the rest of the application code into the container
 COPY . .
 
+ENV PYTHONPATH=/app
+
 CMD ["python3", "main.py"]
