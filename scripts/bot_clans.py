@@ -580,7 +580,3 @@ class ClanTracker(Tracking):
                 self.raid_cache.clear()
 
             print(f"Finished tracking clans in {time.time() - t} seconds")
-
-
-if __name__ == "__main__":
-    asyncio.run(ClanTracker().run())

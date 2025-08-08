@@ -873,6 +873,3 @@ class ScheduledTracking(Tracking):
             self.logger.info("Shutting down scheduler...")
             self.scheduler.shutdown()
 
-
-
-asyncio.run(ScheduledTracking().run())

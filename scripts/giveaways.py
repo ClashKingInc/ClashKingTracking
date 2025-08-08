@@ -96,4 +96,3 @@ class GiveawayTracking(Tracking):
             await asyncio.sleep(60)  # Check every minute
 
 
-asyncio.run(GiveawayTracking().run())

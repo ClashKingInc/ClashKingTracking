@@ -326,5 +326,3 @@ class PlayerTracking(Tracking):
             await self._batch(player_tags=player_tags)
             self._submit_stats()
 
-
-asyncio.run(PlayerTracking().run())

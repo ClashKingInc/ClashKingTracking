@@ -296,5 +296,3 @@ class GlobalWarTrack(Tracking):
             if is_cwl():
                 await self._cwl_track()
 
-
-asyncio.run(GlobalWarTrack().run())

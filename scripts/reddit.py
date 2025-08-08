@@ -78,5 +78,3 @@ class RedditTracking(Tracking):
         reddit = await self.create_reddit()
         await self._post_stream(reddit)
 
-
-asyncio.run(RedditTracking().run())

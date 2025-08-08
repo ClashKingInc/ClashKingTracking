@@ -169,5 +169,3 @@ class GlobalWarStore(Tracking):
         )
         await self.store()
 
-
-asyncio.run(GlobalWarStore().run())

@@ -94,4 +94,3 @@ class TrackingWebsocket(Tracking):
         await server.serve()
 
 
-asyncio.run(TrackingWebsocket().run())

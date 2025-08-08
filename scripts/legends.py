@@ -243,7 +243,3 @@ class LegendTracking(Tracking):
             self._submit_stats()
 
 
-
-
-
-asyncio.run(LegendTracking().run())
