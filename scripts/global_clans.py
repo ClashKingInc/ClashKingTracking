@@ -1,7 +1,7 @@
 import asyncio
+import time
 
 import pendulum as pend
-from loguru import logger
 from pymongo import DeleteOne, InsertOne, UpdateOne
 from utility.time import gen_season_date
 
@@ -40,7 +40,7 @@ class GlobalClanTracking(Tracking):
         # this add one of the inactive clan groups to this tracking cycle
         active_clans += self.inactive_clans.pop()
 
-        logger.info(f"{len(active_clans)} active clans")
+        self.logger.info(f"{len(active_clans)} active clans")
 
         return [active_clans[i : i + self.batch_size] for i in range(0, len(active_clans), self.batch_size)]
 
@@ -211,8 +211,7 @@ class GlobalClanTracking(Tracking):
             return UpdateOne({"data.tag": new_clan.get("tag")}, {"$set": to_set}, upsert=True)
 
     async def track_clans(self):
-        import time
-
+        self.logger.info("Started Loop")
         for batch in self._batches():
             t = time.time()
             tasks = []
@@ -223,20 +222,20 @@ class GlobalClanTracking(Tracking):
                     )
                 )
 
-            print(f"pull clans API: START {time.time() - t} seconds")
+            self.logger.debug(f"pull clans API: START {time.time() - t} seconds")
             responses: list[dict] = await self._run_tasks(tasks=tasks, return_exceptions=True, wrapped=True)
-            print(f"pull clans API: STOP {time.time() - t} seconds")
+            self.logger.debug(f"pull clans API: STOP {time.time() - t} seconds")
 
             changes = []
             join_leave_changes = []
             season_stat_changes = []
             changes_history = []
 
-            print(f"pull clans DB: START {time.time() - t} seconds")
+            self.logger.debug(f"pull clans DB: START {time.time() - t} seconds")
             previous_clan_batch = await self._get_previous_clans(clan_tags=batch)
-            print(f"pull clans DB: END {time.time() - t} seconds")
+            self.logger.debug(f"pull clans DB: END {time.time() - t} seconds")
 
-            print(f"clan data loop: START {time.time() - t} seconds")
+            self.logger.debug(f"clan data loop: START {time.time() - t} seconds")
 
             self.season = gen_season_date()
             self.priority_clans = self._priority_clans()
@@ -267,21 +266,23 @@ class GlobalClanTracking(Tracking):
 
             if changes:
                 self.mongo.all_clans.bulk_write(changes, ordered=False)
-                logger.info(f"Made {len(changes)} clan changes")
+                self.logger.info(f"Made {len(changes)} clan changes")
 
             if changes_history:
                 self.mongo.clan_change_history.bulk_write(changes_history, ordered=False)
-                logger.info(f"Made {len(changes_history)} clan change history")
+                self.logger.info(f"Made {len(changes_history)} clan change history")
 
             if join_leave_changes:
                 self.mongo.join_leave_history.bulk_write(join_leave_changes, ordered=False)
-                logger.info(f'Made {len(join_leave_changes)} join/leave changes')
+                self.logger.info(f'Made {len(join_leave_changes)} join/leave changes')
 
             if season_stat_changes:
                 self.mongo.new_player_stats.bulk_write(season_stat_changes, ordered=False)
-                logger.info(f'Made {len(join_leave_changes)} donation changes')
+                self.logger.info(f'Made {len(join_leave_changes)} donation changes')
 
-            print("batch time: ", time.time() - t, " seconds")
+            self.logger.info("batch time: ", time.time() - t, " seconds")
+        self.logger.info("Finished Loop")
+
 
     async def run(self):
         await self.initialize()
@@ -291,6 +292,4 @@ class GlobalClanTracking(Tracking):
         while True:
             await self.track_clans()
             self._submit_stats()
-            # LETS STORE THE CWL & RAID LEAGUE CHANGES ELSEWHERE, SCHEDULED
-
 
