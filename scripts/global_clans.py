@@ -197,7 +197,7 @@ class GlobalClanTracking(Tracking):
 
     def _find_clan_updates(self, previous_clan: dict, new_clan: dict):
         if not previous_clan:
-            return UpdateOne({"tag": new_clan.get("tag"), "data": new_clan, "records": {}}, upsert=True)
+            return UpdateOne({"tag": new_clan.get("tag")}, {"$set" : {"data": new_clan, "records": {}}}, upsert=True)
 
         to_set = {}
 
