@@ -281,7 +281,7 @@ class GlobalClanTracking(Tracking):
                 self.mongo.new_player_stats.bulk_write(season_stat_changes, ordered=False)
                 self.logger.info(f'Made {len(join_leave_changes)} donation changes')
 
-            self.logger.info("batch time: ", time.time() - t, " seconds")
+            self.logger.info(f"batch time: {time.time() - t} seconds")
         self.logger.info("Finished Loop")
 
 
