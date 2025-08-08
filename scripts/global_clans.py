@@ -213,6 +213,7 @@ class GlobalClanTracking(Tracking):
     async def track_clans(self):
         self.logger.info("Started Loop")
         for batch in self._batches():
+            self.season = gen_season_date()
             t = time.time()
             tasks = []
             for tag in batch:
