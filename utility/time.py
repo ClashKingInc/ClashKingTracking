@@ -203,3 +203,24 @@ def get_season_raid_weeks(season: str):
         weeks.append(week.to_date_string())
 
     return weeks
+
+def weekend_to_coc_py_timestamp(weekend: str, end=False) -> coc.Timestamp:
+    """
+    Convert a weekend date string to a Clash of Clans Timestamp.
+
+    Args:
+        weekend (str): The weekend date in 'YYYY-MM-DD' format.
+        end (bool, optional): If True, calculate the end timestamp (3 days after the start). Defaults to False.
+
+    Returns:
+        coc.Timestamp: A Clash of Clans Timestamp object.
+    """
+    # Parse the weekend string using Pendulum
+    weekend_date = pend.from_format(weekend, 'YYYY-MM-DD', tz='UTC').at(7, 0, 0)
+
+    # Adjust for end timestamp if specified
+    if end:
+        weekend_date = weekend_date.add(days=3)
+
+    # Return the formatted Clash of Clans Timestamp
+    return coc.Timestamp(data=weekend_date.format(CLASH_ISO_FORMAT))
