@@ -14,8 +14,8 @@ class GlobalClanTracking(Tracking):
 
         self.season = gen_season_date()
         self.inactive_clans = []
-        self.priority_clans = self._priority_clans()
-        self.priority_players = self._priority_players()
+        self.priority_clans = ...
+        self.priority_players = ...
         self.clan_cache = {}
 
     def _clans(self, active: bool):
@@ -285,6 +285,8 @@ class GlobalClanTracking(Tracking):
 
     async def run(self):
         await self.initialize()
+        self.priority_clans = self._priority_clans()
+        self.priority_players = self._priority_players()
 
         while True:
             await self.track_clans()
