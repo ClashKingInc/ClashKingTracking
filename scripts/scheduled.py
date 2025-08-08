@@ -511,11 +511,11 @@ class ScheduledTracking(Tracking):
         # Find clans in the combined set but not in existing_clans
         new_clans = combined_set - existing_clans
         print(len(new_clans))
-        return
+
         tags_to_add = []
         for clan in new_clans:
-            tags_to_add.append(InsertOne({"tag": clan}))
-        results = await self.async_mongo.global_clans.bulk_write(tags_to_add, ordered=False)
+            tags_to_add.append(InsertOne({"tag": clan, "active": True}))
+        results = await self.async_mongo.all_clans.bulk_write(tags_to_add, ordered=False)
         print(results.bulk_api_result)
 
     async def set_active_clans(self):
@@ -866,8 +866,6 @@ class ScheduledTracking(Tracking):
         try:
             await self.initialize()
             #await self.update_autocomplete()
-
-            await self.create_leaderboards()
             self.logger.info("Scheduler started. Running scheduled jobs...")
             # Keep the main thread alive
             while True:

@@ -20,13 +20,6 @@ class GlobalClanTracking(Tracking):
 
     def _clans(self, active: bool):
         pipeline = [{"$match": {"active": active}}, {"$group": {"_id": "$tag"}}]
-        if active:
-            pipeline = [
-                {"$match" : {}},
-                {"$group": {"_id": "$tag"}},
-            ]
-        else:
-            return []
         all_tags = [x["_id"] for x in self.mongo.all_clans.aggregate(pipeline).to_list(length=None)]
         if active:
             bot_clan_tags = self.mongo.clans_db.distinct("tag")
