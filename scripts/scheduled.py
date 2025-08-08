@@ -3,7 +3,6 @@ import random
 import time
 from collections import defaultdict
 
-import aiohttp
 import coc
 import orjson
 import pendulum as pend
@@ -17,7 +16,7 @@ from utility.constants import locations
 
 import math
 
-from tracking import Tracking, TrackingType
+from .tracking import Tracking, TrackingType
 from utility.time import gen_games_season, gen_raid_date, gen_season_date
 
 

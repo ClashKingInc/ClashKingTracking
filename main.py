@@ -1,29 +1,25 @@
-
 import os
-import runpy
-import sys
-from pathlib import Path
+import asyncio
 from dotenv import load_dotenv
-
 load_dotenv()
-# Get script name from env variable
-script_name = os.getenv("SCRIPT_NAME")
 
-if not script_name:
-    print("ERROR: SCRIPT_NAME environment variable is not set.")
-    sys.exit(1)
+import scripts
+SCRIPT_NAME = os.getenv("SCRIPT_NAME")
+main_function = ...
 
-# Build the full path under /scripts
-scripts_dir = Path(__file__).parent / "scripts"
-target_script = scripts_dir / f"{script_name}.py"
 
-if not target_script.exists():
-    print(f"ERROR: Script '{script_name}.py' not found in {scripts_dir}")
-    sys.exit(1)
+class_script_map = {
+    "bot_clans": scripts.ClanTracker,
+    "bot_players": scripts.PlayerTracking,
+    "events_ws": scripts.TrackingWebsocket,
+    "giveaways": scripts.GiveawayTracking,
+    "global_clans": scripts.GlobalClanTracking,
+    "global_war_store": scripts.GlobalWarStore,
+    "global_war_track": scripts.GlobalWarTrack,
+    "legends": scripts.LegendTracking,
+    "reddit": scripts.RedditTracking,
+    "scheduled": scripts.ScheduledTracking,
+}
 
-print(f"Running script: {target_script}")
-# Make sure /app is on sys.path so imports like `utility.*` work
-sys.path.insert(0, str(Path(__file__).parent))
-
-# Run the script as if it were the main program
-runpy.run_path(str(target_script), run_name="__main__")
+run_class = class_script_map[SCRIPT_NAME]
+asyncio.run(run_class().run())

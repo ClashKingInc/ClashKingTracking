@@ -5,7 +5,7 @@ from loguru import logger
 from pymongo import DeleteOne, InsertOne, UpdateOne
 from utility.time import gen_season_date
 
-from tracking import Tracking, TrackingType
+from .tracking import Tracking, TrackingType
 
 
 class GlobalClanTracking(Tracking):
@@ -294,4 +294,3 @@ class GlobalClanTracking(Tracking):
             # LETS STORE THE CWL & RAID LEAGUE CHANGES ELSEWHERE, SCHEDULED
 
 
-asyncio.run(GlobalClanTracking().run())

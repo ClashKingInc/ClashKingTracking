@@ -4,7 +4,7 @@ import traceback
 
 import asyncpraw
 
-from tracking import Tracking, TrackingType
+from .tracking import Tracking, TrackingType
 
 subreddit = "ClashOfClansRecruit"
 

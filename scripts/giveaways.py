@@ -4,7 +4,7 @@ from datetime import datetime
 import pendulum as pend
 from loguru import logger
 
-from tracking import Tracking
+from .tracking import Tracking
 from utility.config import TrackingType
 
 

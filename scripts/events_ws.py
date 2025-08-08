@@ -6,7 +6,7 @@ from aiokafka import AIOKafkaConsumer
 from fastapi import FastAPI, WebSocket
 from uvicorn import Config, Server
 
-from tracking import Tracking, TrackingType
+from .tracking import Tracking, TrackingType
 
 
 class TrackingWebsocket(Tracking):

@@ -1,14 +1,9 @@
 import asyncio
-from typing import List
-
-import aiohttp
 import coc
 import pendulum as pend
-from loguru import logger
-from mypy.checkexpr import defaultdict
 from pymongo import UpdateOne
-
-from tracking import Tracking
+from collections import defaultdict
+from .tracking import Tracking
 from utility.config import TrackingType
 from utility.time import gen_legend_date
 

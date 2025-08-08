@@ -6,7 +6,7 @@ import pendulum as pend
 import snappy
 from pymongo import InsertOne, UpdateOne
 
-from tracking import Tracking, TrackingType
+from .tracking import Tracking, TrackingType
 from utility.time import gen_season_date
 
 

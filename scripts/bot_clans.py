@@ -4,7 +4,7 @@ import coc
 import pendulum as pend
 import sentry_sdk
 
-from tracking import Tracking
+from .tracking import Tracking
 from utility.config import TrackingType
 from utility.time import is_raids, gen_games_season, gen_raid_date, weekend_to_coc_py_timestamp
 

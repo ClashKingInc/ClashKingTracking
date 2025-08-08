@@ -7,7 +7,7 @@ import pendulum as pend
 from aiokafka import AIOKafkaConsumer
 from hashids import Hashids
 
-from tracking import Tracking, TrackingType
+from .tracking import Tracking, TrackingType
 
 
 class GlobalWarStore(Tracking):
