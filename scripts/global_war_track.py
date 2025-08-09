@@ -151,6 +151,7 @@ class GlobalWarTrack(Tracking):
             ]
 
             wars = await self._run_tasks(tasks=tasks, return_exceptions=True, wrapped=True)
+            self.logger.debug(f"Pulled {len(wars)} wars")
 
             changes = []
             war_timers = []
@@ -196,14 +197,14 @@ class GlobalWarTrack(Tracking):
                 }
                 self._send_to_kafka(topic="war_store", data=json_data, key=None)
 
-                if changes:
-                    try:
-                        self.mongo.clan_wars.bulk_write(changes, ordered=False)
-                    except Exception as e: #sometimes we will get duplicates, nothing we can do about it
-                        pass
+            if changes:
+                try:
+                    self.mongo.clan_wars.bulk_write(changes, ordered=False)
+                except Exception as e: #sometimes we will get duplicates, nothing we can do about it
+                    pass
 
-                if war_timers:
-                    self.mongo.war_timer.bulk_write(war_timers, ordered=False)
+            if war_timers:
+                self.mongo.war_timer.bulk_write(war_timers, ordered=False)
 
             self.logger.info(f"{len(self.CLANS_IN_WAR)} clans in war")
 
