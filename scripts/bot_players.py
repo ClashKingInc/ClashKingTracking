@@ -242,7 +242,7 @@ class PlayerTracking(Tracking):
                     if activity_score == 0:
                         self.season_stats.append(
                             UpdateOne(
-                                {"tag": tag, "season": season, "clan_tag": clan_tag}, {"$inc": {"activity_score": 1}}
+                                {"tag": tag, "season": season, "clan_tag": clan_tag}, {"$inc": {"activity": 1}}
                             )
                         )
                     activity_score += 1
