@@ -91,7 +91,7 @@ class GlobalWarTrack(Tracking):
         timers = []
         for member in war.clan.members + war.opponent.members:
             if isinstance(war, coc.ClanWar):
-                time = pend.instance(war.end_time.time, tz=pend.UTC).time()
+                time = pend.instance(war.end_time.time, tz=pend.UTC)
                 tag = f"cwl-{member.tag}"
             else:
                 regular_war_prep_time = 23 * 60 * 60
@@ -101,7 +101,7 @@ class GlobalWarTrack(Tracking):
                     tag = member.tag
                 else:
                     tag = f"friendly-{member.tag}"
-                time = pend.parse(war.endTime).time()
+                time = pend.parse(war.endTime)
             timers.append(
                 UpdateOne(
                     {"_id": tag}, {"$set": {"clans": [war.clan.tag, war.opponent.tag], "time": time}}, upsert=True
