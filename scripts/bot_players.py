@@ -140,6 +140,10 @@ class PlayerTracking(Tracking):
                 # all list items in clash have a name
                 fixed_name = list_item["name"].replace(".", "")
 
+                if fixed_name == "Baby Dragon":
+                    if list_item["village"] == "builderBase":
+                        fixed_name = "Baby Dragon (Builder Base)"
+
                 old_list_item = next((item for item in previous_value if item["name"] == list_item["name"]), {})
 
                 if key == "heroes":
