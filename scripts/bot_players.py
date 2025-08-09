@@ -326,7 +326,6 @@ class PlayerTracking(Tracking):
         stale_tags = self.tracked_tags - player_tags
 
         keys_to_delete = [f"player-cache:{tag}" for tag in stale_tags]
-        print(len(keys_to_delete), "keys to delete")
         if keys_to_delete:
             pipe = self.redis_raw.pipeline()
             for key in keys_to_delete:
