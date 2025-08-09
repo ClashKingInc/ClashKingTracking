@@ -202,7 +202,7 @@ class PlayerTracking(Tracking):
             clan_tag = response.get("clan", {}).get("tag", None)
 
             activity_score = 0
-            changed_keys = []
+            changed_keys = set()
             for key, value in player_changes.items():  # type: tuple[str, str] | str, tuple[Any, Any]
                 item_key = key
                 if isinstance(key, tuple):
@@ -254,11 +254,11 @@ class PlayerTracking(Tracking):
                     )
 
                 if key in self.ws_types:
-                    changed_keys.append(key)
+                    changed_keys.add(key)
 
             if changed_keys:
                 json_data = {
-                    "types": changed_keys,
+                    "types": list(changed_keys),
                     "old_player": previous_response,
                     "new_player": response,
                     "timestamp": int(pend.now(tz=pend.UTC).timestamp()),
