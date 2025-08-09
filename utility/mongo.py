@@ -45,6 +45,7 @@ class MongoDatabase:
 
         self.deleted_clans: collection_class = self.new_looper.deleted_clans
         self.join_leave_history: collection_class = self.looper.join_leave_history
+        self.last_online = self.looper.get_collection("last_online")
         self.global_players: collection_class = self.clashking.global_players
         self.tracking_stats = self.clashking.get_collection("tracking_stats")
 

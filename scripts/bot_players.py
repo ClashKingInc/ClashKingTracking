@@ -78,7 +78,7 @@ class PlayerTracking(Tracking):
 
         self.season_stats = []
         self.historical_changes = []
-        self.base_changes = []
+        self.last_online = []
 
         self.last_run = pend.now(tz=pend.UTC)
 
@@ -266,29 +266,30 @@ class PlayerTracking(Tracking):
                 self._send_to_kafka("player", json_data, key=clan_tag)
 
             if activity_score:
-                lo_time = pend.now(tz=pend.UTC).int_timestamp
-                self.base_changes.append(
-                    UpdateOne(
-                        {"tag": tag},
-                        {"$push": {"last_online_list": lo_time}, "$set": {"last_online": lo_time}},
-                        upsert=True,
-                    )
+                self.last_online.append(
+                    InsertOne({
+                        "timestamp": pend.now(tz=pend.UTC),
+                        "meta": {
+                            "tag": tag,
+                            "clan_tag": clan_tag,
+                        }
+                    })
                 )
 
-        self.logger.debug(f"Updating {len(self.base_changes)} base changes")
-        if self.base_changes:
-            self.mongo.base_player.bulk_write(self.base_changes, ordered=False)
-            self.base_changes = []
+        self.logger.debug(f"Updating {len(self.last_online)} base changes")
+        if self.last_online:
+            self.mongo.last_online.bulk_write(self.last_online, ordered=False)
+            self.last_online.clear()
 
         self.logger.debug(f"Updating {len(self.historical_changes)} historical changes")
         if self.historical_changes:
             self.mongo.player_history.bulk_write(self.historical_changes, ordered=False)
-            self.historical_changes = []
+            self.historical_changes.clear()
 
         self.logger.debug(f"Updating {len(self.season_stats)} season stats")
         if self.season_stats:
             self.mongo.new_player_stats.bulk_write(self.season_stats, ordered=False)
-            self.season_stats = []
+            self.season_stats.clear()
 
         pipe.execute()
 
