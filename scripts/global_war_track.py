@@ -26,6 +26,7 @@ class War(Struct):
     clan: Clan
     opponent: Clan
     preparationStartTime: str = None
+    startTime: str = None
     endTime: str = None
 
 
@@ -33,6 +34,7 @@ class GlobalWarTrack(Tracking):
     def __init__(self):
         super().__init__(tracker_type=TrackingType.GLOBAL_WAR, batch_size=50_000)
         self.CLANS_IN_WAR = ExpiringDict()
+        self.GROUP_IN_WAR = ExpiringDict()
         self.inactive_clans = []
 
     def _active_clans(self):
@@ -92,8 +94,14 @@ class GlobalWarTrack(Tracking):
                 time = pend.instance(war.end_time.time, tz=pend.UTC).time()
                 tag = f"cwl-{member.tag}"
             else:
+                regular_war_prep_time = 23 * 60 * 60
+                start_time = pend.parse(war.startTime)
+                prep_time = pend.parse(war.preparationStartTime)
+                if start_time.diff(prep_time).in_seconds() == regular_war_prep_time:
+                    tag = member.tag
+                else:
+                    tag = f"friendly-{member.tag}"
                 time = pend.parse(war.endTime).time()
-                tag = member.tag
             timers.append(
                 UpdateOne(
                     {"_id": tag}, {"$set": {"clans": [war.clan.tag, war.opponent.tag], "time": time}}, upsert=True
@@ -172,10 +180,10 @@ class GlobalWarTrack(Tracking):
                 self._send_to_kafka(topic="war_store", data=json_data, key=None)
 
                 if changes:
-                    await self.mongo.clan_wars.bulk_write(changes, ordered=False)
+                    self.mongo.clan_wars.bulk_write(changes, ordered=False)
 
                 if war_timers:
-                    await self.mongo.war_timer.bulk_write(war_timers, ordered=False)
+                    self.mongo.war_timer.bulk_write(war_timers, ordered=False)
 
             self.logger.info(f"{len(self.CLANS_IN_WAR)} clans in war")
 
@@ -265,10 +273,12 @@ class GlobalWarTrack(Tracking):
                 wars: list[coc.ClanWar] = await self.get_current_league_wars(
                     league_group=league_group, cwl_round=coc.enums.WarRound.current_war
                 )
-
+                if self.GROUP_IN_WAR.get(cwl_id):
+                    continue
                 wars = wars or []
                 for war in wars:
                     war_end = pend.instance(war.end_time.time, tz=pend.UTC)
+                    self.GROUP_IN_WAR.ttl(key=cwl_id, value=True, ttl=war_end.diff(pend.now(tz=pend.UTC)).in_seconds())
 
                     now = pend.now(tz=pend.UTC)
                     if war_end < now:
@@ -289,6 +299,12 @@ class GlobalWarTrack(Tracking):
                         "war_tag": war.war_tag,
                     }
                     self._send_to_kafka(topic="war_store", data=json_data, key=None)
+
+            if cwl_group_changes:
+                self.mongo.cwl_group.bulk_write(cwl_group_changes, ordered=False)
+
+            if war_timers:
+                self.mongo.war_timer.bulk_write(war_timers, ordered=False)
 
     async def run(self):
         await self.initialize()
