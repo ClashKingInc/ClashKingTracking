@@ -144,6 +144,9 @@ class PlayerTracking(Tracking):
                     if list_item["village"] == "builderBase":
                         fixed_name = "Baby Dragon (Builder Base)"
 
+                if fixed_name == "Keep Your Account Safe!":
+                    continue
+
                 if "village" in list_item:
                     old_list_item = next((item for item in previous_value
                                           if item["name"] == list_item["name"] and
@@ -181,7 +184,6 @@ class PlayerTracking(Tracking):
         for result in results:  # type: bytes, str
             if isinstance(result, coc.NotFound):
                 tag = result.__notes__[0]
-                # self.mongo.player_stats.delete_one({"tag": tag})
                 pipe.getdel(f"player-cache:{tag}")
                 continue
 
@@ -242,7 +244,8 @@ class PlayerTracking(Tracking):
                     if activity_score == 0:
                         self.season_stats.append(
                             UpdateOne(
-                                {"tag": tag, "season": season, "clan_tag": clan_tag}, {"$inc": {"activity": 1}}
+                                {"tag": tag, "season": season, "clan_tag": clan_tag}, {"$inc": {"activity": 1}},
+                                upsert=True
                             )
                         )
                     activity_score += 1
@@ -252,14 +255,17 @@ class PlayerTracking(Tracking):
                         UpdateOne(
                             {"tag": tag, "season": season, "clan_tag": clan_tag},
                             {"$inc": {self.seasonal_inc.get(key): change}},
+                            upsert=True,
                         )
                     )
 
                 if key in self.seasonal_set and clan_tag:
+
                     self.season_stats.append(
                         UpdateOne(
                             {"tag": tag, "season": season, "clan_tag": clan_tag},
                             {"$set": {self.seasonal_set.get(key): new_value}},
+                            upsert=True,
                         )
                     )
 
@@ -320,7 +326,7 @@ class PlayerTracking(Tracking):
         stale_tags = self.tracked_tags - player_tags
 
         keys_to_delete = [f"player-cache:{tag}" for tag in stale_tags]
-
+        print(len(keys_to_delete), "keys to delete")
         if keys_to_delete:
             pipe = self.redis_raw.pipeline()
             for key in keys_to_delete:
