@@ -36,6 +36,7 @@ class GlobalWarTrack(Tracking):
         self.CLANS_IN_WAR = ExpiringDict()
         self.GROUP_IN_WAR = ExpiringDict()
         self.inactive_clans = []
+        self.captured_timers = set()
 
     def _active_clans(self):
         two_weeks_ago = pend.now(tz=pend.UTC).subtract(days=14).int_timestamp
@@ -76,6 +77,8 @@ class GlobalWarTrack(Tracking):
             active_set = set(active_clans)
             inactive_clans = list(set(openlog_clans) - active_set)
             self.inactive_clans = self._chunk_into_n(inactive_clans, 24)
+            if self._cycle_count != 0:
+                self.captured_timers.clear()
 
         # this add one of the inactive clan groups to this tracking cycle
         active_clans += self.inactive_clans.pop()
@@ -109,6 +112,16 @@ class GlobalWarTrack(Tracking):
             )
         return timers
 
+    def timers_already_captured(self):
+        pipeline = [
+            {"$match": {"endTime": {"$gte": pend.now(tz=pend.UTC).subtract(weeks=1).int_timestamp}}},
+            {"$match": {"data": None}},
+            {"$project" : {"war_id" : 1}},
+        ]
+        result = self.mongo.clan_wars.aggregate(pipeline).to_list(length=None)
+        war_ids = [x["war_id"] for x in result]
+        return set(war_ids)
+
     async def _maintenance_protocol(self):
         maintenance_time = await self._check_maintenance()
         if maintenance_time:
@@ -119,9 +132,14 @@ class GlobalWarTrack(Tracking):
             )
 
     async def _war_track(self):
-        for batch in self._batches():
-            await self._maintenance_protocol()
+        if self._cycle_count == 0:
+            self.captured_timers = self.timers_already_captured()
+            self.logger.debug(f"Captured {len(self.captured_timers)} timers")
 
+        batches = self._batches()
+        for count, batch in enumerate(batches, start=1):
+            await self._maintenance_protocol()
+            self.logger.debug(f"Starting Cycle {self._cycle_count} | Batch {count}/{len(batches)}")
             tasks = [
                 self.fetch(
                     url=f"https://api.clashofclans.com/v1/clans/{tag.replace('#', '%23')}/currentwar",
@@ -162,15 +180,14 @@ class GlobalWarTrack(Tracking):
                 self.CLANS_IN_WAR.ttl(key=opponent_tag, value=True, ttl=war_end.diff(now).in_seconds())
 
                 war_unique_id = "-".join(sorted([war.clan.tag, war.opponent.tag])) + f"-{war_prep.int_timestamp}"
-                war_timers.extend(self._war_timer_changes(war))
-
-                changes.append(
-                    UpdateOne(
-                        {"war_id": war_unique_id},
-                        {"$set": {"clans": [clan_tag, opponent_tag], "endTime": war_end.int_timestamp}},
-                        upsert=True
+                if war_unique_id not in self.captured_timers:
+                    war_timers.extend(self._war_timer_changes(war))
+                    changes.append(
+                        InsertOne(
+                            {"war_id": war_unique_id, "clans": [clan_tag, opponent_tag], "endTime": war_end.int_timestamp},
+                        )
                     )
-                )
+
                 json_data = {
                     "tag": clan_tag,
                     "opponent_tag": opponent_tag,
@@ -180,7 +197,10 @@ class GlobalWarTrack(Tracking):
                 self._send_to_kafka(topic="war_store", data=json_data, key=None)
 
                 if changes:
-                    self.mongo.clan_wars.bulk_write(changes, ordered=False)
+                    try:
+                        self.mongo.clan_wars.bulk_write(changes, ordered=False)
+                    except Exception as e: #sometimes we will get duplicates, nothing we can do about it
+                        pass
 
                 if war_timers:
                     self.mongo.war_timer.bulk_write(war_timers, ordered=False)
@@ -313,4 +333,5 @@ class GlobalWarTrack(Tracking):
             await self._war_track()
             if is_cwl():
                 await self._cwl_track()
+            self._cycle_count += 1
 
