@@ -276,7 +276,7 @@ class PlayerTracking(Tracking):
                     })
                 )
 
-        self.logger.debug(f"Updating {len(self.last_online)} base changes")
+        self.logger.debug(f"Inserting {len(self.last_online)} last online records")
         if self.last_online:
             self.mongo.last_online.bulk_write(self.last_online, ordered=False)
             self.last_online.clear()
