@@ -60,7 +60,7 @@ class GlobalWarTrack(Tracking):
 
     def _all_clans_batched(self):
         pipeline = [{"$match": {}}, {"$group": {"_id": "$tag"}}]
-        all_tags = [x["_id"] for x in self.mongo.global_clans.aggregate(pipeline).to_list(length=None)]
+        all_tags = [x["_id"] for x in self.mongo.all_clans.aggregate(pipeline).to_list(length=None)]
         bot_clan_tags = self.mongo.clans_db.distinct("tag")
         all_tags = list(set(all_tags + bot_clan_tags))
 
