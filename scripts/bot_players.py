@@ -144,7 +144,13 @@ class PlayerTracking(Tracking):
                     if list_item["village"] == "builderBase":
                         fixed_name = "Baby Dragon (Builder Base)"
 
-                old_list_item = next((item for item in previous_value if item["name"] == list_item["name"]), {})
+                if "village" in list_item:
+                    old_list_item = next((item for item in previous_value
+                                          if item["name"] == list_item["name"] and
+                                          item["village"] == list_item["village"]), {})
+                else:
+                    old_list_item = next((item for item in previous_value if item["name"] == list_item["name"]), {})
+
 
                 if key == "heroes":
                     old_list_item.pop('equipment', None)
