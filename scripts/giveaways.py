@@ -57,7 +57,7 @@ class GiveawayTracking(Tracking):
                     misfire_grace_time=600,  # 5 minuteS grace period
                 )
                 # Update database status
-                self.mongo.giveaways.update_one({"_id": giveaway["_id"]}, {"$set": {"status": "ongoing"}})
+                await self.async_mongo.giveaways.update_one({"_id": giveaway["_id"]}, {"$set": {"status": "ongoing"}})
 
             # Schedule update events
             for giveaway in giveaways_to_update:
@@ -71,7 +71,7 @@ class GiveawayTracking(Tracking):
                     misfire_grace_time=600,
                 )
                 # Update database status
-                await self.mongo.giveaways.update_one({"_id": giveaway["_id"]}, {"$set": {"updated": "no"}})
+                await self.async_mongo.giveaways.update_one({"_id": giveaway["_id"]}, {"$set": {"updated": "no"}})
 
             # Schedule end events
             for giveaway in giveaways_to_end:
@@ -85,7 +85,7 @@ class GiveawayTracking(Tracking):
                     misfire_grace_time=None,
                 )
                 # Update database status
-                await self.mongo.giveaways.update_one({"_id": giveaway["_id"]}, {"$set": {"status": "ended"}})
+                await self.async_mongo.giveaways.update_one({"_id": giveaway["_id"]}, {"$set": {"status": "ended"}})
         except Exception as e:
             logger.error(f"Error while scheduling giveaways: {e}")
 
