@@ -259,7 +259,7 @@ class PlayerTracking(Tracking):
                     self.season_stats.append(
                         UpdateOne(
                             {"tag": tag, "season": season, "clan_tag": clan_tag},
-                            {"$set": {self.seasonal_set.get(key): change}},
+                            {"$set": {self.seasonal_set.get(key): new_value}},
                         )
                     )
 
