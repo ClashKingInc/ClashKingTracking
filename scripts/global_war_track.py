@@ -157,8 +157,10 @@ class GlobalWarTrack(Tracking):
                 war_timers.extend(self._war_timer_changes(war))
 
                 changes.append(
-                    InsertOne(
-                        {"war_id": war_unique_id, "clans": [clan_tag, opponent_tag], "endTime": war_end.int_timestamp}
+                    UpdateOne(
+                        {"war_id": war_unique_id},
+                        {"$set": {"clans": [clan_tag, opponent_tag], "endTime": war_end.int_timestamp}},
+                        upsert=True
                     )
                 )
                 json_data = {
