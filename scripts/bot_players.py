@@ -250,7 +250,7 @@ class PlayerTracking(Tracking):
                         )
                     activity_score += 1
 
-                if key in self.seasonal_inc and change > 0 and clan_tag:
+                if item_key in self.seasonal_inc and change > 0 and clan_tag:
                     self.season_stats.append(
                         UpdateOne(
                             {"tag": tag, "season": season, "clan_tag": clan_tag},
@@ -259,8 +259,7 @@ class PlayerTracking(Tracking):
                         )
                     )
 
-                if key in self.seasonal_set and clan_tag:
-
+                if item_key in self.seasonal_set and clan_tag:
                     self.season_stats.append(
                         UpdateOne(
                             {"tag": tag, "season": season, "clan_tag": clan_tag},
