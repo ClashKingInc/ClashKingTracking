@@ -3,6 +3,7 @@ from typing import List, Optional
 
 import coc
 import pendulum as pend
+from aiohttp import ContentTypeError
 from expiring_dict import ExpiringDict
 from msgspec import Struct
 from msgspec.json import decode
@@ -160,6 +161,8 @@ class GlobalWarTrack(Tracking):
                     break
                 elif isinstance(war_data, coc.ClashOfClansException):
                     continue
+                elif isinstance(war_data, ContentTypeError):
+                    self.logger.debug(f"Error fetching data")
 
                 war, clan_tag = war_data
 
