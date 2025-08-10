@@ -168,7 +168,7 @@ class GlobalWarTrack(Tracking):
                 war, clan_tag = war_data
 
                 war = decode(war, type=War)
-                if war.preparationStartTime is None:
+                if war.preparationStartTime is None or not war.clan.members:
                     continue
 
                 war_end = pend.parse(war.endTime)
@@ -260,7 +260,8 @@ class GlobalWarTrack(Tracking):
 
         current_season = gen_season_date()
 
-        for batch in self._all_clans_batched():
+        all_clans = self._all_clans_batched()
+        for batch in all_clans:
             tasks = [
                 self.fetch(
                     url=f"https://api.clashofclans.com/v1/clans/{tag.replace('#', '%23')}/currentwar/leaguegroup",
@@ -271,14 +272,15 @@ class GlobalWarTrack(Tracking):
                 if tag not in found_in_previous_group
             ]
 
-            league_groups = await self._run_tasks(tasks=tasks, return_exceptions=False, wrapped=True)
+            league_groups = await self._run_tasks(tasks=tasks, return_exceptions=True, wrapped=True)
 
             war_timers = []
             cwl_group_changes = []
 
-            for league_group, clan_tag in league_groups:
-                if league_group is None:
+            for league_data in league_groups:
+                if isinstance(league_data, Exception):
                     continue
+                league_group, clan_tag = league_data
 
                 season = league_group.get("season")
 
