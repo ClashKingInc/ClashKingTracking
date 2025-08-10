@@ -982,7 +982,6 @@ class ScheduledTracking(Tracking):
     async def run(self):
         try:
             await self.initialize()
-            await self.create_stat_leaderboards(permanent=False)
             self.logger.info("Scheduler started. Running scheduled jobs...")
             # Keep the main thread alive
             while True:
