@@ -91,6 +91,7 @@ class GiveawayTracking(Tracking):
 
     async def run(self):
         await self.initialize()
+        self.scheduler.start()
         while True:
             await self._schedule_giveaways()
             await asyncio.sleep(60)  # Check every minute
