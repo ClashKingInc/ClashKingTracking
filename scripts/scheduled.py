@@ -982,8 +982,8 @@ class ScheduledTracking(Tracking):
     async def run(self):
         try:
             await self.initialize()
+            self.scheduler.start()
             self.logger.info("Scheduler started. Running scheduled jobs...")
-            # Keep the main thread alive
             while True:
                 await asyncio.sleep(3600)  # Sleep for an hour, adjust as needed
         except (KeyboardInterrupt, SystemExit):
