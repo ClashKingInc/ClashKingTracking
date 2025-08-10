@@ -32,16 +32,17 @@ class ScheduledTracking(Tracking):
             hashids = Hashids(min_length=7)
             season = gen_games_season()
             pipeline = [{"$match": {"data.season": season}}, {"$group": {"_id": "$data.rounds.warTags"}}]
-            result = await self.async_mongo.cwl_group.aggregate(pipeline).to_list(length=None)
+            result = await self.async_mongo.cwl_group.aggregate(pipeline)
+            result = await result.to_list(length=None)
             done_for_this_season = [x["_id"] for x in result]
             done_for_this_season = [j for sub in done_for_this_season for j in sub]
             all_tags = set([j for sub in done_for_this_season for j in sub])
             self.logger.info(f"{len(all_tags)} war tags total")
 
             pipeline = [{"$match": {"data.season": season}}, {"$group": {"_id": "$data.tag"}}]
-            tags_already_found = set(
-                [x["_id"] for x in (await self.async_mongo.clan_wars.aggregate(pipeline).to_list(length=None))]
-            )
+            result = await self.async_mongo.clan_wars.aggregate(pipeline)
+            tags_already_found = set([x["_id"] for x in await result.to_list(length=None)])
+
             self.logger.info(f"{len(tags_already_found)} war tags already found")
             all_tags = [t for t in all_tags if t not in tags_already_found]
 
@@ -57,6 +58,7 @@ class ScheduledTracking(Tracking):
                         self.fetch(
                             url=f"https://api.clashofclans.com/v1/clanwarleagues/wars/{tag.replace('#', '%23')}",
                             tag=tag,
+                            json=True
                         )
                     )
                 self.logger.info(f"{len(tasks)} tasks")
@@ -130,15 +132,17 @@ class ScheduledTracking(Tracking):
             season = gen_games_season()
 
             pipeline = [{"$match": {}}, {"$group": {"_id": "$tag"}}]
-            all_tags = [x["_id"] for x in (await self.async_mongo.basic_clan.aggregate(pipeline).to_list(length=None))]
+            pipeline = await self.async_mongo.all_clans.aggregate(pipeline=pipeline)
+            pipeline = await pipeline.to_list(length=None)
+            all_tags = [x["_id"] for x in pipeline]
 
             pipeline = [
                 {"$match": {"$and": [{"data.season": season}, {"data.state": "ended"}]}},
                 {"$group": {"_id": "$data.clans.tag"}},
             ]
-            done_for_this_season = [
-                x["_id"] for x in (await self.async_mongo.cwl_group.aggregate(pipeline).to_list(length=None))
-            ]
+            pipeline = await self.async_mongo.cwl_group.aggregate(pipeline=pipeline)
+            pipeline = await pipeline.to_list(length=None)
+            done_for_this_season = [x["_id"] for x in pipeline]
             done_for_this_season = set([j for sub in done_for_this_season for j in sub])
 
             all_tags = [tag for tag in all_tags if tag not in done_for_this_season]
@@ -231,6 +235,10 @@ class ScheduledTracking(Tracking):
                         self.logger.error(f"Error storing leaderboards: {e}")
         except Exception as e:
             self.logger.exception(f"Unexpected error in store_all_leaderboards: {e}")
+
+        await self.async_mongo.legend_rankings.aggregate(
+            [{"$match" : {}}, {"$out" : {"db" : "ranking_history", "coll" : "legends"}}]
+        )
 
     async def store_legends(self):
         """
@@ -673,7 +681,6 @@ class ScheduledTracking(Tracking):
             {"$set": {"active": True}},
         )
 
-
     async def store_league_changes(self, league_type: str):
 
         if league_type == "capitalLeague":
@@ -707,81 +714,183 @@ class ScheduledTracking(Tracking):
         if updates:
             await self.async_mongo.clan_change_history.bulk_write(updates, ordered=False)
 
-
-    async def create_leaderboards(self):
-        server_to_clans = defaultdict(list)
-        default_stats_data = {
-            "donated" : 0,
-            "received" : 0,
-            "activity" : 0,
-            "dark_elixir_looted": 0,
-            "gold_looted" : 0,
-            "elixir_looted" : 0,
-            "capital_gold_dono" : 0,
-            "obstacles_removed" : 0,
-            "attack_wins" : 0,
-            "boosted_super_troops" : 0,
-            "walls_destroyed" : 0
-        }
+    async def create_stat_leaderboards(self, permanent: bool):
+        clan_to_servers = defaultdict(list)
+        default_stats_data = [
+            "donated",
+            "received",
+            "activity",
+            "dark_elixir_looted",
+            "gold_looted",
+            "elixir_looted",
+            "capital_gold_dono",
+            "obstacles_removed",
+            "attack_wins",
+            "boosted_super_troops",
+            "walls_destroyed"
+        ]
+        server_clans = set()
         async for clan in self.async_mongo.clans_db.find({}, {"_id": 0, "tag": 1, "server": 1}):
             tag = clan.get("tag")
-            server_to_clans[clan.get("server")].append(tag)
+            server_clans.add(tag)
+            clan_to_servers[tag].append(clan.get("server"))
 
         season = gen_season_date()
 
-        for field in default_stats_data.keys():
+        for field in default_stats_data:
+            if field in ["donated", "received"]:
+                player_pipeline = [
+                    {"$match": {"season": season}},
+                    {"$sort": {field: -1}},
+                    {"$limit": 1000},
+                    {"$group": {
+                        "_id": "$tag",
+                        "value": {"$sum": f"${field}"},
+                    }},
+                    {"$sort": {"value": -1}},
+                ]
+            else:
+                player_pipeline = [
+                    {"$match": {"season": season, "activity" : {"$ne": None}}},
+                    {"$group": {
+                        "_id": "$tag",
+                        "value": {"$sum": f"${field}"},
+                    }},
+                    {"$sort": {"value": -1}},
+                    {"$limit": 1000}
+                ]
+            field_leaderboard = await self.async_mongo.new_player_stats.aggregate(pipeline=player_pipeline)
+            field_leaderboard = await field_leaderboard.to_list(length=None)
+
+            field_leaderboard = [f for f in field_leaderboard if f.get("value") != 0]
+            if not field_leaderboard:
+                continue
+
+            for count, data in enumerate(field_leaderboard, 1):
+                data["type"] = field
+                data["season"] = season
+                data["tag"] = data["_id"]
+                data["rank"] = count
+                del data["_id"]
+
+            if permanent:
+                await self.async_mongo.ranking_history.get_collection("player_leaderboard").insert_many(field_leaderboard)
+            else:
+                await self.async_mongo.leaderboards.get_collection("player").delete_many({"type": field})
+                await self.async_mongo.leaderboards.get_collection("player").insert_many(field_leaderboard)
+
+        for field in default_stats_data:
+            if field in ["donated", "received"]:
+                clan_pipeline = [
+                    {"$match": {"season": season}},
+                    {"$group": {
+                        "_id": "$clan_tag",
+                        "value": {"$sum": f"${field}"},
+                    }},
+                    {"$sort": {"value": -1}},
+                    {"$limit": 1000}
+                ]
+            else:
+                if field in ["donated", "received"]:
+                    clan_pipeline = [
+                        {"$match": {"season": season, "activity": {"$ne": None}}},
+                        {"$group": {
+                            "_id": "$clan_tag",
+                            "value": {"$sum": f"${field}"},
+                        }},
+                        {"$sort": {"value": -1}},
+                        {"$limit": 1000}
+                    ]
+            field_leaderboard = await self.async_mongo.new_player_stats.aggregate(pipeline=clan_pipeline)
+            field_leaderboard = await field_leaderboard.to_list(length=None)
+
+            field_leaderboard = [f for f in field_leaderboard if f.get("value") != 0]
+
+            if not field_leaderboard:
+                continue
+
+            for count, data in enumerate(field_leaderboard, 1):
+                data["type"] = field
+                data["season"] = season
+                data["tag"] = data["_id"]
+                data["rank"] = count
+                del data["_id"]
+
+            if permanent:
+                await self.async_mongo.ranking_history.get_collection("clan_leaderboard").insert_many(field_leaderboard)
+            else:
+                await self.async_mongo.leaderboards.get_collection("clan").delete_many({"type": field})
+                await self.async_mongo.leaderboards.get_collection("clan").insert_many(field_leaderboard)
+
+        for field in default_stats_data:
             clan_pipeline = [
+                {"$match": {"clan_tag": {"$in": list(server_clans)}}},
                 {"$match": {"season": season}},
                 {"$group": {
                     "_id": "$clan_tag",
                     "value": {"$sum": f"${field}"},
                 }},
                 {"$sort": {"value": -1}},
-                {"$limit": 1000}
             ]
             field_leaderboard = await self.async_mongo.new_player_stats.aggregate(pipeline=clan_pipeline)
             field_leaderboard = await field_leaderboard.to_list(length=None)
-
             field_leaderboard = [f for f in field_leaderboard if f.get("value") != 0]
-            for count, data in enumerate(field_leaderboard, 1):
-                data["type"] = field
-                data["season"] = season
-                data["tag"] = data["_id"]
-                data["rank"] = count
-                del data["_id"]
 
-            if field_leaderboard:
-                await self.async_mongo.ranking_history.get_collection("clan_leaderboard").insert_many(field_leaderboard)
+            if not field_leaderboard:
+                continue
 
-        for field in default_stats_data.keys():
-            player_pipeline = [
-                {"$match": {"season": season}},
-                {"$group": {
-                    "_id": "$tag",
-                    "value": {"$sum": f"${field}"},
-                }},
-                {"$sort": {"value": -1}},
-                {"$limit": 1000}
-            ]
-            field_leaderboard = await self.async_mongo.new_player_stats.aggregate(pipeline=player_pipeline)
-            field_leaderboard = await field_leaderboard.to_list(length=None)
+            leaderboard_mapping = {d.get("_id") : d.get("value") for d in field_leaderboard}
+            holder_lb = {}
+            for clan, servers in clan_to_servers.items():
+                for server in servers:
+                    if server not in holder_lb:
+                        holder_lb[server] = 0
+                    holder_lb[server] += leaderboard_mapping.get(clan, 0)
 
-            field_leaderboard = [f for f in field_leaderboard if f.get("value") != 0]
-            for count, data in enumerate(field_leaderboard, 1):
-                data["type"] = field
-                data["season"] = season
-                data["tag"] = data["_id"]
-                data["rank"] = count
-                del data["_id"]
+            store_lb = []
+            holder_lb = dict(sorted(holder_lb.items(), key=lambda item: item[1], reverse=True))
+            for count, (server, value) in enumerate(holder_lb.items(), 1):
+                if count > 1000:
+                    continue
+                store_lb.append({
+                    "server": server,
+                    "type": field,
+                    "value": value,
+                    "season": season,
+                    "rank": count
+                })
 
-            if field_leaderboard:
-                await self.async_mongo.ranking_history.get_collection("player_leaderboard").insert_many(field_leaderboard)
+            if permanent:
+                await self.async_mongo.ranking_history.get_collection("server_leaderboard").insert_many(store_lb)
+            else:
+                await self.async_mongo.leaderboards.get_collection("server").delete_many({"type": field})
+                await self.async_mongo.leaderboards.get_collection("server").insert_many(store_lb)
 
 
-
-
-
-
+    async def build_legend_rankings(self):
+        ranking_pipeline = [
+            {"$match" : {}},
+            {"$project" : {"data.memberList" : 1, "_id" : 0}},
+            {"$unwind": "$data.memberList"},
+            {"$match": {"data.memberList.league.name": "Legend League"}},
+            {
+                "$project": {
+                    "name": "$data.memberList.name",
+                    "tag": "$data.memberList.tag",
+                    "trophies": "$data.memberList.trophies",
+                    "townhall": "$data.memberList.townHallLevel",
+                    "sort_field": {"trophies": "$data.memberList.trophies", "tag": "$data.memberList.tag"},
+                }
+            },
+            {"$unset": ["_id"]},
+            #window‐function to compute rank over our sort_field
+            {"$setWindowFields": {"sortBy": {"sort_field": -1}, "output": {"rank": {"$rank": {}}}}},
+            # clean up the temporary sort key
+            {"$unset": ["sort_field"]},
+            {"$out": {"db": "leaderboards", "coll": "legends"}},
+        ]
+        cursor = await self.async_mongo.all_clans.aggregate(ranking_pipeline, allowDiskUse=True)
+        await cursor.to_list(length=None)
 
 
     async def add_permanent_schedules(self):
@@ -799,7 +908,7 @@ class ScheduledTracking(Tracking):
         )
         self.scheduler.add_job(
             self.update_autocomplete,
-            IntervalTrigger(minutes=30),
+            IntervalTrigger(minutes=15),
             name="Update Autocomplete",
             misfire_grace_time=300
         )
@@ -832,39 +941,48 @@ class ScheduledTracking(Tracking):
             misfire_grace_time=300,
         )
 
+        self.scheduler.add_job(
+            self.build_legend_rankings,
+            IntervalTrigger(minutes=20),
+            name="Build Global Legend Rankings",
+            misfire_grace_time=300,
+        )
 
-    async def build_ranking(self):
-        ranking_pipeline = [
-            # 1) unwind the now‐nested memberList
-            {"$unwind": "$data.memberList"},
-            # 2) filter to only Legend League entries
-            {"$match": {"data.memberList.league": "Legend League"}},
-            # 3) project the fields we care about, plus a composite sort key
-            {
-                "$project": {
-                    "name": "$data.memberList.name",
-                    "tag": "$data.memberList.tag",
-                    "trophies": "$data.memberList.trophies",
-                    "townhall": "$data.memberList.townhall",
-                    "sort_field": {"trophies": "$data.memberList.trophies", "tag": "$data.memberList.tag"},
-                }
-            },
-            # 4) drop the original _id
-            {"$unset": ["_id"]},
-            # 5) window‐function to compute rank over our sort_field
-            {"$setWindowFields": {"sortBy": {"sort_field": -1}, "output": {"rank": {"$rank": {}}}}},
-            # 6) clean up the temporary sort key
-            {"$unset": ["sort_field"]},
-            # 7) write results out to your new collection
-            {"$out": {"db": "new_looper", "coll": "legend_rankings"}},
-        ]
-        await self.mongo.all_clans.aggregate(ranking_pipeline).to_list(length=None)
+        self.scheduler.add_job(
+            self.create_stat_leaderboards,
+            IntervalTrigger(minutes=60),
+            args=[False],
+            name="Build Stat Leaderboards",
+            misfire_grace_time=300,
+        )
+
+        self.scheduler.add_job(
+            self.create_stat_leaderboards,
+            CronTrigger(day="last mon", hour=4, minute=55),
+            args=[True],
+            name="Build Global Legend Rankings",
+            misfire_grace_time=300,
+        )
+
+        self.scheduler.add_job(
+            self.store_cwl_wars,
+            CronTrigger(day='2-13', hour="*/2", minute=5),
+            name="Store CWL Wars",
+            misfire_grace_time=300,
+            max_instances=1
+        )
+        self.scheduler.add_job(
+            self.store_cwl_groups,
+            CronTrigger(day='1-12', hour='*', minute=35),
+            name="Store CWL Groups",
+            misfire_grace_time=300,
+        )
 
 
     async def run(self):
         try:
             await self.initialize()
-            #await self.update_autocomplete()
+            await self.create_stat_leaderboards(permanent=False)
             self.logger.info("Scheduler started. Running scheduled jobs...")
             # Keep the main thread alive
             while True:

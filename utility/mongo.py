@@ -34,6 +34,8 @@ class MongoDatabase:
         self.cwl_group: collection_class = self.looper.cwl_group
         self.basic_clan: collection_class = self.looper.clan_tags
 
+        self.legend_rankings = self.leaderboards.get_collection("legends")
+
         self.new_legend_stats = self.looper.get_collection("legend_stats")
         self.new_player_stats = self.looper.get_collection("player_stats")
         self.base_player = self.looper.get_collection("base_player")
