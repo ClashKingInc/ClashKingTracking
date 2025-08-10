@@ -163,6 +163,7 @@ class GlobalWarTrack(Tracking):
                     continue
                 elif isinstance(war_data, ContentTypeError):
                     self.logger.debug(f"Error fetching data")
+                    continue
 
                 war, clan_tag = war_data
 
