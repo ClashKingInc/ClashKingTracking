@@ -311,7 +311,7 @@ class GlobalWarTrack(Tracking):
                     if war_end < now:
                         continue
 
-                    war_prep = pend.parse(war.preparation_start_time.time, tz=pend.UTC)
+                    war_prep = pend.instance(war.preparation_start_time.time, tz=pend.UTC)
 
                     self.CLANS_IN_WAR.ttl(key=war.clan.tag, value=True, ttl=war_end.diff(now).in_seconds())
                     self.CLANS_IN_WAR.ttl(key=war.opponent.tag, value=True, ttl=war_end.diff(now).in_seconds())
