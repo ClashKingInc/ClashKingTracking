@@ -16,7 +16,6 @@ class GlobalClanTracking(Tracking):
         self.inactive_clans = []
         self.priority_clans = ...
         self.priority_players = ...
-        self.clan_cache = {}
 
     def _clans(self, active: bool):
         pipeline = [{"$match": {"active": active}}, {"$group": {"_id": "$tag"}}]
