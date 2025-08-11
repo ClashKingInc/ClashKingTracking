@@ -10,12 +10,12 @@ from apscheduler.schedulers.asyncio import AsyncIOScheduler
 from asyncio_throttle import Throttler
 from kafka import KafkaProducer
 from loguru import logger
-import loguru
 from redis import Redis
 from redis.asyncio import Redis as AsyncRedis
 
 from utility.mongo import MongoDatabase
 from utility.config import Config, TrackingType
+from utility.health import run_health_check_server
 
 
 class Tracking:
@@ -54,9 +54,11 @@ class Tracking:
         self._cycle_count = 0
         self._last_run = pend.now(tz=pend.UTC)
 
+
     async def initialize(self):
         """Initialise the tracker with dependencies."""
         await self.config.initialize()
+        run_health_check_server()
         self.mongo = self.config.get_mongo_database()
         self.async_mongo = self.config.get_mongo_database(sync=False)
         self.redis_raw = await self.config.get_redis_client(decode_responses=False)

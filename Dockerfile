@@ -31,4 +31,6 @@ RUN uv pip install -r requirements.txt --system \
 # Copy the rest of the application code into the container
 COPY . .
 
+EXPOSE 8027
+
 CMD ["python3", "main.py"]
