@@ -22,7 +22,7 @@ from utility.time import gen_games_season, gen_raid_date, gen_season_date
 
 class ScheduledTracking(Tracking):
     def __init__(self):
-        super().__init__(tracker_type=TrackingType.GLOBAL_SCHEDULED, batch_size=25_000)
+        super().__init__(tracker_type=TrackingType.GLOBAL_SCHEDULED, batch_size=50_000)
 
     async def store_cwl_wars(self):
         """
