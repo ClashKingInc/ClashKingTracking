@@ -44,7 +44,7 @@ class ScheduledTracking(Tracking):
             tags_already_found = set([x["_id"] for x in await result.to_list(length=None)])
 
             self.logger.info(f"{len(tags_already_found)} war tags already found")
-            all_tags = [t for t in all_tags if t not in tags_already_found]
+            all_tags = list(set([t for t in all_tags if t not in tags_already_found]))
 
             self.logger.info(f"{len(all_tags)} war tags to find")
 
