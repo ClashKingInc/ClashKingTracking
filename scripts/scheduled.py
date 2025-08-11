@@ -98,33 +98,12 @@ class ScheduledTracking(Tracking):
                 self.logger.info(f"Working on adding | {time.time() - start_time} sec")
                 if add_war:
                     try:
-                        # 1) split into 10 batches
-                        n_batches = 10
-                        batch_size = math.ceil(len(add_war) / n_batches)
-                        batches = [add_war[i * batch_size : (i + 1) * batch_size] for i in range(n_batches)]
-
-                        # 2) schedule all the insert_many calls
-                        tasks = [
-                            self.async_mongo.clan_wars.insert_many(batch, ordered=False) for batch in batches if batch
-                        ]
-
-                        # 3) run them in parallel, catching exceptions per‐batch
-                        results = await asyncio.gather(*tasks, return_exceptions=True)
-
-                        # 4) tally inserted vs. any errors
-                        total_inserted = sum(len(res.inserted_ids) for res in results if not isinstance(res, Exception))
-                        errors = [e for e in results if isinstance(e, Exception)]
-
-                        for e in errors:
-                            self.logger.error(f"Error inserting wars batch: {e}")
-
-                        self.logger.info(
-                            f"{total_inserted}/{len(add_war)} Wars inserted "
-                            f"in {len(tasks)} batches | {time.time() - start_time:.2f} sec"
-                        )
-
+                        await self.async_mongo.clan_wars.insert_many(add_war, ordered=False)
                     except Exception as e:
-                        self.logger.error(f"Unexpected batch‐insert error: {e}")
+                        self.logger.error(str(e))
+
+                    self.logger.info(f"{len(add_war)} Wars inserted {time.time() - start_time:.2f} sec")
+
         except Exception as e:
             self.logger.exception(f"Unexpected error in store_cwl_wars: {e}")
 
@@ -970,7 +949,7 @@ class ScheduledTracking(Tracking):
 
         self.scheduler.add_job(
             self.store_cwl_wars,
-            CronTrigger(day='2-13', hour="*", minute=5),
+            CronTrigger(day='2-13', hour="*", minute=15),
             name="Store CWL Wars",
             misfire_grace_time=300,
             max_instances=1
