@@ -982,6 +982,7 @@ class ScheduledTracking(Tracking):
     async def run(self):
         try:
             await self.initialize()
+            await self.add_permanent_schedules()
             self.scheduler.start()
             self.logger.info("Scheduler started. Running scheduled jobs...")
             while True:
