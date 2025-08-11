@@ -58,7 +58,8 @@ class Tracking:
     async def initialize(self):
         """Initialise the tracker with dependencies."""
         await self.config.initialize()
-        run_health_check_server()
+        await run_health_check_server()
+
         self.mongo = self.config.get_mongo_database()
         self.async_mongo = self.config.get_mongo_database(sync=False)
         self.redis_raw = await self.config.get_redis_client(decode_responses=False)
