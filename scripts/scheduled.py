@@ -75,6 +75,10 @@ class ScheduledTracking(Tracking):
                         war = coc.ClanWar(data=response, client=self.coc_client)
                         if war.preparation_start_time is None:
                             continue
+
+                        if war.state != coc.enums.WarState.war_ended:
+                            continue
+
                         custom_id = hashids.encode(
                             int(war.preparation_start_time.time.replace(tzinfo=pend.UTC).timestamp())
                             + int(pend.now(tz=pend.UTC).timestamp())
@@ -966,7 +970,7 @@ class ScheduledTracking(Tracking):
 
         self.scheduler.add_job(
             self.store_cwl_wars,
-            CronTrigger(day='2-13', hour="*/2", minute=5),
+            CronTrigger(day='2-13', hour="*", minute=5),
             name="Store CWL Wars",
             misfire_grace_time=300,
             max_instances=1
