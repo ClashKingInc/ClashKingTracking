@@ -949,7 +949,7 @@ class ScheduledTracking(Tracking):
 
         self.scheduler.add_job(
             self.store_cwl_wars,
-            CronTrigger(day='2-13', hour="*", minute=15),
+            CronTrigger(day='2-13', hour="*", minute=5),
             name="Store CWL Wars",
             misfire_grace_time=300,
             max_instances=1
