@@ -14,10 +14,9 @@ from pymongo import InsertOne, UpdateOne
 
 from utility.constants import locations
 
-import math
 
 from .tracking import Tracking, TrackingType
-from utility.time import gen_games_season, gen_raid_date, gen_season_date
+from utility.time import gen_games_season, gen_raid_date, gen_season_date, season_start_end, CLASH_ISO_FORMAT
 
 
 class ScheduledTracking(Tracking):
@@ -774,16 +773,15 @@ class ScheduledTracking(Tracking):
                     {"$limit": 1000}
                 ]
             else:
-                if field in ["donated", "received"]:
-                    clan_pipeline = [
-                        {"$match": {"season": season, "activity": {"$ne": None}}},
-                        {"$group": {
-                            "_id": "$clan_tag",
-                            "value": {"$sum": f"${field}"},
-                        }},
-                        {"$sort": {"value": -1}},
-                        {"$limit": 1000}
-                    ]
+                clan_pipeline = [
+                    {"$match": {"season": season, "activity": {"$ne": None}}},
+                    {"$group": {
+                        "_id": "$clan_tag",
+                        "value": {"$sum": f"${field}"},
+                    }},
+                    {"$sort": {"value": -1}},
+                    {"$limit": 1000}
+                ]
             field_leaderboard = await self.async_mongo.new_player_stats.aggregate(pipeline=clan_pipeline)
             field_leaderboard = await field_leaderboard.to_list(length=None)
 
@@ -876,6 +874,340 @@ class ScheduledTracking(Tracking):
         await cursor.to_list(length=None)
 
 
+    async def build_cwl_rankings(self):
+        self.logger.info("Building CWL Rankings")
+        season = gen_games_season()
+
+        pipeline = [
+            {"$match": {"data.season": season}},
+            {"$group": {"_id": "$cwl_id"}},
+        ]
+        result = await self.async_mongo.cwl_group.aggregate(pipeline)
+        result = await result.to_list(length=None)
+        all_cwl_ids = [doc["_id"] for doc in result]
+
+        batched_cwl_ids = self._split_into_batch(items=all_cwl_ids, batch_size=6_000)
+
+        self.logger.info(f"BATCHED CWL IDS: {len(batched_cwl_ids)}")
+        for cwl_id_batch in batched_cwl_ids:
+            cwl_rank_data = []
+            pipeline = [
+                {"$match": {"cwl_id": {"$in": cwl_id_batch}}},
+                {"$unwind": "$data.rounds"},
+                {"$unwind": "$data.rounds.warTags"},
+                {
+                    "$group": {
+                        "_id": "$cwl_id",
+                        "warTags": {"$addToSet": "$data.rounds.warTags"}
+                    }
+                },
+                {"$project": {"_id": 0, "cwl_id": "$_id", "warTags": 1}}
+            ]
+            result = await self.async_mongo.cwl_group.aggregate(pipeline)
+            result = await result.to_list(length=None)
+            self.logger.info(f"GRABBED CWL ID BATCH")
+
+            war_to_cwl_id = {}
+            all_war_tags = []
+            for doc in result:
+                for tag in doc["warTags"]:
+                    if tag == "#0":
+                        continue
+                    war_to_cwl_id[tag] = doc["cwl_id"]
+                    all_war_tags.append(tag)
+
+            self.logger.info(f"EXTRACTED {len(all_war_tags)} WAR TAGS")
+
+            pipeline = [
+                {"$match": {"data.tag": {"$in": all_war_tags}}},
+
+                # 1) Compute destruction sums for both sides
+                {
+                    "$set": {
+                        "data.clan.totalDestructionFromAttacks": {
+                            "$sum": {
+                                "$map": {
+                                    "input": {"$ifNull": ["$data.clan.members", []]},
+                                    "as": "m",
+                                    "in": {
+                                        "$sum": {
+                                            "$map": {
+                                                "input": {"$ifNull": ["$$m.attacks", []]},
+                                                "as": "a",
+                                                "in": {"$ifNull": ["$$a.destructionPercentage", 0]}
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+                        },
+                        "data.opponent.totalDestructionFromAttacks": {
+                            "$sum": {
+                                "$map": {
+                                    "input": {"$ifNull": ["$data.opponent.members", []]},
+                                    "as": "m",
+                                    "in": {
+                                        "$sum": {
+                                            "$map": {
+                                                "input": {"$ifNull": ["$$m.attacks", []]},
+                                                "as": "a",
+                                                "in": {"$ifNull": ["$$a.destructionPercentage", 0]}
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                },
+
+                # 2) Decide winner
+                {
+                    "$set": {
+                        "winnerSide": {
+                            "$switch": {
+                                "branches": [
+                                    {"case": {"$gt": ["$data.clan.stars", "$data.opponent.stars"]}, "then": "clan"},
+                                    {"case": {"$lt": ["$data.clan.stars", "$data.opponent.stars"]}, "then": "opponent"},
+                                    {"case": {"$gt": ["$data.clan.destructionPercentage",
+                                                      "$data.opponent.destructionPercentage"]}, "then": "clan"},
+                                    {"case": {"$lt": ["$data.clan.destructionPercentage",
+                                                      "$data.opponent.destructionPercentage"]}, "then": "opponent"}
+                                ],
+                                "default": "tie"
+                            }
+                        }
+                    }
+                },
+
+                # 3) Flatten into two rows (clan & opponent)
+                {
+                    "$project": {
+                        "sides": [
+                            {
+                                "tag": "$data.clan.tag",
+                                "name": "$data.clan.name",
+                                "badge": "$data.clan.badgeUrls.large",
+                                "attacks": "$data.clan.attacks",
+                                "raw_stars": "$data.clan.stars",
+                                "stars_with_bonus": {
+                                    "$add": ["$data.clan.stars", {"$cond": [{"$eq": ["$winnerSide", "clan"]}, 10, 0]}]
+                                },
+                                "win": {"$cond": [{"$eq": ["$winnerSide", "clan"]}, 1, 0]},
+                                "totalDestructionFromAttacks": "$data.clan.totalDestructionFromAttacks",
+                                "war_tag": "$data.tag"
+                            },
+                            {
+                                "tag": "$data.opponent.tag",
+                                "name": "$data.opponent.name",
+                                "badge": "$data.opponent.badgeUrls.large",
+                                "attacks": "$data.opponent.attacks",
+                                "raw_stars": "$data.opponent.stars",
+                                "stars_with_bonus": {
+                                    "$add": ["$data.opponent.stars",
+                                             {"$cond": [{"$eq": ["$winnerSide", "opponent"]}, 10, 0]}]
+                                },
+                                "win": {"$cond": [{"$eq": ["$winnerSide", "opponent"]}, 1, 0]},
+                                "totalDestructionFromAttacks": "$data.opponent.totalDestructionFromAttacks",
+                                "war_tag": "$data.tag"
+                            }
+                        ]
+                    }
+                },
+                {"$unwind": "$sides"},
+                {"$replaceRoot": {"newRoot": "$sides"}},
+
+                # 4) Group by clan tag
+                {
+                    "$group": {
+                        "_id": "$tag",
+                        "name": {"$last": "$name"},
+                        "badge": {"$last": "$badge"},
+                        "attacks": {"$sum": "$attacks"},
+                        "raw_stars": {"$sum": "$raw_stars"},
+                        "stars": {"$sum": "$stars_with_bonus"},
+                        "wins": {"$sum": "$win"},
+                        "totalDestruction": {"$sum": "$totalDestructionFromAttacks"},
+                        "wars": {"$addToSet": "$war_tag"},
+                        "war_count": {"$sum": 1}
+                    }
+                },
+
+                # 5) Final shape
+                {
+                    "$project": {
+                        "_id": 0,
+                        "tag": "$_id",
+                        "name": 1,
+                        "badge": 1,
+                        "attacks": 1,
+                        "raw_stars": 1,
+                        "stars": 1,
+                        "totalDestruction": 1,
+                        "wars": 1,
+                        "wins": 1,
+                        "war_count": 1,
+                    }
+                }
+            ]
+            result = await self.async_mongo.clan_wars.aggregate(pipeline, allowDiskUse=True)
+            self.logger.info(f"GRABBED CWL DATA")
+            wars = await result.to_list(length=None)
+
+            self.logger.info(f"PULLED {len(wars)} WARS")
+
+            clan_to_cwl_id = {}
+            for war in wars:
+                clan_tag = war["tag"]
+                war_tag = war["wars"][0]
+                cwl_id = war_to_cwl_id.get(war_tag)
+                clan_to_cwl_id[clan_tag] = cwl_id
+                war["season"] = season
+                war["cwl_id"] = cwl_id
+
+            self.logger.info(f"MAPPED WARS")
+
+            previous_season = pend.now(tz=pend.UTC).subtract(months=1).format("YYYY-MM")
+            cwl_id_to_league = {}
+            cwl_rank_history = self.async_mongo.league_history.find({"tag" : {"$in" : list(clan_to_cwl_id.keys())}},
+                                                                   {"_id": 0, "tag": 1,
+                                                                    f"changes.clanWarLeague.{previous_season}.league": 1,
+                                                                    })
+            cwl_rank_history = await cwl_rank_history.to_list(length=None)
+            for clan in cwl_rank_history:
+                league = clan.get("changes").get("clanWarLeague", {}).get(previous_season, {}).get("league")
+                if not league:
+                    continue
+                cwl_id_to_league[clan_to_cwl_id[clan.get("tag")]] = league
+
+            self.logger.info(f"PULLED CWL LEAGUES")
+
+            for war in wars:
+                cwl_id = war.get("cwl_id")
+                war["league"] = cwl_id_to_league.get(cwl_id)
+
+
+            for war in wars:
+                cwl_rank_data.append(UpdateOne({"tag" : war["tag"], "season": season}, {"$set" : war}, upsert=True))
+
+            self.logger.info(f"STARTED STORING")
+
+            if cwl_rank_data:
+                await self.async_mongo.leaderboards.get_collection("cwl").bulk_write(cwl_rank_data)
+            self.logger.info(f"FINISHED STORING")
+
+        pipeline = [
+            {
+                '$set': {
+                    'sort_field': {
+                        's': '$stars',
+                        'd': '$destructionPercentage'
+                    }
+                }
+            }, {
+            '$setWindowFields': {
+                'partitionBy': {
+                    'season': '$season',
+                    'league': '$league',
+                    'teamSize': '$teamSize'
+                },
+                'sortBy': {
+                    'sort_field': -1
+                },
+                'output': {
+                    'rank': {
+                        '$rank': {}
+                    }
+                }
+            }
+        }, {
+            '$unset': 'sort_field'
+        }, {
+            '$merge': {
+                'into': 'cwl',
+                'on': '_id',
+                'whenMatched': 'merge',
+                'whenNotMatched': 'discard'
+            }
+        }
+        ]
+        await self.async_mongo.leaderboards.get_collection("cwl").aggregate(pipeline)
+        self.logger.info("Finished CWL Rankings")
+
+
+    async def build_hitrate(self):
+        todays_date = "2025-08-12"
+        now = pend.parse(todays_date)
+        for day in range(1, 91):
+            war_stats = defaultdict(lambda: defaultdict(lambda: defaultdict(int)))
+
+            player_war_stats = defaultdict(lambda: defaultdict(lambda: defaultdict(int)))
+            day = now.subtract(days=day).replace(hour=0, minute=0, second=0, microsecond=0)
+            season = day.format("YYYY-MM")
+            day_start = day.format(CLASH_ISO_FORMAT)
+            day_end = day.replace(hour=23, minute=59, second=59).format(CLASH_ISO_FORMAT)
+
+            count = 1
+            async for war in self.async_mongo.clan_wars.find(
+                    {"data.endTime": {"$gte": day_start, "$lte": day_end}},
+                    {"_id": 0, "data": 1},
+            ):
+                war = war.get("data")
+                count += 1
+                if count % 10_000 == 0:
+                    print(f"Processed {count} wars")
+                if not war:
+                    continue
+                war = coc.ClanWar(data=war, client=None)
+                if war.type == "friendly":
+                    continue
+                for attack in war.attacks:
+                    versus = f"{attack.attacker.town_hall}v{attack.defender.town_hall}"
+                    if attack.attacker.town_hall == attack.defender.town_hall:
+                        player_war_stats[attack.attacker_tag][str(attack.attacker.town_hall)]["attacks"] += 1
+                        player_war_stats[attack.attacker_tag][str(attack.attacker.town_hall)][f"{attack.stars}_star_attack"] += 1
+                    if attack.is_fresh_attack:
+                        war_stats[versus]["fresh"]["attacks"] += 1
+                        war_stats[versus]["fresh"][f"{attack.stars}_star_attack"] += 1
+                    else:
+                        war_stats[versus]["non-fresh"]["attacks"] += 1
+                        war_stats[versus]["non-fresh"][f"{attack.stars}_star_attack"] += 1
+
+            def defaultdict_to_dict(obj):
+                if isinstance(obj, defaultdict):
+                    obj = {k: defaultdict_to_dict(v) for k, v in obj.items()}
+                elif isinstance(obj, dict):
+                    obj = {k: defaultdict_to_dict(v) for k, v in obj.items()}
+                elif isinstance(obj, list):
+                    obj = [defaultdict_to_dict(v) for v in obj]
+                return obj
+
+            store_war_data = []
+            war_stats = defaultdict_to_dict(war_stats)
+            for townhall_versus, freshness_data in war_stats.items():
+                townhall, opponent_townhall = townhall_versus.split("v")
+                for fresh_type, war_data in freshness_data.items():
+                    extended_data = {
+                        "townhall": int(townhall),
+                        "opponent_townhall": int(opponent_townhall),
+                        "fresh" : fresh_type == "fresh",
+                        "day": day,
+                    }
+                    war_data.update(extended_data)
+                    store_war_data.append(InsertOne(war_data))
+            await self.async_mongo.leaderboards.get_collection("global_hitrates").bulk_write(store_war_data)
+
+            store_player_hitrates = []
+            player_war_stats = defaultdict_to_dict(player_war_stats)
+            for player_tag, townhall_data in player_war_stats.items():
+                for townhall, war_data in townhall_data.items():
+                    store_player_hitrates.append(UpdateOne(
+                        {"season": season, "player_tag": player_tag, "townhall": int(townhall)},
+                        {"$inc": war_data}, upsert=True
+                    ))
+            await self.async_mongo.leaderboards.get_collection("player_hitrates").bulk_write(store_player_hitrates)
+
+
     async def add_permanent_schedules(self):
         self.scheduler.add_job(
             self.store_all_leaderboards,
@@ -948,6 +1280,14 @@ class ScheduledTracking(Tracking):
         )
 
         self.scheduler.add_job(
+            self.build_cwl_rankings,
+            CronTrigger(day='2-12', hour="*/4", minute=15),
+            name="Build CWL Rankings",
+            misfire_grace_time=300,
+            max_instances=1
+        )
+
+        self.scheduler.add_job(
             self.store_cwl_wars,
             CronTrigger(day='2-13', hour="*", minute=5),
             name="Store CWL Wars",
@@ -960,6 +1300,12 @@ class ScheduledTracking(Tracking):
             name="Store CWL Groups",
             misfire_grace_time=300,
         )
+        self.scheduler.add_job(
+            self.build_hitrate,
+            CronTrigger(day='*', hour='14'),
+            name="Create Seasonal Hitrate Stats",
+            misfire_grace_time=300,
+        )
 
 
     async def run(self):
@@ -967,6 +1313,7 @@ class ScheduledTracking(Tracking):
             await self.initialize()
             await self.add_permanent_schedules()
             self.scheduler.start()
+
             self.logger.info("Scheduler started. Running scheduled jobs...")
             while True:
                 await asyncio.sleep(3600)  # Sleep for an hour, adjust as needed
