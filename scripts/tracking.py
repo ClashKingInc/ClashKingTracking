@@ -177,8 +177,9 @@ class Tracking:
         logger.info(f"Finished {len(tasks)} tracking tasks")
         return full_results
 
-    def _split_into_batch(self, items: list):
-        return [items[i : i + self.batch_size] for i in range(0, len(items), self.batch_size)]
+    def _split_into_batch(self, items: list, batch_size: int = None):
+        batch_size = batch_size or self.batch_size
+        return [items[i : i + batch_size] for i in range(0, len(items), batch_size)]
 
     def _chunk_into_n(self, lst: list, n: int):
         length = len(lst)
