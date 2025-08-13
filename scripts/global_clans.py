@@ -10,7 +10,7 @@ from .tracking import Tracking, TrackingType
 
 class GlobalClanTracking(Tracking):
     def __init__(self):
-        super().__init__(tracker_type=TrackingType.GLOBAL_CLAN_VERIFY, batch_size=25_000)
+        super().__init__(tracker_type=TrackingType.GLOBAL_CLAN_VERIFY, batch_size=10_000)
 
         self.season = gen_season_date()
         self.inactive_clans = []
