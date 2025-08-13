@@ -211,76 +211,110 @@ class GlobalClanTracking(Tracking):
 
     async def track_clans(self):
         self.logger.info("Started Loop")
+
         for batch in self._batches():
-            self.season = gen_season_date()
             t = time.time()
-            tasks = []
-            for tag in batch:
-                tasks.append(
-                    self.fetch(
-                        url=f"https://api.clashofclans.com/v1/clans/{tag.replace('#', '%23')}", tag=tag, json=True
-                    )
-                )
-
-            self.logger.debug(f"pull clans API: START {time.time() - t} seconds")
-            responses: list[dict] = await self._run_tasks(tasks=tasks, return_exceptions=True, wrapped=True)
-            self.logger.debug(f"pull clans API: STOP {time.time() - t} seconds")
-
-            changes = []
-            join_leave_changes = []
-            season_stat_changes = []
-            changes_history = []
-
+            self.season = gen_season_date()
             self.logger.debug(f"pull clans DB: START {time.time() - t} seconds")
             previous_clan_batch = await self._get_previous_clans(clan_tags=batch)
             self.logger.debug(f"pull clans DB: END {time.time() - t} seconds")
 
-            self.logger.debug(f"clan data loop: START {time.time() - t} seconds")
+            # Prepare streaming request coroutines
+            tasks = [
+                self.fetch(
+                    url=f"https://api.clashofclans.com/v1/clans/{tag.replace('#', '%23')}",
+                    tag=tag,
+                    json=True
+                )
+                for tag in batch
+            ]
 
-            self.season = gen_season_date()
-            self.priority_clans = self._priority_clans()
-            self.priority_players = self._priority_players()
+            changes_buf = []
+            join_leave_buf = []
+            season_stat_buf = []
+            history_buf = []
 
-            for clan_data in responses:
+            FLUSH_EVERY = 5_000
+
+            self.logger.debug(f"pull clans API: START {time.time() - t} seconds")
+            # Stream results as they complete; do not build a full list
+            async for clan_data in self._run_tasks_stream(tasks, return_exceptions=True):
                 if not isinstance(clan_data, tuple):
                     continue
+
                 clan, clan_tag = clan_data
+
                 if clan.get("members") == 0:
-                    changes.append(DeleteOne({"_id": clan.get("tag")}))
+                    changes_buf.append(DeleteOne({"_id": clan.get("tag")}))
                     continue
 
                 previous_clan, clan_records = previous_clan_batch.get(clan_tag, ({}, {}))
+
                 if previous_clan:
                     join_leave, season_stats = self._find_join_leaves_and_donos(previous_clan, clan)
-                    join_leave_changes.extend(join_leave)
-                    season_stat_changes.extend(season_stats)
+                    if join_leave:
+                        join_leave_buf.extend(join_leave)
+                    if season_stats:
+                        season_stat_buf.extend(season_stats)
 
-                    changes_history.extend(self._find_clan_changes(previous_clan=previous_clan, current_clan=clan))
-                    changes.extend(self._find_new_records(current_clan=clan, clan_records=clan_records))
+                    hist = self._find_clan_changes(previous_clan=previous_clan, current_clan=clan)
+                    if hist:
+                        history_buf.extend(hist)
 
-                if clan_update := self._find_clan_updates(previous_clan, clan):
-                    if clan_update:
-                        changes.append(clan_update)
+                    new_recs = self._find_new_records(current_clan=clan, clan_records=clan_records)
+                    if new_recs:
+                        changes_buf.extend(new_recs)
 
-            self.logger.debug(f"clan data loop: END {time.time() - t} seconds")
+                clan_update = self._find_clan_updates(previous_clan, clan)
+                if clan_update:
+                    changes_buf.append(clan_update)
 
-            if changes:
-                self.mongo.all_clans.bulk_write(changes, ordered=False)
-                self.logger.info(f"Made {len(changes)} clan changes")
+                # Flush periodically to keep memory flat
+                if len(changes_buf) >= FLUSH_EVERY:
+                    self.mongo.all_clans.bulk_write(changes_buf, ordered=False)
+                    self.logger.info(f"Made {len(changes_buf)} clan changes (partial flush)")
+                    changes_buf.clear()
 
-            if changes_history:
-                self.mongo.clan_change_history.bulk_write(changes_history, ordered=False)
-                self.logger.info(f"Made {len(changes_history)} clan change history")
+                if len(history_buf) >= FLUSH_EVERY:
+                    self.mongo.clan_change_history.bulk_write(history_buf, ordered=False)
+                    self.logger.info(f"Made {len(history_buf)} clan change history (partial flush)")
+                    history_buf.clear()
 
-            if join_leave_changes:
-                self.mongo.join_leave_history.bulk_write(join_leave_changes, ordered=False)
-                self.logger.info(f'Made {len(join_leave_changes)} join/leave changes')
+                if len(join_leave_buf) >= FLUSH_EVERY:
+                    self.mongo.join_leave_history.bulk_write(join_leave_buf, ordered=False)
+                    self.logger.info(f"Made {len(join_leave_buf)} join/leave changes (partial flush)")
+                    join_leave_buf.clear()
 
-            if season_stat_changes:
-                self.mongo.new_player_stats.bulk_write(season_stat_changes, ordered=False)
-                self.logger.info(f'Made {len(join_leave_changes)} donation changes')
+                if len(season_stat_buf) >= FLUSH_EVERY:
+                    self.mongo.new_player_stats.bulk_write(season_stat_buf, ordered=False)
+                    self.logger.info(f"Made {len(season_stat_buf)} donation changes (partial flush)")
+                    season_stat_buf.clear()
+
+            self.logger.debug(f"pull clans API: STOP {time.time() - t} seconds")
+
+            # Final flush for the batch
+            if changes_buf:
+                self.mongo.all_clans.bulk_write(changes_buf, ordered=False)
+                self.logger.info(f"Made {len(changes_buf)} clan changes")
+                changes_buf.clear()
+
+            if history_buf:
+                self.mongo.clan_change_history.bulk_write(history_buf, ordered=False)
+                self.logger.info(f"Made {len(history_buf)} clan change history")
+                history_buf.clear()
+
+            if join_leave_buf:
+                self.mongo.join_leave_history.bulk_write(join_leave_buf, ordered=False)
+                self.logger.info(f"Made {len(join_leave_buf)} join/leave changes")
+                join_leave_buf.clear()
+
+            if season_stat_buf:
+                self.mongo.new_player_stats.bulk_write(season_stat_buf, ordered=False)
+                self.logger.info(f"Made {len(season_stat_buf)} donation changes")
+                season_stat_buf.clear()
 
             self.logger.info(f"batch time: {time.time() - t} seconds")
+
         self.logger.info("Finished Loop")
 
 

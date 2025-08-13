@@ -12,6 +12,7 @@ from kafka import KafkaProducer
 from loguru import logger
 from redis import Redis
 from redis.asyncio import Redis as AsyncRedis
+from typing import AsyncIterator, Awaitable, Iterable, Any
 
 from utility.mongo import MongoDatabase
 from utility.config import Config, TrackingType
@@ -166,6 +167,38 @@ class Tracking:
 
         results = await asyncio.gather(*tasks, return_exceptions=return_exceptions)
         return results
+
+    async def _run_tasks_stream(
+            self,
+            coros: Iterable[Awaitable[Any]],
+            *,
+            return_exceptions: bool = False,
+    ) -> AsyncIterator[Any]:
+        """
+        Run coroutines with bounded concurrency (self.semaphore) and yield results
+        as soon as each completes (asyncio.as_completed).
+        """
+
+        async def runner(coro: Awaitable[Any]) -> Any:
+            async with self.semaphore:
+                try:
+                    return await coro
+                except Exception as e:
+                    if return_exceptions:
+                        return e
+                    raise
+
+        tasks = [asyncio.create_task(runner(c)) for c in coros]
+        try:
+            for fut in asyncio.as_completed(tasks):
+                yield await fut
+        finally:
+            # In case the caller breaks early, make sure we don't leak tasks
+            for t in tasks:
+                if not t.done():
+                    t.cancel()
+            # Let cancellations propagate
+            await asyncio.gather(*tasks, return_exceptions=True)
 
     async def _batch_tasks(self, tasks: list):
         """Track a batch of items."""
