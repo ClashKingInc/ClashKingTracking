@@ -1136,6 +1136,7 @@ class ScheduledTracking(Tracking):
 
 
     async def build_hitrate(self):
+        return
         todays_date = "2025-08-12"
         now = pend.parse(todays_date)
         for day in range(1, 91):
@@ -1313,7 +1314,6 @@ class ScheduledTracking(Tracking):
             await self.initialize()
             await self.add_permanent_schedules()
             self.scheduler.start()
-
             self.logger.info("Scheduler started. Running scheduled jobs...")
             while True:
                 await asyncio.sleep(3600)  # Sleep for an hour, adjust as needed
