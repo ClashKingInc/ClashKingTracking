@@ -66,68 +66,86 @@ class GlobalClanTracking(Tracking):
         clan_tag = current_clan.get("tag")
         now = pend.now(tz=pend.UTC)
 
-        # Build lookup dicts keyed by player tag
-        current_members = {m["tag"]: m for m in current_clan.get("memberList", [])}
-        previous_members = {m["tag"]: m for m in previous_clan.get("memberList", [])}
+        curr_list = current_clan.get("memberList", ()) or ()
+        prev_list = previous_clan.get("memberList", ()) or ()
 
-        # Tags for comparison
-        current_tags = set(current_members)
-        previous_tags = set(previous_members)
+        curr_tags = {m.get("tag") for m in curr_list if m.get("tag")}
+        prev_tags = {m.get("tag") for m in prev_list if m.get("tag")}
 
-        joined_tags = current_tags - previous_tags
-        left_tags = previous_tags - current_tags
+        joined_tags = curr_tags - prev_tags
+        left_tags = prev_tags - curr_tags
 
-        # Joins
-        for tag in joined_tags:
-            member = current_members[tag]
-            changes.append(
-                InsertOne({
-                    "type": "join",
-                    "clan": clan_tag,
-                    "time": now,
-                    "tag": tag,
-                    "name": member.get("name"),
-                    "th": member.get("townHallLevel"),
-                })
-            )
+        del curr_tags, prev_tags
 
-        # Leaves
-        for tag in left_tags:
-            member = previous_members[tag]
-            changes.append(
-                InsertOne({
-                    "type": "leave",
-                    "clan": clan_tag,
-                    "time": now,
-                    "tag": tag,
-                    "name": member.get("name"),
-                    "th": member.get("townHallLevel"),
-                })
-            )
+        if joined_tags:
+            for member in curr_list:
+                tag = member.get("tag")
+                if tag in joined_tags:
+                    changes.append(
+                        InsertOne({
+                            "type": "join",
+                            "clan": clan_tag,
+                            "time": now,
+                            "tag": tag,
+                            "name": member.get("name"),
+                            "th": member.get("townHallLevel"),
+                        })
+                    )
+                    # shrink the set; early-exit once empty
+                    joined_tags.remove(tag)
+                    if not joined_tags:
+                        break
 
+        if left_tags:
+            for member in prev_list:
+                tag = member.get("tag")
+                if tag in left_tags:
+                    changes.append(
+                        InsertOne({
+                            "type": "leave",
+                            "clan": clan_tag,
+                            "time": now,
+                            "tag": tag,
+                            "name": member.get("name"),
+                            "th": member.get("townHallLevel"),
+                        })
+                    )
+                    left_tags.remove(tag)
+                    if not left_tags:
+                        break
+
+        # Donation deltas (skip for priority clans)
         if clan_tag not in self.priority_clans:
-            # Donation changes
-            for tag, curr in current_members.items():
-                if tag in self.priority_players:
-                    continue
-                prev = previous_members.get(tag, {})
+            prev_min = {
+                m.get("tag"): (m.get("donations", 0), m.get("donationsReceived", 0))
+                for m in prev_list
+                if m.get("tag")
+            }
 
-                donation_change = curr.get("donations", 0) - prev.get("donations", 0)
-                received_change = curr.get("donationsReceived", 0) - prev.get("donationsReceived", 0)
+            season = self.season
+
+            for member in curr_list:
+                tag = member.get("tag")
+                if not tag or tag in self.priority_players:
+                    continue
+
+                previous_donations, previous_received = prev_min.get(tag, (0, 0))
+                current_donations = member.get("donations", 0)
+                current_received = member.get("donationsReceived", 0)
+
+                donation_change = current_donations - previous_donations
+                received_change = current_received - previous_received
 
                 if donation_change > 0 or received_change > 0:
                     season_stats.append(
                         UpdateOne(
-                            {"tag": tag, "season": self.season, "clan_tag": clan_tag},
-                            {
-                                "$inc": {
-                                    "donated": donation_change,
-                                    "received": received_change,
-                                }
-                            },
-                            upsert=True
+                            {"tag": tag, "season": season, "clan_tag": clan_tag},
+                            {"$inc": {"donated": donation_change, "received": received_change}},
+                            upsert=True,
                         )
                     )
+
+            prev_min.clear()
 
         return changes, season_stats
 

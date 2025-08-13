@@ -174,13 +174,10 @@ class Tracking:
             *,
             return_exceptions: bool = False,
     ) -> AsyncIterator[Any]:
-        """
-        Run coroutines with bounded concurrency (self.semaphore) and yield results
-        as soon as each completes (asyncio.as_completed).
-        """
+        sem = self.semaphore
 
-        async def runner(coro: Awaitable[Any]) -> Any:
-            async with self.semaphore:
+        async def run_with_sem(coro):
+            async with sem:
                 try:
                     return await coro
                 except Exception as e:
@@ -188,17 +185,38 @@ class Tracking:
                         return e
                     raise
 
-        tasks = [asyncio.create_task(runner(c)) for c in coros]
+        it = iter(coros)
+        in_flight: set[asyncio.Task] = set()
+
+        # Prime up to concurrency
         try:
-            for fut in asyncio.as_completed(tasks):
-                yield await fut
+            for _ in range(self.batch_size):
+                try:
+                    coro = next(it)
+                except StopIteration:
+                    break
+                in_flight.add(asyncio.create_task(run_with_sem(coro)))
+
+            while in_flight:
+                done, in_flight = await asyncio.wait(in_flight, return_when=asyncio.FIRST_COMPLETED)
+
+                # Yield all finished results
+                for t in done:
+                    yield t.result()  # may be an Exception if return_exceptions=True
+
+                # Refill the window
+                for _ in range(len(done)):
+                    try:
+                        coro = next(it)
+                    except StopIteration:
+                        break
+                    in_flight.add(asyncio.create_task(run_with_sem(coro)))
         finally:
-            # In case the caller breaks early, make sure we don't leak tasks
-            for t in tasks:
-                if not t.done():
-                    t.cancel()
-            # Let cancellations propagate
-            await asyncio.gather(*tasks, return_exceptions=True)
+            # If caller breaks early, cancel the rest
+            for t in in_flight:
+                t.cancel()
+            if in_flight:
+                await asyncio.gather(*in_flight, return_exceptions=True)
 
     async def _batch_tasks(self, tasks: list):
         """Track a batch of items."""
