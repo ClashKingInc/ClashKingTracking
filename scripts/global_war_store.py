@@ -166,7 +166,7 @@ class GlobalWarStore(Tracking):
         await self.initialize()
         self.scheduler.start()
         self.consumer: AIOKafkaConsumer = AIOKafkaConsumer(
-            *self.topics, bootstrap_servers=[self.config.kafka_host], auto_offset_reset="latest"
+            *self.topics, bootstrap_servers=self.config.kafka_host, auto_offset_reset="latest"
         )
         await self.store()
 
