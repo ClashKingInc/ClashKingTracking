@@ -83,7 +83,6 @@ class TrackingWebsocket(Tracking):
         self.logger.info("Events Started")
         async for msg in self.consumer:
             message_to_send = {"topic": msg.topic, "value": orjson.loads(msg.value)}
-            self.logger.info(f"Sending {message_to_send}")
             key = msg.key.decode("utf-8") if msg.key is not None else None
             tasks = []
             for client_id, client in self.CONNECTED_CLIENTS.items():  # type: str, WebSocket
