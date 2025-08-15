@@ -99,6 +99,8 @@ class Config:
         self.is_main = remote_settings.get("is_main", False)
         self.webhook_url = remote_settings.get("webhook_url")
         self.kafka_host = remote_settings.get("kafka_connection")
+        self.kafka_user = remote_settings.get("kafka_connection")
+        self.kafka_password = remote_settings.get("kafka_password")
 
         # Determine the account range based on config_type
         self.__beta_range = (7, 10)
@@ -140,7 +142,7 @@ class Config:
 
     def get_kafka_producer(self):
         if self.is_main:
-            return KafkaProducer(bootstrap_servers=[self.kafka_host], api_version=(3, 6, 0))
+            return KafkaProducer(bootstrap_servers=self.kafka_host, api_version=(3, 6, 0))
         return MockKafkaProducer()
 
     def get_mongo_database(self, sync: bool = True):

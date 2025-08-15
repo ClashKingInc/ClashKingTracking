@@ -270,6 +270,8 @@ class Tracking:
         )
         self.message_count += 1
 
+
+
     @staticmethod
     def _handle_exception(message, exception):
         """Handle exceptions by logging to Sentry and console."""

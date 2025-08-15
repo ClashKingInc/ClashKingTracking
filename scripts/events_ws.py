@@ -27,8 +27,14 @@ class TrackingWebsocket(Tracking):
     async def _on_startup(self):
         await self.initialize()
         self.consumer: AIOKafkaConsumer = AIOKafkaConsumer(
-            *self.topics, bootstrap_servers=[self.config.kafka_host], auto_offset_reset="latest"
+            *self.topics,
+            bootstrap_servers=self.config.kafka_host,
+            client_id="tracking_websocket",
+            auto_offset_reset="latest",
+            api_version="auto"
         )
+
+
         asyncio.create_task(self._broadcast())
 
     async def _event_websocket(self, websocket: WebSocket):
