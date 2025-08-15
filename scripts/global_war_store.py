@@ -89,7 +89,7 @@ class GlobalWarStore(Tracking):
             + random.randint(1_000_000_000, 9_999_999_999)
         )
 
-        await self.mongo.clan_wars.update_one(
+        await self.async_mongo.clan_wars.update_one(
             {"war_id": war_unique_id},
             {"$set": {"custom_id": custom_id, "data": war._raw_data, "type": war.type}},
             upsert=True,
