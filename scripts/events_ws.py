@@ -38,10 +38,6 @@ class TrackingWebsocket(Tracking):
         asyncio.create_task(self._broadcast())
 
     async def _event_websocket(self, websocket: WebSocket):
-        global CLAN_MAP
-        global MISSED_EVENTS
-        global CONNECTED_CLIENTS
-
         await websocket.accept()
         await websocket.send_text("Successfully Login!")
         try:
@@ -55,12 +51,12 @@ class TrackingWebsocket(Tracking):
                     return
                 await websocket.send_text(f"Login! with clans: {clans} and id: {client_id}")
 
-                CONNECTED_CLIENTS[client_id] = websocket
-                CLAN_MAP[client_id] = set(clans)
+                self.CONNECTED_CLIENTS[client_id] = websocket
+                self.CLAN_MAP[client_id] = set(clans)
 
                 # Send missed events if any exist
-                while MISSED_EVENTS.get(client_id):
-                    missed_event = MISSED_EVENTS[client_id].popleft()
+                while self.MISSED_EVENTS.get(client_id):
+                    missed_event = self.MISSED_EVENTS[client_id].popleft()
                     await websocket.send_json(missed_event)
         except Exception as e:
             self.logger.error(e)
