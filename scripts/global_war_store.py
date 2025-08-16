@@ -17,13 +17,9 @@ class GlobalWarStore(Tracking):
         self.topics = ["war_store"]
 
     async def store(self):
-        topics = ['war_store']
-        consumer: AIOKafkaConsumer = AIOKafkaConsumer(
-            *topics, bootstrap_servers='85.10.200.219:9092', auto_offset_reset='latest'
-        )
-        await consumer.start()
+        await self.consumer.start()
         self.logger.info('Events Started')
-        async for msg in consumer:
+        async for msg in self.consumer:
             msg = orjson.loads(msg.value)
             run_time = pend.from_timestamp(timestamp=msg.get('run_time'), tz=pend.UTC)
             try:
