@@ -49,6 +49,7 @@ class GlobalWarStore(Tracking):
     async def find_active_war(self, clan_tag: str, opponent_tag: str, prep_time: int):
         switched = False
         errors = 0
+        best_war = None
         while True:
             war = await self.get_war(clan_tag=clan_tag)
             if isinstance(war, coc.ClanWar):
@@ -56,16 +57,21 @@ class GlobalWarStore(Tracking):
                     return war  # Found the completed war
 
                 # Check prep time and retry if needed
+                #this means either they tried to a spin a new war, or they did and matched, either way it is gone
                 if (war.preparation_start_time is None
                         or int(war.preparation_start_time.time.replace(tzinfo=pend.UTC).timestamp()) != prep_time):
                     if not switched:
                         clan_tag = opponent_tag
                         switched = True
                     else:
+                        if best_war:
+                            return best_war
                         return "no access"  # Both tags checked, no valid war found
 
                 if war.state == coc.enums.WarState.in_war:
+                    best_war = war
                     await asyncio.sleep(min(war._response_retry, 120))
+
             elif war == 'maintenance':
                 await asyncio.sleep(15 * 60)  # Wait 15 minutes for maintenance, then continue loop
             elif war == 'error':
@@ -78,6 +84,8 @@ class GlobalWarStore(Tracking):
                     clan_tag = opponent_tag
                     switched = True
                 else:
+                    if best_war:
+                        return best_war
                     return "no_access"  # Both tags checked, no access to either
 
     async def store_war(self, clan_tag: str, opponent_tag: str, prep_time: int):
