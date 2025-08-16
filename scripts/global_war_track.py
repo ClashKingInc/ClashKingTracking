@@ -128,7 +128,7 @@ class GlobalWarTrack(Tracking):
             json_data = {"maintenance_status": "end", "maintenance_duration": maintenance_time}
             self._send_to_kafka("maintenance", json_data, None)
             self.mongo.war_timer.update_many(
-                {}, [{"$set": {"time": {"$dateAdd": {"startDate": "$time", "unit": "second", "amount": 2}}}}]
+                {}, [{"$set": {"time": {"$dateAdd": {"startDate": "$time", "unit": "second", "amount": maintenance_time}}}}]
             )
 
     async def _war_track(self):
