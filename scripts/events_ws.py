@@ -31,9 +31,8 @@ class TrackingWebsocket(Tracking):
             bootstrap_servers=self.config.kafka_host,
             client_id="tracking_websocket",
             auto_offset_reset="latest",
-            api_version="auto"
+            api_version="auto",
         )
-
 
         asyncio.create_task(self._broadcast())
 
@@ -93,5 +92,3 @@ class TrackingWebsocket(Tracking):
         )
         server = Server(config)
         await server.serve()
-
-

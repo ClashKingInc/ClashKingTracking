@@ -1,11 +1,13 @@
-import asyncio
+from collections import defaultdict
+
 import coc
 import pendulum as pend
 from pymongo import UpdateOne
-from collections import defaultdict
-from .tracking import Tracking
+
 from utility.config import TrackingType
 from utility.time import gen_legend_date
+
+from .tracking import Tracking
 
 
 class LegendTracking(Tracking):
@@ -43,7 +45,6 @@ class LegendTracking(Tracking):
     def _clan_tags(self):
         return set(self.mongo.clans_db.distinct("tag"))
 
-
     async def _get_legend_clan_members_to_check(self) -> set:
         """
         Check legend players and if trophies changed, then they need to be checked
@@ -80,14 +81,13 @@ class LegendTracking(Tracking):
                 elif member['tag'] in self.player_tags:
                     self.player_tags.remove(member['tag'])
 
-        #remove any players that arent in our player tag or clan member set from the cache
+        # remove any players that arent in our player tag or clan member set from the cache
         full_player_set = self.player_tags | legend_clan_members
         keys_to_remove = [key for key in self.cache if key not in full_player_set]
         for key in keys_to_remove:
             del self.cache[key]
 
         return members_that_changed
-
 
     async def _find_changes(self, tags: list[str]):
         self.logger.info(f"fetching {len(tags)} tags")
@@ -102,7 +102,7 @@ class LegendTracking(Tracking):
         base_player = []
 
         legend_date = gen_legend_date()
-        
+
         for player_data in responses:
             if isinstance(player_data, coc.NotFound):
                 self.mongo.base_player.delete_one({"tag": player_data.__notes__[0]})
@@ -120,10 +120,9 @@ class LegendTracking(Tracking):
                     self.mongo.base_player.update_one({"tag": tag}, {"$set": {"legends_tracking": False}})
                 continue
 
-            player = {k : v for k, v in player.items() if k in self.fields}
+            player = {k: v for k, v in player.items() if k in self.fields}
 
             clan_tag = player.get("clan", {}).get("tag")
-
 
             previous_player = self.cache.get(tag)
             self.cache[tag] = player
@@ -152,22 +151,29 @@ class LegendTracking(Tracking):
 
             for defense in defenses:
                 if defense <= 100:
-                    legend_stats.append(UpdateOne(
-                            filter={"tag" : tag, "date" : legend_date},
+                    legend_stats.append(
+                        UpdateOne(
+                            filter={"tag": tag, "date": legend_date},
                             update={
-                                "$push": {"defenses": {
-                                    "change": defense,
-                                    "time": pend.now(tz=pend.UTC).int_timestamp,
-                                    "trophies": player.get("trophies"),
-                                }},
-                                "$inc" : {"defense" : defense, "num_defenses": 1},
-                             },
+                                "$push": {
+                                    "defenses": {
+                                        "change": defense,
+                                        "time": pend.now(tz=pend.UTC).int_timestamp,
+                                        "trophies": player.get("trophies"),
+                                    }
+                                },
+                                "$inc": {"defense": defense, "num_defenses": 1},
+                            },
                             upsert=True,
-                        ))
+                        )
+                    )
 
             if trophy_change > 0:
-                equipment = [{"name": gear.get("name"), "level": gear.get("level")}
-                             for hero in player.get("heroes", []) for gear in hero.get("equipment", [])]
+                equipment = [
+                    {"name": gear.get("name"), "level": gear.get("level")}
+                    for hero in player.get("heroes", [])
+                    for gear in hero.get("equipment", [])
+                ]
                 attacks = [attack_change]
                 streak = 0
                 if trophy_change == attack_change * 40:
@@ -175,31 +181,28 @@ class LegendTracking(Tracking):
                     streak = attack_change
 
                 if streak:
-                    base_player.append(UpdateOne(
-                        {"tag": tag},
-                        {"$inc": {"legends_streak": 1}},
-                    ))
+                    base_player.append(UpdateOne({"tag": tag}, {"$inc": {"legends_streak": 1}}))
                 else:
-                    base_player.append(UpdateOne(
-                        {"tag": tag},
-                        {"$set": {"legends_streak": 0}},
-                    ))
-
+                    base_player.append(UpdateOne({"tag": tag}, {"$set": {"legends_streak": 0}}))
 
                 for attack in attacks:
-                    legend_stats.append(UpdateOne(
-                        filter={"tag": tag, "date": legend_date},
-                        update={
-                            "$push": {"attacks": {
-                                "change": attack,
-                                "time": pend.now(tz=pend.UTC).int_timestamp,
-                                "trophies": player.get("trophies"),
-                                "hero_gear": equipment,
-                            }},
-                            "$inc": {"offense": attack, "num_attacks": 1},
-                        },
-                        upsert=True,
-                    ))
+                    legend_stats.append(
+                        UpdateOne(
+                            filter={"tag": tag, "date": legend_date},
+                            update={
+                                "$push": {
+                                    "attacks": {
+                                        "change": attack,
+                                        "time": pend.now(tz=pend.UTC).int_timestamp,
+                                        "trophies": player.get("trophies"),
+                                        "hero_gear": equipment,
+                                    }
+                                },
+                                "$inc": {"offense": attack, "num_attacks": 1},
+                            },
+                            upsert=True,
+                        )
+                    )
 
         self.logger.info(f"{len(legend_stats)} legend stats to write")
         if legend_stats:
@@ -208,7 +211,6 @@ class LegendTracking(Tracking):
         self.logger.info(f"{len(legend_stats)} base player updates")
         if base_player:
             self.mongo.base_player.bulk_write(base_player, ordered=False)
-        
 
     async def _track(self):
         clan_members_changed_trophies = await self._get_legend_clan_members_to_check()
@@ -219,7 +221,7 @@ class LegendTracking(Tracking):
 
         batch = self._split_into_batch(items=list(tags_to_track))
         self.logger.info(f"created {len(batch)} batches ")
-        
+
         for tags in batch:
             await self._find_changes(tags=tags)
 
@@ -231,7 +233,6 @@ class LegendTracking(Tracking):
         self.other_clan_tags = other_clan_tags
         self.logger.info(f"{len(self.other_clan_tags | self.bot_clan_tags)} clan tags to track")
 
-
     async def run(self):
         await self.initialize()
 
@@ -241,5 +242,3 @@ class LegendTracking(Tracking):
             self.logger.info(f"{len(self.player_tags)} players in base player")
             await self._track()
             self._submit_stats()
-
-

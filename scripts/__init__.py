@@ -1,4 +1,3 @@
-
 from .bot_clans import ClanTracker
 from .bot_players import PlayerTracking
 from .events_ws import TrackingWebsocket

@@ -1,9 +1,12 @@
-import os
 import asyncio
+import os
+
 from dotenv import load_dotenv
+
 load_dotenv()
 
 import scripts
+
 SCRIPT_NAME = os.getenv("SCRIPT_NAME")
 main_function = ...
 

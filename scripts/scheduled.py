@@ -13,10 +13,9 @@ from hashids import Hashids
 from pymongo import InsertOne, UpdateOne
 
 from utility.constants import locations
-
+from utility.time import CLASH_ISO_FORMAT, gen_games_season, gen_raid_date, gen_season_date
 
 from .tracking import Tracking, TrackingType
-from utility.time import gen_games_season, gen_raid_date, gen_season_date, season_start_end, CLASH_ISO_FORMAT
 
 
 class ScheduledTracking(Tracking):
@@ -57,7 +56,7 @@ class ScheduledTracking(Tracking):
                         self.fetch(
                             url=f"https://api.clashofclans.com/v1/clanwarleagues/wars/{tag.replace('#', '%23')}",
                             tag=tag,
-                            json=True
+                            json=True,
                         )
                     )
                 self.logger.info(f"{len(tasks)} tasks")
@@ -139,7 +138,8 @@ class ScheduledTracking(Tracking):
                     tasks.append(
                         self.fetch(
                             url=f"https://api.clashofclans.com/v1/clans/{tag.replace('#', '%23')}/currentwar/leaguegroup",
-                            tag=tag, json=True
+                            tag=tag,
+                            json=True,
                         )
                     )
                 responses = await self._run_tasks(tasks=tasks, return_exceptions=True, wrapped=True)
@@ -189,9 +189,7 @@ class ScheduledTracking(Tracking):
                     self.coc_client.get_location_players_builder_base,
                 ],
             ):
-                tasks = [
-                    function(location_id=location) for location in locations
-                ]
+                tasks = [function(location_id=location) for location in locations]
                 responses = await asyncio.gather(*tasks, return_exceptions=True)
                 store_tasks = []
                 for index, response in enumerate(responses):
@@ -219,7 +217,7 @@ class ScheduledTracking(Tracking):
             self.logger.exception(f"Unexpected error in store_all_leaderboards: {e}")
 
         await self.async_mongo.legend_rankings.aggregate(
-            [{"$match" : {}}, {"$out" : {"db" : "ranking_history", "coll" : "legends"}}]
+            [{"$match": {}}, {"$out": {"db": "ranking_history", "coll": "legends"}}]
         )
 
     async def store_legends(self):
@@ -232,13 +230,10 @@ class ScheduledTracking(Tracking):
         missing = set(seasons) - set(seasons_present)
 
         for season_id in missing:
-            rankings = await self.coc_client.get_season_rankings(
-                league_id=29000022,
-                season_id=season_id, limit=25_000
-            )
+            rankings = await self.coc_client.get_season_rankings(league_id=29000022, season_id=season_id, limit=25_000)
             changes = []
             async for ranking in rankings:
-                data = ranking._raw_data | {"season" : season_id}
+                data = ranking._raw_data | {"season": season_id}
                 changes.append(InsertOne(data))
 
             if changes:
@@ -300,7 +295,9 @@ class ScheduledTracking(Tracking):
         """
         try:
             # Reset ranks
-            await self.async_mongo.region_leaderboard.update_many({}, {"$set": {"global_rank": None, "local_rank": None}})
+            await self.async_mongo.region_leaderboard.update_many(
+                {}, {"$set": {"global_rank": None, "local_rank": None}}
+            )
             lb_changes = []
             tasks = [
                 asyncio.create_task(self.coc_client.get_location_players(location_id=location))
@@ -516,34 +513,22 @@ class ScheduledTracking(Tracking):
             {"$group": {"_id": "$clans"}},
         ]
         active_clans = [
-            x["_id"] for x in
-            await (await self.async_mongo.clan_wars.aggregate(pipeline)).to_list(length=None)
+            x["_id"] for x in await (await self.async_mongo.clan_wars.aggregate(pipeline)).to_list(length=None)
         ]
 
         self.logger.info(f"ACTIVE CLANS: {len(active_clans)}")
         await self.async_mongo.all_clans.update_many(
-            {"$or": [
-                {"data.members": {"$lt": 5}},
-                {"data.clanLevel": {"$lt": 3}},
-                {"data.capitalLeague.name": None}
-            ]},
+            {"$or": [{"data.members": {"$lt": 5}}, {"data.clanLevel": {"$lt": 3}}, {"data.capitalLeague.name": None}]},
             {"$set": {"active": False}},
         )
 
         await self.async_mongo.all_clans.update_many(
-            {"$nor": [
-                {"data.members": {"$lt": 5}},
-                {"data.clanLevel": {"$lt": 3}},
-                {"data.capitalLeague.name": None}
-            ]},
+            {"$nor": [{"data.members": {"$lt": 5}}, {"data.clanLevel": {"$lt": 3}}, {"data.capitalLeague.name": None}]},
             {"$set": {"active": True}},
         )
         batches = self._split_into_batch(items=active_clans)
         for clans in batches:
-            await self.async_mongo.all_clans.update_many(
-                {"tag": {"$in": clans}},
-                {"$set": {"active": True}},
-            )
+            await self.async_mongo.all_clans.update_many({"tag": {"$in": clans}}, {"$set": {"active": True}})
 
     async def remove_dead_clans(self):
         thirty_five_days = pend.now(tz=pend.UTC).subtract(days=35).int_timestamp
@@ -554,19 +539,14 @@ class ScheduledTracking(Tracking):
             {"$group": {"_id": "$clans"}},
         ]
         active_clans = [
-            x["_id"] for x in
-            await (await self.async_mongo.clan_wars.aggregate(pipeline)).to_list(length=None)
+            x["_id"] for x in await (await self.async_mongo.clan_wars.aggregate(pipeline)).to_list(length=None)
         ]
 
         active_clans = set(active_clans)
         self.logger.info(f"ACTIVE CLANS: {len(active_clans)}")
 
         pipeline = [
-            {"$match": {"$or": [
-                {"members": {"$lt": 5}},
-                {"level": {"$lt": 3}},
-                {"capitalLeague": "Unranked"}
-            ]}},
+            {"$match": {"$or": [{"members": {"$lt": 5}}, {"level": {"$lt": 3}}, {"capitalLeague": "Unranked"}]}},
             {"$group": {"_id": "$tag"}},
         ]
         pipeline = await self.async_mongo.global_clans.aggregate(pipeline)
@@ -579,9 +559,7 @@ class ScheduledTracking(Tracking):
 
         batches = await self._split_into_batch(items=clans_to_delete)
         for batch in batches:
-            await self.async_mongo.all_clans.update_many(
-                {"data.tag" : {"$in": batch}},
-                {"$unset": {"data": ""}})
+            await self.async_mongo.all_clans.update_many({"data.tag": {"$in": batch}}, {"$unset": {"data": ""}})
         self.logger.info(f"DELETING {len(clans_to_delete)} DEAD CLANS")
 
     async def test_name_search(self):
@@ -664,7 +642,6 @@ class ScheduledTracking(Tracking):
         )
 
     async def store_league_changes(self, league_type: str):
-
         if league_type == "capitalLeague":
             timestamp = gen_raid_date()
             spot = "clanCapital"
@@ -674,20 +651,15 @@ class ScheduledTracking(Tracking):
 
         updates = []
 
-        async for clan in self.async_mongo.all_clans.find({}, {"_id": 0, "tag": 1, f"data.{league_type}": 1, "data.clanCapitalPoints" : 1}):
+        async for clan in self.async_mongo.all_clans.find(
+            {}, {"_id": 0, "tag": 1, f"data.{league_type}": 1, "data.clanCapitalPoints": 1}
+        ):
             league = clan.get("data").get(league_type).get("name", "Unranked")
-            history = {
-                "league" : league
-            }
+            history = {"league": league}
             if league_type == "capitalLeague":
                 history["trophies"] = clan.get("data").get("clanCapitalPoints", 0)
 
-            updates.append(
-                UpdateOne(
-                    {"tag" : clan.get("tag")},
-                    {"$set" : {f"changes.{spot}.{timestamp}" : history}},
-
-                ))
+            updates.append(UpdateOne({"tag": clan.get("tag")}, {"$set": {f"changes.{spot}.{timestamp}": history}}))
 
             if len(updates) >= 25_000:
                 await self.async_mongo.clan_change_history.bulk_write(updates, ordered=False)
@@ -709,7 +681,7 @@ class ScheduledTracking(Tracking):
             "obstacles_removed",
             "attack_wins",
             "boosted_super_troops",
-            "walls_destroyed"
+            "walls_destroyed",
         ]
         server_clans = set()
         async for clan in self.async_mongo.clans_db.find({}, {"_id": 0, "tag": 1, "server": 1}):
@@ -725,21 +697,15 @@ class ScheduledTracking(Tracking):
                     {"$match": {"season": season}},
                     {"$sort": {field: -1}},
                     {"$limit": 1000},
-                    {"$group": {
-                        "_id": "$tag",
-                        "value": {"$sum": f"${field}"},
-                    }},
+                    {"$group": {"_id": "$tag", "value": {"$sum": f"${field}"}}},
                     {"$sort": {"value": -1}},
                 ]
             else:
                 player_pipeline = [
-                    {"$match": {"season": season, "activity" : {"$ne": None}}},
-                    {"$group": {
-                        "_id": "$tag",
-                        "value": {"$sum": f"${field}"},
-                    }},
+                    {"$match": {"season": season, "activity": {"$ne": None}}},
+                    {"$group": {"_id": "$tag", "value": {"$sum": f"${field}"}}},
                     {"$sort": {"value": -1}},
-                    {"$limit": 1000}
+                    {"$limit": 1000},
                 ]
             field_leaderboard = await self.async_mongo.new_player_stats.aggregate(pipeline=player_pipeline)
             field_leaderboard = await field_leaderboard.to_list(length=None)
@@ -756,7 +722,9 @@ class ScheduledTracking(Tracking):
                 del data["_id"]
 
             if permanent:
-                await self.async_mongo.ranking_history.get_collection("player_leaderboard").insert_many(field_leaderboard)
+                await self.async_mongo.ranking_history.get_collection("player_leaderboard").insert_many(
+                    field_leaderboard
+                )
             else:
                 await self.async_mongo.leaderboards.get_collection("player").delete_many({"type": field})
                 await self.async_mongo.leaderboards.get_collection("player").insert_many(field_leaderboard)
@@ -765,22 +733,16 @@ class ScheduledTracking(Tracking):
             if field in ["donated", "received"]:
                 clan_pipeline = [
                     {"$match": {"season": season}},
-                    {"$group": {
-                        "_id": "$clan_tag",
-                        "value": {"$sum": f"${field}"},
-                    }},
+                    {"$group": {"_id": "$clan_tag", "value": {"$sum": f"${field}"}}},
                     {"$sort": {"value": -1}},
-                    {"$limit": 1000}
+                    {"$limit": 1000},
                 ]
             else:
                 clan_pipeline = [
                     {"$match": {"season": season, "activity": {"$ne": None}}},
-                    {"$group": {
-                        "_id": "$clan_tag",
-                        "value": {"$sum": f"${field}"},
-                    }},
+                    {"$group": {"_id": "$clan_tag", "value": {"$sum": f"${field}"}}},
                     {"$sort": {"value": -1}},
-                    {"$limit": 1000}
+                    {"$limit": 1000},
                 ]
             field_leaderboard = await self.async_mongo.new_player_stats.aggregate(pipeline=clan_pipeline)
             field_leaderboard = await field_leaderboard.to_list(length=None)
@@ -807,10 +769,7 @@ class ScheduledTracking(Tracking):
             clan_pipeline = [
                 {"$match": {"clan_tag": {"$in": list(server_clans)}}},
                 {"$match": {"season": season}},
-                {"$group": {
-                    "_id": "$clan_tag",
-                    "value": {"$sum": f"${field}"},
-                }},
+                {"$group": {"_id": "$clan_tag", "value": {"$sum": f"${field}"}}},
                 {"$sort": {"value": -1}},
             ]
             field_leaderboard = await self.async_mongo.new_player_stats.aggregate(pipeline=clan_pipeline)
@@ -820,7 +779,7 @@ class ScheduledTracking(Tracking):
             if not field_leaderboard:
                 continue
 
-            leaderboard_mapping = {d.get("_id") : d.get("value") for d in field_leaderboard}
+            leaderboard_mapping = {d.get("_id"): d.get("value") for d in field_leaderboard}
             holder_lb = {}
             for clan, servers in clan_to_servers.items():
                 for server in servers:
@@ -833,13 +792,7 @@ class ScheduledTracking(Tracking):
             for count, (server, value) in enumerate(holder_lb.items(), 1):
                 if count > 1000:
                     continue
-                store_lb.append({
-                    "server": server,
-                    "type": field,
-                    "value": value,
-                    "season": season,
-                    "rank": count
-                })
+                store_lb.append({"server": server, "type": field, "value": value, "season": season, "rank": count})
 
             if permanent:
                 await self.async_mongo.ranking_history.get_collection("server_leaderboard").insert_many(store_lb)
@@ -847,11 +800,10 @@ class ScheduledTracking(Tracking):
                 await self.async_mongo.leaderboards.get_collection("server").delete_many({"type": field})
                 await self.async_mongo.leaderboards.get_collection("server").insert_many(store_lb)
 
-
     async def build_legend_rankings(self):
         ranking_pipeline = [
-            {"$match" : {}},
-            {"$project" : {"data.memberList" : 1, "_id" : 0}},
+            {"$match": {}},
+            {"$project": {"data.memberList": 1, "_id": 0}},
             {"$unwind": "$data.memberList"},
             {"$match": {"data.memberList.league.name": "Legend League"}},
             {
@@ -864,7 +816,7 @@ class ScheduledTracking(Tracking):
                 }
             },
             {"$unset": ["_id"]},
-            #window‐function to compute rank over our sort_field
+            # window‐function to compute rank over our sort_field
             {"$setWindowFields": {"sortBy": {"sort_field": -1}, "output": {"rank": {"$rank": {}}}}},
             # clean up the temporary sort key
             {"$unset": ["sort_field"]},
@@ -873,15 +825,11 @@ class ScheduledTracking(Tracking):
         cursor = await self.async_mongo.all_clans.aggregate(ranking_pipeline, allowDiskUse=True)
         await cursor.to_list(length=None)
 
-
     async def build_cwl_rankings(self):
         self.logger.info("Building CWL Rankings")
         season = gen_games_season()
 
-        pipeline = [
-            {"$match": {"data.season": season}},
-            {"$group": {"_id": "$cwl_id"}},
-        ]
+        pipeline = [{"$match": {"data.season": season}}, {"$group": {"_id": "$cwl_id"}}]
         result = await self.async_mongo.cwl_group.aggregate(pipeline)
         result = await result.to_list(length=None)
         all_cwl_ids = [doc["_id"] for doc in result]
@@ -895,17 +843,12 @@ class ScheduledTracking(Tracking):
                 {"$match": {"cwl_id": {"$in": cwl_id_batch}}},
                 {"$unwind": "$data.rounds"},
                 {"$unwind": "$data.rounds.warTags"},
-                {
-                    "$group": {
-                        "_id": "$cwl_id",
-                        "warTags": {"$addToSet": "$data.rounds.warTags"}
-                    }
-                },
-                {"$project": {"_id": 0, "cwl_id": "$_id", "warTags": 1}}
+                {"$group": {"_id": "$cwl_id", "warTags": {"$addToSet": "$data.rounds.warTags"}}},
+                {"$project": {"_id": 0, "cwl_id": "$_id", "warTags": 1}},
             ]
             result = await self.async_mongo.cwl_group.aggregate(pipeline)
             result = await result.to_list(length=None)
-            self.logger.info(f"GRABBED CWL ID BATCH")
+            self.logger.info("GRABBED CWL ID BATCH")
 
             war_to_cwl_id = {}
             all_war_tags = []
@@ -920,7 +863,6 @@ class ScheduledTracking(Tracking):
 
             pipeline = [
                 {"$match": {"data.tag": {"$in": all_war_tags}}},
-
                 # 1) Compute destruction sums for both sides
                 {
                     "$set": {
@@ -934,10 +876,10 @@ class ScheduledTracking(Tracking):
                                             "$map": {
                                                 "input": {"$ifNull": ["$$m.attacks", []]},
                                                 "as": "a",
-                                                "in": {"$ifNull": ["$$a.destructionPercentage", 0]}
+                                                "in": {"$ifNull": ["$$a.destructionPercentage", 0]},
                                             }
                                         }
-                                    }
+                                    },
                                 }
                             }
                         },
@@ -951,16 +893,15 @@ class ScheduledTracking(Tracking):
                                             "$map": {
                                                 "input": {"$ifNull": ["$$m.attacks", []]},
                                                 "as": "a",
-                                                "in": {"$ifNull": ["$$a.destructionPercentage", 0]}
+                                                "in": {"$ifNull": ["$$a.destructionPercentage", 0]},
                                             }
                                         }
-                                    }
+                                    },
                                 }
                             }
-                        }
+                        },
                     }
                 },
-
                 # 2) Decide winner
                 {
                     "$set": {
@@ -969,17 +910,30 @@ class ScheduledTracking(Tracking):
                                 "branches": [
                                     {"case": {"$gt": ["$data.clan.stars", "$data.opponent.stars"]}, "then": "clan"},
                                     {"case": {"$lt": ["$data.clan.stars", "$data.opponent.stars"]}, "then": "opponent"},
-                                    {"case": {"$gt": ["$data.clan.destructionPercentage",
-                                                      "$data.opponent.destructionPercentage"]}, "then": "clan"},
-                                    {"case": {"$lt": ["$data.clan.destructionPercentage",
-                                                      "$data.opponent.destructionPercentage"]}, "then": "opponent"}
+                                    {
+                                        "case": {
+                                            "$gt": [
+                                                "$data.clan.destructionPercentage",
+                                                "$data.opponent.destructionPercentage",
+                                            ]
+                                        },
+                                        "then": "clan",
+                                    },
+                                    {
+                                        "case": {
+                                            "$lt": [
+                                                "$data.clan.destructionPercentage",
+                                                "$data.opponent.destructionPercentage",
+                                            ]
+                                        },
+                                        "then": "opponent",
+                                    },
                                 ],
-                                "default": "tie"
+                                "default": "tie",
                             }
                         }
                     }
                 },
-
                 # 3) Flatten into two rows (clan & opponent)
                 {
                     "$project": {
@@ -995,7 +949,7 @@ class ScheduledTracking(Tracking):
                                 },
                                 "win": {"$cond": [{"$eq": ["$winnerSide", "clan"]}, 1, 0]},
                                 "totalDestructionFromAttacks": "$data.clan.totalDestructionFromAttacks",
-                                "war_tag": "$data.tag"
+                                "war_tag": "$data.tag",
                             },
                             {
                                 "tag": "$data.opponent.tag",
@@ -1004,19 +958,20 @@ class ScheduledTracking(Tracking):
                                 "attacks": "$data.opponent.attacks",
                                 "raw_stars": "$data.opponent.stars",
                                 "stars_with_bonus": {
-                                    "$add": ["$data.opponent.stars",
-                                             {"$cond": [{"$eq": ["$winnerSide", "opponent"]}, 10, 0]}]
+                                    "$add": [
+                                        "$data.opponent.stars",
+                                        {"$cond": [{"$eq": ["$winnerSide", "opponent"]}, 10, 0]},
+                                    ]
                                 },
                                 "win": {"$cond": [{"$eq": ["$winnerSide", "opponent"]}, 1, 0]},
                                 "totalDestructionFromAttacks": "$data.opponent.totalDestructionFromAttacks",
-                                "war_tag": "$data.tag"
-                            }
+                                "war_tag": "$data.tag",
+                            },
                         ]
                     }
                 },
                 {"$unwind": "$sides"},
                 {"$replaceRoot": {"newRoot": "$sides"}},
-
                 # 4) Group by clan tag
                 {
                     "$group": {
@@ -1029,10 +984,9 @@ class ScheduledTracking(Tracking):
                         "wins": {"$sum": "$win"},
                         "totalDestruction": {"$sum": "$totalDestructionFromAttacks"},
                         "wars": {"$addToSet": "$war_tag"},
-                        "war_count": {"$sum": 1}
+                        "war_count": {"$sum": 1},
                     }
                 },
-
                 # 5) Final shape
                 {
                     "$project": {
@@ -1048,10 +1002,10 @@ class ScheduledTracking(Tracking):
                         "wins": 1,
                         "war_count": 1,
                     }
-                }
+                },
             ]
             result = await self.async_mongo.clan_wars.aggregate(pipeline, allowDiskUse=True)
-            self.logger.info(f"GRABBED CWL DATA")
+            self.logger.info("GRABBED CWL DATA")
             wars = await result.to_list(length=None)
 
             self.logger.info(f"PULLED {len(wars)} WARS")
@@ -1065,14 +1019,14 @@ class ScheduledTracking(Tracking):
                 war["season"] = season
                 war["cwl_id"] = cwl_id
 
-            self.logger.info(f"MAPPED WARS")
+            self.logger.info("MAPPED WARS")
 
             previous_season = pend.now(tz=pend.UTC).subtract(months=1).format("YYYY-MM")
             cwl_id_to_league = {}
-            cwl_rank_history = self.async_mongo.league_history.find({"tag" : {"$in" : list(clan_to_cwl_id.keys())}},
-                                                                   {"_id": 0, "tag": 1,
-                                                                    f"changes.clanWarLeague.{previous_season}.league": 1,
-                                                                    })
+            cwl_rank_history = self.async_mongo.league_history.find(
+                {"tag": {"$in": list(clan_to_cwl_id.keys())}},
+                {"_id": 0, "tag": 1, f"changes.clanWarLeague.{previous_season}.league": 1},
+            )
             cwl_rank_history = await cwl_rank_history.to_list(length=None)
             for clan in cwl_rank_history:
                 league = clan.get("changes").get("clanWarLeague", {}).get(previous_season, {}).get("league")
@@ -1080,60 +1034,35 @@ class ScheduledTracking(Tracking):
                     continue
                 cwl_id_to_league[clan_to_cwl_id[clan.get("tag")]] = league
 
-            self.logger.info(f"PULLED CWL LEAGUES")
+            self.logger.info("PULLED CWL LEAGUES")
 
             for war in wars:
                 cwl_id = war.get("cwl_id")
                 war["league"] = cwl_id_to_league.get(cwl_id)
 
-
             for war in wars:
-                cwl_rank_data.append(UpdateOne({"tag" : war["tag"], "season": season}, {"$set" : war}, upsert=True))
+                cwl_rank_data.append(UpdateOne({"tag": war["tag"], "season": season}, {"$set": war}, upsert=True))
 
-            self.logger.info(f"STARTED STORING")
+            self.logger.info("STARTED STORING")
 
             if cwl_rank_data:
                 await self.async_mongo.leaderboards.get_collection("cwl").bulk_write(cwl_rank_data)
-            self.logger.info(f"FINISHED STORING")
+            self.logger.info("FINISHED STORING")
 
         pipeline = [
+            {'$set': {'sort_field': {'s': '$stars', 'd': '$destructionPercentage'}}},
             {
-                '$set': {
-                    'sort_field': {
-                        's': '$stars',
-                        'd': '$destructionPercentage'
-                    }
+                '$setWindowFields': {
+                    'partitionBy': {'season': '$season', 'league': '$league', 'teamSize': '$teamSize'},
+                    'sortBy': {'sort_field': -1},
+                    'output': {'rank': {'$rank': {}}},
                 }
-            }, {
-            '$setWindowFields': {
-                'partitionBy': {
-                    'season': '$season',
-                    'league': '$league',
-                    'teamSize': '$teamSize'
-                },
-                'sortBy': {
-                    'sort_field': -1
-                },
-                'output': {
-                    'rank': {
-                        '$rank': {}
-                    }
-                }
-            }
-        }, {
-            '$unset': 'sort_field'
-        }, {
-            '$merge': {
-                'into': 'cwl',
-                'on': '_id',
-                'whenMatched': 'merge',
-                'whenNotMatched': 'discard'
-            }
-        }
+            },
+            {'$unset': 'sort_field'},
+            {'$merge': {'into': 'cwl', 'on': '_id', 'whenMatched': 'merge', 'whenNotMatched': 'discard'}},
         ]
         await self.async_mongo.leaderboards.get_collection("cwl").aggregate(pipeline)
         self.logger.info("Finished CWL Rankings")
-
 
     async def build_hitrate(self):
         return
@@ -1150,8 +1079,7 @@ class ScheduledTracking(Tracking):
 
             count = 1
             async for war in self.async_mongo.clan_wars.find(
-                    {"data.endTime": {"$gte": day_start, "$lte": day_end}},
-                    {"_id": 0, "data": 1},
+                {"data.endTime": {"$gte": day_start, "$lte": day_end}}, {"_id": 0, "data": 1}
             ):
                 war = war.get("data")
                 count += 1
@@ -1166,7 +1094,9 @@ class ScheduledTracking(Tracking):
                     versus = f"{attack.attacker.town_hall}v{attack.defender.town_hall}"
                     if attack.attacker.town_hall == attack.defender.town_hall:
                         player_war_stats[attack.attacker_tag][str(attack.attacker.town_hall)]["attacks"] += 1
-                        player_war_stats[attack.attacker_tag][str(attack.attacker.town_hall)][f"{attack.stars}_star_attack"] += 1
+                        player_war_stats[attack.attacker_tag][str(attack.attacker.town_hall)][
+                            f"{attack.stars}_star_attack"
+                        ] += 1
                     if attack.is_fresh_attack:
                         war_stats[versus]["fresh"]["attacks"] += 1
                         war_stats[versus]["fresh"][f"{attack.stars}_star_attack"] += 1
@@ -1191,7 +1121,7 @@ class ScheduledTracking(Tracking):
                     extended_data = {
                         "townhall": int(townhall),
                         "opponent_townhall": int(opponent_townhall),
-                        "fresh" : fresh_type == "fresh",
+                        "fresh": fresh_type == "fresh",
                         "day": day,
                     }
                     war_data.update(extended_data)
@@ -1202,12 +1132,14 @@ class ScheduledTracking(Tracking):
             player_war_stats = defaultdict_to_dict(player_war_stats)
             for player_tag, townhall_data in player_war_stats.items():
                 for townhall, war_data in townhall_data.items():
-                    store_player_hitrates.append(UpdateOne(
-                        {"season": season, "player_tag": player_tag, "townhall": int(townhall)},
-                        {"$inc": war_data}, upsert=True
-                    ))
+                    store_player_hitrates.append(
+                        UpdateOne(
+                            {"season": season, "player_tag": player_tag, "townhall": int(townhall)},
+                            {"$inc": war_data},
+                            upsert=True,
+                        )
+                    )
             await self.async_mongo.leaderboards.get_collection("player_hitrates").bulk_write(store_player_hitrates)
-
 
     async def add_permanent_schedules(self):
         self.scheduler.add_job(
@@ -1217,16 +1149,10 @@ class ScheduledTracking(Tracking):
             misfire_grace_time=300,
         )
         self.scheduler.add_job(
-            self.store_legends,
-            CronTrigger(day="*", hour=5, minute=56),
-            name="Store Legends",
-            misfire_grace_time=300
+            self.store_legends, CronTrigger(day="*", hour=5, minute=56), name="Store Legends", misfire_grace_time=300
         )
         self.scheduler.add_job(
-            self.update_autocomplete,
-            IntervalTrigger(minutes=15),
-            name="Update Autocomplete",
-            misfire_grace_time=300
+            self.update_autocomplete, IntervalTrigger(minutes=15), name="Update Autocomplete", misfire_grace_time=300
         )
         self.scheduler.add_job(
             self.update_region_leaderboards,
@@ -1285,7 +1211,7 @@ class ScheduledTracking(Tracking):
             CronTrigger(day='2-12', hour="*/4", minute=15),
             name="Build CWL Rankings",
             misfire_grace_time=300,
-            max_instances=1
+            max_instances=1,
         )
 
         self.scheduler.add_job(
@@ -1293,7 +1219,7 @@ class ScheduledTracking(Tracking):
             CronTrigger(day='2-13', hour="*", minute=5),
             name="Store CWL Wars",
             misfire_grace_time=300,
-            max_instances=1
+            max_instances=1,
         )
         self.scheduler.add_job(
             self.store_cwl_groups,
@@ -1308,7 +1234,6 @@ class ScheduledTracking(Tracking):
             misfire_grace_time=300,
         )
 
-
     async def run(self):
         try:
             await self.initialize()
@@ -1320,4 +1245,3 @@ class ScheduledTracking(Tracking):
         except (KeyboardInterrupt, SystemExit):
             self.logger.info("Shutting down scheduler...")
             self.scheduler.shutdown()
-

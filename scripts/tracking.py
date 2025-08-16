@@ -1,5 +1,6 @@
 import asyncio
 from collections import defaultdict, deque
+from typing import Any, AsyncIterator, Awaitable, Iterable
 
 import aiohttp
 import coc
@@ -12,11 +13,10 @@ from kafka import KafkaProducer
 from loguru import logger
 from redis import Redis
 from redis.asyncio import Redis as AsyncRedis
-from typing import AsyncIterator, Awaitable, Iterable, Any
 
-from utility.mongo import MongoDatabase
 from utility.config import Config, TrackingType
 from utility.health import run_health_check_server
+from utility.mongo import MongoDatabase
 
 
 class Tracking:
@@ -54,7 +54,6 @@ class Tracking:
         self._api_requests_made = 0
         self._cycle_count = 0
         self._last_run = pend.now(tz=pend.UTC)
-
 
     async def initialize(self):
         """Initialise the tracker with dependencies."""
@@ -122,19 +121,16 @@ class Tracking:
         result = self.mongo.tracking_stats.update_one(
             filter={"type": str(self.tracker_type)},
             update={
-            "$set": {
-                "last_cycle": now.int_timestamp,
-                "current_cycle": self._cycle_count,
-                "number_tracked": self._api_requests_made,
+                "$set": {
+                    "last_cycle": now.int_timestamp,
+                    "current_cycle": self._cycle_count,
+                    "number_tracked": self._api_requests_made,
+                },
+                "$inc": {"total_cycles_run": 1, "total_api_requests_made": self._api_requests_made},
+                "$push": {"cycles": {"$each": [time_since_last_run], "$slice": -1000}},
             },
-            "$inc": {
-                "total_cycles_run": 1,
-                "total_api_requests_made": self._api_requests_made
-            },
-            "$push": {
-                "cycles": {"$each": [time_since_last_run], "$slice": -1000}
-            }
-        }, upsert=True)
+            upsert=True,
+        )
         self._last_run = now
         self._cycle_count += 1
         self._api_requests_made = 0
@@ -169,10 +165,7 @@ class Tracking:
         return results
 
     async def _run_tasks_stream(
-            self,
-            coros: Iterable[Awaitable[Any]],
-            *,
-            return_exceptions: bool = False,
+        self, coros: Iterable[Awaitable[Any]], *, return_exceptions: bool = False
     ) -> AsyncIterator[Any]:
         sem = self.semaphore
 
@@ -269,8 +262,6 @@ class Tracking:
             timestamp_ms=int(pend.now(tz=pend.UTC).timestamp() * 1000),
         )
         self.message_count += 1
-
-
 
     @staticmethod
     def _handle_exception(message, exception):

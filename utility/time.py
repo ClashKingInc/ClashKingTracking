@@ -1,9 +1,11 @@
-from datetime import datetime, timedelta
-import pendulum as pend
-import coc
 import calendar
+from datetime import datetime, timedelta
+
+import coc
+import pendulum as pend
 
 CLASH_ISO_FORMAT = 'YYYYMMDDTHHmmss.000[Z]'
+
 
 class DiscordTimeStamp:
     def __init__(self, date: pend.DateTime):
@@ -203,6 +205,7 @@ def get_season_raid_weeks(season: str):
         weeks.append(week.to_date_string())
 
     return weeks
+
 
 def weekend_to_coc_py_timestamp(weekend: str, end=False) -> coc.Timestamp:
     """

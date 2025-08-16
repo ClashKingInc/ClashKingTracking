@@ -10,8 +10,8 @@ from redis import Redis
 from redis.asyncio import Redis as AsyncRedis
 
 from utility.kafka_mock import MockKafkaProducer
-from utility.mongo import MongoDatabase
 from utility.keycreation import create_keys
+from utility.mongo import MongoDatabase
 
 # Load environment variables from .env file
 load_dotenv()

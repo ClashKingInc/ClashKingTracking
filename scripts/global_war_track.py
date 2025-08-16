@@ -1,4 +1,3 @@
-import asyncio
 from typing import List, Optional
 
 import coc
@@ -10,7 +9,6 @@ from msgspec.json import decode
 from pymongo import InsertOne, UpdateOne
 
 from .tracking import Tracking, TrackingType
-from utility.time import gen_season_date, is_cwl
 
 
 class Members(Struct):
@@ -57,8 +55,9 @@ class GlobalWarTrack(Tracking):
         pipeline = [{"$match": {"data.isWarLogPublic": True}}, {"$group": {"_id": "$tag"}}]
         all_tags = [
             x["_id"]
-            for x in self.mongo.all_clans.aggregate(pipeline,
-                                                    hint={"data.isWarLogPublic": 1, "tag": 1}).to_list(length=None)
+            for x in self.mongo.all_clans.aggregate(pipeline, hint={"data.isWarLogPublic": 1, "tag": 1}).to_list(
+                length=None
+            )
         ]
         return all_tags
 
@@ -117,7 +116,7 @@ class GlobalWarTrack(Tracking):
         pipeline = [
             {"$match": {"endTime": {"$gte": pend.now(tz=pend.UTC).subtract(weeks=1).int_timestamp}}},
             {"$match": {"data": None}},
-            {"$project" : {"war_id" : 1}},
+            {"$project": {"war_id": 1}},
         ]
         result = self.mongo.clan_wars.aggregate(pipeline).to_list(length=None)
         war_ids = [x["war_id"] for x in result]
@@ -162,7 +161,7 @@ class GlobalWarTrack(Tracking):
                 elif isinstance(war_data, coc.ClashOfClansException):
                     continue
                 elif isinstance(war_data, ContentTypeError):
-                    self.logger.debug(f"Error fetching data")
+                    self.logger.debug("Error fetching data")
                     continue
 
                 war, clan_tag = war_data
@@ -189,7 +188,11 @@ class GlobalWarTrack(Tracking):
                     war_timers.extend(self._war_timer_changes(war))
                     changes.append(
                         InsertOne(
-                            {"war_id": war_unique_id, "clans": [clan_tag, opponent_tag], "endTime": war_end.int_timestamp},
+                            {
+                                "war_id": war_unique_id,
+                                "clans": [clan_tag, opponent_tag],
+                                "endTime": war_end.int_timestamp,
+                            }
                         )
                     )
 
@@ -204,7 +207,7 @@ class GlobalWarTrack(Tracking):
             if changes:
                 try:
                     self.mongo.clan_wars.bulk_write(changes, ordered=False)
-                except Exception as e: #sometimes we will get duplicates, nothing we can do about it
+                except Exception:  # sometimes we will get duplicates, nothing we can do about it
                     pass
 
             if war_timers:
@@ -212,11 +215,9 @@ class GlobalWarTrack(Tracking):
 
             self.logger.info(f"{len(self.CLANS_IN_WAR)} clans in war")
 
-
     async def run(self):
         await self.initialize()
 
         while True:
             await self._war_track()
             self._cycle_count += 1
-

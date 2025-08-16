@@ -1,12 +1,12 @@
-import asyncio
 
 import coc
 import pendulum as pend
 import sentry_sdk
 
-from .tracking import Tracking
 from utility.config import TrackingType
-from utility.time import is_raids, gen_games_season, gen_raid_date, weekend_to_coc_py_timestamp
+from utility.time import gen_games_season, is_raids
+
+from .tracking import Tracking
 
 
 class ClanTracker(Tracking):
@@ -270,7 +270,6 @@ class ClanTracker(Tracking):
             }
             self._send_to_kafka("war", json_data, clan.tag)
 
-
     # CLAN UPDATES
     def _handle_private_warlog(self, clan):
         """Handle cases where the war log is private."""
@@ -340,20 +339,17 @@ class ClanTracker(Tracking):
     def is_member_eligible(self, member: coc.ClanMember, roles, townhall_levels):
         """Check if a member meets the role and townhall level criteria."""
         return (not roles or str(member.role) in roles) and (
-                not townhall_levels or str(member.town_hall) in townhall_levels
+            not townhall_levels or str(member.town_hall) in townhall_levels
         )
 
-
-    #REMINDERS
+    # REMINDERS
     async def _send_clan_games_reminders(self):
         now = pend.now(tz=pend.UTC)
         clan_games_end_time = now.start_of('month').add(days=28, hours=9)
         remaining_hours = (clan_games_end_time - now).in_hours()
 
         if remaining_hours <= 0:
-            self.logger.info(
-                'Clan Games have ended. No reminders to send.'
-            )
+            self.logger.info('Clan Games have ended. No reminders to send.')
             return
 
         remaining_time_formatted = f'{int(remaining_hours)} hr'
@@ -372,43 +368,32 @@ class ClanTracker(Tracking):
             townhall_levels = reminder.get('townhalls', [])
 
             eligible_members = [
-                member
-                for member in clan.members
-                if self.is_member_eligible(member, roles, townhall_levels)
+                member for member in clan.members if self.is_member_eligible(member, roles, townhall_levels)
             ]
 
-            player_points = await self.async_mongo.new_player_stats.find({
-                "clan_tag" : clan_tag,
-                "season" : gen_games_season()
-            })
+            player_points = await self.async_mongo.new_player_stats.find(
+                {"clan_tag": clan_tag, "season": gen_games_season()}
+            )
 
             missing_clan_members = []
             for member in eligible_members:
                 db_member = next((m for m in player_points if m['tag'] == member.tag), None)
-                points = (
-                    db_member['clan_games']
-                    if db_member
-                    else 0
-                )
+                points = db_member['clan_games'] if db_member else 0
 
                 if points <= point_threshold:
-                    missing_clan_members.append({
-                        'name': member.name,
-                        'townhall': member.town_hall,
-                        'role': member.role,
-                        'points': points,
-                    })
+                    missing_clan_members.append(
+                        {'name': member.name, 'townhall': member.town_hall, 'role': member.role, 'points': points}
+                    )
 
             if missing_clan_members:
                 reminder_data = {
-                    "clan_data" : clan._raw_data,
-                    "reminder_data" : reminder,
-                    "missing" : missing_clan_members,
+                    "clan_data": clan._raw_data,
+                    "reminder_data": reminder,
+                    "missing": missing_clan_members,
                 }
                 self._send_to_kafka(topic="reminders", key=clan_tag, data=reminder_data)
 
     async def _send_inactivity_reminders(self):
-
         reminders = await self.async_mongo.reminders.find({'type': 'inactivity'})
         reminders = await reminders.to_list(length=None)
 
@@ -427,10 +412,7 @@ class ClanTracker(Tracking):
             inactive_members = await self.async_mongo.base_player.find(
                 {
                     'tag': {'$in': [member.tag for member in clan.members]},
-                    'last_online': {
-                        '$gte': lower_bound.int_timestamp,
-                        '$lt': upper_bound.int_timestamp,
-                    },
+                    'last_online': {'$gte': lower_bound.int_timestamp, '$lt': upper_bound.int_timestamp},
                 }
             )
             inactive_members = await inactive_members.to_list(length=None)
@@ -440,21 +422,22 @@ class ClanTracker(Tracking):
                 clan_member = clan.get_member(tag=member['tag'])
                 if not clan_member:
                     continue
-                clan_inactive_members.append({
-                    "name": clan_member.name,
-                    "tag": clan_member.tag,
-                    "townhall": clan_member.town_hall,
-                    "last_online": member['last_online'],
-                })
+                clan_inactive_members.append(
+                    {
+                        "name": clan_member.name,
+                        "tag": clan_member.tag,
+                        "townhall": clan_member.town_hall,
+                        "last_online": member['last_online'],
+                    }
+                )
 
             if clan_inactive_members:
                 reminder_data = {
-                    "clan_data" : clan._raw_data,
-                    "reminder_data" : reminder,
-                    "missing" : clan_inactive_members,
+                    "clan_data": clan._raw_data,
+                    "reminder_data": reminder,
+                    "missing": clan_inactive_members,
                 }
                 self._send_to_kafka(topic="reminders", key=clan_tag, data=reminder_data)
-
 
             return inactive_members
 
@@ -469,9 +452,7 @@ class ClanTracker(Tracking):
 
         remaining_time_formatted = f'{int(remaining_hours)} hr'
 
-        reminders = await self.async_mongo.reminders.find(
-            {'type': 'Clan Capital', 'time': remaining_time_formatted}
-        )
+        reminders = await self.async_mongo.reminders.find({'type': 'Clan Capital', 'time': remaining_time_formatted})
         reminders = await reminders.to_list(length=None)
 
         for reminder in reminders:
@@ -495,34 +476,37 @@ class ClanTracker(Tracking):
                 if int(member.attack_count) < (int(attack_total) - int(attack_threshold)):
                     enriched_member = clan.get_member(tag=member.tag)
                     if enriched_member and self.is_member_eligible(enriched_member, roles, townhall_levels):
-                        missing_clan_members.append({
-                            "name": enriched_member.name,
-                            "townhall": enriched_member.town_hall,
-                            "role": enriched_member.role,
-                            "attacks" : member.attack_count,
-                            "total_attacks" : attack_total
-                        })
+                        missing_clan_members.append(
+                            {
+                                "name": enriched_member.name,
+                                "townhall": enriched_member.town_hall,
+                                "role": enriched_member.role,
+                                "attacks": member.attack_count,
+                                "total_attacks": attack_total,
+                            }
+                        )
 
             for member in clan.members:
                 raid_member = raid_log.get_member(tag=member.tag)
                 if raid_member and self.is_member_eligible(member, roles, townhall_levels):
-                    missing_clan_members.append({
-                        "name": member.name,
-                        "townhall": member.town_hall,
-                        "role": member.role,
-                        "attacks": 0,
-                        "total_attacks": 5
-                    })
+                    missing_clan_members.append(
+                        {
+                            "name": member.name,
+                            "townhall": member.town_hall,
+                            "role": member.role,
+                            "attacks": 0,
+                            "total_attacks": 5,
+                        }
+                    )
 
             if missing_clan_members:
                 reminder_data = {
-                    "clan_data" : clan._raw_data,
-                    "reminder_data" : reminder,
+                    "clan_data": clan._raw_data,
+                    "reminder_data": reminder,
                     "raid_data": raid_log._raw_data,
-                    "missing" : missing_clan_members,
+                    "missing": missing_clan_members,
                 }
                 self._send_to_kafka(topic="reminders", key=clan_tag, data=reminder_data)
-
 
     # PROCESSING
     def clan_list(self) -> list[str]:
@@ -563,7 +547,6 @@ class ClanTracker(Tracking):
             if current_raid:
                 previous_raid = await self._get_previous_raid(clan_tag)
                 await self._process_raid_changes(clan_tag, current_raid, previous_raid)
-
 
     async def run(self):
         import time

@@ -1,6 +1,7 @@
-from uvicorn import Config, Server
-from fastapi import FastAPI
 import asyncio
+
+from fastapi import FastAPI
+from uvicorn import Config, Server
 
 
 async def run_health_check_server() -> asyncio.Task:
@@ -19,4 +20,3 @@ async def run_health_check_server() -> asyncio.Task:
     _server_task = asyncio.create_task(server.serve())
 
     return _server_task
-

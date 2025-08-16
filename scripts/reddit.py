@@ -1,4 +1,3 @@
-import asyncio
 import re
 import traceback
 
@@ -77,4 +76,3 @@ class RedditTracking(Tracking):
         await self.initialize()
         reddit = await self.create_reddit()
         await self._post_stream(reddit)
-

@@ -3,6 +3,7 @@ import time
 
 import pendulum as pend
 from pymongo import DeleteOne, InsertOne, UpdateOne
+
 from utility.time import gen_season_date
 
 from .tracking import Tracking, TrackingType
@@ -82,14 +83,16 @@ class GlobalClanTracking(Tracking):
                 tag = member.get("tag")
                 if tag in joined_tags:
                     changes.append(
-                        InsertOne({
-                            "type": "join",
-                            "clan": clan_tag,
-                            "time": now,
-                            "tag": tag,
-                            "name": member.get("name"),
-                            "th": member.get("townHallLevel"),
-                        })
+                        InsertOne(
+                            {
+                                "type": "join",
+                                "clan": clan_tag,
+                                "time": now,
+                                "tag": tag,
+                                "name": member.get("name"),
+                                "th": member.get("townHallLevel"),
+                            }
+                        )
                     )
                     # shrink the set; early-exit once empty
                     joined_tags.remove(tag)
@@ -101,14 +104,16 @@ class GlobalClanTracking(Tracking):
                 tag = member.get("tag")
                 if tag in left_tags:
                     changes.append(
-                        InsertOne({
-                            "type": "leave",
-                            "clan": clan_tag,
-                            "time": now,
-                            "tag": tag,
-                            "name": member.get("name"),
-                            "th": member.get("townHallLevel"),
-                        })
+                        InsertOne(
+                            {
+                                "type": "leave",
+                                "clan": clan_tag,
+                                "time": now,
+                                "tag": tag,
+                                "name": member.get("name"),
+                                "th": member.get("townHallLevel"),
+                            }
+                        )
                     )
                     left_tags.remove(tag)
                     if not left_tags:
@@ -117,9 +122,7 @@ class GlobalClanTracking(Tracking):
         # Donation deltas (skip for priority clans)
         if clan_tag not in self.priority_clans:
             prev_min = {
-                m.get("tag"): (m.get("donations", 0), m.get("donationsReceived", 0))
-                for m in prev_list
-                if m.get("tag")
+                m.get("tag"): (m.get("donations", 0), m.get("donationsReceived", 0)) for m in prev_list if m.get("tag")
             }
 
             season = self.season
@@ -214,7 +217,7 @@ class GlobalClanTracking(Tracking):
 
     def _find_clan_updates(self, previous_clan: dict, new_clan: dict):
         if not previous_clan:
-            return UpdateOne({"tag": new_clan.get("tag")}, {"$set" : {"data": new_clan, "records": {}}}, upsert=True)
+            return UpdateOne({"tag": new_clan.get("tag")}, {"$set": {"data": new_clan, "records": {}}}, upsert=True)
 
         to_set = {}
 
@@ -239,11 +242,7 @@ class GlobalClanTracking(Tracking):
 
             # Prepare streaming request coroutines
             tasks = [
-                self.fetch(
-                    url=f"https://api.clashofclans.com/v1/clans/{tag.replace('#', '%23')}",
-                    tag=tag,
-                    json=True
-                )
+                self.fetch(url=f"https://api.clashofclans.com/v1/clans/{tag.replace('#', '%23')}", tag=tag, json=True)
                 for tag in batch
             ]
 
@@ -335,7 +334,6 @@ class GlobalClanTracking(Tracking):
 
         self.logger.info("Finished Loop")
 
-
     async def run(self):
         await self.initialize()
         self.priority_clans = self._priority_clans()
@@ -344,4 +342,3 @@ class GlobalClanTracking(Tracking):
         while True:
             await self.track_clans()
             self._submit_stats()
-

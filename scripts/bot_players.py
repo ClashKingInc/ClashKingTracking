@@ -1,4 +1,3 @@
-import asyncio
 
 import coc
 import orjson
@@ -6,8 +5,9 @@ import pendulum as pend
 import snappy
 from pymongo import InsertOne, UpdateOne
 
-from .tracking import Tracking, TrackingType
 from utility.time import gen_season_date
+
+from .tracking import Tracking, TrackingType
 
 
 class PlayerTracking(Tracking):
@@ -26,7 +26,7 @@ class PlayerTracking(Tracking):
             "warPreference",
             "bestBuilderBaseTrophies",
             "bestTrophies",
-            "expLevel"
+            "expLevel",
         }
 
         self.online_types = {
@@ -47,7 +47,7 @@ class PlayerTracking(Tracking):
             "builderBaseTrophies",
             "Anti-Artillery",
             "Firefighter",
-            "X-Bow Exterminator"
+            "X-Bow Exterminator",
         }
         self.ws_types = {
             "clanCapitalContributions",
@@ -59,7 +59,7 @@ class PlayerTracking(Tracking):
             "townHallLevel",
             "league",
             "Most Valuable Clanmate",
-            "role"
+            "role",
         }
         self.seasonal_inc = {
             "donations": "donated",
@@ -70,8 +70,8 @@ class PlayerTracking(Tracking):
             "Heroic Heist": "dark_elixir_looted",
             "Well Seasoned": "season_pass",
             "Games Champion": "clan_games",
-            "Nice and Tidy" : "obstacles_removed",
-            "Superb Work" : "boosted_super_troops",
+            "Nice and Tidy": "obstacles_removed",
+            "Superb Work": "boosted_super_troops",
             "Wall Buster": "walls_destroyed",
         }
         self.seasonal_set = {"attackWins": "attack_wins", "trophies": "trophies"}
@@ -148,12 +148,16 @@ class PlayerTracking(Tracking):
                     continue
 
                 if "village" in list_item:
-                    old_list_item = next((item for item in previous_value
-                                          if item["name"] == list_item["name"] and
-                                          item["village"] == list_item["village"]), {})
+                    old_list_item = next(
+                        (
+                            item
+                            for item in previous_value
+                            if item["name"] == list_item["name"] and item["village"] == list_item["village"]
+                        ),
+                        {},
+                    )
                 else:
                     old_list_item = next((item for item in previous_value if item["name"] == list_item["name"]), {})
-
 
                 if key == "heroes":
                     old_list_item.pop('equipment', None)
@@ -176,8 +180,7 @@ class PlayerTracking(Tracking):
         results = await self._run_tasks(tasks=tasks, return_exceptions=True, wrapped=True)
 
         previous_player_responses = self.redis_raw.mget(keys=[f"player-cache:{tag}" for tag in player_tags])
-        previous_player_responses = {tag: response
-                                     for tag, response in zip(player_tags, previous_player_responses)}
+        previous_player_responses = {tag: response for tag, response in zip(player_tags, previous_player_responses)}
         pipe = self.redis_raw.pipeline()
         season = gen_season_date()
 
@@ -244,8 +247,9 @@ class PlayerTracking(Tracking):
                     if activity_score == 0:
                         self.season_stats.append(
                             UpdateOne(
-                                {"tag": tag, "season": season, "clan_tag": clan_tag}, {"$inc": {"activity": 1}},
-                                upsert=True
+                                {"tag": tag, "season": season, "clan_tag": clan_tag},
+                                {"$inc": {"activity": 1}},
+                                upsert=True,
                             )
                         )
                     activity_score += 1
@@ -282,13 +286,7 @@ class PlayerTracking(Tracking):
 
             if activity_score:
                 self.last_online.append(
-                    InsertOne({
-                        "timestamp": pend.now(tz=pend.UTC),
-                        "meta": {
-                            "tag": tag,
-                            "clan_tag": clan_tag,
-                        }
-                    })
+                    InsertOne({"timestamp": pend.now(tz=pend.UTC), "meta": {"tag": tag, "clan_tag": clan_tag}})
                 )
 
         self.logger.debug(f"Inserting {len(self.last_online)} last online records")
@@ -340,4 +338,3 @@ class PlayerTracking(Tracking):
             self._clean_cache(player_tags=player_tags)
             await self._batch(player_tags=player_tags)
             self._submit_stats()
-

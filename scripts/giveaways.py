@@ -1,11 +1,11 @@
 import asyncio
-from datetime import datetime
 
 import pendulum as pend
 from loguru import logger
 
-from .tracking import Tracking
 from utility.config import TrackingType
+
+from .tracking import Tracking
 
 
 class GiveawayTracking(Tracking):
@@ -95,5 +95,3 @@ class GiveawayTracking(Tracking):
         while True:
             await self._schedule_giveaways()
             await asyncio.sleep(60)  # Check every minute
-
-
