@@ -217,7 +217,13 @@ class ClanTracker(Tracking):
 
         # this war is different from the previous one (new clans and or/prep time)
         # this means a new war started
-        if previous_war != war:
+        is_new_war = (
+            previous_war is None or 
+            previous_war.opponent.tag != war.opponent.tag or
+            previous_war.preparation_start_time != war.preparation_start_time
+        )
+        
+        if is_new_war:
             await self._set_reminders(war=war)
             # if none, no war was tracked before, hit on restarts primarily
             if previous_war is not None:
