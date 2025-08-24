@@ -189,7 +189,6 @@ class ClanTracker(Tracking):
 
         if set_times:
             end_time = pend.instance(war.end_time.time).in_tz("UTC")
-            start_time = pend.instance(war.preparation_start_time.time).in_tz("UTC")
 
             for r_time in reversed(self.reminder_times):
                 time_hours = float(r_time.replace("hr", ""))
