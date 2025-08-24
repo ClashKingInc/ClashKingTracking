@@ -552,6 +552,7 @@ class ClanTracker(Tracking):
         import time
 
         await self.initialize()
+        self.scheduler.start()
         while True:
             t = time.time()
             tasks = []
