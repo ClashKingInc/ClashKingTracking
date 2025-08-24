@@ -145,8 +145,8 @@ class ClanTracker(Tracking):
 
         return war
 
-    def _send_reminder(self, time: str, war_unique_id: str, clan_tag: str):
-        war = self.war_cache.get(war_unique_id)
+    def _send_reminder(self, time: str, clan_tag: str):
+        war = self.war_cache.get(clan_tag)
         if war is None:
             return
 
@@ -201,7 +201,7 @@ class ClanTracker(Tracking):
                             self._send_reminder,
                             "date",
                             run_date=future_time,
-                            args=[r_time, f"{war.clan.tag}_{war.opponent.tag}_{start_time.int_timestamp}"],
+                            args=[r_time, war.clan.tag],
                             id=f"war_end_{war.clan.tag}_{war.opponent.tag}_{future_time.timestamp()}",
                             misfire_grace_time=1200,
                             max_instances=1,
