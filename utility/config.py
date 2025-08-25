@@ -129,7 +129,8 @@ class Config:
                 raise RuntimeError(f"Failed to create keys: {e}")
 
         # Initialize the CoC client with desired parameters
-        self.coc_client = coc.Client(throttle_limit=30, cache_max_size=0, raw_attribute=True)
+        self.coc_client = coc.Client(throttle_limit=30, cache_max_size=0, raw_attribute=True,
+                                     load_game_data=coc.LoadGameData(never=True))
 
         # Log in to the CoC client using the generated keys
         try:
