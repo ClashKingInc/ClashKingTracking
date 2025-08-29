@@ -22,7 +22,7 @@ class ClanTracker(Tracking):
         self.last_private_warlog_warn = {}
 
         self.reminder_times = [
-            f"{int(time)} hr" if time.is_integer() else f"{time}hr" for time in (x * 0.25 for x in range(1, 193))
+            f"{int(time)} hr" if time.is_integer() else f"{time} hr" for time in (x * 0.25 for x in range(1, 193))
         ]
 
     # CLAN CAPITAL
@@ -187,9 +187,9 @@ class ClanTracker(Tracking):
         set_times = await self.async_mongo.reminders.distinct(
             "time", filter={"$and": [{"clan": war.clan.tag}, {"type": "War"}]}
         )
-        if set_times:
-            end_time = pend.instance(war.end_time.time).in_tz("UTC")
 
+        if set_times:
+            end_time = pend.instance(war.end_time.time, tz=pend.UTC)
             for r_time in reversed(self.reminder_times):
                 hours = float(r_time.rstrip("hr"))
                 candidate = end_time.subtract(seconds=int(hours * 3600))
@@ -204,6 +204,8 @@ class ClanTracker(Tracking):
                             misfire_grace_time=1200,
                             max_instances=1,
                         )
+
+
 
     async def _handle_war_updates(self, war: coc.ClanWar, clan: coc.Clan):
         # notInWar state, skip
@@ -508,6 +510,7 @@ class ClanTracker(Tracking):
 
     # PROCESSING
     def clan_list(self) -> list[str]:
+        return ["#2QPCJQQ2U"]
         return self.mongo.clans_db.distinct("tag")
 
     async def _track_clan(self, clan_tag):
@@ -559,6 +562,4 @@ class ClanTracker(Tracking):
             if not is_raids():
                 self.raid_cache.clear()
 
-            print(len(self.war_cache.keys()))
-            self.scheduler.print_jobs()
             print(f"Finished tracking clans in {time.time() - t} seconds")
