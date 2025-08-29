@@ -22,7 +22,7 @@ class ClanTracker(Tracking):
         self.last_private_warlog_warn = {}
 
         self.reminder_times = [
-            f"{int(time)}hr" if time.is_integer() else f"{time}hr" for time in (x * 0.25 for x in range(1, 193))
+            f"{int(time)} hr" if time.is_integer() else f"{time}hr" for time in (x * 0.25 for x in range(1, 193))
         ]
 
     # CLAN CAPITAL
@@ -151,6 +151,7 @@ class ClanTracker(Tracking):
             return
 
         json_data = {"type": "war", "clan_tag": clan_tag, "time": time, "data": war._raw_data}
+        print("Sending war reminder", str(json_data))
         self._send_to_kafka("reminder", json_data, clan_tag)
 
     def _send_cwl_lineup_change(self, previous_war: coc.ClanWar, war: coc.ClanWar):
@@ -186,22 +187,20 @@ class ClanTracker(Tracking):
         set_times = await self.async_mongo.reminders.distinct(
             "time", filter={"$and": [{"clan": war.clan.tag}, {"type": "War"}]}
         )
-
         if set_times:
             end_time = pend.instance(war.end_time.time).in_tz("UTC")
 
             for r_time in reversed(self.reminder_times):
-                time_hours = float(r_time.replace("hr", ""))
-                time_seconds = int(time_hours * 3600)
-                if end_time.diff().in_seconds() >= time_seconds:
-                    future_time = end_time.subtract(seconds=time_seconds)
-                    if future_time in set_times:
+                hours = float(r_time.rstrip("hr"))
+                candidate = end_time.subtract(seconds=int(hours * 3600))
+                if candidate > pend.now(tz=pend.UTC):
+                    if r_time in set_times:
                         self.scheduler.add_job(
                             self._send_reminder,
                             "date",
-                            run_date=future_time,
+                            run_date=candidate,
                             args=[r_time, war.clan.tag],
-                            id=f"war_end_{war.clan.tag}_{war.opponent.tag}_{future_time.timestamp()}",
+                            id=f"war_end_{war.clan.tag}_{r_time}",
                             misfire_grace_time=1200,
                             max_instances=1,
                         )
@@ -529,14 +528,12 @@ class ClanTracker(Tracking):
         previous_clan = self.clan_cache.get(clan.tag)
         self.clan_cache[clan.tag] = clan
 
-        if previous_clan is None:
-            return
-
-        sentry_sdk.add_breadcrumb(message=f"Tracking clan: {clan_tag}", level="info")
-        self._handle_private_warlog(clan)
-        self._handle_attribute_changes(clan, previous_clan)
-        self._handle_member_changes(clan, previous_clan)
-        self._handle_donation_updates(clan, previous_clan)
+        if previous_clan is not None:
+            sentry_sdk.add_breadcrumb(message=f"Tracking clan: {clan_tag}", level="info")
+            self._handle_private_warlog(clan)
+            self._handle_attribute_changes(clan, previous_clan)
+            self._handle_member_changes(clan, previous_clan)
+            self._handle_donation_updates(clan, previous_clan)
 
         war = await self.get_clan_war(clan.tag)
         await self._handle_war_updates(war=war, clan=clan)
@@ -562,4 +559,6 @@ class ClanTracker(Tracking):
             if not is_raids():
                 self.raid_cache.clear()
 
+            print(len(self.war_cache.keys()))
+            self.scheduler.print_jobs()
             print(f"Finished tracking clans in {time.time() - t} seconds")
