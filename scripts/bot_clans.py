@@ -510,7 +510,6 @@ class ClanTracker(Tracking):
 
     # PROCESSING
     def clan_list(self) -> list[str]:
-        return ["#2QPCJQQ2U"]
         return self.mongo.clans_db.distinct("tag")
 
     async def _track_clan(self, clan_tag):
