@@ -75,7 +75,7 @@ class Config:
         """
         Fetch remote configuration settings from the API and assign them to instance attributes.
         """
-        bot_config_url = "https://api.clashking.xyz/bot/config"
+        bot_config_url = "https://api.clashk.ing/bot/config"
         try:
             response = requests.get(bot_config_url, timeout=5, headers={"bot-token": self.bot_token})
             response.raise_for_status()
