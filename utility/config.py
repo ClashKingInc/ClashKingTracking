@@ -1,5 +1,4 @@
 from collections import deque
-from enum import Enum
 from os import getenv
 
 import coc
@@ -10,55 +9,17 @@ from redis import Redis
 from redis.asyncio import Redis as AsyncRedis
 
 from utility.kafka_mock import MockKafkaProducer
-from utility.keycreation import create_keys
 from utility.mongo import MongoDatabase
 
 # Load environment variables from .env file
 load_dotenv()
 
-# Configuration mapping for different types
-MASTER_API_CONFIG = {
-    "bot_clan": (41, 42),
-    "bot_raids": (43, 43),
-    "bot_war": (44, 45),
-    "bot_player": (11, 15),
-    "bot_legends": (16, 20),
-    "global_clan_find": (21, 25),
-    "global_clan_verify": (46, 50),
-    "global_scheduled": (26, 30),
-    "global_war": (31, 38),
-    "global_war_store": (39, 40),
-}
-
-
-class TrackingType(Enum):
-    BOT_CLAN = "bot_clan"
-    BOT_RAIDS = "bot_raids"
-    BOT_WAR = "bot_war"
-    BOT_PLAYER = "bot_player"
-    BOT_LEGENDS = "bot_legends"
-    GLOBAL_CLAN_FIND = "global_clan_find"
-    GLOBAL_CLAN_VERIFY = "global_clan_verify"
-    GLOBAL_SCHEDULED = "global_scheduled"
-    GLOBAL_WAR = "global_war"
-    GLOBAL_WAR_STORE = "global_war_store"
-    GIVEAWAY = "giveaway"
-    REDDIT = "reddit"
-    WEBSOCKET = "websocket"
-
-    def __str__(self):
-        return self.value
-
-
 class Config:
-    def __init__(self, config_type: TrackingType):
+    def __init__(self):
         """
         Initialize the Config object by fetching remote settings and setting up attributes.
 
-        :param config_type: The type of configuration to load (e.g., 'bot_clan')
         """
-        self.type = str(config_type)
-
         # Load BOT_TOKEN from environment
         self.bot_token = getenv("BOT_TOKEN", "")
         if not self.bot_token:
@@ -69,7 +30,6 @@ class Config:
 
         # Initialize other attributes
         self.coc_client = coc.Client()
-        self.keys = deque()
 
     def _fetch_remote_settings(self):
         """
@@ -101,45 +61,26 @@ class Config:
         self.kafka_host = remote_settings.get("kafka_connection")
         self.kafka_user = remote_settings.get("kafka_connection")
         self.kafka_password = remote_settings.get("kafka_password")
-
-        # Determine the account range based on config_type
-        self.__beta_range = (7, 10)
-        self.account_range = MASTER_API_CONFIG.get(self.type, (0, 0)) if not self.is_beta else self.__beta_range
-        self.min_coc_email, self.max_coc_email = self.account_range
+        self.proxy_url = remote_settings.get("local_coc_proxy_url")
 
     async def initialize(self):
         """
         Asynchronously initialize the CoC client by generating keys and logging in.
         """
-        if not self.coc_email or not self.coc_password:
-            raise ValueError("CoC email or password is not set in the configuration.")
-
-        # Generate list of emails based on the account range
-        keys = [""]
-        if self.min_coc_email:
-            emails = [self.coc_email.format(x=x) for x in range(self.min_coc_email, self.max_coc_email + 1)]
-
-            # Generate matching passwords
-            passwords = [self.coc_password] * len(emails)
-
-            # Create keys using the provided utility function
-            try:
-                keys = await create_keys(emails, passwords, as_list=True)
-            except Exception as e:
-                raise RuntimeError(f"Failed to create keys: {e}")
 
         # Initialize the CoC client with desired parameters
-        self.coc_client = coc.Client(throttle_limit=30, cache_max_size=0, raw_attribute=True,
-                                     load_game_data=coc.LoadGameData(never=True))
+        self.coc_client = coc.Client(
+            base_url=self.proxy_url,
+            throttle_limit=500,
+            cache_max_size=0,
+            raw_attribute=True,
+            load_game_data=coc.LoadGameData(never=True)
+        )
 
         # Log in to the CoC client using the generated keys
-        try:
-            await self.coc_client.login_with_tokens(*keys)
-        except Exception as e:
-            raise ConnectionError(f"Failed to log in to CoC client: {e}")
+        await self.coc_client.login_with_tokens("")
 
         # Store the keys in a deque for future use
-        self.keys = deque(keys)
 
     def get_kafka_producer(self):
         if self.is_main:

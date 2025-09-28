@@ -6,12 +6,12 @@ from pymongo import DeleteOne, InsertOne, UpdateOne
 
 from utility.time import gen_season_date
 
-from .tracking import Tracking, TrackingType
+from .tracking import Tracking
 
 
 class GlobalClanTracking(Tracking):
     def __init__(self):
-        super().__init__(tracker_type=TrackingType.GLOBAL_CLAN_VERIFY, batch_size=10_000)
+        super().__init__(batch_size=10_000)
 
         self.season = gen_season_date()
         self.inactive_clans = []
@@ -242,7 +242,7 @@ class GlobalClanTracking(Tracking):
 
             # Prepare streaming request coroutines
             tasks = [
-                self.fetch(url=f"https://api.clashofclans.com/v1/clans/{tag.replace('#', '%23')}", tag=tag, json=True)
+                self.fetch(url=f"{self.proxy_url}/clans/{tag.replace('#', '%23')}", tag=tag, json=True)
                 for tag in batch
             ]
 

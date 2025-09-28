@@ -3,7 +3,6 @@ import coc
 import pendulum as pend
 import sentry_sdk
 
-from utility.config import TrackingType
 from utility.time import gen_games_season, is_raids
 
 from .tracking import Tracking
@@ -13,7 +12,7 @@ class ClanTracker(Tracking):
     """Class to manage clan tracking."""
 
     def __init__(self):
-        super().__init__(tracker_type=TrackingType.BOT_CLAN, batch_size=10_000)
+        super().__init__(batch_size=10_000)
         self.clan_cache: dict[str, coc.Clan] = {}
         self.war_cache = {}
 

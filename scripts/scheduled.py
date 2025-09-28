@@ -15,12 +15,12 @@ from pymongo import InsertOne, UpdateOne
 from utility.constants import locations
 from utility.time import CLASH_ISO_FORMAT, gen_games_season, gen_raid_date, gen_season_date
 
-from .tracking import Tracking, TrackingType
+from scripts.tracking import Tracking
 
 
 class ScheduledTracking(Tracking):
     def __init__(self):
-        super().__init__(tracker_type=TrackingType.GLOBAL_SCHEDULED, batch_size=50_000)
+        super().__init__(batch_size=50_000)
 
     async def store_cwl_wars(self):
         """
@@ -54,7 +54,7 @@ class ScheduledTracking(Tracking):
                 for tag in tag_group:
                     tasks.append(
                         self.fetch(
-                            url=f"https://api.clashofclans.com/v1/clanwarleagues/wars/{tag.replace('#', '%23')}",
+                            url=f"{self.proxy_url}/clanwarleagues/wars/{tag.replace('#', '%23')}",
                             tag=tag,
                             json=True,
                         )
@@ -137,7 +137,7 @@ class ScheduledTracking(Tracking):
                         continue
                     tasks.append(
                         self.fetch(
-                            url=f"https://api.clashofclans.com/v1/clans/{tag.replace('#', '%23')}/currentwar/leaguegroup",
+                            url=f"{self.proxy_url}/clans/{tag.replace('#', '%23')}/currentwar/leaguegroup",
                             tag=tag,
                             json=True,
                         )
@@ -420,7 +420,7 @@ class ScheduledTracking(Tracking):
             for tag in all_clans:
                 tasks.append(
                     self.fetch(
-                        url=f"https://api.clashofclans.com/v1/clans/{tag.replace('#', '%23')}/capitalraidseasons?limit=1",
+                        url=f"{self.proxy_url}/clans/{tag.replace('#', '%23')}/capitalraidseasons?limit=1",
                         tag=tag,
                         json=True,
                     )

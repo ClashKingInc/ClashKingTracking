@@ -4,7 +4,6 @@ import coc
 import pendulum as pend
 from pymongo import UpdateOne
 
-from utility.config import TrackingType
 from utility.time import gen_legend_date
 
 from .tracking import Tracking
@@ -12,7 +11,7 @@ from .tracking import Tracking
 
 class LegendTracking(Tracking):
     def __init__(self):
-        super().__init__(tracker_type=TrackingType.BOT_LEGENDS, batch_size=25_000)
+        super().__init__(batch_size=25_000)
 
         self.cache: dict[str, dict] = {}
 
@@ -54,7 +53,7 @@ class LegendTracking(Tracking):
         all_tags = self.bot_clan_tags | self.other_clan_tags
         for tag in all_tags:
             tasks.append(
-                self.fetch(url=f"https://api.clashofclans.com/v1/clans/{tag.replace('#', '%23')}", tag=tag, json=True)
+                self.fetch(url=f"{self.proxy_url}/clans/{tag.replace('#', '%23')}", tag=tag, json=True)
             )
         batches = self._split_into_batch(items=tasks)
         clan_data: list[tuple[dict, str]] = []
@@ -94,7 +93,7 @@ class LegendTracking(Tracking):
         tasks = []
         for tag in tags:
             tasks.append(
-                self.fetch(url=f"https://api.clashofclans.com/v1/players/{tag.replace('#', '%23')}", tag=tag, json=True)
+                self.fetch(url=f"{self.proxy_url}/players/{tag.replace('#', '%23')}", tag=tag, json=True)
             )
         responses: list[tuple[dict, str]] = await self._run_tasks(tasks=tasks, return_exceptions=True, wrapped=True)
 

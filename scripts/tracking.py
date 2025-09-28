@@ -14,21 +14,19 @@ from loguru import logger
 from redis import Redis
 from redis.asyncio import Redis as AsyncRedis
 
-from utility.config import Config, TrackingType
+from utility.config import Config
 from utility.health import run_health_check_server
 from utility.mongo import MongoDatabase
 
 
 class Tracking:
-    def __init__(self, batch_size: int = 500, tracker_type: TrackingType = ...):
+    def __init__(self, batch_size: int = 500):
         self.is_maintenance = False
         self.batch_size = batch_size
         self.max_concurrent_requests = 1000
         self.throttle_speed = self.max_concurrent_requests
 
-        self.tracker_type: TrackingType = tracker_type
-
-        self.config = Config(self.tracker_type)
+        self.config = Config()
         self.mongo: MongoDatabase = ...
         self.async_mongo: MongoDatabase = ...
 
@@ -38,6 +36,7 @@ class Tracking:
         self.throttler = Throttler(self.throttle_speed)
 
         self.coc_client: coc.Client = ...
+        self.proxy_url: str = ...
         self.redis_raw: Redis = ...
         self.redis_decoded: Redis = ...
         self.aredis_decoded: AsyncRedis = ...
@@ -46,10 +45,8 @@ class Tracking:
         self.http_session = None
         self.scheduler: AsyncIOScheduler = ...
         self.kafka: KafkaProducer = ...
-        self.type = self.tracker_type
         self.max_stats_size = 10_000
         self.request_stats = defaultdict(lambda: deque(maxlen=self.max_stats_size))
-        self.keys = deque()
 
         self._api_requests_made = 0
         self._cycle_count = 0
@@ -67,7 +64,7 @@ class Tracking:
         self.aredis_decoded = await self.config.get_redis_client(decode_responses=True, sync=False)
 
         self.coc_client = self.config.coc_client
-        self.keys = self.config.keys
+        self.proxy_url = self.config.proxy_url
         self.kafka = self.config.get_kafka_producer()
 
         connector = aiohttp.TCPConnector(limit=1200, ttl_dns_cache=300)
@@ -76,16 +73,6 @@ class Tracking:
 
         self.scheduler = AsyncIOScheduler(timezone=pend.UTC)
 
-    async def track(self, items):
-        """Track items in batches."""
-        self.message_count = 0  # Reset message count
-        for i in range(0, len(items), self.batch_size):
-            batch = items[i : i + self.batch_size]
-            print(f"Processing batch {i // self.batch_size + 1} of {len(items) // self.batch_size + 1}.")
-            await self._track_batch(batch)
-
-        sentry_sdk.add_breadcrumb(message="Finished tracking all clans.", level="info")
-        print("Finished tracking all clans.")
 
     async def fetch(
         self, url: str, tag: str | None = None, json: bool = False
@@ -115,11 +102,13 @@ class Tracking:
                 elif response.status == 503:
                     raise coc.Maintenance(503, data)
 
-    def _submit_stats(self):
+    async def _submit_stats(self):
         now = pend.now(tz=pend.UTC)
         time_since_last_run = (now - self._last_run).total_seconds()
+        print(str(self.__class__.__name__))
+        return
         result = self.mongo.tracking_stats.update_one(
-            filter={"type": str(self.tracker_type)},
+            filter={"type": str(self.__class__.__name__)},
             update={
                 "$set": {
                     "last_cycle": now.int_timestamp,
@@ -140,7 +129,7 @@ class Tracking:
         is_maintenance = False
         while True:
             try:
-                await self.fetch(url="https://api.clashofclans.com/v1/goldpass/seasons/current")
+                await self.fetch(url="{self.proxy_url}/goldpass/seasons/current")
                 break
             except coc.ClashOfClansException:
                 if not is_maintenance:

@@ -8,7 +8,7 @@ from msgspec import Struct
 from msgspec.json import decode
 from pymongo import InsertOne, UpdateOne
 
-from .tracking import Tracking, TrackingType
+from .tracking import Tracking
 
 
 class Members(Struct):
@@ -31,7 +31,7 @@ class War(Struct):
 
 class GlobalWarTrack(Tracking):
     def __init__(self):
-        super().__init__(tracker_type=TrackingType.GLOBAL_WAR, batch_size=50_000)
+        super().__init__(batch_size=50_000)
         self.CLANS_IN_WAR = ExpiringDict()
         self.GROUP_IN_WAR = ExpiringDict()
         self.inactive_clans = []
@@ -142,7 +142,7 @@ class GlobalWarTrack(Tracking):
             self.logger.debug(f"Starting Cycle {self._cycle_count} | Batch {count}/{len(batches)}")
             tasks = [
                 self.fetch(
-                    url=f"https://api.clashofclans.com/v1/clans/{tag.replace('#', '%23')}/currentwar",
+                    url=f"{self.proxy_url}/clans/{tag.replace('#', '%23')}/currentwar",
                     tag=tag,
                     json=False,
                 )

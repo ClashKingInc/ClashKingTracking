@@ -26,7 +26,7 @@ class HTTPClient:
 class Route:
     """Helper class to create endpoint URLs."""
 
-    BASE = "https://api.clashofclans.com/v1"
+    BASE = "{self.proxy_url}"
 
     def __init__(self, method: str, path: str, **kwargs: dict):
         """

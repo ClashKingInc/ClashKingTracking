@@ -3,14 +3,13 @@ import asyncio
 import pendulum as pend
 from loguru import logger
 
-from utility.config import TrackingType
 
 from .tracking import Tracking
 
 
 class GiveawayTracking(Tracking):
     def __init__(self):
-        super().__init__(tracker_type=TrackingType.GIVEAWAY)
+        super().__init__()
 
     async def _send_giveaway_event(self, event_type, giveaway):
         """

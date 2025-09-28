@@ -6,12 +6,12 @@ from aiokafka import AIOKafkaConsumer
 from fastapi import FastAPI, WebSocket
 from uvicorn import Config, Server
 
-from .tracking import Tracking, TrackingType
+from .tracking import Tracking
 
 
 class TrackingWebsocket(Tracking):
     def __init__(self):
-        super().__init__(tracker_type=TrackingType.WEBSOCKET)
+        super().__init__()
         self.CONNECTED_CLIENTS = {}
         self.CLAN_MAP = defaultdict(set)
         self.MISSED_EVENTS = defaultdict(lambda: deque(maxlen=10_000))

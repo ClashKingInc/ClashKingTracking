@@ -6,12 +6,12 @@ import pendulum as pend
 from aiokafka import AIOKafkaConsumer
 from hashids import Hashids
 import orjson
-from .tracking import Tracking, TrackingType
+from .tracking import Tracking
 
 
 class GlobalWarStore(Tracking):
     def __init__(self):
-        super().__init__(tracker_type=TrackingType.GLOBAL_WAR_STORE)
+        super().__init__()
 
         self.consumer: AIOKafkaConsumer = ...
         self.topics = ["war_store"]

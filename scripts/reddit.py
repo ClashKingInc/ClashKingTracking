@@ -3,14 +3,14 @@ import traceback
 
 import asyncpraw
 
-from .tracking import Tracking, TrackingType
+from .tracking import Tracking
 
 subreddit = "ClashOfClansRecruit"
 
 
 class RedditTracking(Tracking):
     def __init__(self):
-        super().__init__(tracker_type=TrackingType.REDDIT)
+        super().__init__()
 
     async def _post_stream(self, reddit: asyncpraw.Reddit):
         self.logger.info("Started Post Stream")

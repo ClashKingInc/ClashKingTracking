@@ -7,12 +7,12 @@ from pymongo import InsertOne, UpdateOne
 
 from utility.time import gen_season_date
 
-from .tracking import Tracking, TrackingType
+from .tracking import Tracking
 
 
 class PlayerTracking(Tracking):
     def __init__(self):
-        super().__init__(batch_size=25_000, tracker_type=TrackingType.BOT_PLAYER)
+        super().__init__(batch_size=25_000)
         self.tracked_tags = set()
 
         self.store_types = {
@@ -173,7 +173,7 @@ class PlayerTracking(Tracking):
 
     async def _track(self, player_tags: list[str]):
         tasks = [
-            self.fetch(url=f"https://api.clashofclans.com/v1/players/{tag.replace('#', '%23')}", json=False, tag=tag)
+            self.fetch(url=f"{self.proxy_url}/players/{tag.replace('#', '%23')}", json=False, tag=tag)
             for tag in player_tags
         ]
 
