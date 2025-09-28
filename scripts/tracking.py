@@ -126,7 +126,7 @@ class Tracking:
         is_maintenance = False
         while True:
             try:
-                await self.fetch(url="{self.proxy_url}/goldpass/seasons/current")
+                await self.fetch(url=f"{self.proxy_url}/goldpass/seasons/current")
                 break
             except coc.ClashOfClansException:
                 if not is_maintenance:
