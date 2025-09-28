@@ -78,10 +78,9 @@ class Tracking:
         self, url: str, tag: str | None = None, json: bool = False
     ) -> tuple[dict | bytes, str] | dict | bytes | aiohttp.ClientResponse:
         async with self.throttler:
-            self.keys.rotate(1)
             self.request_stats["all"].append({"time": pend.now(tz=pend.UTC).timestamp()})
             self._api_requests_made += 1
-            async with self.http_session.get(url, headers={"Authorization": f"Bearer {self.keys[0]}"}) as response:
+            async with self.http_session.get(url) as response:
                 if response.status != 200 or json:
                     data = await response.json()
                 else:
