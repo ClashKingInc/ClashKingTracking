@@ -10,7 +10,6 @@ import scripts
 SCRIPT_NAME = os.getenv("SCRIPT_NAME")
 main_function = ...
 
-
 class_script_map = {
     "bot_clans": scripts.ClanTracker,
     "bot_players": scripts.PlayerTracking,
