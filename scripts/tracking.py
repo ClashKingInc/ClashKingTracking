@@ -102,11 +102,9 @@ class Tracking:
                 elif response.status == 503:
                     raise coc.Maintenance(503, data)
 
-    async def _submit_stats(self):
+    def _submit_stats(self):
         now = pend.now(tz=pend.UTC)
         time_since_last_run = (now - self._last_run).total_seconds()
-        print(str(self.__class__.__name__))
-        return
         result = self.mongo.tracking_stats.update_one(
             filter={"type": str(self.__class__.__name__)},
             update={
