@@ -1,6 +1,50 @@
+[project]
+name = "clashking-tracking"
+version = "0.1.0"
+description = "Tracking services for ClashKing data collection and processing"
+
+requires-python = "==3.13.7"
+dependencies = [
+    "aiohttp",
+    "aiokafka",
+    "APScheduler",
+    "asyncio-throttle",
+    "asyncpraw",
+    "coc-py @ git+https://github.com/ClashKingInc/coc.py.git@master",
+    "expiring-dict",
+    "fastapi",
+    "hashids",
+    "loguru",
+    "kafka-python",
+    "meilisearch-python-sdk",
+    "msgspec",
+    "orjson",
+    "pendulum",
+    "python-dotenv",
+    "pymongo",
+    "python-snappy",
+    "redis",
+    "uvicorn",
+    "websockets",
+    "sentry-sdk",
+    "requests",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest",
+    "black",
+    "isort",
+    "flake8",
+    "ruff",
+]
+
+[tool.uv]
+package = false
+
 [tool.ruff]
 line-length    = 120
-target-version = "py312"
+target-version = "py313"
 exclude        = ["venv", ".venv", "build", "dist", "old_commands"]
 
 [tool.ruff.lint]
