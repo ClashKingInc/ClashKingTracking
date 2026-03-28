@@ -377,10 +377,13 @@ class RosterAutomationTracking(Tracking):
                 )
                 self._cancel_automation_jobs(automation_id)
             else:
-                # Clear any missed flag from a previous skipped cycle
+                # Clear any missed flag and record last trigger time for recurring automations
                 await self.async_mongo.roster_automation.update_one(
                     {"automation_id": automation_id},
-                    {"$unset": {"last_missed_at": ""}},
+                    {
+                        "$unset": {"last_missed_at": ""},
+                        "$set": {"last_triggered_at": now},
+                    },
                 )
 
             self.logger.info(
