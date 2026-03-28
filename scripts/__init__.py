@@ -8,3 +8,4 @@ from .global_war_track import GlobalWarTrack
 from .legends import LegendTracking
 from .reddit import RedditTracking
 from .scheduled import ScheduledTracking
+from .roster_automations import RosterAutomationTracking

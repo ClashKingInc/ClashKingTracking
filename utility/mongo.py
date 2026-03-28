@@ -52,6 +52,8 @@ class MongoDatabase:
         self.tracking_stats = self.clashking.get_collection("tracking_stats")
 
         self.giveaways: collection_class = self.clashking.giveaways
+        self.rosters: collection_class = self.clashking.get_collection("rosters")
+        self.roster_automation: collection_class = self.clashking.get_collection("roster_automation")
         self.raid_weekends: collection_class = self.looper.raid_weekends
         self.war_timer = self.looper.get_collection("war_timer")
         self.legend_history: collection_class = self.looper.legend_history

@@ -21,6 +21,7 @@ class_script_map = {
     "legends": scripts.LegendTracking,
     "reddit": scripts.RedditTracking,
     "scheduled": scripts.ScheduledTracking,
+    "roster_automations": scripts.RosterAutomationTracking,
 }
 run_class = class_script_map[SCRIPT_NAME]
 asyncio.run(run_class().run())
