@@ -7,6 +7,7 @@ import (
 	"go.mongodb.org/mongo-driver/v2/bson"
 	"go.mongodb.org/mongo-driver/v2/mongo"
 	"go.mongodb.org/mongo-driver/v2/mongo/options"
+	"go.opentelemetry.io/otel/attribute"
 )
 
 type MongoStore struct {
@@ -60,15 +61,22 @@ type mongoCollection struct {
 }
 
 func (c mongoCollection) AggregateAll(ctx context.Context, pipeline any) ([]bson.M, error) {
+	ctx, span := StartSpan(ctx, "mongo.aggregate", mongoAttrs(c.collection, "aggregate")...)
+	defer span.End()
 	cursor, err := c.collection.Aggregate(ctx, pipeline)
 	if err != nil {
+		RecordSpanError(span, err)
+		span.SetAttributes(SpanErrorStatus(err))
 		return nil, err
 	}
 	defer cursor.Close(ctx)
 	var docs []bson.M
 	if err := cursor.All(ctx, &docs); err != nil {
+		RecordSpanError(span, err)
+		span.SetAttributes(SpanErrorStatus(err))
 		return nil, err
 	}
+	span.SetAttributes(attribute.Int("rows.count", len(docs)), SpanErrorStatus(nil))
 	return docs, nil
 }
 
@@ -76,27 +84,45 @@ func (c mongoCollection) BulkWrite(ctx context.Context, models []mongo.WriteMode
 	if len(models) == 0 {
 		return nil
 	}
+	ctx, span := StartSpan(ctx, "mongo.bulk_write", append(mongoAttrs(c.collection, "bulk_write"), attribute.Int("write.count", len(models)))...)
+	defer span.End()
 	_, err := c.collection.BulkWrite(ctx, models, options.BulkWrite().SetOrdered(ordered))
+	RecordSpanError(span, err)
+	span.SetAttributes(SpanErrorStatus(err))
 	return err
 }
 
 func (c mongoCollection) DeleteMany(ctx context.Context, filter any) error {
+	ctx, span := StartSpan(ctx, "mongo.delete_many", mongoAttrs(c.collection, "delete_many")...)
+	defer span.End()
 	_, err := c.collection.DeleteMany(ctx, filter)
+	RecordSpanError(span, err)
+	span.SetAttributes(SpanErrorStatus(err))
 	return err
 }
 
 func (c mongoCollection) DeleteOne(ctx context.Context, filter any) error {
+	ctx, span := StartSpan(ctx, "mongo.delete_one", append(mongoAttrs(c.collection, "delete_one"), attribute.Int("write.count", 1))...)
+	defer span.End()
 	_, err := c.collection.DeleteOne(ctx, filter)
+	RecordSpanError(span, err)
+	span.SetAttributes(SpanErrorStatus(err))
 	return err
 }
 
 func (c mongoCollection) DistinctStrings(ctx context.Context, field string, filter any) ([]string, error) {
+	ctx, span := StartSpan(ctx, "mongo.distinct", mongoAttrs(c.collection, "distinct")...)
+	defer span.End()
 	distinctResult := c.collection.Distinct(ctx, field, filter)
 	if err := distinctResult.Err(); err != nil {
+		RecordSpanError(span, err)
+		span.SetAttributes(SpanErrorStatus(err))
 		return nil, err
 	}
 	var values []string
 	if err := distinctResult.Decode(&values); err != nil {
+		RecordSpanError(span, err)
+		span.SetAttributes(SpanErrorStatus(err))
 		return nil, err
 	}
 	out := make([]string, 0, len(values))
@@ -105,10 +131,13 @@ func (c mongoCollection) DistinctStrings(ctx context.Context, field string, filt
 			out = append(out, value)
 		}
 	}
+	span.SetAttributes(attribute.Int("rows.count", len(out)), SpanErrorStatus(nil))
 	return out, nil
 }
 
 func (c mongoCollection) FindAll(ctx context.Context, filter any, opts FindOptions) ([]bson.M, error) {
+	ctx, span := StartSpan(ctx, "mongo.find", mongoAttrs(c.collection, "find")...)
+	defer span.End()
 	findOptions := options.Find()
 	if opts.Projection != nil {
 		findOptions.SetProjection(opts.Projection)
@@ -121,22 +150,35 @@ func (c mongoCollection) FindAll(ctx context.Context, filter any, opts FindOptio
 	}
 	cursor, err := c.collection.Find(ctx, filter, findOptions)
 	if err != nil {
+		RecordSpanError(span, err)
+		span.SetAttributes(SpanErrorStatus(err))
 		return nil, err
 	}
 	defer cursor.Close(ctx)
 	var docs []bson.M
 	if err := cursor.All(ctx, &docs); err != nil {
+		RecordSpanError(span, err)
+		span.SetAttributes(SpanErrorStatus(err))
 		return nil, err
 	}
+	span.SetAttributes(attribute.Int("rows.count", len(docs)), SpanErrorStatus(nil))
 	return docs, nil
 }
 
 func (c mongoCollection) FindOne(ctx context.Context, filter any) (bson.M, error) {
+	ctx, span := StartSpan(ctx, "mongo.find_one", mongoAttrs(c.collection, "find_one")...)
+	defer span.End()
 	var doc bson.M
 	err := c.collection.FindOne(ctx, filter).Decode(&doc)
 	if errors.Is(err, mongo.ErrNoDocuments) {
+		span.SetAttributes(attribute.Int("rows.count", 0), SpanErrorStatus(nil))
 		return nil, ErrNotFound
 	}
+	RecordSpanError(span, err)
+	if err == nil {
+		span.SetAttributes(attribute.Int("rows.count", 1))
+	}
+	span.SetAttributes(SpanErrorStatus(err))
 	return doc, err
 }
 
@@ -144,23 +186,48 @@ func (c mongoCollection) InsertMany(ctx context.Context, docs []any, ordered boo
 	if len(docs) == 0 {
 		return nil
 	}
+	ctx, span := StartSpan(ctx, "mongo.insert_many", append(mongoAttrs(c.collection, "insert_many"), attribute.Int("write.count", len(docs)))...)
+	defer span.End()
 	_, err := c.collection.InsertMany(ctx, docs, options.InsertMany().SetOrdered(ordered))
+	RecordSpanError(span, err)
+	span.SetAttributes(SpanErrorStatus(err))
 	return err
 }
 
 func (c mongoCollection) InsertOne(ctx context.Context, doc any) error {
+	ctx, span := StartSpan(ctx, "mongo.insert_one", append(mongoAttrs(c.collection, "insert_one"), attribute.Int("write.count", 1))...)
+	defer span.End()
 	_, err := c.collection.InsertOne(ctx, doc)
+	RecordSpanError(span, err)
+	span.SetAttributes(SpanErrorStatus(err))
 	return err
 }
 
 func (c mongoCollection) UpdateMany(ctx context.Context, filter any, update any) error {
+	ctx, span := StartSpan(ctx, "mongo.update_many", mongoAttrs(c.collection, "update_many")...)
+	defer span.End()
 	_, err := c.collection.UpdateMany(ctx, filter, update)
+	RecordSpanError(span, err)
+	span.SetAttributes(SpanErrorStatus(err))
 	return err
 }
 
 func (c mongoCollection) UpdateOne(ctx context.Context, filter any, update any, upsert bool) error {
+	ctx, span := StartSpan(ctx, "mongo.update_one", append(mongoAttrs(c.collection, "update_one"), attribute.Int("write.count", 1))...)
+	defer span.End()
 	_, err := c.collection.UpdateOne(ctx, filter, update, options.UpdateOne().SetUpsert(upsert))
+	RecordSpanError(span, err)
+	span.SetAttributes(SpanErrorStatus(err))
 	return err
+}
+
+func mongoAttrs(collection *mongo.Collection, operation string) []attribute.KeyValue {
+	return []attribute.KeyValue{
+		attribute.String("operation", operation),
+		attribute.String("db.system", "mongodb"),
+		attribute.String("db.name", collection.Database().Name()),
+		attribute.String("db.collection", collection.Name()),
+	}
 }
 
 func collectionPath(name string) (string, string) {

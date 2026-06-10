@@ -29,14 +29,12 @@ type Tracker struct {
 	started time.Time
 	mu      sync.RWMutex
 	domains map[string]*DomainStats
-	bus     *Bus
 }
 
-func NewTracker(bus *Bus) *Tracker {
+func NewTracker() *Tracker {
 	return &Tracker{
 		started: time.Now().UTC(),
 		domains: make(map[string]*DomainStats),
-		bus:     bus,
 	}
 }
 
@@ -149,7 +147,7 @@ func (t *Tracker) handleStats(w http.ResponseWriter, _ *http.Request) {
 		"heap_objects": mem.HeapObjects,
 		"gc_cycles":    mem.NumGC,
 		"domains":      t.snapshotDomains(),
-		"events":       t.bus.Snapshot(),
+		"queues":       t.snapshotQueues(),
 	})
 }
 
@@ -158,7 +156,7 @@ func (t *Tracker) handleDomains(w http.ResponseWriter, _ *http.Request) {
 }
 
 func (t *Tracker) handleQueues(w http.ResponseWriter, _ *http.Request) {
-	writeJSON(w, http.StatusOK, t.bus.Snapshot())
+	writeJSON(w, http.StatusOK, t.snapshotQueues())
 }
 
 func (t *Tracker) snapshotDomains() []DomainStats {
@@ -167,6 +165,16 @@ func (t *Tracker) snapshotDomains() []DomainStats {
 	out := make([]DomainStats, 0, len(t.domains))
 	for _, stats := range t.domains {
 		out = append(out, *stats)
+	}
+	return out
+}
+
+func (t *Tracker) snapshotQueues() map[string]int {
+	t.mu.RLock()
+	defer t.mu.RUnlock()
+	out := make(map[string]int, len(t.domains))
+	for name, stats := range t.domains {
+		out[name] = stats.QueueDepth
 	}
 	return out
 }

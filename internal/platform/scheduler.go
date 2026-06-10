@@ -8,23 +8,29 @@ import (
 )
 
 type Job struct {
-	ID   string
-	When time.Time
-	Run  func(context.Context)
+	ID         string
+	When       time.Time
+	Run        func(context.Context)
+	generation uint64
 }
 
 type Scheduler struct {
 	mu     sync.Mutex
 	queue  jobHeap
+	latest map[string]uint64
 	wakeup chan struct{}
 }
 
 func NewScheduler() *Scheduler {
-	return &Scheduler{wakeup: make(chan struct{}, 1)}
+	return &Scheduler{latest: make(map[string]uint64), wakeup: make(chan struct{}, 1)}
 }
 
 func (s *Scheduler) Schedule(job Job) {
 	s.mu.Lock()
+	if job.ID != "" {
+		s.latest[job.ID]++
+		job.generation = s.latest[job.ID]
+	}
 	heap.Push(&s.queue, job)
 	s.mu.Unlock()
 	// A buffered wakeup collapses bursts of schedules into a single loop interrupt.
@@ -86,6 +92,10 @@ func (s *Scheduler) runDue(ctx context.Context) {
 			return
 		}
 		job := heap.Pop(&s.queue).(Job)
+		if job.ID != "" && job.generation != s.latest[job.ID] {
+			s.mu.Unlock()
+			continue
+		}
 		s.mu.Unlock()
 		// Jobs run asynchronously so one slow callback does not stall later deadlines.
 		go job.Run(ctx)

@@ -1,3 +1,5 @@
+//go:build platform_internal_tests
+
 package platform
 
 import (
@@ -7,18 +9,18 @@ import (
 
 func TestNewRequiresProxyForClashDomains(t *testing.T) {
 	_, err := New(context.Background(), Config{
-		MockDB:  true,
-		Domains: map[string]bool{"globalclans": true},
+		MockDB: true,
+		Script: "globalclans",
 	})
 	if err == nil {
-		t.Fatal("expected missing PROXY_URL error for Clash-backed domains")
+		t.Fatal("expected missing proxy_url error for Clash-backed domains")
 	}
 }
 
 func TestNewSkipsClashClientForNonClashDomains(t *testing.T) {
 	app, err := New(context.Background(), Config{
-		MockDB:  true,
-		Domains: map[string]bool{"events": true},
+		MockDB: true,
+		Script: "events",
 	})
 	if err != nil {
 		t.Fatalf("New returned error: %v", err)

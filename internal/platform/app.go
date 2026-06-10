@@ -8,10 +8,10 @@ import (
 	"net/http"
 	"os"
 	"sync"
-	"time"
 
 	clashy "github.com/clashkinginc/clashy.go"
-	"github.com/redis/go-redis/v9"
+	valkey "github.com/valkey-io/valkey-go"
+	sdktrace "go.opentelemetry.io/otel/sdk/trace"
 )
 
 type Domain interface {
@@ -20,39 +20,50 @@ type Domain interface {
 }
 
 type App struct {
-	Config    Config
-	Logger    *slog.Logger
-	Store     Store
-	Redis     *redis.Client
-	Clash     *clashy.Client
-	Bus       *Bus
-	Stats     *Tracker
-	Scheduler *Scheduler
-	httpSrv   *http.Server
+	Config         Config
+	Logger         *slog.Logger
+	Store          Store
+	Valkey         valkey.Client
+	Clash          *clashy.Client
+	R2             ObjectStore
+	Stats          *Tracker
+	Scheduler      *Scheduler
+	tracerProvider *sdktrace.TracerProvider
+	httpSrv        *http.Server
 }
 
 func New(ctx context.Context, cfg Config) (*App, error) {
 	logger := slog.New(slog.NewJSONHandler(os.Stdout, &slog.HandlerOptions{Level: slog.LevelInfo}))
-	store, err := newStore(ctx, cfg)
+	tracerProvider, err := newTracerProvider(ctx, cfg)
 	if err != nil {
 		return nil, err
 	}
+	store, err := newStore(ctx, cfg)
+	if err != nil {
+		if tracerProvider != nil {
+			_ = tracerProvider.Shutdown(ctx)
+		}
+		return nil, err
+	}
 	if needsClashClient(cfg) && cfg.ProxyURL == "" {
-		return nil, errors.New("PROXY_URL is required when Clash-backed domains are enabled")
+		return nil, errors.New("proxy_url is required when Clash-backed domains are enabled")
 	}
-	var redisClient *redis.Client
-	if cfg.RedisAddr != "" {
-		redisClient = redis.NewClient(&redis.Options{
-			Addr:         cfg.RedisAddr,
-			Password:     cfg.RedisPassword,
-			DB:           0,
-			PoolSize:     50,
-			ReadTimeout:  10 * time.Second,
-			WriteTimeout: 10 * time.Second,
+	var valkeyClient valkey.Client
+	if cfg.ValkeyAddr != "" {
+		valkeyClient, err = valkey.NewClient(valkey.ClientOption{
+			InitAddress:  []string{cfg.ValkeyAddr},
+			Password:     cfg.ValkeyPassword,
+			DisableCache: true,
 		})
+		if err != nil {
+			_ = store.Close(ctx)
+			if tracerProvider != nil {
+				_ = tracerProvider.Shutdown(ctx)
+			}
+			return nil, err
+		}
 	}
-	bus := NewBus(cfg.EventBufferSize, cfg.RecentEventBuffer)
-	stats := NewTracker(bus)
+	stats := NewTracker()
 	var clashClient *clashy.Client
 	if needsClashClient(cfg) {
 		clashClient, err = clashy.NewClient(clashy.ClientConfig{
@@ -61,18 +72,46 @@ func New(ctx context.Context, cfg Config) (*App, error) {
 			UpdateCache: false,
 		})
 		if err != nil {
+			if valkeyClient != nil {
+				valkeyClient.Close()
+			}
+			_ = store.Close(ctx)
+			if tracerProvider != nil {
+				_ = tracerProvider.Shutdown(ctx)
+			}
 			return nil, err
 		}
 	}
+	var objectStore ObjectStore
+	hasR2Config := cfg.R2Endpoint != "" || cfg.R2Bucket != "" || cfg.R2AccessKeyID != "" || cfg.R2SecretAccessKey != ""
+	if hasR2Config {
+		objectStore, err = NewR2ObjectStore(cfg)
+		if err != nil {
+			if clashClient != nil {
+				_ = clashClient.Close()
+			}
+			if valkeyClient != nil {
+				valkeyClient.Close()
+			}
+			_ = store.Close(ctx)
+			if tracerProvider != nil {
+				_ = tracerProvider.Shutdown(ctx)
+			}
+			return nil, err
+		}
+	} else if cfg.R2MockUpload {
+		objectStore = MockObjectStore{}
+	}
 	app := &App{
-		Config:    cfg,
-		Logger:    logger,
-		Store:     store,
-		Redis:     redisClient,
-		Clash:     clashClient,
-		Bus:       bus,
-		Stats:     stats,
-		Scheduler: NewScheduler(),
+		Config:         cfg,
+		Logger:         logger,
+		Store:          store,
+		Valkey:         valkeyClient,
+		Clash:          clashClient,
+		R2:             objectStore,
+		Stats:          stats,
+		Scheduler:      NewScheduler(),
+		tracerProvider: tracerProvider,
 		httpSrv: &http.Server{
 			Addr:    cfg.HTTPAddr,
 			Handler: stats.HTTPMux(),
@@ -90,8 +129,8 @@ func (a *App) StartHTTP() {
 }
 
 func (a *App) Close(ctx context.Context) error {
-	if a.Redis != nil {
-		_ = a.Redis.Close()
+	if a.Valkey != nil {
+		a.Valkey.Close()
 	}
 	if a.Clash != nil {
 		_ = a.Clash.Close()
@@ -99,7 +138,13 @@ func (a *App) Close(ctx context.Context) error {
 	if err := a.httpSrv.Shutdown(ctx); err != nil {
 		return err
 	}
-	return a.Store.Close(ctx)
+	if err := a.Store.Close(ctx); err != nil {
+		return err
+	}
+	if a.tracerProvider != nil {
+		return a.tracerProvider.Shutdown(ctx)
+	}
+	return nil
 }
 
 func Run(ctx context.Context, app *App, domains []Domain) error {
@@ -146,10 +191,10 @@ func newStore(ctx context.Context, cfg Config) (Store, error) {
 }
 
 func needsClashClient(cfg Config) bool {
-	for _, domain := range []string{"globalclans", "botplayers", "botclans", "wars", "scheduled"} {
-		if cfg.Enabled(domain) {
-			return true
-		}
+	switch cfg.Script {
+	case "globalclans", "botplayers", "botclans", "wars", "scheduled", "battlelogs":
+		return true
+	default:
+		return false
 	}
-	return false
 }
