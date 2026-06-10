@@ -1,0 +1,58 @@
+{
+  "http_addr": ":8080",
+  "grpc_addr": ":9090",
+  "proxy_url": "https://proxy.clashk.ing/v1",
+  "valkey_addr": "localhost:6379",
+  "run_once": false,
+  "dry_run": false,
+  "mock_db": false,
+  "target_page_multiplier": 5,
+  "otel": {
+    "enabled": true,
+    "service_name": "clashking-tracking",
+    "exporter_otlp_endpoint": "http://localhost:4318"
+  },
+  "r2": {
+    "mock_upload": true
+  },
+  "events": {
+    "stream": "tracking:events",
+    "group": "tracking-events",
+    "consumer": "events-1",
+    "retention_seconds": 300,
+    "batch_size": 100,
+    "reclaim_idle_seconds": 60
+  },
+  "globalclans": {
+    "priority_requests_per_second": 950,
+    "non_priority_requests_per_second": 50
+  },
+  "battlelogs": {
+    "requests_per_second": 10,
+    "rollup_flush_attacks": 5000,
+    "checkpoint_ttl_days": 15,
+    "first_seen_lookback_days": 14
+  },
+  "wars": {
+    "requests_per_second": 950,
+    "cwl_sync_seconds": 180
+  },
+  "botclans": {
+    "requests_per_second": 950,
+    "snapshot_prefix": "botclans:snapshot:",
+    "cwl_state_snapshot": "cwlstate"
+  },
+  "botplayers": {
+    "requests_per_second": 950
+  },
+  "scheduled": {
+    "interval_seconds": 900
+  },
+  "giveaways": {
+    "scan_seconds": 60
+  },
+  "reddit": {
+    "poll_seconds": 120,
+    "limit": 10
+  }
+}
