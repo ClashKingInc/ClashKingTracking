@@ -74,13 +74,7 @@ func (d *scheduledDomain) Run(ctx context.Context, app *platform.App) error {
 		err = d.runCycle(ctx, app)
 		app.Stats.RecordProcess(scheduledDomainName, time.Since(start))
 		if err != nil {
-			if app.Config.RunOnce {
-				return err
-			}
 			app.Stats.SetReady(scheduledDomainName, false, err.Error())
-		}
-		if app.Config.RunOnce {
-			return nil
 		}
 		if err := sleepOrDone(ctx, interval); err != nil {
 			return err

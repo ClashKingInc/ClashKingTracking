@@ -9,20 +9,27 @@ import (
 )
 
 type DomainStats struct {
-	Name             string        `json:"name"`
-	LastSuccess      time.Time     `json:"last_success,omitempty"`
-	LastError        string        `json:"last_error,omitempty"`
-	Requests         int64         `json:"requests"`
-	Writes           int64         `json:"writes"`
-	Errors           int64         `json:"errors"`
-	LastCycle        time.Duration `json:"last_cycle"`
-	LastLatency      time.Duration `json:"last_latency"`
-	AvgLatency       time.Duration `json:"avg_latency"`
-	QueueDepth       int           `json:"queue_depth"`
-	Healthy          bool          `json:"healthy"`
-	LastReadyChange  time.Time     `json:"last_ready_change,omitempty"`
-	ProcessingCount  int64         `json:"processing_count"`
-	TotalProcessTime time.Duration `json:"total_process_time"`
+	Name                   string        `json:"name"`
+	LastSuccess            time.Time     `json:"last_success,omitempty"`
+	LastError              string        `json:"last_error,omitempty"`
+	Requests               int64         `json:"requests"`
+	Writes                 int64         `json:"writes"`
+	Errors                 int64         `json:"errors"`
+	LastCycle              time.Duration `json:"last_cycle"`
+	LastLatency            time.Duration `json:"last_latency"`
+	AvgLatency             time.Duration `json:"avg_latency"`
+	QueueDepth             int           `json:"queue_depth"`
+	Healthy                bool          `json:"healthy"`
+	LastReadyChange        time.Time     `json:"last_ready_change,omitempty"`
+	ProcessingCount        int64         `json:"processing_count"`
+	TotalProcessTime       time.Duration `json:"total_process_time"`
+	StoreBatches           int64         `json:"store_batches"`
+	StoreRowsRequested     int64         `json:"store_rows_requested"`
+	StoreRowsAffected      int64         `json:"store_rows_affected"`
+	LastStoreRowsRequested int           `json:"last_store_rows_requested"`
+	LastStoreRowsAffected  int           `json:"last_store_rows_affected"`
+	AvgStoreMs             float64       `json:"avg_store_ms"`
+	LastStoreMs            float64       `json:"last_store_ms"`
 }
 
 type Tracker struct {
@@ -83,6 +90,24 @@ func (t *Tracker) RecordWrite(name string, count int) {
 	t.mu.Lock()
 	defer t.mu.Unlock()
 	t.domainLocked(name).Writes += int64(count)
+}
+
+func (t *Tracker) RecordStore(name string, duration time.Duration, requestedRows, affectedRows int) {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	stats := t.domainLocked(name)
+	elapsedMs := float64(duration) / float64(time.Millisecond)
+	stats.StoreBatches++
+	stats.StoreRowsRequested += int64(requestedRows)
+	stats.StoreRowsAffected += int64(affectedRows)
+	stats.LastStoreRowsRequested = requestedRows
+	stats.LastStoreRowsAffected = affectedRows
+	stats.LastStoreMs = elapsedMs
+	if stats.StoreBatches == 1 {
+		stats.AvgStoreMs = elapsedMs
+		return
+	}
+	stats.AvgStoreMs = (stats.AvgStoreMs*float64(stats.StoreBatches-1) + elapsedMs) / float64(stats.StoreBatches)
 }
 
 func (t *Tracker) SetReady(name string, healthy bool, detail string) {

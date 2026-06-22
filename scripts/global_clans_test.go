@@ -58,6 +58,7 @@ func TestGlobalClanTargetSQLClassifiesBuckets(t *testing.T) {
 		t.Fatalf("active query should require recent last_active: %s", activeGlobalClanTargetSQL)
 	}
 	for _, want := range []string{
+		"member_count > 0",
 		"member_count <= 5",
 		"last_active IS NULL",
 		"last_active < now() - interval '7 days'",
@@ -68,46 +69,32 @@ func TestGlobalClanTargetSQLClassifiesBuckets(t *testing.T) {
 	}
 }
 
-func TestMemoryGlobalClanTargetCursorWrapsAfterBucketEnd(t *testing.T) {
+func TestMemoryGlobalClanTargetListsSeedActiveAndInactiveBuckets(t *testing.T) {
 	now := time.Now().UTC()
 	store := newMemoryGlobalClanStore()
+	old := now.Add(-8 * 24 * time.Hour)
 	store.rows = map[string]models.BasicClanRow{
 		"#A": {Tag: "#A", MemberCount: 10, LastActive: &now},
-		"#B": {Tag: "#B", MemberCount: 10, LastActive: &now},
-		"#C": {Tag: "#C", MemberCount: 10, LastActive: &now},
+		"#B": {Tag: "#B", MemberCount: 4, LastActive: &now},
+		"#C": {Tag: "#C", MemberCount: 10, LastActive: &old},
+		"#D": {Tag: "#D", MemberCount: 10},
+		"#E": {Tag: "#E", MemberCount: 0},
 	}
 
-	first, err := store.NextTargetBatch(context.Background(), "active", 2)
+	active, err := store.ListTargetTags(context.Background(), "active", 2)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if want := []string{"#A", "#B"}; !reflect.DeepEqual(first.Tags, want) {
-		t.Fatalf("first tags = %#v, want %#v", first.Tags, want)
-	}
-	if first.ActiveCursor != "#B" {
-		t.Fatalf("first active cursor = %q, want #B", first.ActiveCursor)
+	if want := []string{"#A"}; !reflect.DeepEqual(active, want) {
+		t.Fatalf("active tags = %#v, want %#v", active, want)
 	}
 
-	secondWithoutCommit, err := store.NextTargetBatch(context.Background(), "active", 2)
+	inactive, err := store.ListTargetTags(context.Background(), "inactive", 2)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if !reflect.DeepEqual(secondWithoutCommit.Tags, first.Tags) {
-		t.Fatalf("cursor advanced before commit: %#v vs %#v", secondWithoutCommit.Tags, first.Tags)
-	}
-
-	if err := store.CommitTargetBatch(context.Background(), first); err != nil {
-		t.Fatal(err)
-	}
-	second, err := store.NextTargetBatch(context.Background(), "active", 2)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if want := []string{"#C"}; !reflect.DeepEqual(second.Tags, want) {
-		t.Fatalf("second tags = %#v, want %#v", second.Tags, want)
-	}
-	if second.ActiveCursor != "" {
-		t.Fatalf("second active cursor = %q, want empty wrap", second.ActiveCursor)
+	if want := []string{"#B", "#C", "#D"}; !reflect.DeepEqual(inactive, want) {
+		t.Fatalf("inactive tags = %#v, want %#v", inactive, want)
 	}
 }
 
@@ -120,7 +107,7 @@ func TestBasicClanRowUsesUnrankedWarLeagueWhenMissing(t *testing.T) {
 
 func TestBuildGlobalClanIngestOnlyUsesJoinLeaveForMembers(t *testing.T) {
 	now := time.Date(2026, 5, 20, 10, 0, 0, 0, time.UTC)
-	previous := &models.BasicClanRow{
+	previous := models.BasicClanRow{
 		Tag:             "#CLAN",
 		Description:     "before",
 		ClanLevel:       10,
@@ -144,6 +131,9 @@ func TestBuildGlobalClanIngestOnlyUsesJoinLeaveForMembers(t *testing.T) {
 	ingest := buildGlobalClanIngest(current, previous, now)
 	if len(ingest.Clans) != 1 {
 		t.Fatalf("Clans len = %d, want 1", len(ingest.Clans))
+	}
+	if len(ingest.Players) != 2 || ingest.Players[0].ClanTag != "#CLAN" || ingest.Players[1].ClanTag != "#CLAN" {
+		t.Fatalf("player rows should carry source clan tag: %#v", ingest.Players)
 	}
 	if len(ingest.JoinLeaves) != 2 {
 		t.Fatalf("JoinLeaves len = %d, want 2: %#v", len(ingest.JoinLeaves), ingest.JoinLeaves)
@@ -169,7 +159,7 @@ func TestBuildGlobalClanIngestOnlyUsesJoinLeaveForMembers(t *testing.T) {
 
 func TestBuildGlobalClanIngestDoesNotMarkLeaveOnlyClanActive(t *testing.T) {
 	now := time.Date(2026, 5, 20, 10, 0, 0, 0, time.UTC)
-	previous := &models.BasicClanRow{
+	previous := models.BasicClanRow{
 		Tag:        "#CLAN",
 		MemberTags: []string{"#A", "#B"},
 	}
@@ -187,5 +177,46 @@ func TestBuildGlobalClanIngestDoesNotMarkLeaveOnlyClanActive(t *testing.T) {
 	}
 	if len(ingest.ActiveClanTags) != 0 {
 		t.Fatalf("leave-only change should not mark active: %#v", ingest.ActiveClanTags)
+	}
+}
+
+func TestGlobalClanTargetMovesBetweenActiveAndInactive(t *testing.T) {
+	now := time.Date(2026, 5, 20, 10, 0, 0, 0, time.UTC)
+	previous := models.BasicClanRow{
+		Tag:         "#CLAN",
+		MemberCount: 10,
+		LastActive:  &now,
+		MemberTags:  []string{"#A"},
+	}
+	current := clashy.Clan{
+		Tag:         "#CLAN",
+		MemberCount: 2,
+		Members: []clashy.ClanMember{
+			{Tag: "#A", Name: "A", TownHall: 16},
+			{Tag: "#B", Name: "B", TownHall: 16},
+		},
+	}
+
+	ingest := buildGlobalClanIngest(current, previous, now)
+	moves := globalClanTargetMoves(current, previous, ingest, now)
+	if len(moves) != 1 || moves[0].Tag != "#CLAN" || moves[0].ToBucket != "inactive" || moves[0].Remove {
+		t.Fatalf("unexpected moves: %#v", moves)
+	}
+}
+
+func TestZeroMemberClanStoresRowAndRemovesTarget(t *testing.T) {
+	now := time.Date(2026, 5, 20, 10, 0, 0, 0, time.UTC)
+	current := clashy.Clan{Tag: "#CLAN", Name: "Deleted Clan", Level: 6, MemberCount: 0}
+
+	ingest := buildGlobalClanIngest(current, models.BasicClanRow{}, now)
+	if len(ingest.Clans) != 1 || ingest.Clans[0].Tag != "#CLAN" || ingest.Clans[0].MemberCount != 0 {
+		t.Fatalf("zero-member clan should still be stored: %#v", ingest.Clans)
+	}
+	if len(ingest.DeletedClanTags) != 0 {
+		t.Fatalf("zero-member clan should not be written as a delete: %#v", ingest.DeletedClanTags)
+	}
+	moves := globalClanTargetMoves(current, models.BasicClanRow{}, ingest, now)
+	if len(moves) != 1 || moves[0].Tag != "#CLAN" || !moves[0].Remove {
+		t.Fatalf("unexpected zero-member target moves: %#v", moves)
 	}
 }

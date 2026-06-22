@@ -14,27 +14,14 @@ import (
 	"clashking_tracking/internal/utils"
 
 	clashy "github.com/clashkinginc/clashy.go"
+	clashtracker "github.com/clashkinginc/clashy.go/tracker"
 	"github.com/jackc/pgx/v5/pgxpool"
 	valkey "github.com/valkey-io/valkey-go"
 	"go.mongodb.org/mongo-driver/v2/bson"
 	"go.opentelemetry.io/otel/attribute"
 )
 
-type TargetSource interface {
-	Targets(context.Context) ([]string, error)
-}
-
-type FetchFunc[T any] func(context.Context, string) (*T, int, error)
-
-type BatchProcessor[T any] interface {
-	Process(context.Context, *platform.App, TrackedItem[T]) error
-}
-
-type BatchProcessorFunc[T any] func(context.Context, *platform.App, TrackedItem[T]) error
-
-func (f BatchProcessorFunc[T]) Process(ctx context.Context, app *platform.App, item TrackedItem[T]) error {
-	return f(ctx, app, item)
-}
+type botClanFetchFunc[T any] func(context.Context, string) (*T, int, error)
 
 type TrackedItem[T any] struct {
 	Group   string
@@ -45,24 +32,10 @@ type TrackedItem[T any] struct {
 	Retry   int
 }
 
-type CycleGroup[T any] struct {
-	Name         string
-	Kind         string
-	Source       TargetSource
-	Fetch        FetchFunc[T]
-	Processor    BatchProcessor[T]
-	RateLimit    int
-	BatchSize    int
-	PollInterval time.Duration
-}
-
-type CycleRunner[T any] struct {
-	App     *platform.App
-	Domain  string
-	Groups  []CycleGroup[T]
-	Limiter *platform.RequestLimiter
-
-	maintenanceBackoff time.Duration
+type botClanTrackedValue[T any] struct {
+	Current *T
+	Raw     []byte
+	Retry   int
 }
 
 const (
@@ -72,7 +45,7 @@ const (
 type botClansDomain struct {
 	mu               sync.Mutex
 	scheduled        map[string]struct{}
-	source           botClanTargetSource
+	targets          clashtracker.TargetStore
 	snapshots        botClanSnapshotStore
 	snapshotPrefix   string
 	cwlStateSnapshot string
@@ -93,65 +66,40 @@ func (d *botClansDomain) Run(ctx context.Context, app *platform.App) error {
 	if err := validateBotClansConfig(app.Config); err != nil {
 		return err
 	}
-	source, err := newBotClanTargetSource(ctx, app)
+	targetSource, err := newBotClanTargetStore(ctx, app)
 	if err != nil {
 		return err
 	}
-	defer source.Close()
-	d.source = source
+	defer targetSource.Close()
+	targetSet, err := newScriptMemoryTargetSet(ctx, app, botClansDomainName, "targets", 15*time.Second, targetSource.List)
+	if err != nil {
+		return err
+	}
+	d.targets = targetSet.Store()
 	d.snapshots = newBotClanSnapshotStore(app)
 	d.snapshotPrefix = app.Config.BotClanSnapshotPrefix
 	d.cwlStateSnapshot = app.Config.BotClanCWLStateSnapshot
 
-	if app.Config.RunOnce {
-		return d.runOnce(ctx, app)
-	}
-
 	rateLimit := app.Config.BotClanRequestsPerSecond
-	limiter := platform.NewRequestLimiter(rateLimit)
 	errCh := make(chan error, 4)
 	go func() {
-		errCh <- CycleRunner[clashy.Clan]{App: app, Domain: botClansDomainName, Limiter: limiter, Groups: []CycleGroup[clashy.Clan]{{
-			Name: "clans", Kind: "clan", Source: source, Fetch: fetchClan(app),
-			Processor: BatchProcessorFunc[clashy.Clan](d.handleClanChange), RateLimit: rateLimit, BatchSize: 10000,
-		}}}.Run(ctx)
+		errCh <- runBotClanTracker(ctx, app, targetSet, "clans", "clan", fetchClan(app), d.handleClanChange, rateLimit)
 	}()
 	go func() {
-		errCh <- CycleRunner[clashy.ClanWar]{App: app, Domain: botClansDomainName, Limiter: limiter, Groups: []CycleGroup[clashy.ClanWar]{{
-			Name: "wars", Kind: "war", Source: source, Fetch: fetchWar(app),
-			Processor: BatchProcessorFunc[clashy.ClanWar](d.handleWarChange), RateLimit: rateLimit, BatchSize: 10000,
-		}}}.Run(ctx)
+		errCh <- runBotClanTracker(ctx, app, targetSet, "wars", "war", fetchWar(app), d.handleWarChange, rateLimit)
 	}()
 	go func() {
-		errCh <- CycleRunner[clashy.RaidLogEntry]{App: app, Domain: botClansDomainName, Limiter: limiter, Groups: []CycleGroup[clashy.RaidLogEntry]{{
-			Name: "raids", Kind: "raid", Source: source, Fetch: fetchRaid(app),
-			Processor: BatchProcessorFunc[clashy.RaidLogEntry](d.handleRaidChange), RateLimit: rateLimit, BatchSize: 10000,
-		}}}.Run(ctx)
+		errCh <- runBotClanTracker(ctx, app, targetSet, "raids", "raid", fetchRaid(app), d.handleRaidChange, rateLimit)
 	}()
-	go func() {
-		errCh <- d.runCWLLoop(ctx, app, limiter)
-	}()
-	return <-errCh
-}
-
-func (d *botClansDomain) runOnce(ctx context.Context, app *platform.App) error {
-	tags, err := collectSourceTags(ctx, d.source)
+	go targetSet.Run(ctx)
+	cwlLimiter, err := clashtracker.NewLimiter(rateLimit, rateLimit)
 	if err != nil {
 		return err
 	}
-	for _, tag := range tags {
-		if clan, err := app.Clash.GetClan(ctx, tag); err == nil && clan != nil {
-			_ = d.handleClanChange(ctx, app, TrackedItem[clashy.Clan]{Tag: tag, Current: clan})
-		}
-		if war, err := app.Clash.GetClanWar(ctx, tag); err == nil && war != nil {
-			_ = d.handleWarChange(ctx, app, TrackedItem[clashy.ClanWar]{Tag: tag, Current: war})
-		}
-		if raids, err := app.Clash.GetRaidLog(ctx, tag, 1, "", ""); err == nil && len(raids) > 0 {
-			raid := raids[0]
-			_ = d.handleRaidChange(ctx, app, TrackedItem[clashy.RaidLogEntry]{Tag: tag, Current: &raid})
-		}
-	}
-	return d.runCWLCycle(ctx, app, platform.NewRequestLimiter(app.Config.BotClanRequestsPerSecond))
+	go func() {
+		errCh <- d.runCWLLoop(ctx, app, cwlLimiter)
+	}()
+	return <-errCh
 }
 
 func validateBotClansConfig(cfg platform.Config) error {
@@ -176,34 +124,34 @@ func validateBotClansConfig(cfg platform.Config) error {
 	return nil
 }
 
-type botClanTargetSource interface {
-	TargetSource
+type botClanTargetStore interface {
+	clashtracker.TargetStore
 	Close() error
 }
 
-type timescaleBotClanTargetSource struct {
+type timescaleBotClanTargetStore struct {
 	pool *pgxpool.Pool
 }
 
-func newBotClanTargetSource(ctx context.Context, app *platform.App) (botClanTargetSource, error) {
+func newBotClanTargetStore(ctx context.Context, app *platform.App) (botClanTargetStore, error) {
 	if app.Config.MockDB || app.Config.DryRun || app.Config.TimescaleURL == "" {
-		return memoryBotClanTargetSource{}, nil
+		return memoryBotClanTargetStore{}, nil
 	}
 	pool, err := pgxpool.New(ctx, app.Config.TimescaleURL)
 	if err != nil {
 		return nil, err
 	}
-	return &timescaleBotClanTargetSource{pool: pool}, nil
+	return &timescaleBotClanTargetStore{pool: pool}, nil
 }
 
-func (s *timescaleBotClanTargetSource) Close() error {
+func (s *timescaleBotClanTargetStore) Close() error {
 	if s != nil && s.pool != nil {
 		s.pool.Close()
 	}
 	return nil
 }
 
-func (s *timescaleBotClanTargetSource) Targets(ctx context.Context) ([]string, error) {
+func (s *timescaleBotClanTargetStore) List(ctx context.Context) ([]clashtracker.Target, error) {
 	rows, err := s.pool.Query(ctx, `
 		SELECT DISTINCT tag
 		FROM server_clans
@@ -214,28 +162,126 @@ func (s *timescaleBotClanTargetSource) Targets(ctx context.Context) ([]string, e
 		return nil, err
 	}
 	defer rows.Close()
-	var out []string
+	var out []clashtracker.Target
 	for rows.Next() {
 		var tag string
 		if err := rows.Scan(&tag); err != nil {
 			return nil, err
 		}
-		out = append(out, tag)
+		out = append(out, clashtracker.Target{Key: tag})
 	}
 	return out, rows.Err()
 }
 
-type memoryBotClanTargetSource struct {
+func (s *timescaleBotClanTargetStore) Add(context.Context, ...clashtracker.Target) error {
+	return nil
+}
+
+func (s *timescaleBotClanTargetStore) Remove(context.Context, ...string) error {
+	return nil
+}
+
+type memoryBotClanTargetStore struct {
 	tags []string
 }
 
-func (s memoryBotClanTargetSource) Close() error { return nil }
+func (s memoryBotClanTargetStore) Close() error { return nil }
 
-func (s memoryBotClanTargetSource) Targets(context.Context) ([]string, error) {
-	return append([]string(nil), s.tags...), nil
+func (s memoryBotClanTargetStore) List(context.Context) ([]clashtracker.Target, error) {
+	targets := make([]clashtracker.Target, 0, len(s.tags))
+	for _, tag := range s.tags {
+		targets = append(targets, clashtracker.Target{Key: tag})
+	}
+	return targets, nil
 }
 
-func fetchClan(app *platform.App) FetchFunc[clashy.Clan] {
+func (s memoryBotClanTargetStore) Add(context.Context, ...clashtracker.Target) error {
+	return nil
+}
+
+func (s memoryBotClanTargetStore) Remove(context.Context, ...string) error {
+	return nil
+}
+
+func runBotClanTracker[T any](
+	ctx context.Context,
+	app *platform.App,
+	targetSet *scriptMemoryTargetSet,
+	group string,
+	kind string,
+	fetch botClanFetchFunc[T],
+	handle func(context.Context, *platform.App, TrackedItem[T]) error,
+	rateLimit int,
+) error {
+	runner, err := clashtracker.NewRunner[botClanTrackedValue[T], botClanTrackedValue[T]](clashtracker.Config[botClanTrackedValue[T], botClanTrackedValue[T]]{
+		TargetStore:       targetSet.Store(),
+		Store:             botClanTrackerStore[T]{},
+		RequestsPerSecond: rateLimit,
+		MaxInFlight:       rateLimit,
+		MinInterval:       15 * time.Second,
+		EmitInitial:       true,
+		Fetch: func(fetchCtx context.Context, target clashtracker.Target) (clashtracker.FetchResult[botClanTrackedValue[T]], error) {
+			start := time.Now()
+			current, retry, err := fetch(fetchCtx, target.Key)
+			app.Stats.RecordRequest(botClansDomainName, time.Since(start), err)
+			if err != nil {
+				return clashtracker.FetchResult[botClanTrackedValue[T]]{}, err
+			}
+			value := botClanTrackedValue[T]{Current: current, Retry: retry}
+			if current != nil {
+				value.Raw = jsonBytes(current)
+			}
+			retryAfter := 15 * time.Second
+			if retry > 0 {
+				retryAfter = time.Duration(retry) * time.Second
+			}
+			return clashtracker.FetchResult[botClanTrackedValue[T]]{Value: value, RetryAfter: retryAfter}, nil
+		},
+		Project: func(value botClanTrackedValue[T]) (botClanTrackedValue[T], error) {
+			return value, nil
+		},
+		Diff: func(diffCtx context.Context, target clashtracker.Target, _, current botClanTrackedValue[T]) error {
+			return handle(diffCtx, app, TrackedItem[T]{
+				Group:   group,
+				Kind:    kind,
+				Tag:     target.Key,
+				Current: current.Current,
+				Raw:     current.Raw,
+				Retry:   current.Retry,
+			})
+		},
+		OnError: func(_ context.Context, target clashtracker.Target, err error) error {
+			app.Logger.Error("bot clan fetch failed", "group", group, "tag", target.Key, "err", err)
+			app.Stats.SetReady(botClansDomainName, false, err.Error())
+			return nil
+		},
+	})
+	if err != nil {
+		return err
+	}
+	targetSet.SetRunner(runner)
+	return runner.Run(ctx)
+}
+
+type botClanTrackerStore[T any] struct{}
+
+func (botClanTrackerStore[T]) Load(context.Context, string) (botClanTrackedValue[T], bool, error) {
+	return botClanTrackedValue[T]{}, false, nil
+}
+
+func (botClanTrackerStore[T]) Store(context.Context, string, botClanTrackedValue[T], time.Duration) error {
+	return nil
+}
+
+func (botClanTrackerStore[T]) LoadBatch(context.Context, []string) (map[string]clashtracker.Snapshot[botClanTrackedValue[T]], error) {
+	return map[string]clashtracker.Snapshot[botClanTrackedValue[T]]{}, nil
+}
+
+func (botClanTrackerStore[T]) StoreBatch(context.Context, []clashtracker.StoredSnapshot[botClanTrackedValue[T]]) error {
+	return nil
+}
+
+func fetchClan(app *platform.App) botClanFetchFunc[clashy.Clan] {
 	return func(ctx context.Context, tag string) (*clashy.Clan, int, error) {
 		clan, err := app.Clash.GetClan(ctx, tag)
 		retry := 0
@@ -246,7 +292,7 @@ func fetchClan(app *platform.App) FetchFunc[clashy.Clan] {
 	}
 }
 
-func fetchWar(app *platform.App) FetchFunc[clashy.ClanWar] {
+func fetchWar(app *platform.App) botClanFetchFunc[clashy.ClanWar] {
 	return func(ctx context.Context, tag string) (*clashy.ClanWar, int, error) {
 		war, err := app.Clash.GetClanWar(ctx, tag)
 		retry := 0
@@ -257,7 +303,7 @@ func fetchWar(app *platform.App) FetchFunc[clashy.ClanWar] {
 	}
 }
 
-func fetchRaid(app *platform.App) FetchFunc[clashy.RaidLogEntry] {
+func fetchRaid(app *platform.App) botClanFetchFunc[clashy.RaidLogEntry] {
 	return func(ctx context.Context, tag string) (*clashy.RaidLogEntry, int, error) {
 		raids, err := app.Clash.GetRaidLog(ctx, tag, 1, "", "")
 		if err != nil {
@@ -769,7 +815,7 @@ type botCWLState struct {
 	NoSpin           bool   `json:"no_spin,omitempty"`
 }
 
-func (d *botClansDomain) runCWLLoop(ctx context.Context, app *platform.App, limiter *platform.RequestLimiter) error {
+func (d *botClansDomain) runCWLLoop(ctx context.Context, app *platform.App, limiter *clashtracker.Limiter) error {
 	interval := time.Duration(app.Config.WarCWLSyncSeconds) * time.Second
 	if interval <= 0 {
 		interval = 3 * time.Minute
@@ -781,17 +827,14 @@ func (d *botClansDomain) runCWLLoop(ctx context.Context, app *platform.App, limi
 		if err != nil {
 			return err
 		}
-		if app.Config.RunOnce {
-			return nil
-		}
 		if err := sleepOrDone(ctx, interval); err != nil {
 			return err
 		}
 	}
 }
 
-func (d *botClansDomain) runCWLCycle(ctx context.Context, app *platform.App, limiter *platform.RequestLimiter) error {
-	tags, err := collectSourceTags(ctx, d.source)
+func (d *botClansDomain) runCWLCycle(ctx context.Context, app *platform.App, limiter *clashtracker.Limiter) error {
+	tags, err := collectTargetStoreTags(ctx, d.targets)
 	if err != nil {
 		return err
 	}
@@ -804,7 +847,7 @@ func (d *botClansDomain) runCWLCycle(ctx context.Context, app *platform.App, lim
 	return nil
 }
 
-func (d *botClansDomain) processCWLTarget(ctx context.Context, app *platform.App, limiter *platform.RequestLimiter, tag string, now time.Time) error {
+func (d *botClansDomain) processCWLTarget(ctx context.Context, app *platform.App, limiter *clashtracker.Limiter, tag string, now time.Time) error {
 	state, _, ok, err := loadBotClanSnapshot[botCWLState](ctx, d.snapshots, d.snapshotPrefix, d.cwlStateSnapshot, tag)
 	if err != nil {
 		return err
@@ -867,7 +910,7 @@ func (d *botClansDomain) processCWLTarget(ctx context.Context, app *platform.App
 	return storeBotClanValue(ctx, d.snapshots, d.snapshotPrefix, d.cwlStateSnapshot, tag, currentState)
 }
 
-func (d *botClansDomain) fetchCWLGroup(ctx context.Context, app *platform.App, limiter *platform.RequestLimiter, tag string) (*clashy.ClanWarLeagueGroup, []byte, error) {
+func (d *botClansDomain) fetchCWLGroup(ctx context.Context, app *platform.App, limiter *clashtracker.Limiter, tag string) (*clashy.ClanWarLeagueGroup, []byte, error) {
 	release, err := limiter.Acquire(ctx)
 	if err != nil {
 		return nil, nil, err
@@ -882,7 +925,7 @@ func (d *botClansDomain) fetchCWLGroup(ctx context.Context, app *platform.App, l
 	return group, jsonBytes(group), nil
 }
 
-func (d *botClansDomain) fetchCWLWar(ctx context.Context, app *platform.App, limiter *platform.RequestLimiter, warTag string) (*clashy.ClanWar, []byte, error) {
+func (d *botClansDomain) fetchCWLWar(ctx context.Context, app *platform.App, limiter *clashtracker.Limiter, warTag string) (*clashy.ClanWar, []byte, error) {
 	release, err := limiter.Acquire(ctx)
 	if err != nil {
 		return nil, nil, err
@@ -897,7 +940,7 @@ func (d *botClansDomain) fetchCWLWar(ctx context.Context, app *platform.App, lim
 	return &wars[0], jsonBytes(wars[0]), nil
 }
 
-func (d *botClansDomain) findClanCWLWar(ctx context.Context, app *platform.App, limiter *platform.RequestLimiter, clanTag string, warTags []string) (string, *clashy.ClanWar, []byte, error) {
+func (d *botClansDomain) findClanCWLWar(ctx context.Context, app *platform.App, limiter *clashtracker.Limiter, clanTag string, warTags []string) (string, *clashy.ClanWar, []byte, error) {
 	for _, warTag := range warTags {
 		war, raw, err := d.fetchCWLWar(ctx, app, limiter, warTag)
 		if err != nil {
@@ -1206,252 +1249,21 @@ func intContains(values []int, target int) bool {
 	return false
 }
 
-func (r CycleRunner[T]) Run(ctx context.Context) error {
-	if r.maintenanceBackoff == 0 {
-		r.maintenanceBackoff = 15 * time.Second
-	}
-	for {
-		start := time.Now()
-		cycleCtx, span := platform.StartSpan(ctx, "tracker.cycle", attribute.String("domain", r.Domain))
-		err := r.runCycle(cycleCtx)
-		platform.RecordSpanError(span, err)
-		span.SetAttributes(platform.SpanErrorStatus(err))
-		span.End()
-		if err != nil {
-			return err
-		}
-		if r.App.Stats.Domain(r.Domain).Healthy {
-			r.App.Stats.RecordProcess(r.Domain, time.Since(start))
-		}
-		if r.App.Config.RunOnce {
-			return nil
-		}
-		delay := r.nextDelay()
-		if delay <= 0 {
-			delay = r.maintenanceBackoff
-		}
-		timer := time.NewTimer(delay)
-		select {
-		case <-ctx.Done():
-			timer.Stop()
-			return ctx.Err()
-		case <-timer.C:
-		}
-	}
-}
-
-func (r CycleRunner[T]) runCycle(ctx context.Context) error {
-	for _, group := range r.Groups {
-		if err := r.runGroup(ctx, group); err != nil {
-			return err
-		}
-	}
-	return nil
-}
-
-func (r CycleRunner[T]) runGroup(ctx context.Context, group CycleGroup[T]) error {
-	if group.Source == nil || group.Fetch == nil || group.Processor == nil {
-		return nil
-	}
-	ctx, span := platform.StartSpan(ctx, "tracker.group",
-		attribute.String("domain", r.Domain),
-		attribute.String("group", group.Name),
-	)
-	defer span.End()
-	targets, err := group.Source.Targets(ctx)
-	if err != nil {
-		platform.RecordSpanError(span, err)
-		span.SetAttributes(platform.SpanErrorStatus(err))
-		r.App.Stats.SetReady(r.Domain, false, err.Error())
-		return err
-	}
-	span.SetAttributes(attribute.Int("target.count", len(targets)))
-	if group.BatchSize <= 0 {
-		group.BatchSize = len(targets)
-	}
-	if group.BatchSize <= 0 {
-		span.SetAttributes(platform.SpanErrorStatus(nil))
-		return nil
-	}
-	limiter := r.Limiter
-	if limiter == nil && group.RateLimit > 0 {
-		limiter = platform.NewRequestLimiter(group.RateLimit)
-	}
-	for _, batch := range chunkStrings(targets, group.BatchSize) {
-		if err := r.runBatch(ctx, group, batch, limiter); err != nil {
-			platform.RecordSpanError(span, err)
-			span.SetAttributes(platform.SpanErrorStatus(err))
-			return err
-		}
-	}
-	span.SetAttributes(platform.SpanErrorStatus(nil))
-	return nil
-}
-
-func (r CycleRunner[T]) runBatch(ctx context.Context, group CycleGroup[T], tags []string, limiter *platform.RequestLimiter) error {
-	ctx, span := platform.StartSpan(ctx, "tracker.batch",
-		attribute.String("domain", r.Domain),
-		attribute.String("group", group.Name),
-		attribute.Int("batch.size", len(tags)),
-	)
-	defer span.End()
-	limit := group.RateLimit
-	if limit <= 0 || limit > len(tags) {
-		limit = len(tags)
-	}
-	if limit <= 0 {
-		span.SetAttributes(platform.SpanErrorStatus(nil))
-		return nil
-	}
-	sem := make(chan struct{}, limit)
-	var wg sync.WaitGroup
-	errCh := make(chan error, len(tags))
-	for _, tag := range tags {
-		wg.Add(1)
-		sem <- struct{}{}
-		go func(tag string) {
-			defer wg.Done()
-			defer func() { <-sem }()
-			if err := r.processTarget(ctx, group, tag, limiter); err != nil {
-				errCh <- err
-			}
-		}(tag)
-	}
-	wg.Wait()
-	close(errCh)
-	for err := range errCh {
-		if err != nil {
-			platform.RecordSpanError(span, err)
-			span.SetAttributes(platform.SpanErrorStatus(err))
-			return err
-		}
-	}
-	span.SetAttributes(platform.SpanErrorStatus(nil))
-	return nil
-}
-
-func (r CycleRunner[T]) processTarget(ctx context.Context, group CycleGroup[T], tag string, limiter *platform.RequestLimiter) error {
-	ctx, span := platform.StartSpan(ctx, "tracker.target",
-		attribute.String("domain", r.Domain),
-		attribute.String("group", group.Name),
-		attribute.String("operation", "process"),
-	)
-	defer span.End()
-	start := time.Now()
-	fetchCtx, fetchSpan := platform.StartSpan(ctx, "clash.fetch",
-		attribute.String("domain", r.Domain),
-		attribute.String("group", group.Name),
-		attribute.String("operation", group.Kind),
-	)
-	var release func()
-	var err error
-	if limiter != nil {
-		release, err = limiter.Acquire(fetchCtx)
-		if err != nil {
-			platform.RecordSpanError(fetchSpan, err)
-			fetchSpan.SetAttributes(platform.SpanErrorStatus(err))
-			fetchSpan.End()
-			platform.RecordSpanError(span, err)
-			span.SetAttributes(platform.SpanErrorStatus(err))
-			return err
-		}
-	}
-	current, retry, err := group.Fetch(fetchCtx, tag)
-	if release != nil {
-		release()
-	}
-	platform.RecordSpanError(fetchSpan, err)
-	fetchSpan.SetAttributes(platform.SpanErrorStatus(err))
-	fetchSpan.End()
-	r.App.Stats.RecordRequest(r.Domain, time.Since(start), err)
-	if err != nil {
-		platform.RecordSpanError(span, err)
-		span.SetAttributes(platform.SpanErrorStatus(err))
-		r.App.Stats.SetReady(r.Domain, false, err.Error())
-		return nil
-	}
-	if current == nil {
-		span.SetAttributes(platform.SpanErrorStatus(nil))
-		return nil
-	}
-
-	_, jsonSpan := platform.StartSpan(ctx, "tracker.json",
-		attribute.String("domain", r.Domain),
-		attribute.String("group", group.Name),
-		attribute.String("operation", "marshal"),
-	)
-	raw, err := json.Marshal(current)
-	platform.RecordSpanError(jsonSpan, err)
-	jsonSpan.SetAttributes(platform.SpanErrorStatus(err))
-	jsonSpan.End()
-	if err != nil {
-		platform.RecordSpanError(span, err)
-		span.SetAttributes(platform.SpanErrorStatus(err))
-		r.App.Stats.SetReady(r.Domain, false, err.Error())
-		return nil
-	}
-
-	item := TrackedItem[T]{
-		Group:   group.Name,
-		Kind:    group.Kind,
-		Tag:     tag,
-		Current: current,
-		Raw:     raw,
-		Retry:   retry,
-	}
-	processCtx, processSpan := platform.StartSpan(ctx, "tracker.target.process",
-		attribute.String("domain", r.Domain),
-		attribute.String("group", group.Name),
-		attribute.String("operation", "processor"),
-	)
-	err = group.Processor.Process(processCtx, r.App, item)
-	platform.RecordSpanError(processSpan, err)
-	processSpan.SetAttributes(platform.SpanErrorStatus(err))
-	processSpan.End()
-	if err != nil {
-		platform.RecordSpanError(span, err)
-		span.SetAttributes(platform.SpanErrorStatus(err))
-		r.App.Stats.SetReady(r.Domain, false, err.Error())
-		return err
-	}
-	r.App.Stats.SetReady(r.Domain, true, "")
-	span.SetAttributes(platform.SpanErrorStatus(nil))
-	return nil
-}
-
-func (r CycleRunner[T]) nextDelay() time.Duration {
-	var delay time.Duration
-	for _, group := range r.Groups {
-		if group.PollInterval <= 0 {
-			return 0
-		}
-		if delay == 0 || group.PollInterval < delay {
-			delay = group.PollInterval
-		}
-	}
-	return delay
-}
-
-func chunkStrings(values []string, size int) [][]string {
-	if size <= 0 || len(values) == 0 {
-		return nil
-	}
-	out := make([][]string, 0, (len(values)+size-1)/size)
-	for start := 0; start < len(values); start += size {
-		end := start + size
-		if end > len(values) {
-			end = len(values)
-		}
-		out = append(out, values[start:end])
-	}
-	return out
-}
-
-func collectSourceTags(ctx context.Context, source TargetSource) ([]string, error) {
-	if source == nil {
+func collectTargetStoreTags(ctx context.Context, targets clashtracker.TargetStore) ([]string, error) {
+	if targets == nil {
 		return nil, nil
 	}
-	return source.Targets(ctx)
+	list, err := targets.List(ctx)
+	if err != nil {
+		return nil, err
+	}
+	tags := make([]string, 0, len(list))
+	for _, target := range list {
+		if target.Key != "" {
+			tags = append(tags, target.Key)
+		}
+	}
+	return tags, nil
 }
 
 func rawPayload(raw []byte, fallback any) string {

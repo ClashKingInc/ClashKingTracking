@@ -14,7 +14,6 @@ func TestLoadWithArgsReadsConfigJSON(t *testing.T) {
 		"grpc_addr": ":9191",
 		"proxy_url": "http://proxy-json",
 		"valkey_addr": "valkey-json:6379",
-		"run_once": true,
 		"target_page_multiplier": 9,
 		"otel": {
 			"service_name": "from-json",
@@ -73,8 +72,8 @@ func TestLoadWithArgsReadsConfigJSON(t *testing.T) {
 	if cfg.Enabled("wars") {
 		t.Fatalf("script should not be enabled without --script")
 	}
-	if cfg.HTTPAddr != ":8181" || !cfg.RunOnce {
-		t.Fatalf("json runtime config was not applied: addr=%q runOnce=%v", cfg.HTTPAddr, cfg.RunOnce)
+	if cfg.HTTPAddr != ":8181" {
+		t.Fatalf("json runtime config was not applied: addr=%q", cfg.HTTPAddr)
 	}
 	if cfg.ProxyURL != "http://proxy-json" || cfg.ValkeyAddr != "valkey-json:6379" ||
 		cfg.OTELExporterOTLPEndpoint != "http://otel-json:4318" {
@@ -113,7 +112,6 @@ func TestLoadWithArgsOnlyScriptComesFromCLI(t *testing.T) {
 		"http_addr": ":8181",
 		"grpc_addr": ":9191",
 		"proxy_url": "http://proxy-json",
-		"run_once": true,
 		"dry_run": true,
 		"mock_db": true,
 		"target_page_multiplier": 9,

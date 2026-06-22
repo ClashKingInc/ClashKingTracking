@@ -48,13 +48,7 @@ func (d *giveawaysDomain) Run(ctx context.Context, app *platform.App) error {
 		err = d.runCycle(ctx, app)
 		app.Stats.RecordProcess(giveawaysDomainName, time.Since(start))
 		if err != nil {
-			if app.Config.RunOnce {
-				return err
-			}
 			app.Stats.SetReady(giveawaysDomainName, false, err.Error())
-		}
-		if app.Config.RunOnce {
-			return nil
 		}
 		if err := sleepOrDone(ctx, interval); err != nil {
 			return err

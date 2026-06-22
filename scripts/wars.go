@@ -15,6 +15,7 @@ import (
 	"clashking_tracking/models"
 
 	clashy "github.com/clashkinginc/clashy.go"
+	clashtracker "github.com/clashkinginc/clashy.go/tracker"
 	"github.com/jackc/pgx/v5/pgxpool"
 	"go.opentelemetry.io/otel/attribute"
 )
@@ -137,7 +138,10 @@ func (d *warsDomain) Run(ctx context.Context, app *platform.App) error {
 	go d.runMaintenanceLoop(ctx, app)
 	go d.runCWLLoop(ctx, app)
 
-	limiter := platform.NewRequestLimiter(app.Config.WarRequestsPerSecond)
+	limiter, err := newWarLimiter(app)
+	if err != nil {
+		return err
+	}
 	for {
 		start := time.Now()
 		cycleCtx, span := platform.StartSpan(ctx, "tracker.cycle", attribute.String("domain", warsDomainName))
@@ -151,9 +155,6 @@ func (d *warsDomain) Run(ctx context.Context, app *platform.App) error {
 		}
 		app.Stats.RecordProcess(warsDomainName, time.Since(start))
 		app.Stats.SetReady(warsDomainName, true, "")
-		if app.Config.RunOnce {
-			return nil
-		}
 		select {
 		case <-ctx.Done():
 			return ctx.Err()
@@ -325,7 +326,11 @@ func memoryWarTargetBatch(targets []models.BasicClanRow, cursor int, limit int) 
 	return out, cursor
 }
 
-func (d *warsDomain) runCycle(ctx context.Context, app *platform.App, limiter *platform.RequestLimiter) error {
+func newWarLimiter(app *platform.App) (*clashtracker.Limiter, error) {
+	return clashtracker.NewLimiter(app.Config.WarRequestsPerSecond, app.Config.WarMaxInFlight)
+}
+
+func (d *warsDomain) runCycle(ctx context.Context, app *platform.App, limiter *clashtracker.Limiter) error {
 	targetPageSize := app.Config.WarRequestsPerSecond * app.Config.TargetPageMultiplier
 	targets, err := d.targets.NextTargetBatch(ctx, targetPageSize)
 	if err != nil {
@@ -340,7 +345,7 @@ func (d *warsDomain) runCycle(ctx context.Context, app *platform.App, limiter *p
 	return d.processQueue(ctx, app, limiter, queue.items)
 }
 
-func (d *warsDomain) processQueue(ctx context.Context, app *platform.App, limiter *platform.RequestLimiter, requests []warFetchRequest) error {
+func (d *warsDomain) processQueue(ctx context.Context, app *platform.App, limiter *clashtracker.Limiter, requests []warFetchRequest) error {
 	// Max in-flight and request starts/sec are intentionally tied for this script.
 	// The limiter controls starts; the slots channel caps concurrently running requests.
 	slots := make(chan struct{}, app.Config.WarMaxInFlight)
@@ -364,6 +369,9 @@ func (d *warsDomain) processQueue(ctx context.Context, app *platform.App, limite
 			}
 			if err != nil {
 				app.Logger.Error("war processing failed", "err", err)
+				if platform.IsNonFatalClashError(err) {
+					return
+				}
 				errCh <- err
 			}
 		}()
@@ -378,7 +386,7 @@ func (d *warsDomain) processQueue(ctx context.Context, app *platform.App, limite
 	return nil
 }
 
-func (d *warsDomain) do(ctx context.Context, app *platform.App, limiter *platform.RequestLimiter, req warFetchRequest) (models.WarIngest, error) {
+func (d *warsDomain) do(ctx context.Context, app *platform.App, limiter *clashtracker.Limiter, req warFetchRequest) (models.WarIngest, error) {
 	ctx, span := platform.StartSpan(ctx, "wars.do",
 		attribute.String("domain", warsDomainName),
 		attribute.String("operation", "do"),
@@ -523,7 +531,7 @@ func warIndexRow(warID string, clan, opponent *clashy.WarClan, prepAt time.Time,
 		Size:             war.TeamSize,
 		WarType:          warType,
 		State:            string(war.State),
-		BattleModifier:   war.BattleModifier,
+		BattleModifier:   string(war.BattleModifier),
 		CWLWarTag:        cwlWarTag,
 	}
 }
@@ -554,7 +562,7 @@ func warAttackRows(warID string, war clashy.ClanWar, warType string, warEndTime 
 			DestructionPercentage: int(attack.Destruction),
 			Duration:              attack.Duration,
 			AttackOrder:           attack.Order,
-			BattleModifier:        war.BattleModifier,
+			BattleModifier:        string(war.BattleModifier),
 		})
 	}
 	return rows
@@ -685,7 +693,11 @@ func (d *warsDomain) scheduleStore(app *platform.App, schedule models.WarSchedul
 				app.Logger.Error("invalid scheduled war store request", "err", err)
 				return
 			}
-			limiter := platform.NewRequestLimiter(app.Config.WarRequestsPerSecond)
+			limiter, err := newWarLimiter(app)
+			if err != nil {
+				app.Logger.Error("scheduled war limiter failed", "err", err)
+				return
+			}
 			if err := d.processQueue(ctx, app, limiter, queue.items); err != nil {
 				app.Logger.Error("scheduled war store failed", "err", err)
 				retry := schedule
@@ -721,7 +733,10 @@ func (d *warsDomain) syncCWLGroups(ctx context.Context, app *platform.App) error
 	}
 	season := utils.CurrentSeason(time.Now())
 	seen := make(map[string]struct{})
-	limiter := platform.NewRequestLimiter(app.Config.WarRequestsPerSecond)
+	limiter, err := newWarLimiter(app)
+	if err != nil {
+		return err
+	}
 	for _, target := range targets {
 		release, err := limiter.Acquire(ctx)
 		if err != nil {
@@ -770,7 +785,7 @@ func (d *warsDomain) syncCWLGroups(ctx context.Context, app *platform.App) error
 	return nil
 }
 
-func (d *warsDomain) scheduleCWLWars(ctx context.Context, app *platform.App, limiter *platform.RequestLimiter, group *clashy.ClanWarLeagueGroup) error {
+func (d *warsDomain) scheduleCWLWars(ctx context.Context, app *platform.App, limiter *clashtracker.Limiter, group *clashy.ClanWarLeagueGroup) error {
 	for _, warTag := range cwlWarTags(group) {
 		release, err := limiter.Acquire(ctx)
 		if err != nil {

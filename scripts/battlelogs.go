@@ -19,6 +19,7 @@ import (
 
 	"github.com/cespare/xxhash/v2"
 	"github.com/clashkinginc/clashy.go"
+	clashtracker "github.com/clashkinginc/clashy.go/tracker"
 	"github.com/google/uuid"
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgconn"
@@ -61,9 +62,21 @@ type battlelogTargetBatch struct {
 type battlelogStore interface {
 	NextTargetBatch(context.Context, int) (battlelogTargetBatch, error)
 	CommitTargetBatch(context.Context, battlelogTargetBatch) error
-	LoadBasicPlayers(context.Context, []string) (map[string]models.BasicPlayerRow, error)
 	Store(context.Context, models.BattlelogIngest) error
 	Close() error
+}
+
+type battlelogTrackerTargetStore struct {
+	store    battlelogStore
+	pageSize int
+	batch    battlelogTargetBatch
+}
+
+type battlelogTrackerStore struct {
+	d         *battlelogsDomain
+	app       *platform.App
+	targets   *battlelogTrackerTargetStore
+	targetSet *scriptMemoryTargetSet
 }
 
 type timescaleBattlelogStore struct {
@@ -123,88 +136,145 @@ func (d *battlelogsDomain) Run(ctx context.Context, app *platform.App) error {
 		defer store.Close()
 	}
 
-	limiter := platform.NewRequestLimiter(app.Config.BattlelogRequestsPerSecond)
 	targetPageSize := app.Config.BattlelogRequestsPerSecond * app.Config.TargetPageMultiplier
-	for {
-		start := time.Now()
-		var batch battlelogTargetBatch
-		var err error
-		if d.sink != nil {
-			batch, err = d.sink.NextTargetBatch(ctx, targetPageSize)
-		}
-		if err == nil && len(batch.Players) > 0 {
-			err = d.processTargets(ctx, app, limiter, batch.Players, app.Config.BattlelogRequestsPerSecond)
-		}
-		if err == nil && d.sink != nil {
-			// Advance the scan cursor only after the fetched players have been processed.
-			err = d.sink.CommitTargetBatch(ctx, batch)
-		}
-		if err != nil {
-			app.Stats.SetReady(battlelogsDomainName, false, err.Error())
-			return err
-		}
+	if d.sink == nil {
 		app.Stats.SetReady(battlelogsDomainName, true, "")
-		app.Stats.RecordProcess(battlelogsDomainName, time.Since(start))
-		if app.Config.RunOnce {
-			return nil
-		}
-		select {
-		case <-ctx.Done():
-			return ctx.Err()
-		default:
-		}
+		return nil
 	}
+
+	refreshInterval := 5 * time.Second
+	targets := &battlelogTrackerTargetStore{store: d.sink, pageSize: targetPageSize}
+	targetSet, err := newScriptMemoryTargetSet(ctx, app, battlelogsDomainName, "targets", refreshInterval, targets.List)
+	if err != nil {
+		return err
+	}
+	store := battlelogTrackerStore{d: d, app: app, targets: targets, targetSet: targetSet}
+	runner, err := clashtracker.NewRunner[models.BattlelogIngest, models.BattlelogIngest](clashtracker.Config[models.BattlelogIngest, models.BattlelogIngest]{
+		TargetStore:       targetSet.Store(),
+		Store:             store,
+		RequestsPerSecond: app.Config.BattlelogRequestsPerSecond,
+		MaxInFlight:       app.Config.BattlelogRequestsPerSecond,
+		MinInterval:       refreshInterval,
+		EmitInitial:       true,
+		Fetch: func(fetchCtx context.Context, target clashtracker.Target) (clashtracker.FetchResult[models.BattlelogIngest], error) {
+			player, err := decodeBattlelogTarget(target)
+			if err != nil {
+				return clashtracker.FetchResult[models.BattlelogIngest]{}, err
+			}
+			ingest, err := d.do(fetchCtx, app, player)
+			return clashtracker.FetchResult[models.BattlelogIngest]{Value: ingest}, err
+		},
+		Project: func(ingest models.BattlelogIngest) (models.BattlelogIngest, error) {
+			return ingest, nil
+		},
+		OnError: func(_ context.Context, target clashtracker.Target, err error) error {
+			app.Logger.Error("battlelog processing failed", "tag", target.Key, "err", err)
+			app.Stats.SetReady(battlelogsDomainName, false, err.Error())
+			if platform.IsNonFatalClashError(err) {
+				return nil
+			}
+			return err
+		},
+	})
+	if err != nil {
+		return err
+	}
+	targetSet.SetRunner(runner)
+	go targetSet.Run(ctx)
+	return runner.Run(ctx)
 }
 
-func (d *battlelogsDomain) processTargets(ctx context.Context, app *platform.App, limiter *platform.RequestLimiter, targets []models.BasicPlayerRow, maxInFlight int) error {
-	// The target scan can read several seconds of players, while maxInFlight keeps the
-	// active Clash calls bounded to the configured requests-per-second value.
-	slots := make(chan struct{}, maxInt(maxInFlight, 1))
-	errCh := make(chan error, len(targets))
-	var wg sync.WaitGroup
-	for _, target := range targets {
-		target := target
-		if target.Tag == "" || target.Name == "" || target.TownHall <= 0 {
-			continue
-		}
-		select {
-		case slots <- struct{}{}:
-		case <-ctx.Done():
-			wg.Wait()
-			return ctx.Err()
-		}
-		wg.Add(1)
-		go func() {
-			defer wg.Done()
-			defer func() { <-slots }()
-			ingest, err := d.do(ctx, app, limiter, target)
-			if err == nil {
-				err = d.store(ctx, app, ingest)
-			}
-			if err != nil {
-				app.Logger.Error("battlelog processing failed", "tag", target.Tag, "err", err)
-				errCh <- err
-			}
-		}()
+func (s *battlelogTrackerTargetStore) List(ctx context.Context) ([]clashtracker.Target, error) {
+	batch, err := s.store.NextTargetBatch(ctx, s.pageSize)
+	if err != nil {
+		return nil, err
 	}
-	wg.Wait()
-	close(errCh)
-	for err := range errCh {
-		if err != nil {
-			return err
+	s.batch = batch
+	if len(batch.Players) == 0 {
+		if err := s.store.CommitTargetBatch(ctx, batch); err != nil {
+			return nil, err
 		}
+		return nil, nil
 	}
+	targets := make([]clashtracker.Target, 0, len(batch.Players))
+	for _, player := range batch.Players {
+		targets = append(targets, encodeBattlelogTarget(player))
+	}
+	return targets, nil
+}
+
+func (s *battlelogTrackerTargetStore) Add(context.Context, ...clashtracker.Target) error {
 	return nil
 }
 
-func (d *battlelogsDomain) do(ctx context.Context, app *platform.App, limiter *platform.RequestLimiter, player models.BasicPlayerRow) (models.BattlelogIngest, error) {
+func (s *battlelogTrackerTargetStore) Remove(context.Context, ...string) error {
+	return nil
+}
+
+func (s *battlelogTrackerTargetStore) Commit(ctx context.Context) error {
+	err := s.store.CommitTargetBatch(ctx, s.batch)
+	s.batch = battlelogTargetBatch{}
+	return err
+}
+
+func encodeBattlelogTarget(player models.BasicPlayerRow) clashtracker.Target {
+	raw, _ := json.Marshal(player)
+	return clashtracker.Target{Key: player.Tag, Value: string(raw)}
+}
+
+func decodeBattlelogTarget(target clashtracker.Target) (models.BasicPlayerRow, error) {
+	var player models.BasicPlayerRow
+	if err := json.Unmarshal([]byte(target.Value), &player); err != nil {
+		return models.BasicPlayerRow{}, err
+	}
+	if player.Tag == "" {
+		player.Tag = target.Key
+	}
+	return player, nil
+}
+
+func (s battlelogTrackerStore) Load(context.Context, string) (models.BattlelogIngest, bool, error) {
+	return models.BattlelogIngest{}, false, nil
+}
+
+func (s battlelogTrackerStore) Store(ctx context.Context, _ string, ingest models.BattlelogIngest, _ time.Duration) error {
+	return s.d.store(ctx, s.app, ingest)
+}
+
+func (s battlelogTrackerStore) LoadBatch(context.Context, []string) (map[string]clashtracker.Snapshot[models.BattlelogIngest], error) {
+	return map[string]clashtracker.Snapshot[models.BattlelogIngest]{}, nil
+}
+
+func (s battlelogTrackerStore) StoreBatch(ctx context.Context, values []clashtracker.StoredSnapshot[models.BattlelogIngest]) error {
+	start := time.Now()
+	for _, value := range values {
+		if err := s.d.store(ctx, s.app, value.Value); err != nil {
+			return err
+		}
+	}
+	if s.targets != nil {
+		if err := s.targets.Commit(ctx); err != nil {
+			return err
+		}
+	}
+	if s.targetSet != nil {
+		if err := s.targetSet.Refresh(ctx); err != nil {
+			return err
+		}
+	}
+	s.app.Stats.SetReady(battlelogsDomainName, true, "")
+	s.app.Stats.RecordProcess(battlelogsDomainName, time.Since(start))
+	return nil
+}
+
+func (d *battlelogsDomain) do(ctx context.Context, app *platform.App, player models.BasicPlayerRow) (models.BattlelogIngest, error) {
 	ctx, span := platform.StartSpan(ctx, "battlelogs.do",
 		attribute.String("domain", battlelogsDomainName),
 		attribute.String("operation", "do"),
 	)
 	defer span.End()
 
-	entries, err := d.fetchBattleLog(ctx, app, limiter, player.Tag)
+	entries, err := d.fetchBattleLog(ctx, app, player.Tag)
 	if err != nil {
 		platform.RecordSpanError(span, err)
 		span.SetAttributes(attribute.Int("rows.count", len(entries)), platform.SpanErrorStatus(err))
@@ -242,44 +312,28 @@ func (d *battlelogsDomain) do(ctx context.Context, app *platform.App, limiter *p
 		return ingest, nil
 	}
 	sort.Slice(newEntries, func(i, j int) bool {
-		if newEntries[i].Timestamp.Equal(newEntries[j].Timestamp) {
+		leftTime := battlelogEntryTimestamp(newEntries[i])
+		rightTime := battlelogEntryTimestamp(newEntries[j])
+		if leftTime.Equal(rightTime) {
 			return newEntries[i].OpponentPlayerTag < newEntries[j].OpponentPlayerTag
 		}
-		return newEntries[i].Timestamp.Before(newEntries[j].Timestamp)
+		return leftTime.Before(rightTime)
 	})
 
-	opponentTags := opponentTagsFromEntries(newEntries)
-	opponents, err := d.loadBasicPlayers(ctx, opponentTags)
-	if err != nil {
-		platform.RecordSpanError(span, err)
-		span.SetAttributes(platform.SpanErrorStatus(err))
-		return models.BattlelogIngest{}, err
-	}
-	if opponents == nil {
-		opponents = make(map[string]models.BasicPlayerRow)
-	}
 	rows := make([]models.BattlelogRow, 0, len(newEntries))
 	var checkpointTime time.Time
 	for _, entry := range newEntries {
-		opponent, ok := opponents[entry.OpponentPlayerTag]
-		if entry.OpponentPlayerTag != "" && (!ok || opponent.TownHall == 0) {
-			// Battlelog rows need defender TH for analytics; fetch missing opponents lazily.
-			player, fetchErr := d.fetchPlayer(ctx, app, limiter, entry.OpponentPlayerTag, "opponent_metadata")
-			if fetchErr == nil && player != nil {
-				opponent = basicPlayerFromPlayer(player)
-				opponents[opponent.Tag] = opponent
-				players[opponent.Tag] = opponent
-				ok = true
-			}
-		}
-		if !ok || opponent.TownHall <= 0 {
-			// Do not checkpoint past a gap; later rows will be retried once this
-			// opponent can be resolved.
+		timestamp := battlelogEntryTimestamp(entry)
+		opponent := basicPlayerFromBattlelogOpponent(entry)
+		if timestamp.IsZero() || opponent.Tag == "" || opponent.Name == "" || opponent.TownHall <= 0 {
+			// Do not checkpoint past incomplete rows; later polls can retry after
+			// the API returns the required battle timestamp and opponent metadata.
 			break
 		}
+		players[opponent.Tag] = opponent
 		rows = append(rows, battlelogRowFromEntry(player.Tag, players[player.Tag], entry, opponent))
-		if entry.Timestamp.After(checkpointTime) {
-			checkpointTime = entry.Timestamp.UTC()
+		if timestamp.After(checkpointTime) {
+			checkpointTime = timestamp.UTC()
 		}
 	}
 
@@ -323,55 +377,18 @@ func (d *battlelogsDomain) store(ctx context.Context, app *platform.App, ingest 
 	return nil
 }
 
-func (d *battlelogsDomain) fetchBattleLog(ctx context.Context, app *platform.App, limiter *platform.RequestLimiter, tag string) ([]clashy.BattleLogEntry, error) {
+func (d *battlelogsDomain) fetchBattleLog(ctx context.Context, app *platform.App, tag string) ([]clashy.BattleLogEntry, error) {
 	start := time.Now()
 	fetchCtx, fetchSpan := platform.StartSpan(ctx, "clash.fetch",
 		attribute.String("domain", battlelogsDomainName),
 		attribute.String("operation", "battlelog"),
 	)
-	release, err := limiter.Acquire(fetchCtx)
-	if err != nil {
-		platform.RecordSpanError(fetchSpan, err)
-		fetchSpan.SetAttributes(platform.SpanErrorStatus(err))
-		fetchSpan.End()
-		return nil, err
-	}
 	entries, err := app.Clash.GetBattleLog(fetchCtx, tag)
-	release()
 	platform.RecordSpanError(fetchSpan, err)
 	fetchSpan.SetAttributes(platform.SpanErrorStatus(err))
 	fetchSpan.End()
 	app.Stats.RecordRequest(battlelogsDomainName, time.Since(start), err)
 	return entries, err
-}
-
-func (d *battlelogsDomain) fetchPlayer(ctx context.Context, app *platform.App, limiter *platform.RequestLimiter, tag string, operation string) (*clashy.Player, error) {
-	start := time.Now()
-	fetchCtx, fetchSpan := platform.StartSpan(ctx, "clash.fetch",
-		attribute.String("domain", battlelogsDomainName),
-		attribute.String("operation", operation),
-	)
-	release, err := limiter.Acquire(fetchCtx)
-	if err != nil {
-		platform.RecordSpanError(fetchSpan, err)
-		fetchSpan.SetAttributes(platform.SpanErrorStatus(err))
-		fetchSpan.End()
-		return nil, err
-	}
-	player, err := app.Clash.GetPlayer(fetchCtx, tag)
-	release()
-	platform.RecordSpanError(fetchSpan, err)
-	fetchSpan.SetAttributes(platform.SpanErrorStatus(err))
-	fetchSpan.End()
-	app.Stats.RecordRequest(battlelogsDomainName, time.Since(start), err)
-	return player, err
-}
-
-func (d *battlelogsDomain) loadBasicPlayers(ctx context.Context, tags []string) (map[string]models.BasicPlayerRow, error) {
-	if d.sink == nil {
-		return map[string]models.BasicPlayerRow{}, nil
-	}
-	return d.sink.LoadBasicPlayers(ctx, tags)
 }
 
 func (d *battlelogsDomain) loadBattlelogCheckpoint(ctx context.Context, tag string) (models.BattlelogCheckpoint, error) {
@@ -390,33 +407,12 @@ func basicPlayersFromMap(values map[string]models.BasicPlayerRow) []models.Basic
 	return players
 }
 
-func basicPlayerFromPlayer(player *clashy.Player) models.BasicPlayerRow {
-	if player == nil {
-		return models.BasicPlayerRow{}
-	}
+func basicPlayerFromBattlelogOpponent(entry clashy.BattleLogEntry) models.BasicPlayerRow {
 	return models.BasicPlayerRow{
-		Tag:      player.Tag,
-		Name:     player.Name,
-		LeagueID: player.LeagueTier.ID,
-		TownHall: player.TownHall,
+		Tag:      entry.OpponentPlayerTag,
+		Name:     entry.OpponentName,
+		TownHall: entry.OpponentTownHallLevel,
 	}
-}
-
-func opponentTagsFromEntries(entries []clashy.BattleLogEntry) []string {
-	seen := make(map[string]struct{}, len(entries))
-	tags := make([]string, 0, len(entries))
-	for _, entry := range entries {
-		if entry.OpponentPlayerTag == "" {
-			continue
-		}
-		if _, ok := seen[entry.OpponentPlayerTag]; ok {
-			continue
-		}
-		seen[entry.OpponentPlayerTag] = struct{}{}
-		tags = append(tags, entry.OpponentPlayerTag)
-	}
-	sort.Strings(tags)
-	return tags
 }
 
 func newTimescaleBattlelogStore(ctx context.Context, dsn string, rollupFlushAttacks int, client valkey.Client) (*timescaleBattlelogStore, error) {
@@ -654,43 +650,6 @@ func (s *timescaleBattlelogStore) insertBattlelogRows(ctx context.Context, tx pg
 	platform.RecordSpanError(span, err)
 	span.SetAttributes(attribute.Int("rows.inserted", len(inserted)), platform.SpanErrorStatus(err))
 	return inserted, err
-}
-
-func (s *timescaleBattlelogStore) LoadBasicPlayers(ctx context.Context, tags []string) (map[string]models.BasicPlayerRow, error) {
-	out := make(map[string]models.BasicPlayerRow)
-	if len(tags) == 0 {
-		return out, nil
-	}
-	ctx, span := platform.StartSpan(ctx, "timescale.basic_player.load",
-		attribute.String("domain", battlelogsDomainName),
-		attribute.String("operation", "load_basic_players"),
-		attribute.Int("target.count", len(tags)),
-	)
-	defer span.End()
-	rows, err := s.pool.Query(ctx, `
-		SELECT tag, name, COALESCE(league_id, 0), townhall_level
-		FROM basic_player
-		WHERE tag = ANY($1)
-	`, tags)
-	if err != nil {
-		platform.RecordSpanError(span, err)
-		span.SetAttributes(platform.SpanErrorStatus(err))
-		return nil, err
-	}
-	defer rows.Close()
-	for rows.Next() {
-		var row models.BasicPlayerRow
-		if err := rows.Scan(&row.Tag, &row.Name, &row.LeagueID, &row.TownHall); err != nil {
-			platform.RecordSpanError(span, err)
-			span.SetAttributes(platform.SpanErrorStatus(err))
-			return nil, err
-		}
-		out[row.Tag] = row
-	}
-	err = rows.Err()
-	platform.RecordSpanError(span, err)
-	span.SetAttributes(attribute.Int("rows.count", len(out)), platform.SpanErrorStatus(err))
-	return out, err
 }
 
 func (s *timescaleBattlelogStore) bufferItemRollups(ctx context.Context, rows []models.BattlelogRow) error {
@@ -1031,7 +990,8 @@ func battlelogCheckpointKey(tag string) string {
 func entriesAfterTimestamp(entries []clashy.BattleLogEntry, after time.Time) []clashy.BattleLogEntry {
 	out := make([]clashy.BattleLogEntry, 0, len(entries))
 	for _, entry := range entries {
-		if entry.Timestamp.After(after) {
+		timestamp := battlelogEntryTimestamp(entry)
+		if !timestamp.IsZero() && timestamp.After(after) {
 			out = append(out, entry)
 		}
 	}
@@ -1041,16 +1001,29 @@ func entriesAfterTimestamp(entries []clashy.BattleLogEntry, after time.Time) []c
 func latestBattlelogTimestamp(entries []clashy.BattleLogEntry) time.Time {
 	var latest time.Time
 	for _, entry := range entries {
-		if entry.Timestamp.After(latest) {
-			latest = entry.Timestamp
+		timestamp := battlelogEntryTimestamp(entry)
+		if timestamp.After(latest) {
+			latest = timestamp
 		}
 	}
 	return latest.UTC()
 }
 
+func battlelogEntryTimestamp(entry clashy.BattleLogEntry) time.Time {
+	if entry.Timestamp == "" {
+		return time.Time{}
+	}
+	timestamp, err := clashy.FromTimestamp(entry.Timestamp)
+	if err != nil {
+		return time.Time{}
+	}
+	return timestamp.UTC()
+}
+
 func battlelogRowFromEntry(playerTag string, player models.BasicPlayerRow, entry clashy.BattleLogEntry, opponent models.BasicPlayerRow) models.BattlelogRow {
 	gold, elixir, darkElixir := lootedResourceColumns(entry.LootedResources)
 	armyColumns := parseArmyColumns(entry.ArmyShareCode)
+	timestamp := battlelogEntryTimestamp(entry)
 	return models.BattlelogRow{
 		BattleID:              battlelogBattleID(playerTag, entry),
 		ArmyHash:              armyHash(armyColumns),
@@ -1059,24 +1032,25 @@ func battlelogRowFromEntry(playerTag string, player models.BasicPlayerRow, entry
 		OpponentTag:           entry.OpponentPlayerTag,
 		OpponentTH:            uint8(opponent.TownHall),
 		LeagueID:              uint32(player.LeagueID),
-		BattleType:            entry.BattleType,
+		BattleType:            string(entry.BattleType),
 		Attack:                entry.Attack,
 		Stars:                 uint8(entry.Stars),
 		DestructionPercentage: uint8(entry.DestructionPercentage),
 		Gold:                  uint32(gold),
 		Elixir:                uint32(elixir),
 		DarkElixir:            uint32(darkElixir),
-		Timestamp:             entry.Timestamp.UTC(),
+		Timestamp:             timestamp,
 		ArmyColumns:           armyColumns,
 	}
 }
 
 func battlelogBattleID(playerTag string, entry clashy.BattleLogEntry) uuid.UUID {
+	timestamp := battlelogEntryTimestamp(entry)
 	key := strings.Join([]string{
 		playerTag,
 		entry.OpponentPlayerTag,
-		entry.Timestamp.UTC().Format(time.RFC3339Nano),
-		entry.BattleType,
+		timestamp.Format(time.RFC3339Nano),
+		string(entry.BattleType),
 		strconv.FormatBool(entry.Attack),
 	}, "|")
 	return uuid.NewSHA1(uuid.NameSpaceOID, []byte(key))

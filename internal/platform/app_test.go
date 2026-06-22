@@ -29,3 +29,24 @@ func TestNewSkipsClashClientForNonClashDomains(t *testing.T) {
 		t.Fatal("expected Clash client to be nil when no Clash-backed domains are enabled")
 	}
 }
+
+func TestProxyConnectionLimitUsesLargestRequestRate(t *testing.T) {
+	cfg := Config{
+		GlobalClanPriorityRequestsPerSecond:    950,
+		GlobalClanNonPriorityRequestsPerSecond: 50,
+		BattlelogRequestsPerSecond:             10,
+		WarRequestsPerSecond:                   950,
+		BotClanRequestsPerSecond:               950,
+		BotPlayerRequestsPerSecond:             950,
+	}
+
+	if got, want := proxyConnectionLimit(cfg), 3000; got != want {
+		t.Fatalf("proxyConnectionLimit = %d, want %d", got, want)
+	}
+}
+
+func TestProxyConnectionLimitFallsBackWhenRatesMissing(t *testing.T) {
+	if got, want := proxyConnectionLimit(Config{}), 100; got != want {
+		t.Fatalf("proxyConnectionLimit = %d, want %d", got, want)
+	}
+}

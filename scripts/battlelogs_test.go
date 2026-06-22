@@ -104,9 +104,9 @@ func TestEntriesAfterTimestamp(t *testing.T) {
 	old := time.Date(2026, 5, 20, 10, 0, 0, 0, time.UTC)
 	cutoff := old.Add(2 * time.Hour)
 	entries := []clashy.BattleLogEntry{
-		{OpponentPlayerTag: "#AAA", Stars: 3, ArmyShareCode: "u1x0", Timestamp: old.Add(3 * time.Hour)},
-		{OpponentPlayerTag: "#BBB", Stars: 2, ArmyShareCode: "u1x1", Timestamp: old.Add(time.Hour)},
-		{OpponentPlayerTag: "#CCC", Stars: 1, ArmyShareCode: "u1x2", Timestamp: old},
+		{OpponentPlayerTag: "#AAA", Stars: 3, ArmyShareCode: "u1x0", Timestamp: clashTimestamp(old.Add(3 * time.Hour))},
+		{OpponentPlayerTag: "#BBB", Stars: 2, ArmyShareCode: "u1x1", Timestamp: clashTimestamp(old.Add(time.Hour))},
+		{OpponentPlayerTag: "#CCC", Stars: 1, ArmyShareCode: "u1x2", Timestamp: clashTimestamp(old)},
 	}
 	got := entriesAfterTimestamp(entries, cutoff)
 	if len(got) != 1 || got[0].OpponentPlayerTag != "#AAA" {
@@ -265,10 +265,6 @@ func (s *fakeBattlelogStore) CommitTargetBatch(context.Context, battlelogTargetB
 	return nil
 }
 
-func (s *fakeBattlelogStore) LoadBasicPlayers(context.Context, []string) (map[string]models.BasicPlayerRow, error) {
-	return nil, nil
-}
-
 func (s *fakeBattlelogStore) Store(_ context.Context, ingest models.BattlelogIngest) error {
 	s.ingest = ingest
 	s.calls++
@@ -281,8 +277,7 @@ func TestBattlelogsStorePersistsRowsAndNames(t *testing.T) {
 	sink := &fakeBattlelogStore{}
 	domain := &battlelogsDomain{sink: sink}
 	app := &platform.App{
-		Config: platform.Config{RunOnce: true},
-		Stats:  platform.NewTracker(),
+		Stats: platform.NewTracker(),
 	}
 	ingest := models.BattlelogIngest{
 		Rows:        []models.BattlelogRow{{PlayerTag: "#PLAYER"}},
@@ -307,4 +302,8 @@ func TestBasicPlayerUpsertSQLSkipsUnchangedProfiles(t *testing.T) {
 	if strings.Contains(utils.UpsertBasicPlayerSQL, "last_updated") || strings.Contains(utils.UpsertBasicPlayerSQL, "last_activity") {
 		t.Fatalf("basic player upsert should not touch activity columns: %s", utils.UpsertBasicPlayerSQL)
 	}
+}
+
+func clashTimestamp(value time.Time) string {
+	return value.UTC().Format("20060102T150405.000Z")
 }

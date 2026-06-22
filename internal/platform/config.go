@@ -61,7 +61,6 @@ type Config struct {
 	MobilePushFCMBearerToken               string
 	MobilePushFCMProjectID                 string
 	MobilePushTokenKey                     string
-	RunOnce                                bool
 	DryRun                                 bool
 	MockDB                                 bool
 	OTELEnabled                            bool
@@ -101,7 +100,6 @@ type jsonConfig struct {
 	GRPCAddr             string                `json:"grpc_addr"`
 	ProxyURL             string                `json:"proxy_url"`
 	ValkeyAddr           string                `json:"valkey_addr"`
-	RunOnce              bool                  `json:"run_once"`
 	DryRun               bool                  `json:"dry_run"`
 	MockDB               bool                  `json:"mock_db"`
 	TargetPageMultiplier int                   `json:"target_page_multiplier"`
@@ -194,7 +192,6 @@ func loadConfigFile(path string) (Config, error) {
 		GRPCAddr:                               file.GRPCAddr,
 		ProxyURL:                               file.ProxyURL,
 		ValkeyAddr:                             file.ValkeyAddr,
-		RunOnce:                                file.RunOnce,
 		DryRun:                                 file.DryRun,
 		MockDB:                                 file.MockDB,
 		TargetPageMultiplier:                   file.TargetPageMultiplier,

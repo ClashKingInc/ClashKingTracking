@@ -3,10 +3,7 @@
 package scripts
 
 import (
-	"context"
-	"errors"
 	"reflect"
-	"sync/atomic"
 	"testing"
 	"time"
 
@@ -122,160 +119,6 @@ func TestRaidMissingMembersUsesClanSnapshot(t *testing.T) {
 	}
 }
 
-type trackerTestValue struct {
-	Tag   string `json:"tag"`
-	Score int    `json:"score"`
-}
-
-type TargetSourceFunc func(context.Context) ([]string, error)
-
-func (f TargetSourceFunc) Targets(ctx context.Context) ([]string, error) {
-	return f(ctx)
-}
-
-func TestChunkStrings(t *testing.T) {
-	chunks := chunkStrings([]string{"a", "b", "c", "d", "e"}, 2)
-	if len(chunks) != 3 || len(chunks[0]) != 2 || len(chunks[2]) != 1 {
-		t.Fatalf("unexpected chunks: %#v", chunks)
-	}
-}
-
-func TestCycleRunnerRunOnceProcessesTargets(t *testing.T) {
-	var processed atomic.Int32
-	runner := CycleRunner[trackerTestValue]{
-		App:    botClansTestApp(),
-		Domain: "test",
-		Groups: []CycleGroup[trackerTestValue]{{
-			Name: "values", Kind: "value",
-			Source: TargetSourceFunc(func(context.Context) ([]string, error) {
-				return []string{"#AAA", "#BBB"}, nil
-			}),
-			Fetch: func(_ context.Context, tag string) (*trackerTestValue, int, error) {
-				return &trackerTestValue{Tag: tag, Score: 1}, 0, nil
-			},
-			Processor: BatchProcessorFunc[trackerTestValue](func(_ context.Context, _ *platform.App, item TrackedItem[trackerTestValue]) error {
-				if item.Current == nil || item.Tag == "" {
-					t.Fatalf("missing current item: %#v", item)
-				}
-				processed.Add(1)
-				return nil
-			}),
-			BatchSize: 10,
-			RateLimit: 2,
-		}},
-	}
-	if err := runner.Run(context.Background()); err != nil {
-		t.Fatalf("Run returned error: %v", err)
-	}
-	if processed.Load() != 2 {
-		t.Fatalf("expected two processed items, got %d", processed.Load())
-	}
-}
-
-func TestCycleRunnerRunOnceCanBeCalledRepeatedly(t *testing.T) {
-	var processed atomic.Int32
-	app := botClansTestApp()
-	runner := CycleRunner[trackerTestValue]{
-		App:    app,
-		Domain: "test",
-		Groups: []CycleGroup[trackerTestValue]{{
-			Name: "values", Kind: "value",
-			Source: TargetSourceFunc(func(context.Context) ([]string, error) {
-				return []string{"#AAA"}, nil
-			}),
-			Fetch: func(_ context.Context, tag string) (*trackerTestValue, int, error) {
-				return &trackerTestValue{Tag: tag, Score: 1}, 0, nil
-			},
-			Processor: BatchProcessorFunc[trackerTestValue](func(context.Context, *platform.App, TrackedItem[trackerTestValue]) error {
-				processed.Add(1)
-				return nil
-			}),
-			BatchSize: 1,
-			RateLimit: 1,
-		}},
-	}
-	if err := runner.Run(context.Background()); err != nil {
-		t.Fatalf("first run: %v", err)
-	}
-	if err := runner.Run(context.Background()); err != nil {
-		t.Fatalf("second run: %v", err)
-	}
-	if processed.Load() != 2 {
-		t.Fatalf("expected each run-once invocation to process, got %d calls", processed.Load())
-	}
-}
-
-func TestCycleRunnerHonorsRateLimit(t *testing.T) {
-	var current atomic.Int32
-	var maxSeen atomic.Int32
-	runner := CycleRunner[trackerTestValue]{
-		App:    botClansTestApp(),
-		Domain: "test",
-		Groups: []CycleGroup[trackerTestValue]{{
-			Name: "values", Kind: "value",
-			Source: TargetSourceFunc(func(context.Context) ([]string, error) {
-				return []string{"#A", "#B", "#C", "#D"}, nil
-			}),
-			Fetch: func(_ context.Context, tag string) (*trackerTestValue, int, error) {
-				now := current.Add(1)
-				for {
-					old := maxSeen.Load()
-					if now <= old || maxSeen.CompareAndSwap(old, now) {
-						break
-					}
-				}
-				time.Sleep(10 * time.Millisecond)
-				current.Add(-1)
-				return &trackerTestValue{Tag: tag}, 0, nil
-			},
-			Processor: BatchProcessorFunc[trackerTestValue](func(context.Context, *platform.App, TrackedItem[trackerTestValue]) error {
-				return nil
-			}),
-			BatchSize: 4,
-			RateLimit: 2,
-		}},
-	}
-	if err := runner.Run(context.Background()); err != nil {
-		t.Fatalf("Run returned error: %v", err)
-	}
-	if maxSeen.Load() > 2 {
-		t.Fatalf("expected max concurrency <= 2, got %d", maxSeen.Load())
-	}
-}
-
-func TestCycleRunnerFetchErrorMarksDomainUnhealthy(t *testing.T) {
-	app := botClansTestApp()
-	runner := CycleRunner[trackerTestValue]{
-		App:    app,
-		Domain: "test",
-		Groups: []CycleGroup[trackerTestValue]{{
-			Name: "values", Kind: "value",
-			Source: TargetSourceFunc(func(context.Context) ([]string, error) {
-				return []string{"#AAA"}, nil
-			}),
-			Fetch: func(context.Context, string) (*trackerTestValue, int, error) {
-				return nil, 0, errors.New("maintenance")
-			},
-			Processor: BatchProcessorFunc[trackerTestValue](func(context.Context, *platform.App, TrackedItem[trackerTestValue]) error {
-				t.Fatal("processor should not run after fetch error")
-				return nil
-			}),
-			BatchSize: 1,
-			RateLimit: 1,
-		}},
-	}
-	if err := runner.Run(context.Background()); err != nil {
-		t.Fatalf("Run returned error: %v", err)
-	}
-	stats := app.Stats.Domain("test")
-	if stats.Healthy {
-		t.Fatalf("expected domain to be unhealthy after fetch error")
-	}
-	if stats.LastError != "maintenance" {
-		t.Fatalf("unexpected last error: %q", stats.LastError)
-	}
-}
-
 func TestParseReminderHours(t *testing.T) {
 	got, err := parseReminderHours("1.5hr")
 	if err != nil {
@@ -292,7 +135,6 @@ func TestParseReminderHours(t *testing.T) {
 func botClansTestApp() *platform.App {
 	return &platform.App{
 		Config: platform.Config{
-			RunOnce:                  true,
 			BotClanRequestsPerSecond: 950,
 			BotClanSnapshotPrefix:    "botclans:test:",
 			BotClanCWLStateSnapshot:  "cwlstate",

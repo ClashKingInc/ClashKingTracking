@@ -10,6 +10,7 @@ type BasicPlayerRow struct {
 	Tag      string
 	Name     string
 	LeagueID int
+	ClanTag  string
 	TownHall int
 }
 

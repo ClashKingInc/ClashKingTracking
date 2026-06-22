@@ -66,11 +66,14 @@ func New(ctx context.Context, cfg Config) (*App, error) {
 	stats := NewTracker()
 	var clashClient *clashy.Client
 	if needsClashClient(cfg) {
-		clashClient, err = clashy.NewClient(clashy.ClientConfig{
-			BaseURL:     cfg.ProxyURL,
-			LookupCache: false,
-			UpdateCache: false,
-		})
+		proxyLimit := proxyConnectionLimit(cfg)
+		clashConfig := clashy.DefaultClientConfig()
+		clashConfig.BaseURL = cfg.ProxyURL
+		clashConfig.ThrottleLimit = proxyLimit
+		clashConfig.LookupCache = false
+		clashConfig.UpdateCache = false
+		clashConfig.MaxBaseURLConns = proxyLimit
+		clashClient, err = clashy.NewClient(clashConfig)
 		if err != nil {
 			if valkeyClient != nil {
 				valkeyClient.Close()
@@ -188,6 +191,20 @@ func newStore(ctx context.Context, cfg Config) (Store, error) {
 		return NewMockStore(), nil
 	}
 	return NewMongoStore(ctx, cfg.StatsMongoURI, cfg.StaticMongoURI)
+}
+
+func proxyConnectionLimit(cfg Config) int {
+	rate := max(
+		cfg.GlobalClanPriorityRequestsPerSecond+cfg.GlobalClanNonPriorityRequestsPerSecond,
+		cfg.BattlelogRequestsPerSecond,
+		cfg.WarRequestsPerSecond,
+		cfg.BotClanRequestsPerSecond,
+		cfg.BotPlayerRequestsPerSecond,
+	)
+	if rate <= 0 {
+		return 100
+	}
+	return rate * 3
 }
 
 func needsClashClient(cfg Config) bool {
