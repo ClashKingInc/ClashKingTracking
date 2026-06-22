@@ -261,7 +261,7 @@ dependencies = [
     { name = "apscheduler" },
     { name = "asyncio-throttle" },
     { name = "asyncpraw" },
-    { name = "coc-py" },
+    { name = "clashy-py" },
     { name = "expiring-dict" },
     { name = "fastapi" },
     { name = "hashids" },
@@ -298,7 +298,7 @@ requires-dist = [
     { name = "asyncio-throttle" },
     { name = "asyncpraw" },
     { name = "black", marker = "extra == 'dev'" },
-    { name = "coc-py", git = "https://github.com/ClashKingInc/coc.py.git?rev=master" },
+    { name = "clashy-py", specifier = "==26.6.0" },
     { name = "expiring-dict" },
     { name = "fastapi" },
     { name = "flake8", marker = "extra == 'dev'" },
@@ -324,6 +324,20 @@ requires-dist = [
 provides-extras = ["dev"]
 
 [[package]]
+name = "clashy-py"
+version = "26.6.0"
+source = { registry = "https://pypi.org/simple" }
+dependencies = [
+    { name = "aiohttp" },
+    { name = "orjson" },
+    { name = "pendulum" },
+]
+sdist = { url = "https://files.pythonhosted.org/packages/ee/a8/60d7378c13fcb26333ddef8c04da7e8b131887e70b887b8e35bb729f666e/clashy_py-26.6.0.tar.gz", hash = "sha256:352b1a6d324cd9b9ff3d27267f8dff83c4dba3c014b33ff7febf7b8a0efe40a0", size = 1192305, upload-time = "2026-06-13T05:53:52.949Z" }
+wheels = [
+    { url = "https://files.pythonhosted.org/packages/25/75/7548487a22c35a2d9f5d11b4e1c5fab315bf21a21228503062e6fdd479d4/clashy_py-26.6.0-py3-none-any.whl", hash = "sha256:f1dfacbb110c7c7a5de36f1129255c311dbf03ad723cdc7ce5a72d46a52f141f", size = 1235485, upload-time = "2026-06-13T05:53:51.393Z" },
+]
+
+[[package]]
 name = "click"
 version = "8.3.0"
 source = { registry = "https://pypi.org/simple" }
@@ -333,15 +347,6 @@ dependencies = [
 sdist = { url = "https://files.pythonhosted.org/packages/46/61/de6cd827efad202d7057d93e0fed9294b96952e188f7384832791c7b2254/click-8.3.0.tar.gz", hash = "sha256:e7b8232224eba16f4ebe410c25ced9f7875cb5f3263ffc93cc3e8da705e229c4", size = 276943, upload-time = "2025-09-18T17:32:23.696Z" }
 wheels = [
     { url = "https://files.pythonhosted.org/packages/db/d3/9dcc0f5797f070ec8edf30fbadfb200e71d9db6b84d211e3b2085a7589a0/click-8.3.0-py3-none-any.whl", hash = "sha256:9b9f285302c6e3064f4330c05f05b81945b2a39544279343e6e7c5f27a9baddc", size = 107295, upload-time = "2025-09-18T17:32:22.42Z" },
-]
-
-[[package]]
-name = "coc-py"
-version = "3.9.1"
-source = { git = "https://github.com/ClashKingInc/coc.py.git?rev=master#9964244faea943441635f0f4b0de2a4648a85b99" }
-dependencies = [
-    { name = "aiohttp" },
-    { name = "orjson" },
 ]
 
 [[package]]

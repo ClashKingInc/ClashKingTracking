@@ -10,7 +10,7 @@ dependencies = [
     "APScheduler",
     "asyncio-throttle",
     "asyncpraw",
-    "coc-py @ git+https://github.com/ClashKingInc/coc.py.git@master",
+    "clashy-py==26.6.0",
     "expiring-dict",
     "fastapi",
     "hashids",
@@ -62,5 +62,4 @@ docstring-code-format     = false
 quote-style               = "preserve"
 indent-style              = "space"
 skip-magic-trailing-comma = true
-
 
