@@ -140,23 +140,23 @@ class ScheduledTracking(Tracking):
             pipeline = await self.async_mongo.all_clans.aggregate(pipeline=pipeline)
             pipeline = await pipeline.to_list(length=None)
             all_tags = [x["_id"] for x in pipeline]
-            print(len(all_tags), "clans to find")
+            self.logger.info(f"{len(all_tags)} clans to find")
             pipeline = [
                 {"$match": {"$and": [self._late_cwl_season_match(season), {"data.state": "ended"}]}},
                 {"$group": {"_id": "$data.clans.tag"}},
             ]
             pipeline = await self.async_mongo.cwl_group.aggregate(pipeline=pipeline)
             pipeline = await pipeline.to_list(length=None)
-            print(len(pipeline), "cwl_groups done")
+            self.logger.info(f"{len(pipeline)} cwl_groups done")
             done_for_this_season = [x["_id"] for x in pipeline]
             done_for_this_season = set([j for sub in done_for_this_season for j in sub])
 
             all_tags = [tag for tag in all_tags if tag not in done_for_this_season]
-            print(len(all_tags), "groups to find")
+            self.logger.info(f"{len(all_tags)} CWL groups to find")
 
             tag_batches = self._split_into_batch(items=all_tags)
             was_found_in_a_previous_group = set()
-            print(f"Processing {len(tag_batches)} batches")
+            self.logger.info(f"Processing {len(tag_batches)} CWL group batches")
             for tag_group in tag_batches:
                 tasks = []
                 for tag in tag_group:
@@ -172,7 +172,7 @@ class ScheduledTracking(Tracking):
                 responses = await self._run_tasks(tasks=tasks, return_exceptions=True, wrapped=True)
 
                 changes = []
-                print(f"Processing {len(tag_group)} tags")
+                self.logger.info(f"Processing {len(tag_group)} CWL group tags")
                 for response in responses:
                     if not isinstance(response, tuple):
                         continue

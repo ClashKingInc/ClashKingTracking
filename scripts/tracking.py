@@ -64,8 +64,7 @@ class Tracking:
         self.aredis_decoded = await self.config.get_redis_client(decode_responses=True, sync=False)
 
         self.coc_client = self.config.coc_client
-        self.proxy_url = "http://localhost:8011/v1"
-        #self.proxy_url = self.config.proxy_url
+        self.proxy_url = self.config.proxy_url
         self.kafka = self.config.get_kafka_producer()
 
         connector = aiohttp.TCPConnector(limit=1200, ttl_dns_cache=300)
