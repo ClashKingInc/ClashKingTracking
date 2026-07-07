@@ -23,23 +23,16 @@ class ScheduledTracking(Tracking):
         super().__init__(batch_size=50_000)
 
     @staticmethod
-    def _late_cwl_season_match(month_season: str, field: str = "data.season") -> dict:
-        next_month = pend.parse(f"{month_season}-01").add(months=1).format("YYYY-MM")
-        return {field: {"$gte": f"{month_season}-16", "$lt": f"{next_month}-01"}}
-
-    @staticmethod
-    def _is_late_cwl_season(season: str | None) -> bool:
+    def _is_cwl_season(season: str | None) -> bool:
         if not season:
             return False
-        parts = season.split("-")
-        if len(parts) != 3:
-            return False
-        month_season = "-".join(parts[:2])
+        now = pend.now(tz=pend.UTC)
+        current_month = now.format("YYYY-MM")
         try:
-            next_month = pend.parse(f"{month_season}-01").add(months=1).format("YYYY-MM")
+            season_date = pend.from_format(season, "YYYY-MM-DD", tz=pend.UTC)
         except ValueError:
             return False
-        return f"{month_season}-16" <= season < f"{next_month}-01"
+        return season_date.format("YYYY-MM") == current_month and 1 <= season_date.day <= 16
 
     async def store_cwl_wars(self):
         """
@@ -47,9 +40,10 @@ class ScheduledTracking(Tracking):
         """
         try:
             hashids = Hashids(min_length=7)
-            season = gen_games_season()
+            season = pend.now(tz=pend.UTC).format("YYYY-MM")
+            cwl_season_match = {"data.season": {"$gte": f"{season}-01", "$lt": f"{season}-17"}}
             pipeline = [
-                {"$match": self._late_cwl_season_match(season)},
+                {"$match": cwl_season_match},
                 {"$unwind": "$data.rounds"},
                 {"$unwind": "$data.rounds.warTags"},
                 {"$match": {"data.rounds.warTags": {"$ne": "#0"}}},
@@ -61,7 +55,7 @@ class ScheduledTracking(Tracking):
             all_tags = set(war_tag_to_season)
             self.logger.info(f"{len(all_tags)} war tags total")
 
-            pipeline = [{"$match": self._late_cwl_season_match(season)}, {"$group": {"_id": "$data.tag"}}]
+            pipeline = [{"$match": cwl_season_match}, {"$group": {"_id": "$data.tag"}}]
             result = await self.async_mongo.clan_wars.aggregate(pipeline)
             tags_already_found = set([x["_id"] for x in await result.to_list(length=None)])
 
@@ -134,15 +128,15 @@ class ScheduledTracking(Tracking):
         Store Clan War League groups data at scheduled times.
         """
         try:
-            season = gen_games_season()
-
+            season = pend.now(tz=pend.UTC).format("YYYY-MM")
+            cwl_season_match = {"data.season": {"$gte": f"{season}-01", "$lt": f"{season}-17"}}
             pipeline = [{"$match": {}}, {"$group": {"_id": "$tag"}}]
             pipeline = await self.async_mongo.all_clans.aggregate(pipeline=pipeline)
             pipeline = await pipeline.to_list(length=None)
             all_tags = [x["_id"] for x in pipeline]
             self.logger.info(f"{len(all_tags)} clans to find")
             pipeline = [
-                {"$match": {"$and": [self._late_cwl_season_match(season), {"data.state": "ended"}]}},
+                {"$match": {"$and": [cwl_season_match, {"data.state": "ended"}]}},
                 {"$group": {"_id": "$data.clans.tag"}},
             ]
             pipeline = await self.async_mongo.cwl_group.aggregate(pipeline=pipeline)
@@ -179,7 +173,7 @@ class ScheduledTracking(Tracking):
                     response, tag = response
                     try:
                         response_season = response.get("season")
-                        if not self._is_late_cwl_season(response_season):
+                        if not self._is_cwl_season(response_season):
                             continue
                         for clan in response.get("clans", []):
                             was_found_in_a_previous_group.add(clan.get("tag"))
@@ -857,9 +851,9 @@ class ScheduledTracking(Tracking):
 
     async def build_cwl_rankings(self):
         self.logger.info("Building CWL Rankings")
-        season = gen_games_season()
-
-        pipeline = [{"$match": self._late_cwl_season_match(season)}, {"$group": {"_id": "$cwl_id"}}]
+        season = pend.now(tz=pend.UTC).format("YYYY-MM")
+        cwl_season_match = {"data.season": {"$gte": f"{season}-01", "$lt": f"{season}-17"}}
+        pipeline = [{"$match": cwl_season_match}, {"$group": {"_id": "$cwl_id"}}]
         result = await self.async_mongo.cwl_group.aggregate(pipeline)
         result = await result.to_list(length=None)
         all_cwl_ids = [doc["_id"] for doc in result]
@@ -1247,7 +1241,7 @@ class ScheduledTracking(Tracking):
 
         self.scheduler.add_job(
             self.build_cwl_rankings,
-            CronTrigger(day='16-31', hour="*/4", minute=15),
+            CronTrigger(day='1-16', hour="*/4", minute=15),
             name="Build CWL Rankings",
             misfire_grace_time=300,
             max_instances=1,
@@ -1255,14 +1249,14 @@ class ScheduledTracking(Tracking):
 
         self.scheduler.add_job(
             self.store_cwl_wars,
-            CronTrigger(day='16-31', hour="*", minute=5),
+            CronTrigger(day='1-16', hour="*", minute=5),
             name="Store CWL Wars",
             misfire_grace_time=300,
             max_instances=1,
         )
         self.scheduler.add_job(
             self.store_cwl_groups,
-            CronTrigger(day='16-31', hour='*', minute=35),
+            CronTrigger(day='1-16', hour='*', minute=35),
             name="Store CWL Groups",
             misfire_grace_time=300,
         )
