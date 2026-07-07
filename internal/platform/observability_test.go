@@ -17,13 +17,46 @@ func TestTrackerRecordStore(t *testing.T) {
 	if got.StoreRowsRequested != 30 || got.StoreRowsAffected != 23 {
 		t.Fatalf("store rows = requested %d affected %d, want 30/23", got.StoreRowsRequested, got.StoreRowsAffected)
 	}
-	if got.LastStoreRowsRequested != 20 || got.LastStoreRowsAffected != 15 {
-		t.Fatalf("last store rows = requested %d affected %d, want 20/15", got.LastStoreRowsRequested, got.LastStoreRowsAffected)
+	if got.StoreDurationTotal != 400*time.Millisecond {
+		t.Fatalf("StoreDurationTotal = %s, want 400ms", got.StoreDurationTotal)
 	}
-	if got.LastStoreMs != 300 {
-		t.Fatalf("LastStoreMs = %f, want 300", got.LastStoreMs)
+}
+
+func TestTrackerTrackingProgress(t *testing.T) {
+	stats := NewTracker()
+	stats.SetTrackingTargets("battlelogs.targets", 2)
+	stats.RecordTrackedTarget("battlelogs.targets")
+
+	got := stats.Domain("battlelogs.targets")
+	if got.TargetCount != 2 || got.TargetCycle != 1 || got.TargetProcessed != 1 {
+		t.Fatalf("unexpected in-cycle progress: %#v", got)
 	}
-	if got.AvgStoreMs != 200 {
-		t.Fatalf("AvgStoreMs = %f, want 200", got.AvgStoreMs)
+
+	stats.RecordTrackedTarget("battlelogs.targets")
+	got = stats.Domain("battlelogs.targets")
+	if got.TargetCycle != 2 || got.TargetProcessed != 0 {
+		t.Fatalf("unexpected rollover progress: %#v", got)
+	}
+}
+
+func TestTrackerSnapshotIncludesRuntimeAndDomains(t *testing.T) {
+	stats := NewTracker()
+	stats.RecordRequest("wars", 25*time.Millisecond, nil)
+	stats.RecordWrite("wars", 3)
+	stats.SetQueueDepth("wars", 7)
+
+	snapshot := stats.Snapshot()
+	if snapshot.ObservedAt.IsZero() || snapshot.Uptime <= 0 || snapshot.Goroutines <= 0 {
+		t.Fatalf("missing runtime snapshot fields: %#v", snapshot)
+	}
+	if len(snapshot.Domains) != 1 {
+		t.Fatalf("domains len = %d, want 1", len(snapshot.Domains))
+	}
+	got := snapshot.Domains[0]
+	if got.Name != "wars" || got.Requests != 1 || got.Writes != 3 || got.QueueDepth != 7 {
+		t.Fatalf("unexpected domain snapshot: %#v", got)
+	}
+	if got.RequestLatencyTotal != 25*time.Millisecond {
+		t.Fatalf("RequestLatencyTotal = %s, want 25ms", got.RequestLatencyTotal)
 	}
 }

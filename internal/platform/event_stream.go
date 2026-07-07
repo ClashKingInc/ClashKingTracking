@@ -7,7 +7,6 @@ import (
 	"time"
 
 	valkey "github.com/valkey-io/valkey-go"
-	"go.opentelemetry.io/otel/attribute"
 )
 
 // PublishEvent appends domain events to Valkey Streams for the independent events script.
@@ -26,12 +25,6 @@ func AppendEvent(ctx context.Context, client valkey.Client, cfg Config, event Ev
 	if err != nil {
 		return err
 	}
-	ctx, span := StartSpan(ctx, "valkey.events.xadd",
-		attribute.String("operation", "xadd"),
-		attribute.String("domain", "events"),
-	)
-	defer span.End()
-
 	builder := client.B().Xadd().Key(cfg.EventStreamName)
 	var cmd valkey.Completed
 	if cfg.EventStreamRetentionSeconds > 0 {
@@ -52,10 +45,7 @@ func AppendEvent(ctx context.Context, client valkey.Client, cfg Config, event Ev
 			FieldValue("value", string(raw)).
 			Build()
 	}
-	err = client.Do(ctx, cmd).Error()
-	RecordSpanError(span, err)
-	span.SetAttributes(SpanErrorStatus(err))
-	return err
+	return client.Do(ctx, cmd).Error()
 }
 
 func eventStreamMinID(now time.Time, retentionSeconds int) string {

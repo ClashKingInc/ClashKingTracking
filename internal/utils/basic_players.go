@@ -3,26 +3,28 @@ package utils
 import (
 	"context"
 
-	"clashking_tracking/internal/platform"
 	"clashking_tracking/models"
 
 	"github.com/jackc/pgx/v5"
-	"go.opentelemetry.io/otel/attribute"
 )
 
 const UpsertBasicPlayerSQL = `
 	INSERT INTO basic_player (
-		tag, name, league_id, townhall_level
+		tag, name, league_id, clan_tag, townhall_level, trophies
 	)
-	VALUES ($1, $2, NULLIF($3, 0), $4)
+	VALUES ($1, $2, NULLIF($3, 0), $4, $5, $6)
 	ON CONFLICT (tag) DO UPDATE SET
 		name = EXCLUDED.name,
-		league_id = EXCLUDED.league_id,
-		townhall_level = EXCLUDED.townhall_level
+		league_id = COALESCE(EXCLUDED.league_id, basic_player.league_id),
+		clan_tag = CASE WHEN $7 THEN EXCLUDED.clan_tag ELSE basic_player.clan_tag END,
+		townhall_level = EXCLUDED.townhall_level,
+		trophies = CASE WHEN EXCLUDED.trophies > 0 THEN EXCLUDED.trophies ELSE basic_player.trophies END
 	WHERE
 		basic_player.name IS DISTINCT FROM EXCLUDED.name OR
-		basic_player.league_id IS DISTINCT FROM EXCLUDED.league_id OR
-		basic_player.townhall_level IS DISTINCT FROM EXCLUDED.townhall_level
+		basic_player.league_id IS DISTINCT FROM COALESCE(EXCLUDED.league_id, basic_player.league_id) OR
+		($7 AND basic_player.clan_tag IS DISTINCT FROM EXCLUDED.clan_tag) OR
+		basic_player.townhall_level IS DISTINCT FROM EXCLUDED.townhall_level OR
+		(EXCLUDED.trophies > 0 AND basic_player.trophies IS DISTINCT FROM EXCLUDED.trophies)
 `
 
 // UpsertBasicPlayers is shared by ingesters that learn basic player facts
@@ -39,29 +41,30 @@ func UpsertBasicPlayersCount(ctx context.Context, tx pgx.Tx, players []models.Ba
 	if len(players) == 0 {
 		return 0, nil
 	}
-	ctx, span := platform.StartSpan(ctx, "timescale.basic_player.upsert",
-		attribute.String("domain", domain),
-		attribute.String("operation", "upsert_basic_players"),
-		attribute.Int("write.count", len(players)),
-	)
-	defer span.End()
-
 	batch := &pgx.Batch{}
 	for _, player := range players {
 		if player.Tag == "" || player.Name == "" || player.TownHall <= 0 {
 			continue
 		}
+		clanTagKnown := player.ClanTagKnown || player.ClanTag != ""
 		batch.Queue(UpsertBasicPlayerSQL,
 			player.Tag,
 			player.Name,
 			player.LeagueID,
+			clanTagValue(player.ClanTag, clanTagKnown),
 			player.TownHall,
+			player.Trophies,
+			clanTagKnown,
 		)
 	}
-	count, err := SendBatchCount(ctx, tx, batch)
-	platform.RecordSpanError(span, err)
-	span.SetAttributes(attribute.Int("rows.affected", count), platform.SpanErrorStatus(err))
-	return count, err
+	return SendBatchCount(ctx, tx, batch)
+}
+
+func clanTagValue(tag string, known bool) any {
+	if !known || tag == "" {
+		return nil
+	}
+	return tag
 }
 
 func SendBatch(ctx context.Context, tx pgx.Tx, batch *pgx.Batch) error {

@@ -1,6 +1,6 @@
 # syntax=docker/dockerfile:1.7
 
-FROM golang:1.25-bookworm AS build
+FROM golang:1.26.4-bookworm AS build
 
 # docker compose passes the temporary local clashy.go replace as the
 # "clashy-go" build context while go.mod points at ../../GolandProjects/clashy.go.

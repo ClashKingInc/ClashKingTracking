@@ -17,16 +17,69 @@ type scriptTargetRunner interface {
 	RemoveTargets(context.Context, ...string) error
 }
 
+type cursorTargetBatchProgress struct {
+	mu             sync.Mutex
+	total          int
+	completed      int
+	expectedStores int
+	stored         int
+	committed      bool
+}
+
+func (p *cursorTargetBatchProgress) reset(total int) {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	p.total = total
+	p.completed = 0
+	p.expectedStores = 0
+	p.stored = 0
+	p.committed = false
+}
+
+func (p *cursorTargetBatchProgress) completedWithStore() bool {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	p.completed++
+	p.expectedStores++
+	return p.readyLocked()
+}
+
+func (p *cursorTargetBatchProgress) completedWithoutStore() bool {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	p.completed++
+	return p.readyLocked()
+}
+
+func (p *cursorTargetBatchProgress) storedOne() bool {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	p.stored++
+	return p.readyLocked()
+}
+
+func (p *cursorTargetBatchProgress) readyLocked() bool {
+	if p.committed || p.total <= 0 {
+		return false
+	}
+	if p.completed < p.total || p.stored < p.expectedStores {
+		return false
+	}
+	p.committed = true
+	return true
+}
+
 type scriptMemoryTargetSet struct {
 	app      *platform.App
 	domain   string
 	group    string
 	interval time.Duration
 	loader   scriptTargetLoader
-	store    *clashtracker.MemoryTargetStore
+	store    *clashtracker.MemoryTagStore
 
-	mu      sync.RWMutex
-	runners []scriptTargetRunner
+	mu            sync.RWMutex
+	runners       []scriptTargetRunner
+	progressNames map[string]struct{}
 }
 
 func newScriptMemoryTargetSet(
@@ -47,15 +100,83 @@ func newScriptMemoryTargetSet(
 		group:    group,
 		interval: interval,
 		loader:   loader,
-		store:    clashtracker.NewMemoryTargetStore(targets...),
+		store:    clashtracker.NewMemoryTagStore(targets...),
 	}
 	app.Logger.Info("loaded tracker targets", "domain", domain, "group", group, "count", len(targets))
 	return set, nil
 }
 
-func (s *scriptMemoryTargetSet) Store() clashtracker.TargetStore {
+func trackingProgressName(domain, group string) string {
+	if group == "" {
+		return domain
+	}
+	return domain + "." + group
+}
+
+func (s *scriptMemoryTargetSet) ProgressName() string {
+	if s == nil {
+		return ""
+	}
+	return trackingProgressName(s.domain, s.group)
+}
+
+func (s *scriptMemoryTargetSet) RegisterProgress(ctx context.Context, name string) error {
+	if s == nil || name == "" {
+		return nil
+	}
+	count, err := s.Len(ctx)
+	if err != nil {
+		return err
+	}
+	s.mu.Lock()
+	if s.progressNames == nil {
+		s.progressNames = make(map[string]struct{})
+	}
+	s.progressNames[name] = struct{}{}
+	s.mu.Unlock()
+	s.app.Stats.SetTrackingTargets(name, count)
+	return nil
+}
+
+func (s *scriptMemoryTargetSet) RecordTracked(names ...string) {
+	if s == nil {
+		return
+	}
+	if len(names) == 0 {
+		names = []string{s.ProgressName()}
+	}
+	for _, name := range names {
+		if name == "" {
+			continue
+		}
+		s.app.Stats.RecordTrackedTarget(name)
+	}
+}
+
+func (s *scriptMemoryTargetSet) Len(ctx context.Context) (int, error) {
 	if s == nil || s.store == nil {
-		return clashtracker.NewMemoryTargetStore()
+		return 0, nil
+	}
+	if counter, ok := any(s.store).(clashtracker.TargetCounter); ok {
+		return counter.Count(ctx)
+	}
+	targets, err := s.store.List(ctx)
+	if err != nil {
+		return 0, err
+	}
+	return len(targets), nil
+}
+
+func (s *scriptMemoryTargetSet) Tags() clashtracker.TagStore {
+	if s == nil || s.store == nil {
+		return clashtracker.NewMemoryTagStore()
+	}
+	return s.store
+}
+
+func (s *scriptMemoryTargetSet) TargetPager() clashtracker.TargetPager {
+	if s == nil || s.store == nil {
+		return clashtracker.NewMemoryTagStore()
 	}
 	return s.store
 }
@@ -102,11 +223,16 @@ func (s *scriptMemoryTargetSet) Refresh(ctx context.Context) error {
 	}
 	have := targetMap(haveList)
 	add := make([]clashtracker.Target, 0)
+	update := make([]clashtracker.Target, 0)
 	remove := make([]string, 0)
 	for key, target := range want {
 		current, ok := have[key]
-		if !ok || current.Value != target.Value {
+		if !ok {
 			add = append(add, target)
+			continue
+		}
+		if current.Value != target.Value {
+			update = append(update, target)
 		}
 	}
 	for key := range have {
@@ -119,8 +245,11 @@ func (s *scriptMemoryTargetSet) Refresh(ctx context.Context) error {
 			return err
 		}
 	}
-	if len(add) > 0 {
-		if err := s.Add(ctx, add...); err != nil {
+	if len(add) > 0 || len(update) > 0 {
+		targets := make([]clashtracker.Target, 0, len(add)+len(update))
+		targets = append(targets, add...)
+		targets = append(targets, update...)
+		if err := s.Add(ctx, targets...); err != nil {
 			return err
 		}
 	}
@@ -128,42 +257,63 @@ func (s *scriptMemoryTargetSet) Refresh(ctx context.Context) error {
 		"domain", s.domain,
 		"group", s.group,
 		"count", len(want),
+		"have_count", len(have),
 		"added", len(add),
+		"updated", len(update),
 		"removed", len(remove),
+		"added_sample", sampleTargetKeys(add, 5),
+		"updated_sample", sampleTargetKeys(update, 5),
+		"removed_sample", sampleStrings(remove, 5),
 	)
+	s.updateProgressTargets(len(want))
 	return nil
 }
 
 func (s *scriptMemoryTargetSet) Add(ctx context.Context, targets ...clashtracker.Target) error {
-	runners := s.runnerSnapshot()
-	if len(runners) > 0 {
-		for _, runner := range runners {
-			if err := runner.AddTargets(ctx, targets...); err != nil {
-				return err
-			}
-		}
-		return nil
+	if err := s.store.Add(ctx, targets...); err != nil {
+		return err
 	}
-	return s.store.Add(ctx, targets...)
+	runners := s.runnerSnapshot()
+	for _, runner := range runners {
+		if err := runner.AddTargets(ctx, targets...); err != nil {
+			return err
+		}
+	}
+	return nil
 }
 
 func (s *scriptMemoryTargetSet) Remove(ctx context.Context, keys ...string) error {
-	runners := s.runnerSnapshot()
-	if len(runners) > 0 {
-		for _, runner := range runners {
-			if err := runner.RemoveTargets(ctx, keys...); err != nil {
-				return err
-			}
-		}
-		return nil
+	if err := s.store.Remove(ctx, keys...); err != nil {
+		return err
 	}
-	return s.store.Remove(ctx, keys...)
+	runners := s.runnerSnapshot()
+	for _, runner := range runners {
+		if err := runner.RemoveTargets(ctx, keys...); err != nil {
+			return err
+		}
+	}
+	return nil
 }
 
 func (s *scriptMemoryTargetSet) runnerSnapshot() []scriptTargetRunner {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
 	return append([]scriptTargetRunner(nil), s.runners...)
+}
+
+func (s *scriptMemoryTargetSet) updateProgressTargets(count int) {
+	if s == nil {
+		return
+	}
+	s.mu.RLock()
+	names := make([]string, 0, len(s.progressNames))
+	for name := range s.progressNames {
+		names = append(names, name)
+	}
+	s.mu.RUnlock()
+	for _, name := range names {
+		s.app.Stats.SetTrackingTargets(name, count)
+	}
 }
 
 func targetMap(targets []clashtracker.Target) map[string]clashtracker.Target {
@@ -180,4 +330,28 @@ func targetMap(targets []clashtracker.Target) map[string]clashtracker.Target {
 		out[key] = target
 	}
 	return out
+}
+
+func sampleTargetKeys(targets []clashtracker.Target, limit int) []string {
+	if limit <= 0 || len(targets) == 0 {
+		return nil
+	}
+	if len(targets) < limit {
+		limit = len(targets)
+	}
+	out := make([]string, 0, limit)
+	for i := 0; i < limit; i++ {
+		out = append(out, targets[i].Key)
+	}
+	return out
+}
+
+func sampleStrings(values []string, limit int) []string {
+	if limit <= 0 || len(values) == 0 {
+		return nil
+	}
+	if len(values) < limit {
+		limit = len(values)
+	}
+	return append([]string(nil), values[:limit]...)
 }

@@ -3,21 +3,17 @@ package models
 import "time"
 
 type WarLogIndexRow struct {
-	WarID            string
-	ClanTag          string
-	OpponentTag      string
-	PrepTime         time.Time
-	StartTime        *time.Time
-	EndTime          time.Time
-	ClanBadgeURL     string
-	OpponentBadgeURL string
-	Size             int
-	WarType          string
-	State            string
-	BattleModifier   string
-	CWLWarTag        string
-	R2Key            string
-	StoredAt         *time.Time
+	WarID          string
+	ClanTag        string
+	OpponentTag    string
+	PrepTime       time.Time
+	StartTime      *time.Time
+	EndTime        time.Time
+	Size           int
+	WarType        string
+	State          string
+	BattleModifier string
+	WarTag         string
 }
 
 type WarAttackRow struct {
@@ -29,6 +25,7 @@ type WarAttackRow struct {
 	DefendingClanTag      string
 	AttackerTag           string
 	DefenderTag           string
+	DefenderName          string
 	AttackerTownHall      int
 	DefenderTownHall      int
 	AttackerMapPosition   int
@@ -41,16 +38,14 @@ type WarAttackRow struct {
 }
 
 type WarScheduleRow struct {
+	ScheduleKey   string
 	WarID         string
 	SourceClanTag string
 	OpponentTag   string
 	PrepTime      time.Time
 	EndTime       time.Time
 	NextRunAt     time.Time
-	CWLWarTag     string
-	Status        string
-	Attempts      int
-	LastError     string
+	WarTag        string
 }
 
 type CWLGroupRow struct {
@@ -63,12 +58,12 @@ type CWLGroupRow struct {
 }
 
 type WarIngest struct {
-	IndexRows     []WarLogIndexRow
-	AttackRows    []WarAttackRow
-	Players       []BasicPlayerRow
-	Schedules     []WarScheduleRow
-	CWLGroups     []CWLGroupRow
-	FinishedWarID string
-	R2Key         string
-	RawWarJSON    []byte
+	IndexRows           []WarLogIndexRow
+	AttackRows          []WarAttackRow
+	Players             []BasicPlayerRow
+	Schedules           []WarScheduleRow
+	CWLGroups           []CWLGroupRow
+	FinishedScheduleKey string
+	FinishedWarID       string
+	RawWarJSON          []byte
 }

@@ -1,18 +1,16 @@
 {
-  "http_addr": ":8080",
   "grpc_addr": ":9090",
   "proxy_url": "http://127.0.0.1:8011/v1",
   "valkey_addr": "localhost:6379",
   "dry_run": false,
   "mock_db": false,
   "target_page_multiplier": 5,
-  "otel": {
-    "enabled": true,
-    "service_name": "clashking-tracking",
-    "exporter_otlp_endpoint": "http://localhost:4318"
-  },
   "r2": {
-    "mock_upload": true
+    "mock_upload": false,
+    "requests_per_second": 100
+  },
+  "stats": {
+    "timescale_flush_seconds": 60
   },
   "events": {
     "stream": "tracking:events",
@@ -24,13 +22,15 @@
   },
   "globalclans": {
     "priority_requests_per_second": 50,
-    "non_priority_requests_per_second": 1000
+    "non_priority_requests_per_second": 1000,
+    "target_refresh_seconds": 3600
   },
   "battlelogs": {
-    "requests_per_second": 10,
-    "rollup_flush_attacks": 5000,
+    "requests_per_second": 1000,
+    "priority_requests_per_second": 100,
+    "target_refresh_seconds": 14400,
     "checkpoint_ttl_days": 15,
-    "first_seen_lookback_days": 14
+    "first_seen_lookback_days": 1
   },
   "wars": {
     "requests_per_second": 950,
@@ -38,11 +38,23 @@
   },
   "botclans": {
     "requests_per_second": 950,
+    "target_refresh_seconds": 3600,
     "snapshot_prefix": "botclans:snapshot:",
     "cwl_state_snapshot": "cwlstate"
   },
   "botplayers": {
-    "requests_per_second": 950
+    "requests_per_second": 950,
+    "target_refresh_seconds": 3600
+  },
+  "basicplayers": {
+    "requests_per_second": 30,
+    "target_refresh_seconds": 43200
+  },
+  "leaderboards": {
+    "requests_per_second": 300,
+    "interval_seconds": 600,
+    "limit": 500,
+    "null_asset_url": "https://api-assets.clashofclans.com/null"
   },
   "scheduled": {
     "interval_seconds": 900

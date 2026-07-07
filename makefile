@@ -8,13 +8,13 @@ format:
 	ruff check . --fix
 
 dev-db-up:
-	docker compose -f $(SCHEMA_COMPOSE) up -d timescale valkey jaeger redis-insight
+	docker compose -f $(SCHEMA_COMPOSE) up -d timescale valkey redis-insight
 
 dev-db-down:
 	docker compose -f $(SCHEMA_COMPOSE) down
 
 dev-db-logs:
-	docker compose -f $(SCHEMA_COMPOSE) logs -f timescale valkey jaeger redis-insight
+	docker compose -f $(SCHEMA_COMPOSE) logs -f timescale valkey redis-insight
 
 goose-timescale-status:
 	$(GOOSE) -dir $(TIMESCALE_MIGRATIONS_DIR) postgres "$(TIMESCALE_URL)" status

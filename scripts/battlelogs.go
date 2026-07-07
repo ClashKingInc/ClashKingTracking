@@ -10,38 +10,27 @@ import (
 	"sort"
 	"strconv"
 	"strings"
-	"sync"
 	"time"
 
 	"clashking_tracking/internal/platform"
-	"clashking_tracking/internal/utils"
 	"clashking_tracking/models"
 
-	"github.com/cespare/xxhash/v2"
 	"github.com/clashkinginc/clashy.go"
 	clashtracker "github.com/clashkinginc/clashy.go/tracker"
 	"github.com/google/uuid"
 	"github.com/jackc/pgx/v5"
-	"github.com/jackc/pgx/v5/pgconn"
 	"github.com/jackc/pgx/v5/pgxpool"
 	"github.com/valkey-io/valkey-go"
-	"go.opentelemetry.io/otel/attribute"
 )
 
 const battlelogsDomainName = "battlelogs"
 
 const (
-	battlelogTargetCursorKey = "battlelogs:cursor:active_players"
+	battlelogAsyncWriteBatchSize     = 1000
+	battlelogAsyncWriteQueueSize     = 3000
+	battlelogAsyncWriteFlushInterval = 500 * time.Millisecond
+	battlelogTargetPageSize          = 20000
 )
-
-const activeBattlelogTargetSQL = `
-	SELECT tag, name, COALESCE(league_id, 0), townhall_level
-	FROM basic_player
-	WHERE last_activity >= now() - interval '10 days'
-	  AND tag > $1
-	ORDER BY tag
-	LIMIT $2
-`
 
 // Battlelog army columns use a compact prefix+ID shape. The prefix keeps the
 // source section of the army link visible:
@@ -54,47 +43,20 @@ type battlelogsDomain struct {
 	checkpoint battlelogTimestampCache
 }
 
-type battlelogTargetBatch struct {
-	Players []models.BasicPlayerRow
-	Cursor  string
-}
-
 type battlelogStore interface {
-	NextTargetBatch(context.Context, int) (battlelogTargetBatch, error)
-	CommitTargetBatch(context.Context, battlelogTargetBatch) error
-	Store(context.Context, models.BattlelogIngest) error
+	NextTargetPage(context.Context, string, string, int) (clashtracker.TargetPage, error)
+	CountTargets(context.Context, string) (int, error)
+	Store(context.Context, models.BattlelogIngest) (int, error)
 	Close() error
 }
 
-type battlelogTrackerTargetStore struct {
-	store    battlelogStore
-	pageSize int
-	batch    battlelogTargetBatch
-}
-
-type battlelogTrackerStore struct {
-	d         *battlelogsDomain
-	app       *platform.App
-	targets   *battlelogTrackerTargetStore
-	targetSet *scriptMemoryTargetSet
-}
-
 type timescaleBattlelogStore struct {
-	pool               *pgxpool.Pool
-	valkey             valkey.Client
-	rollupFlushAttacks int
-
-	// Rollups are buffered across inserts and flushed in larger batches. The raw
-	// battlelog rows are committed first; aggregate writes are additive and can
-	// happen afterward without changing the raw event history.
-	rollupMu sync.Mutex
-	rollups  itemRollupBuffer
+	pool *pgxpool.Pool
 }
 
-type itemRollupBuffer struct {
-	Usage          map[models.ItemRollupKey]int64
-	Hitrate        map[models.ItemRollupKey]models.ItemHitrateCounts
-	PendingAttacks int
+type battlelogTargetPager struct {
+	store battlelogStore
+	group string
 }
 
 func NewBattlelogsDomain() platform.Domain {
@@ -107,8 +69,8 @@ func (d *battlelogsDomain) Run(ctx context.Context, app *platform.App) error {
 	if app.Config.BattlelogRequestsPerSecond <= 0 {
 		return errors.New("battlelogs.requests_per_second must be greater than zero when battlelogs is enabled")
 	}
-	if app.Config.TargetPageMultiplier <= 0 {
-		return errors.New("target_page_multiplier must be greater than zero when battlelogs is enabled")
+	if app.Config.BattlelogTargetRefreshSeconds <= 0 {
+		return errors.New("battlelogs.target_refresh_seconds must be greater than zero when battlelogs is enabled")
 	}
 	if app.Config.BattlelogCheckpointTTLDays <= 0 {
 		return errors.New("battlelogs.checkpoint_ttl_days must be greater than zero when battlelogs is enabled")
@@ -128,7 +90,7 @@ func (d *battlelogsDomain) Run(ctx context.Context, app *platform.App) error {
 	}
 
 	if app.Config.TimescaleURL != "" && !app.Config.DryRun && !app.Config.MockDB {
-		store, err := newTimescaleBattlelogStore(ctx, app.Config.TimescaleURL, app.Config.BattlelogRollupFlushAttacks, app.Valkey)
+		store, err := newTimescaleBattlelogStore(ctx, app.Config.TimescaleURL)
 		if err != nil {
 			return err
 		}
@@ -136,165 +98,165 @@ func (d *battlelogsDomain) Run(ctx context.Context, app *platform.App) error {
 		defer store.Close()
 	}
 
-	targetPageSize := app.Config.BattlelogRequestsPerSecond * app.Config.TargetPageMultiplier
 	if d.sink == nil {
 		app.Stats.SetReady(battlelogsDomainName, true, "")
 		return nil
 	}
 
-	refreshInterval := 5 * time.Second
-	targets := &battlelogTrackerTargetStore{store: d.sink, pageSize: targetPageSize}
-	targetSet, err := newScriptMemoryTargetSet(ctx, app, battlelogsDomainName, "targets", refreshInterval, targets.List)
-	if err != nil {
-		return err
+	writer := platform.NewAsyncBatchWriter[models.BattlelogIngest](
+		app,
+		platform.AsyncBatchWriterConfig[models.BattlelogIngest]{
+			Domain:        battlelogsDomainName,
+			BatchSize:     battlelogAsyncWriteBatchSize,
+			QueueSize:     battlelogAsyncWriteQueueSize,
+			FlushInterval: battlelogAsyncWriteFlushInterval,
+			WriteBatch: func(writeCtx context.Context, values []models.BattlelogIngest) error {
+				start := time.Now()
+				ingest := mergeBattlelogIngests(values)
+				if err := d.store(writeCtx, app, ingest); err != nil {
+					return err
+				}
+				app.Stats.SetReady(battlelogsDomainName, true, "")
+				app.Stats.RecordProcess(battlelogsDomainName, time.Since(start))
+				return nil
+			},
+		},
+	)
+	go writer.Run(ctx)
+
+	legendRPS := app.Config.BattlelogPriorityRequestsPerSecond
+	standardRPS := app.Config.BattlelogRequestsPerSecond - legendRPS
+	errCh := make(chan error, 2)
+	runners := 0
+	if legendRPS > 0 {
+		runners++
+		go func() {
+			errCh <- d.runTracker(ctx, app, writer, "legend", legendRPS)
+		}()
 	}
-	store := battlelogTrackerStore{d: d, app: app, targets: targets, targetSet: targetSet}
-	runner, err := clashtracker.NewRunner[models.BattlelogIngest, models.BattlelogIngest](clashtracker.Config[models.BattlelogIngest, models.BattlelogIngest]{
-		TargetStore:       targetSet.Store(),
-		Store:             store,
-		RequestsPerSecond: app.Config.BattlelogRequestsPerSecond,
-		MaxInFlight:       app.Config.BattlelogRequestsPerSecond,
-		MinInterval:       refreshInterval,
+	if standardRPS > 0 {
+		runners++
+		go func() {
+			errCh <- d.runTracker(ctx, app, writer, "standard", standardRPS)
+		}()
+	}
+	if runners == 0 {
+		return errors.New("battlelogs has no positive request budget after priority split")
+	}
+	for i := 0; i < runners; i++ {
+		if err := <-errCh; err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+func (d *battlelogsDomain) runTracker(
+	ctx context.Context,
+	app *platform.App,
+	writer *platform.AsyncBatchWriter[models.BattlelogIngest],
+	group string,
+	requestsPerSecond int,
+) error {
+	statsName := trackingProgressName(battlelogsDomainName, group)
+	if count, err := d.sink.CountTargets(ctx, group); err == nil {
+		app.Stats.SetTrackingTargets(statsName, count)
+	} else {
+		app.Logger.Error("battlelog target count failed", "group", group, "err", err)
+	}
+	runner, err := clashtracker.NewRunner[models.BattlelogIngest](clashtracker.Config[models.BattlelogIngest]{
+		TargetPager:       battlelogTargetPager{store: d.sink, group: group},
+		TargetPageSize:    battlelogTargetPageSize,
+		ResultBatchSize:   battlelogAsyncWriteBatchSize,
+		RequestsPerSecond: requestsPerSecond,
+		MaxInFlight:       requestsPerSecond,
 		EmitInitial:       true,
 		Fetch: func(fetchCtx context.Context, target clashtracker.Target) (clashtracker.FetchResult[models.BattlelogIngest], error) {
-			player, err := decodeBattlelogTarget(target)
-			if err != nil {
-				return clashtracker.FetchResult[models.BattlelogIngest]{}, err
-			}
-			ingest, err := d.do(fetchCtx, app, player)
+			ingest, err := d.do(fetchCtx, app, statsName, target.Key)
 			return clashtracker.FetchResult[models.BattlelogIngest]{Value: ingest}, err
 		},
-		Project: func(ingest models.BattlelogIngest) (models.BattlelogIngest, error) {
-			return ingest, nil
-		},
-		OnError: func(_ context.Context, target clashtracker.Target, err error) error {
-			app.Logger.Error("battlelog processing failed", "tag", target.Key, "err", err)
-			app.Stats.SetReady(battlelogsDomainName, false, err.Error())
-			if platform.IsNonFatalClashError(err) {
-				return nil
+		Handle: func(handleCtx context.Context, _ clashtracker.Target, _ *models.BattlelogIngest, ingest models.BattlelogIngest) error {
+			if len(ingest.Rows) > 0 || len(ingest.Checkpoints) > 0 {
+				if err := writer.Enqueue(handleCtx, ingest); err != nil {
+					return err
+				}
 			}
-			return err
+			app.Stats.RecordTrackedTarget(statsName)
+			return nil
+		},
+		OnFetchError: func(_ context.Context, target clashtracker.Target, err error) (clashtracker.FetchErrorDecision, error) {
+			app.Logger.Error("battlelog processing failed", "tag", target.Key, "err", err)
+			app.Stats.SetReady(statsName, false, err.Error())
+			if decision, ok := platform.ClashFetchErrorDecision(err); ok {
+				return decision, nil
+			}
+			return clashtracker.FetchErrorDecision{Action: clashtracker.FetchErrorStop}, nil
 		},
 	})
 	if err != nil {
 		return err
 	}
-	targetSet.SetRunner(runner)
-	go targetSet.Run(ctx)
 	return runner.Run(ctx)
 }
 
-func (s *battlelogTrackerTargetStore) List(ctx context.Context) ([]clashtracker.Target, error) {
-	batch, err := s.store.NextTargetBatch(ctx, s.pageSize)
-	if err != nil {
-		return nil, err
-	}
-	s.batch = batch
-	if len(batch.Players) == 0 {
-		if err := s.store.CommitTargetBatch(ctx, batch); err != nil {
-			return nil, err
-		}
-		return nil, nil
-	}
-	targets := make([]clashtracker.Target, 0, len(batch.Players))
-	for _, player := range batch.Players {
-		targets = append(targets, encodeBattlelogTarget(player))
-	}
-	return targets, nil
+func (p battlelogTargetPager) NextPage(ctx context.Context, cursor string, limit int) (clashtracker.TargetPage, error) {
+	return p.store.NextTargetPage(ctx, p.group, cursor, limit)
 }
 
-func (s *battlelogTrackerTargetStore) Add(context.Context, ...clashtracker.Target) error {
-	return nil
+func (p battlelogTargetPager) Count(ctx context.Context) (int, error) {
+	return p.store.CountTargets(ctx, p.group)
 }
 
-func (s *battlelogTrackerTargetStore) Remove(context.Context, ...string) error {
-	return nil
-}
-
-func (s *battlelogTrackerTargetStore) Commit(ctx context.Context) error {
-	err := s.store.CommitTargetBatch(ctx, s.batch)
-	s.batch = battlelogTargetBatch{}
-	return err
-}
-
-func encodeBattlelogTarget(player models.BasicPlayerRow) clashtracker.Target {
-	raw, _ := json.Marshal(player)
-	return clashtracker.Target{Key: player.Tag, Value: string(raw)}
-}
-
-func decodeBattlelogTarget(target clashtracker.Target) (models.BasicPlayerRow, error) {
-	var player models.BasicPlayerRow
-	if err := json.Unmarshal([]byte(target.Value), &player); err != nil {
-		return models.BasicPlayerRow{}, err
-	}
-	if player.Tag == "" {
-		player.Tag = target.Key
-	}
-	return player, nil
-}
-
-func (s battlelogTrackerStore) Load(context.Context, string) (models.BattlelogIngest, bool, error) {
-	return models.BattlelogIngest{}, false, nil
-}
-
-func (s battlelogTrackerStore) Store(ctx context.Context, _ string, ingest models.BattlelogIngest, _ time.Duration) error {
-	return s.d.store(ctx, s.app, ingest)
-}
-
-func (s battlelogTrackerStore) LoadBatch(context.Context, []string) (map[string]clashtracker.Snapshot[models.BattlelogIngest], error) {
-	return map[string]clashtracker.Snapshot[models.BattlelogIngest]{}, nil
-}
-
-func (s battlelogTrackerStore) StoreBatch(ctx context.Context, values []clashtracker.StoredSnapshot[models.BattlelogIngest]) error {
-	start := time.Now()
+func mergeBattlelogIngests(values []models.BattlelogIngest) models.BattlelogIngest {
+	var totalRows, totalCheckpoints int
 	for _, value := range values {
-		if err := s.d.store(ctx, s.app, value.Value); err != nil {
-			return err
+		totalRows += len(value.Rows)
+		totalCheckpoints += len(value.Checkpoints)
+	}
+	out := models.BattlelogIngest{
+		Rows:        make([]models.BattlelogRow, 0, totalRows),
+		Checkpoints: make([]models.BattlelogCheckpoint, 0, totalCheckpoints),
+	}
+	checkpoints := make(map[string]models.BattlelogCheckpoint, totalCheckpoints)
+	for _, value := range values {
+		out.Rows = append(out.Rows, value.Rows...)
+		for _, checkpoint := range value.Checkpoints {
+			if checkpoint.Tag == "" || checkpoint.Timestamp.IsZero() {
+				continue
+			}
+			current, ok := checkpoints[checkpoint.Tag]
+			if !ok || checkpoint.Timestamp.After(current.Timestamp) {
+				checkpoints[checkpoint.Tag] = checkpoint
+			}
 		}
 	}
-	if s.targets != nil {
-		if err := s.targets.Commit(ctx); err != nil {
-			return err
+	if len(checkpoints) > 0 {
+		tags := make([]string, 0, len(checkpoints))
+		for tag := range checkpoints {
+			tags = append(tags, tag)
+		}
+		sort.Strings(tags)
+		out.Checkpoints = out.Checkpoints[:0]
+		for _, tag := range tags {
+			out.Checkpoints = append(out.Checkpoints, checkpoints[tag])
 		}
 	}
-	if s.targetSet != nil {
-		if err := s.targetSet.Refresh(ctx); err != nil {
-			return err
-		}
-	}
-	s.app.Stats.SetReady(battlelogsDomainName, true, "")
-	s.app.Stats.RecordProcess(battlelogsDomainName, time.Since(start))
-	return nil
+	return out
 }
 
-func (d *battlelogsDomain) do(ctx context.Context, app *platform.App, player models.BasicPlayerRow) (models.BattlelogIngest, error) {
-	ctx, span := platform.StartSpan(ctx, "battlelogs.do",
-		attribute.String("domain", battlelogsDomainName),
-		attribute.String("operation", "do"),
-	)
-	defer span.End()
-
-	entries, err := d.fetchBattleLog(ctx, app, player.Tag)
+func (d *battlelogsDomain) do(ctx context.Context, app *platform.App, statsName string, playerTag string) (models.BattlelogIngest, error) {
+	entries, err := d.fetchBattleLog(ctx, app, statsName, playerTag)
 	if err != nil {
-		platform.RecordSpanError(span, err)
-		span.SetAttributes(attribute.Int("rows.count", len(entries)), platform.SpanErrorStatus(err))
 		return models.BattlelogIngest{}, err
 	}
 
 	now := time.Now().UTC()
-	players := map[string]models.BasicPlayerRow{player.Tag: player}
-	checkpoint, err := d.loadBattlelogCheckpoint(ctx, player.Tag)
+	checkpoint, err := d.loadBattlelogCheckpoint(ctx, playerTag)
 	if err != nil {
-		platform.RecordSpanError(span, err)
-		span.SetAttributes(platform.SpanErrorStatus(err))
 		return models.BattlelogIngest{}, err
 	}
 	if len(entries) == 0 {
-		ingest := models.BattlelogIngest{
-			Players: basicPlayersFromMap(players),
-		}
-		span.SetAttributes(attribute.Int("rows.count", 0), platform.SpanErrorStatus(nil))
-		return ingest, nil
+		return models.BattlelogIngest{}, nil
 	}
 
 	after := checkpoint.Timestamp
@@ -305,11 +267,7 @@ func (d *battlelogsDomain) do(ctx context.Context, app *platform.App, player mod
 	}
 	newEntries := entriesAfterTimestamp(entries, after)
 	if len(newEntries) == 0 {
-		ingest := models.BattlelogIngest{
-			Players: basicPlayersFromMap(players),
-		}
-		span.SetAttributes(attribute.Int("rows.count", 0), platform.SpanErrorStatus(nil))
-		return ingest, nil
+		return models.BattlelogIngest{}, nil
 	}
 	sort.Slice(newEntries, func(i, j int) bool {
 		leftTime := battlelogEntryTimestamp(newEntries[i])
@@ -324,70 +282,55 @@ func (d *battlelogsDomain) do(ctx context.Context, app *platform.App, player mod
 	var checkpointTime time.Time
 	for _, entry := range newEntries {
 		timestamp := battlelogEntryTimestamp(entry)
-		opponent := basicPlayerFromBattlelogOpponent(entry)
-		if timestamp.IsZero() || opponent.Tag == "" || opponent.Name == "" || opponent.TownHall <= 0 {
+		if timestamp.IsZero() || entry.OpponentPlayerTag == "" || entry.OpponentName == "" || entry.OpponentTownHallLevel < 0 {
 			// Do not checkpoint past incomplete rows; later polls can retry after
 			// the API returns the required battle timestamp and opponent metadata.
 			break
 		}
-		players[opponent.Tag] = opponent
-		rows = append(rows, battlelogRowFromEntry(player.Tag, players[player.Tag], entry, opponent))
+		rows = append(rows, battlelogRowFromEntry(playerTag, entry))
 		if timestamp.After(checkpointTime) {
 			checkpointTime = timestamp.UTC()
 		}
 	}
+	if len(rows) == 0 {
+		return models.BattlelogIngest{}, nil
+	}
 
 	ingest := models.BattlelogIngest{
-		Rows:    rows,
-		Players: basicPlayersFromMap(players),
+		Rows: rows,
 	}
 	if !checkpointTime.IsZero() {
-		ingest.Checkpoints = []models.BattlelogCheckpoint{{Tag: player.Tag, Timestamp: checkpointTime}}
+		ingest.Checkpoints = []models.BattlelogCheckpoint{{Tag: playerTag, Timestamp: checkpointTime}}
 	}
-	span.SetAttributes(attribute.Int("rows.count", len(rows)), platform.SpanErrorStatus(err))
 	return ingest, nil
 }
 
 func (d *battlelogsDomain) store(ctx context.Context, app *platform.App, ingest models.BattlelogIngest) error {
-	ctx, span := platform.StartSpan(ctx, "battlelogs.store",
-		attribute.String("domain", battlelogsDomainName),
-		attribute.String("operation", "store"),
-		attribute.Int("rows.count", len(ingest.Rows)),
-		attribute.Int("write.count", len(ingest.Rows)+len(ingest.Players)+len(ingest.Checkpoints)),
-	)
-	defer span.End()
+	start := time.Now()
+	insertedRows := 0
 	if d.sink != nil {
-		if err := d.sink.Store(ctx, ingest); err != nil {
-			platform.RecordSpanError(span, err)
-			span.SetAttributes(platform.SpanErrorStatus(err))
+		var err error
+		insertedRows, err = d.sink.Store(ctx, ingest)
+		if err != nil {
 			return err
 		}
 	}
 	if !app.Config.DryRun {
 		// Checkpoints move only after durable rows write successfully.
 		if err := d.checkpoint.UpdateMany(ctx, ingest.Checkpoints); err != nil {
-			platform.RecordSpanError(span, err)
-			span.SetAttributes(platform.SpanErrorStatus(err))
 			return err
 		}
 	}
-	app.Stats.RecordWrite(battlelogsDomainName, len(ingest.Rows)+len(ingest.Players)+len(ingest.Checkpoints))
+	app.Stats.RecordWrite(battlelogsDomainName, len(ingest.Rows)+len(ingest.Checkpoints))
+	app.Stats.RecordStore(battlelogsDomainName, time.Since(start), len(ingest.Rows), insertedRows)
 	app.Stats.SetReady(battlelogsDomainName, true, "")
-	span.SetAttributes(platform.SpanErrorStatus(nil))
 	return nil
 }
 
-func (d *battlelogsDomain) fetchBattleLog(ctx context.Context, app *platform.App, tag string) ([]clashy.BattleLogEntry, error) {
+func (d *battlelogsDomain) fetchBattleLog(ctx context.Context, app *platform.App, statsName string, tag string) ([]clashy.BattleLogEntry, error) {
 	start := time.Now()
-	fetchCtx, fetchSpan := platform.StartSpan(ctx, "clash.fetch",
-		attribute.String("domain", battlelogsDomainName),
-		attribute.String("operation", "battlelog"),
-	)
-	entries, err := app.Clash.GetBattleLog(fetchCtx, tag)
-	platform.RecordSpanError(fetchSpan, err)
-	fetchSpan.SetAttributes(platform.SpanErrorStatus(err))
-	fetchSpan.End()
-	app.Stats.RecordRequest(battlelogsDomainName, time.Since(start), err)
+	entries, err := app.Clash.GetBattleLog(ctx, tag)
+	app.Stats.RecordRequest(statsName, time.Since(start), err)
 	return entries, err
 }
 
@@ -395,368 +338,273 @@ func (d *battlelogsDomain) loadBattlelogCheckpoint(ctx context.Context, tag stri
 	return d.checkpoint.Get(ctx, tag)
 }
 
-func basicPlayersFromMap(values map[string]models.BasicPlayerRow) []models.BasicPlayerRow {
-	players := make([]models.BasicPlayerRow, 0, len(values))
-	for tag, player := range values {
-		if tag == "" || player.Tag == "" || player.Name == "" || player.TownHall <= 0 {
-			continue
-		}
-		players = append(players, player)
-	}
-	sort.Slice(players, func(i, j int) bool { return players[i].Tag < players[j].Tag })
-	return players
-}
-
-func basicPlayerFromBattlelogOpponent(entry clashy.BattleLogEntry) models.BasicPlayerRow {
-	return models.BasicPlayerRow{
-		Tag:      entry.OpponentPlayerTag,
-		Name:     entry.OpponentName,
-		TownHall: entry.OpponentTownHallLevel,
-	}
-}
-
-func newTimescaleBattlelogStore(ctx context.Context, dsn string, rollupFlushAttacks int, client valkey.Client) (*timescaleBattlelogStore, error) {
+func newTimescaleBattlelogStore(ctx context.Context, dsn string) (*timescaleBattlelogStore, error) {
 	pool, err := pgxpool.New(ctx, dsn)
 	if err != nil {
 		return nil, err
 	}
-	return &timescaleBattlelogStore{
-		pool:               pool,
-		valkey:             client,
-		rollupFlushAttacks: maxInt(rollupFlushAttacks, 1),
-		rollups:            newItemRollupBuffer(),
-	}, nil
+	return &timescaleBattlelogStore{pool: pool}, nil
 }
 
 func (s *timescaleBattlelogStore) Close() error {
 	if s == nil || s.pool == nil {
 		return nil
 	}
-	// Flush aggregate deltas on shutdown so low-volume runs do not leave rollups
-	// stranded below the normal threshold.
-	if err := s.flushItemRollups(context.Background()); err != nil {
-		s.pool.Close()
-		return err
-	}
 	s.pool.Close()
 	return nil
 }
 
-func (s *timescaleBattlelogStore) NextTargetBatch(ctx context.Context, batchSize int) (battlelogTargetBatch, error) {
-	if batchSize <= 0 {
-		return battlelogTargetBatch{}, nil
+func (s *timescaleBattlelogStore) NextTargetPage(
+	ctx context.Context,
+	group string,
+	cursor string,
+	limit int,
+) (clashtracker.TargetPage, error) {
+	if limit <= 0 {
+		limit = battlelogTargetPageSize
 	}
-	ctx, span := platform.StartSpan(ctx, "timescale.basic_player.targets",
-		attribute.String("domain", battlelogsDomainName),
-		attribute.String("operation", "scan_basic_player_targets"),
-		attribute.Int("batch.size", batchSize),
-	)
-	defer span.End()
-
-	cursor, err := s.getTargetCursor(ctx)
+	decoded, err := decodeBattlelogTargetCursor(cursor)
 	if err != nil {
-		platform.RecordSpanError(span, err)
-		span.SetAttributes(platform.SpanErrorStatus(err))
-		return battlelogTargetBatch{}, err
+		return clashtracker.TargetPage{}, err
 	}
-	players, nextCursor, err := s.scanActivePlayers(ctx, cursor, batchSize)
+	page, err := s.scanActivePlayerPage(ctx, group, decoded, limit)
 	if err != nil {
-		platform.RecordSpanError(span, err)
-		span.SetAttributes(platform.SpanErrorStatus(err))
-		return battlelogTargetBatch{}, err
+		return clashtracker.TargetPage{}, err
 	}
-	batch := battlelogTargetBatch{Players: players, Cursor: nextCursor}
-	span.SetAttributes(attribute.Int("target.count", len(batch.Players)), platform.SpanErrorStatus(nil))
-	return batch, nil
+	return page, nil
 }
 
-func (s *timescaleBattlelogStore) scanActivePlayers(ctx context.Context, cursor string, limit int) ([]models.BasicPlayerRow, string, error) {
-	rows, err := s.pool.Query(ctx, activeBattlelogTargetSQL, cursor, limit+1)
+func (s *timescaleBattlelogStore) CountTargets(ctx context.Context, group string) (int, error) {
+	query := `
+		SELECT count(*)
+		FROM basic_player
+		WHERE battlelogs_tracking_ttl >= now() - interval '10 days'
+		  AND league_id IS DISTINCT FROM 105000036
+	`
+	if group == "legend" {
+		query = `
+			SELECT count(*)
+			FROM basic_player
+			WHERE battlelogs_tracking_ttl >= now() - interval '10 days'
+			  AND league_id = 105000036
+		`
+	}
+	var count int
+	if err := s.pool.QueryRow(ctx, query).Scan(&count); err != nil {
+		return 0, err
+	}
+	return count, nil
+}
+
+func (s *timescaleBattlelogStore) scanActivePlayerPage(
+	ctx context.Context,
+	group string,
+	cursor battlelogTargetCursor,
+	limit int,
+) (clashtracker.TargetPage, error) {
+	leaguePredicate := "league_id IS DISTINCT FROM 105000036"
+	if group == "legend" {
+		leaguePredicate = "league_id = 105000036"
+	}
+	args := []any{int32(limit)}
+	cursorPredicate := ""
+	if cursor.Valid {
+		cursorPredicate = `
+		  AND (
+			battlelogs_tracking_ttl < $1
+			OR (battlelogs_tracking_ttl = $1 AND tag > $2)
+		  )
+		`
+		args = []any{cursor.TTL, cursor.Tag, int32(limit)}
+	}
+	limitPlaceholder := fmt.Sprintf("$%d", len(args))
+	query := fmt.Sprintf(`
+		SELECT tag, battlelogs_tracking_ttl
+		FROM basic_player
+		WHERE battlelogs_tracking_ttl >= now() - interval '10 days'
+		  AND %s
+		  %s
+		ORDER BY battlelogs_tracking_ttl DESC, tag
+		LIMIT %s
+	`, leaguePredicate, cursorPredicate, limitPlaceholder)
+	rows, err := s.pool.Query(ctx, query, args...)
 	if err != nil {
-		return nil, "", err
+		return clashtracker.TargetPage{}, err
 	}
 	defer rows.Close()
 
-	players := make([]models.BasicPlayerRow, 0, limit+1)
+	page := clashtracker.TargetPage{Targets: make([]clashtracker.Target, 0, limit)}
+	var lastTTL time.Time
+	var lastTag string
 	for rows.Next() {
-		var player models.BasicPlayerRow
-		if err := rows.Scan(&player.Tag, &player.Name, &player.LeagueID, &player.TownHall); err != nil {
-			return nil, "", err
+		var tag string
+		var ttl time.Time
+		if err := rows.Scan(&tag, &ttl); err != nil {
+			return clashtracker.TargetPage{}, err
 		}
-		if player.Tag == "" || player.Name == "" || player.TownHall <= 0 {
+		if tag == "" {
 			continue
 		}
-		players = append(players, player)
+		page.Targets = append(page.Targets, clashtracker.Target{Key: tag})
+		lastTTL = ttl
+		lastTag = tag
 	}
 	if err := rows.Err(); err != nil {
-		return nil, "", err
+		return clashtracker.TargetPage{}, err
 	}
-	if len(players) == 0 {
-		return nil, "", nil
+	if len(page.Targets) == limit {
+		page.NextCursor = encodeBattlelogTargetCursor(lastTTL, lastTag)
 	}
-	if len(players) > limit {
-		// Read one extra row to distinguish "more rows exist" from "wrapped the scan".
-		nextCursor := players[limit-1].Tag
-		return players[:limit], nextCursor, nil
-	}
-	return players, "", nil
+	return page, nil
 }
 
-func (s *timescaleBattlelogStore) getTargetCursor(ctx context.Context) (string, error) {
-	if s.valkey == nil {
-		return "", nil
-	}
-	ctx, span := platform.StartSpan(ctx, "valkey.battlelog_target_cursor.get",
-		attribute.String("domain", battlelogsDomainName),
-		attribute.String("operation", "get"),
-	)
-	defer span.End()
-	value, err := s.valkey.Do(ctx, s.valkey.B().Get().Key(battlelogTargetCursorKey).Build()).ToString()
-	if valkey.IsValkeyNil(err) {
-		span.SetAttributes(attribute.Int("rows.count", 0), platform.SpanErrorStatus(nil))
-		return "", nil
-	}
-	platform.RecordSpanError(span, err)
-	span.SetAttributes(attribute.Int("rows.count", 1), platform.SpanErrorStatus(err))
-	return value, err
+type battlelogTargetCursor struct {
+	TTL   time.Time
+	Tag   string
+	Valid bool
 }
 
-func (s *timescaleBattlelogStore) CommitTargetBatch(ctx context.Context, batch battlelogTargetBatch) error {
-	if s.valkey == nil {
-		return nil
+func encodeBattlelogTargetCursor(ttl time.Time, tag string) string {
+	if ttl.IsZero() || tag == "" {
+		return ""
 	}
-	// Empty cursor deletes the checkpoint, causing the next scan to wrap to the beginning.
-	command := cursorCommand(s.valkey, battlelogTargetCursorKey, batch.Cursor)
-	ctx, span := platform.StartSpan(ctx, "valkey.battlelog_target_cursor.set",
-		attribute.String("domain", battlelogsDomainName),
-		attribute.String("operation", "set"),
-		attribute.Int("write.count", 1),
-	)
-	defer span.End()
-	err := s.valkey.Do(ctx, command).Error()
-	platform.RecordSpanError(span, err)
-	span.SetAttributes(platform.SpanErrorStatus(err))
-	return err
+	return ttl.UTC().Format(time.RFC3339Nano) + "|" + tag
 }
 
-func cursorCommand(client valkey.Client, key, cursor string) valkey.Completed {
+func decodeBattlelogTargetCursor(cursor string) (battlelogTargetCursor, error) {
 	if cursor == "" {
-		return client.B().Del().Key(key).Build()
+		return battlelogTargetCursor{}, nil
 	}
-	return client.B().Set().Key(key).Value(cursor).Build()
+	parts := strings.SplitN(cursor, "|", 2)
+	if len(parts) != 2 || parts[0] == "" || parts[1] == "" {
+		return battlelogTargetCursor{}, fmt.Errorf("invalid battlelog target cursor %q", cursor)
+	}
+	ttl, err := time.Parse(time.RFC3339Nano, parts[0])
+	if err != nil {
+		return battlelogTargetCursor{}, fmt.Errorf("invalid battlelog target cursor %q: %w", cursor, err)
+	}
+	return battlelogTargetCursor{TTL: ttl, Tag: parts[1], Valid: true}, nil
 }
 
-func (s *timescaleBattlelogStore) Store(ctx context.Context, ingest models.BattlelogIngest) error {
-	if len(ingest.Rows) == 0 && len(ingest.Players) == 0 && len(ingest.Checkpoints) == 0 {
-		return nil
+func (s *timescaleBattlelogStore) Store(ctx context.Context, ingest models.BattlelogIngest) (int, error) {
+	if len(ingest.Rows) == 0 && len(ingest.Checkpoints) == 0 {
+		return 0, nil
 	}
-	ctx, span := platform.StartSpan(ctx, "timescale.battlelogs.store",
-		attribute.String("domain", battlelogsDomainName),
-		attribute.String("operation", "store_battlelogs"),
-		attribute.Int("rows.count", len(ingest.Rows)),
-		attribute.Int("write.count", len(ingest.Rows)+len(ingest.Players)+len(ingest.Checkpoints)),
-	)
-	defer span.End()
 	tx, err := s.pool.Begin(ctx)
 	if err != nil {
-		platform.RecordSpanError(span, err)
-		span.SetAttributes(platform.SpanErrorStatus(err))
-		return err
+		return 0, err
 	}
 	defer tx.Rollback(ctx)
 
-	// Persist profile rows before battlelog rows because the insert joins basic_player.
-	if err := utils.UpsertBasicPlayers(ctx, tx, ingest.Players, battlelogsDomainName); err != nil {
-		platform.RecordSpanError(span, err)
-		span.SetAttributes(platform.SpanErrorStatus(err))
-		return err
-	}
 	insertedRows, err := s.insertBattlelogRows(ctx, tx, ingest.Rows)
 	if err != nil {
-		platform.RecordSpanError(span, err)
-		span.SetAttributes(platform.SpanErrorStatus(err))
-		return err
+		return 0, err
 	}
 	if err := tx.Commit(ctx); err != nil {
-		platform.RecordSpanError(span, err)
-		span.SetAttributes(platform.SpanErrorStatus(err))
-		return err
+		return 0, err
 	}
-	err = s.bufferItemRollups(ctx, insertedRows)
-	platform.RecordSpanError(span, err)
-	span.SetAttributes(platform.SpanErrorStatus(err))
-	return err
+	return insertedRows, nil
 }
 
-func (s *timescaleBattlelogStore) insertBattlelogRows(ctx context.Context, tx pgx.Tx, rows []models.BattlelogRow) ([]models.BattlelogRow, error) {
+func (s *timescaleBattlelogStore) insertBattlelogRows(ctx context.Context, tx pgx.Tx, rows []models.BattlelogRow) (int, error) {
 	if len(rows) == 0 {
-		return nil, nil
+		return 0, nil
 	}
-	ctx, span := platform.StartSpan(ctx, "timescale.battlelogs.insert",
-		attribute.String("domain", battlelogsDomainName),
-		attribute.String("operation", "insert_battlelogs"),
-		attribute.Int("rows.count", len(rows)),
-	)
-	defer span.End()
-	batch := &pgx.Batch{}
+	if _, err := tx.Exec(ctx, `
+		CREATE TEMP TABLE battlelog_ingest_stage (
+			battle_id uuid NOT NULL,
+			army_share_code text NOT NULL,
+			player_tag text NOT NULL,
+			opponent_tag text NOT NULL,
+			opponent_name text NOT NULL,
+			opponent_th smallint NOT NULL,
+			battle_type text NOT NULL,
+			attack boolean NOT NULL,
+			stars smallint NOT NULL,
+			destruction_percentage smallint NOT NULL,
+			gold integer NOT NULL,
+			elixir integer NOT NULL,
+			dark_elixir integer NOT NULL,
+			duration integer NOT NULL,
+			battle_time timestamp with time zone NOT NULL,
+			army_items text[] NOT NULL,
+			army_counts text NOT NULL
+	) ON COMMIT DROP
+	`); err != nil {
+		return 0, err
+	}
+
+	copyRows := make([][]any, 0, len(rows))
 	for _, row := range rows {
 		armyItems, armyCounts, err := armyItemsAndCounts(row.ArmyColumns)
 		if err != nil {
-			platform.RecordSpanError(span, err)
-			span.SetAttributes(platform.SpanErrorStatus(err))
-			return nil, err
+			return 0, err
 		}
-		batch.Queue(`
-			INSERT INTO battlelogs (
-				battle_id, army_hash, player_tag, player_th,
-				opponent_tag, opponent_th, league_id, battle_type, attack,
-				stars, destruction_percentage, gold, elixir, dark_elixir, battle_time,
-				army_items, army_counts
-			)
-			SELECT
-				$1, $2::numeric, p.tag, p.townhall_level,
-				o.tag, o.townhall_level, COALESCE(p.league_id, 0), $5, $6,
-				$7, $8, $9, $10, $11, $12,
-				$13, $14::jsonb
-			FROM basic_player p
-			JOIN basic_player o ON o.tag = $4
-			WHERE p.tag = $3
-			ON CONFLICT (battle_id, battle_time) DO NOTHING
-		`,
-			row.BattleID, strconv.FormatUint(row.ArmyHash, 10), row.PlayerTag, row.OpponentTag,
+		copyRows = append(copyRows, []any{
+			row.BattleID, row.ArmyShareCode, row.PlayerTag,
+			row.OpponentTag, row.OpponentName, int16(row.OpponentTH),
 			row.BattleType, row.Attack,
 			int16(row.Stars), int16(row.DestructionPercentage), int32(row.Gold),
-			int32(row.Elixir), int32(row.DarkElixir), row.Timestamp,
+			int32(row.Elixir), int32(row.DarkElixir), int32(row.Duration), row.Timestamp,
 			armyItems, armyCounts,
-		)
+		})
 	}
-	results := tx.SendBatch(ctx, batch)
-	inserted := make([]models.BattlelogRow, 0, len(rows))
-	var err error
-	for i := 0; i < batch.Len(); i++ {
-		var tag pgconn.CommandTag
-		tag, err = results.Exec()
-		if err != nil {
-			break
-		}
-		if tag.RowsAffected() > 0 {
-			inserted = append(inserted, rows[i])
-		}
-	}
-	closeErr := results.Close()
-	if err == nil {
-		err = closeErr
-	}
-	platform.RecordSpanError(span, err)
-	span.SetAttributes(attribute.Int("rows.inserted", len(inserted)), platform.SpanErrorStatus(err))
-	return inserted, err
-}
-
-func (s *timescaleBattlelogStore) bufferItemRollups(ctx context.Context, rows []models.BattlelogRow) error {
-	s.rollupMu.Lock()
-	defer s.rollupMu.Unlock()
-
-	accumulateItemRollups(rows, &s.rollups)
-	if s.rollups.PendingAttacks < s.rollupFlushAttacks {
-		return nil
-	}
-	// Only one goroutine may flush because the map is reset after a successful
-	// commit.
-	return s.flushItemRollupsLocked(ctx)
-}
-
-func (s *timescaleBattlelogStore) flushItemRollups(ctx context.Context) error {
-	s.rollupMu.Lock()
-	defer s.rollupMu.Unlock()
-	return s.flushItemRollupsLocked(ctx)
-}
-
-func (s *timescaleBattlelogStore) flushItemRollupsLocked(ctx context.Context) error {
-	if len(s.rollups.Usage) == 0 && len(s.rollups.Hitrate) == 0 {
-		s.rollups.PendingAttacks = 0
-		return nil
-	}
-	ctx, span := platform.StartSpan(ctx, "timescale.rollups.flush",
-		attribute.String("domain", battlelogsDomainName),
-		attribute.String("operation", "flush_rollups"),
-		attribute.Int("rows.count", len(s.rollups.Usage)+len(s.rollups.Hitrate)),
-	)
-	defer span.End()
-	tx, err := s.pool.Begin(ctx)
+	_, err := tx.CopyFrom(ctx, pgx.Identifier{"battlelog_ingest_stage"}, []string{
+		"battle_id",
+		"army_share_code",
+		"player_tag",
+		"opponent_tag",
+		"opponent_name",
+		"opponent_th",
+		"battle_type",
+		"attack",
+		"stars",
+		"destruction_percentage",
+		"gold",
+		"elixir",
+		"dark_elixir",
+		"duration",
+		"battle_time",
+		"army_items",
+		"army_counts",
+	}, pgx.CopyFromRows(copyRows))
 	if err != nil {
-		platform.RecordSpanError(span, err)
-		span.SetAttributes(platform.SpanErrorStatus(err))
-		return err
+		return 0, err
 	}
-	defer tx.Rollback(ctx)
 
-	// Usage and hitrate rollups share a transaction so the daily aggregates move
-	// forward together for a given flush.
-	if err := s.insertItemUsageRollups(ctx, tx, s.rollups.Usage); err != nil {
-		platform.RecordSpanError(span, err)
-		span.SetAttributes(platform.SpanErrorStatus(err))
-		return err
-	}
-	if err := s.insertItemHitrateRollups(ctx, tx, s.rollups.Hitrate); err != nil {
-		platform.RecordSpanError(span, err)
-		span.SetAttributes(platform.SpanErrorStatus(err))
-		return err
-	}
-	if err := tx.Commit(ctx); err != nil {
-		platform.RecordSpanError(span, err)
-		span.SetAttributes(platform.SpanErrorStatus(err))
-		return err
-	}
-	// Reset only after commit; on failure the buffered deltas remain in memory and
-	// can be retried by a later flush.
-	s.rollups = newItemRollupBuffer()
-	span.SetAttributes(platform.SpanErrorStatus(nil))
-	return nil
-}
-
-func (s *timescaleBattlelogStore) insertItemUsageRollups(ctx context.Context, tx pgx.Tx, usage map[models.ItemRollupKey]int64) error {
-	if len(usage) == 0 {
-		return nil
-	}
-	batch := &pgx.Batch{}
-	for key, uses := range usage {
-		batch.Queue(`
-			INSERT INTO item_usage_daily (
-				day_start, player_th, league_id, battle_type, item_key, uses
-			)
-			VALUES ($1, $2, $3, $4, $5, $6)
-			ON CONFLICT (day_start, player_th, league_id, battle_type, item_key)
-			DO UPDATE SET uses = item_usage_daily.uses + EXCLUDED.uses
-		`, key.DayStart, key.PlayerTH, key.LeagueID, key.BattleType, key.ItemKey, uses)
-	}
-	return utils.SendBatch(ctx, tx, batch)
-}
-
-func (s *timescaleBattlelogStore) insertItemHitrateRollups(ctx context.Context, tx pgx.Tx, hitrate map[models.ItemRollupKey]models.ItemHitrateCounts) error {
-	if len(hitrate) == 0 {
-		return nil
-	}
-	batch := &pgx.Batch{}
-	for key, counts := range hitrate {
-		batch.Queue(`
-			INSERT INTO item_hitrate_daily (
-				day_start, player_th, league_id, battle_type, item_key,
-				attacks, zero_stars, one_stars, two_stars, three_stars
-			)
-			VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)
-			ON CONFLICT (day_start, player_th, league_id, battle_type, item_key)
-			DO UPDATE SET
-				attacks = item_hitrate_daily.attacks + EXCLUDED.attacks,
-				zero_stars = item_hitrate_daily.zero_stars + EXCLUDED.zero_stars,
-				one_stars = item_hitrate_daily.one_stars + EXCLUDED.one_stars,
-				two_stars = item_hitrate_daily.two_stars + EXCLUDED.two_stars,
-				three_stars = item_hitrate_daily.three_stars + EXCLUDED.three_stars
-		`,
-			key.DayStart, key.PlayerTH, key.LeagueID, key.BattleType, key.ItemKey,
-			counts.Attacks, counts.ZeroStars, counts.OneStars, counts.TwoStars, counts.ThreeStars,
+	tag, err := tx.Exec(ctx, `
+		INSERT INTO battlelogs (
+			battle_id, army_share_code, player_tag, player_name, player_th,
+			opponent_tag, opponent_name, opponent_th, battle_type, attack,
+			stars, destruction_percentage, gold, elixir, dark_elixir, duration, timestamp,
+			army_items, army_counts
 		)
-	}
-	return utils.SendBatch(ctx, tx, batch)
+		SELECT
+			stage.battle_id,
+			stage.army_share_code,
+			stage.player_tag,
+			basic_player.name,
+			basic_player.townhall_level,
+			stage.opponent_tag,
+			stage.opponent_name,
+			stage.opponent_th,
+			stage.battle_type,
+			stage.attack,
+			stage.stars,
+			stage.destruction_percentage,
+			stage.gold,
+			stage.elixir,
+			stage.dark_elixir,
+			stage.duration,
+			stage.battle_time,
+			stage.army_items,
+			stage.army_counts::jsonb
+		FROM battlelog_ingest_stage AS stage
+		JOIN basic_player ON basic_player.tag = stage.player_tag
+		ON CONFLICT (battle_id, timestamp) DO NOTHING
+	`)
+	inserted := int(tag.RowsAffected())
+	return inserted, err
 }
 
 func armyItemsAndCounts(columns map[string]uint16) ([]string, string, error) {
@@ -772,116 +620,6 @@ func armyItemsAndCounts(columns map[string]uint16) ([]string, string, error) {
 		return nil, "", err
 	}
 	return items, string(raw), nil
-}
-
-func newItemRollupBuffer() itemRollupBuffer {
-	return itemRollupBuffer{
-		Usage:   make(map[models.ItemRollupKey]int64),
-		Hitrate: make(map[models.ItemRollupKey]models.ItemHitrateCounts),
-	}
-}
-
-func accumulateItemRollups(rows []models.BattlelogRow, buffer *itemRollupBuffer) {
-	// Usage stats count every ranked/legend attack with parsed army items,
-	// regardless of defender town hall.
-	for _, row := range attackRows(rows) {
-		if !rowHasArmyItems(row) {
-			continue
-		}
-		buffer.PendingAttacks++
-		for _, item := range sortedArmyColumnKeys(row.ArmyColumns) {
-			usageKey := models.ItemRollupKey{
-				DayStart:   dayStart(row.Timestamp),
-				PlayerTH:   int16(row.PlayerTH),
-				LeagueID:   int32(row.LeagueID),
-				BattleType: row.BattleType,
-				ItemKey:    item,
-			}
-			buffer.Usage[usageKey]++
-		}
-	}
-
-	// Hitrate stats are narrower: only same-TH ranked/legend attacks are used so
-	// star buckets compare armies in roughly equivalent matchups.
-	for _, row := range qualifyingDynamicSearchRows(rows) {
-		if !rowHasArmyItems(row) {
-			continue
-		}
-		zeroStars, oneStars, twoStars, threeStars := starBuckets(row)
-		for _, item := range sortedArmyColumnKeys(row.ArmyColumns) {
-			hitrateKey := models.ItemRollupKey{
-				DayStart:   dayStart(row.Timestamp),
-				PlayerTH:   int16(row.PlayerTH),
-				LeagueID:   int32(row.LeagueID),
-				BattleType: row.BattleType,
-				ItemKey:    item,
-			}
-			counts := buffer.Hitrate[hitrateKey]
-			counts.Attacks++
-			counts.ZeroStars += int64(zeroStars)
-			counts.OneStars += int64(oneStars)
-			counts.TwoStars += int64(twoStars)
-			counts.ThreeStars += int64(threeStars)
-			buffer.Hitrate[hitrateKey] = counts
-		}
-	}
-}
-
-func qualifyingDynamicSearchRows(rows []models.BattlelogRow) []models.BattlelogRow {
-	// "Dynamic search" stats are meant to answer how an army performs at the
-	// player's own TH, so mismatched TH hits are excluded from hitrate rollups.
-	out := make([]models.BattlelogRow, 0, len(rows))
-	for _, row := range rows {
-		if row.Attack && row.PlayerTH == row.OpponentTH && isBattlelogStatsType(row.BattleType) {
-			out = append(out, row)
-		}
-	}
-	return out
-}
-
-func attackRows(rows []models.BattlelogRow) []models.BattlelogRow {
-	// Rollups ignore defenses and non-stats battle types; the army columns belong
-	// to the attacking player.
-	out := make([]models.BattlelogRow, 0, len(rows))
-	for _, row := range rows {
-		if row.Attack && isBattlelogStatsType(row.BattleType) {
-			out = append(out, row)
-		}
-	}
-	return out
-}
-
-func isBattlelogStatsType(value string) bool {
-	// Friendly/challenge-style entries are deliberately excluded from usage and
-	// hitrate aggregates because they do not reflect normal matchmaking.
-	switch strings.ToLower(value) {
-	case "ranked", "legend":
-		return true
-	default:
-		return false
-	}
-}
-
-func starBuckets(row models.BattlelogRow) (uint64, uint64, uint64, uint64) {
-	switch row.Stars {
-	case 0:
-		return 1, 0, 0, 0
-	case 1:
-		return 0, 1, 0, 0
-	case 2:
-		return 0, 0, 1, 0
-	case 3:
-		return 0, 0, 0, 1
-	default:
-		return 0, 0, 0, 0
-	}
-}
-
-func dayStart(value time.Time) time.Time {
-	// Normalize all aggregate buckets to UTC so workers in different local
-	// timezones write to the same daily row.
-	value = value.UTC()
-	return time.Date(value.Year(), value.Month(), value.Day(), 0, 0, 0, 0, time.UTC)
 }
 
 func sortedArmyColumnKeys(columns map[string]uint16) []string {
@@ -904,15 +642,6 @@ func sortedArmyColumnKeys(columns map[string]uint16) []string {
 	return keys
 }
 
-func rowHasArmyItems(row models.BattlelogRow) bool {
-	for key, value := range row.ArmyColumns {
-		if value > 0 && battlelogColumnPattern.MatchString(key) {
-			return true
-		}
-	}
-	return false
-}
-
 type battlelogTimestampCache struct {
 	client valkey.Client
 	ttl    time.Duration
@@ -922,28 +651,17 @@ func (c battlelogTimestampCache) Get(ctx context.Context, tag string) (models.Ba
 	if c.client == nil || tag == "" {
 		return models.BattlelogCheckpoint{Tag: tag}, nil
 	}
-	ctx, span := platform.StartSpan(ctx, "valkey.battlelog_checkpoint.get",
-		attribute.String("domain", battlelogsDomainName),
-		attribute.String("operation", "get"),
-	)
-	defer span.End()
 	value, err := c.client.Do(ctx, c.client.B().Get().Key(battlelogCheckpointKey(tag)).Build()).ToString()
 	if valkey.IsValkeyNil(err) {
-		span.SetAttributes(attribute.Int("rows.count", 0), platform.SpanErrorStatus(nil))
 		return models.BattlelogCheckpoint{Tag: tag}, nil
 	}
 	if err != nil {
-		platform.RecordSpanError(span, err)
-		span.SetAttributes(platform.SpanErrorStatus(err))
 		return models.BattlelogCheckpoint{}, err
 	}
 	timestamp, err := time.Parse(time.RFC3339Nano, value)
 	if err != nil {
-		platform.RecordSpanError(span, err)
-		span.SetAttributes(platform.SpanErrorStatus(err))
 		return models.BattlelogCheckpoint{}, err
 	}
-	span.SetAttributes(attribute.Int("rows.count", 1), platform.SpanErrorStatus(nil))
 	return models.BattlelogCheckpoint{Tag: tag, Timestamp: timestamp.UTC()}, nil
 }
 
@@ -965,21 +683,12 @@ func (c battlelogTimestampCache) UpdateMany(ctx context.Context, checkpoints []m
 	if len(commands) == 0 {
 		return nil
 	}
-	ctx, span := platform.StartSpan(ctx, "valkey.battlelog_checkpoint.set",
-		attribute.String("domain", battlelogsDomainName),
-		attribute.String("operation", "set"),
-		attribute.Int("write.count", len(commands)),
-	)
-	defer span.End()
 	results := c.client.DoMulti(ctx, commands...)
 	for _, result := range results {
 		if err := result.Error(); err != nil {
-			platform.RecordSpanError(span, err)
-			span.SetAttributes(platform.SpanErrorStatus(err))
 			return err
 		}
 	}
-	span.SetAttributes(platform.SpanErrorStatus(nil))
 	return nil
 }
 
@@ -1020,18 +729,17 @@ func battlelogEntryTimestamp(entry clashy.BattleLogEntry) time.Time {
 	return timestamp.UTC()
 }
 
-func battlelogRowFromEntry(playerTag string, player models.BasicPlayerRow, entry clashy.BattleLogEntry, opponent models.BasicPlayerRow) models.BattlelogRow {
+func battlelogRowFromEntry(playerTag string, entry clashy.BattleLogEntry) models.BattlelogRow {
 	gold, elixir, darkElixir := lootedResourceColumns(entry.LootedResources)
 	armyColumns := parseArmyColumns(entry.ArmyShareCode)
 	timestamp := battlelogEntryTimestamp(entry)
 	return models.BattlelogRow{
 		BattleID:              battlelogBattleID(playerTag, entry),
-		ArmyHash:              armyHash(armyColumns),
+		ArmyShareCode:         normalizeArmyShareCode(entry.ArmyShareCode),
 		PlayerTag:             playerTag,
-		PlayerTH:              uint8(player.TownHall),
 		OpponentTag:           entry.OpponentPlayerTag,
-		OpponentTH:            uint8(opponent.TownHall),
-		LeagueID:              uint32(player.LeagueID),
+		OpponentName:          entry.OpponentName,
+		OpponentTH:            uint8(entry.OpponentTownHallLevel + 1),
 		BattleType:            string(entry.BattleType),
 		Attack:                entry.Attack,
 		Stars:                 uint8(entry.Stars),
@@ -1039,21 +747,28 @@ func battlelogRowFromEntry(playerTag string, player models.BasicPlayerRow, entry
 		Gold:                  uint32(gold),
 		Elixir:                uint32(elixir),
 		DarkElixir:            uint32(darkElixir),
+		Duration:              uint16(entry.Duration),
 		Timestamp:             timestamp,
 		ArmyColumns:           armyColumns,
 	}
 }
 
 func battlelogBattleID(playerTag string, entry clashy.BattleLogEntry) uuid.UUID {
+	leftTag, rightTag := orderedBattlelogTags(playerTag, entry.OpponentPlayerTag)
 	timestamp := battlelogEntryTimestamp(entry)
 	key := strings.Join([]string{
-		playerTag,
-		entry.OpponentPlayerTag,
+		leftTag,
+		rightTag,
 		timestamp.Format(time.RFC3339Nano),
-		string(entry.BattleType),
-		strconv.FormatBool(entry.Attack),
 	}, "|")
 	return uuid.NewSHA1(uuid.NameSpaceOID, []byte(key))
+}
+
+func orderedBattlelogTags(left, right string) (string, string) {
+	if right < left {
+		return right, left
+	}
+	return left, right
 }
 
 func lootedResourceColumns(resources []clashy.Resource) (gold, elixir, darkElixir int) {
@@ -1073,7 +788,7 @@ func lootedResourceColumns(resources []clashy.Resource) (gold, elixir, darkElixi
 func parseArmyColumns(link string) map[string]uint16 {
 	// Army share links encode units/spells/heroes in compact sections. The parser
 	// flattens them into uniform prefix_ID columns so troops, spells, heroes,
-	// pets, equipment, and siege machines can share rollup code.
+	// pets, equipment, and siege machines share one storage shape.
 	payload := extractArmySharePayload(link)
 	columns := make(map[string]uint16)
 	for _, section := range splitArmyShareSections(payload) {
@@ -1191,39 +906,172 @@ func leadingInt(value string) (int, string) {
 	return parsed, value[i:]
 }
 
-func armyHash(columns map[string]uint16) uint64 {
-	// Hash the canonical army shape so equal armies get the same compact ID even
-	// if the original share-link order differed.
-	canonical := canonicalArmy(columns)
-	if canonical == "" {
-		return 0
+func normalizeArmyShareCode(link string) string {
+	payload := extractArmySharePayload(link)
+	sections := splitArmyShareSections(payload)
+	if len(sections) == 0 {
+		return ""
 	}
-	return xxhash.Sum64String(canonical)
+	heroes := make([]armyHeroLoadout, 0)
+	itemSections := map[byte]map[int]uint16{
+		'i': {},
+		'd': {},
+		'u': {},
+		's': {},
+	}
+	for _, section := range sections {
+		if len(section) < 2 {
+			continue
+		}
+		switch section[0] {
+		case 'h':
+			heroes = append(heroes, parseArmyHeroLoadouts(section[1:])...)
+		case 'i', 'd', 'u', 's':
+			parseArmyItemCountsSection(section[1:], itemSections[section[0]])
+		}
+	}
+
+	var parts []string
+	if encoded := encodeArmyHeroSection(heroes); encoded != "" {
+		parts = append(parts, encoded)
+	}
+	for _, marker := range []byte{'i', 'd', 'u', 's'} {
+		if encoded := encodeArmyItemSection(marker, itemSections[marker]); encoded != "" {
+			parts = append(parts, encoded)
+		}
+	}
+	return strings.Join(parts, "")
 }
 
-func canonicalArmy(columns map[string]uint16) string {
-	// Build a deterministic representation of the army. This is what makes the
-	// xxhash value stable despite Go's randomized map iteration order.
-	keys := make([]string, 0, len(columns))
-	for key, value := range columns {
-		if value > 0 {
-			keys = append(keys, key)
+type armyHeroLoadout struct {
+	HeroID    int
+	PetID     int
+	Equipment []int
+}
+
+func parseArmyHeroLoadouts(payload string) []armyHeroLoadout {
+	var heroes []armyHeroLoadout
+	for _, part := range strings.Split(payload, "-") {
+		if part == "" {
+			continue
 		}
+		heroID, rest := leadingInt(part)
+		if heroID < 0 {
+			continue
+		}
+		loadout := armyHeroLoadout{HeroID: heroID}
+		for rest != "" {
+			marker := rest[0]
+			if marker != 'p' && marker != 'e' {
+				if marker == '_' {
+					rest = rest[1:]
+					continue
+				}
+				_, rest = leadingInt(rest[1:])
+				continue
+			}
+			value, next := leadingInt(rest[1:])
+			if value >= 0 {
+				if marker == 'p' {
+					loadout.PetID = value
+				} else {
+					loadout.Equipment = append(loadout.Equipment, value)
+				}
+			}
+			rest = next
+			if strings.HasPrefix(rest, "_") {
+				value, next = leadingInt(rest[1:])
+				if value >= 0 {
+					loadout.Equipment = append(loadout.Equipment, value)
+				}
+				rest = next
+			}
+		}
+		sort.Ints(loadout.Equipment)
+		heroes = append(heroes, loadout)
 	}
-	sort.Slice(keys, func(i, j int) bool {
-		leftSection, leftID := splitArmyColumn(keys[i])
-		rightSection, rightID := splitArmyColumn(keys[j])
-		if leftSection != rightSection {
-			return leftSection < rightSection
+	sort.Slice(heroes, func(i, j int) bool {
+		if heroes[i].HeroID != heroes[j].HeroID {
+			return heroes[i].HeroID < heroes[j].HeroID
 		}
-		return leftID < rightID
+		if heroes[i].PetID != heroes[j].PetID {
+			return heroes[i].PetID < heroes[j].PetID
+		}
+		left := intsKey(heroes[i].Equipment)
+		right := intsKey(heroes[j].Equipment)
+		return left < right
 	})
-	parts := make([]string, 0, len(keys))
-	for _, key := range keys {
-		section, id := splitArmyColumn(key)
-		parts = append(parts, fmt.Sprintf("%s:%d=%d", section, id, columns[key]))
+	return heroes
+}
+
+func encodeArmyHeroSection(heroes []armyHeroLoadout) string {
+	if len(heroes) == 0 {
+		return ""
 	}
-	return strings.Join(parts, ";")
+	parts := make([]string, 0, len(heroes))
+	for _, hero := range heroes {
+		part := strconv.Itoa(hero.HeroID)
+		if hero.PetID > 0 {
+			part += "p" + strconv.Itoa(hero.PetID)
+		}
+		if len(hero.Equipment) > 0 {
+			equipment := make([]string, 0, len(hero.Equipment))
+			for _, id := range hero.Equipment {
+				if id >= 0 {
+					equipment = append(equipment, strconv.Itoa(id))
+				}
+			}
+			if len(equipment) > 0 {
+				part += "e" + strings.Join(equipment, "_")
+			}
+		}
+		parts = append(parts, part)
+	}
+	return "h" + strings.Join(parts, "-")
+}
+
+func encodeArmyItemSection(marker byte, items map[int]uint16) string {
+	if len(items) == 0 {
+		return ""
+	}
+	ids := make([]int, 0, len(items))
+	for id, qty := range items {
+		if qty > 0 {
+			ids = append(ids, id)
+		}
+	}
+	sort.Ints(ids)
+	if len(ids) == 0 {
+		return ""
+	}
+	parts := make([]string, 0, len(ids))
+	for _, id := range ids {
+		parts = append(parts, fmt.Sprintf("%dx%d", items[id], id))
+	}
+	return string(marker) + strings.Join(parts, "-")
+}
+
+func parseArmyItemCountsSection(payload string, counts map[int]uint16) {
+	for _, part := range strings.Split(payload, "-") {
+		qtyText, idText, ok := strings.Cut(part, "x")
+		if !ok {
+			continue
+		}
+		qty, err1 := strconv.Atoi(qtyText)
+		id, err2 := strconv.Atoi(idText)
+		if err1 != nil || err2 != nil || qty <= 0 || id < 0 {
+			continue
+		}
+		counts[id] += uint16(qty)
+	}
+}
+
+func intsKey(values []int) string {
+	parts := make([]string, 0, len(values))
+	for _, value := range values {
+		parts = append(parts, strconv.Itoa(value))
+	}
+	return strings.Join(parts, "_")
 }
 
 func splitArmyColumn(column string) (string, int) {

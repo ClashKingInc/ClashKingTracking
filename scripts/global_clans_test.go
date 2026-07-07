@@ -14,6 +14,15 @@ import (
 	clashy "github.com/clashkinginc/clashy.go"
 )
 
+func globalClanIngestForTest(current clashy.Clan, previous *models.BasicClanRow, now time.Time) models.GlobalClanIngest {
+	row := basicClanRow(current)
+	snapshot := globalClanSnapshot{Clan: current, Row: row, FetchedAt: now}
+	if previous != nil {
+		return buildGlobalClanIngest(snapshot, &globalClanSnapshot{Row: *previous})
+	}
+	return buildGlobalClanIngest(snapshot, nil)
+}
+
 func TestBasicClanRowUsesPersistedShape(t *testing.T) {
 	clan := clashy.Clan{
 		Tag:           "#CLAN",
@@ -45,8 +54,8 @@ func TestBasicClanRowUsesPersistedShape(t *testing.T) {
 	if got.BadgeURL != "medium" || got.TroopsDonated != 8 || got.TroopsReceived != 10 {
 		t.Fatalf("unexpected badge/troops: %#v", got)
 	}
-	if want := []string{"#A", "#B"}; !reflect.DeepEqual(got.MemberTags, want) {
-		t.Fatalf("MemberTags = %#v, want %#v", got.MemberTags, want)
+	if want := []models.BasicClanMember{{Tag: "#A"}, {Tag: "#B"}}; !reflect.DeepEqual(got.Members, want) {
+		t.Fatalf("Members = %#v, want %#v", got.Members, want)
 	}
 }
 
@@ -113,12 +122,15 @@ func TestBuildGlobalClanIngestOnlyUsesJoinLeaveForMembers(t *testing.T) {
 		ClanLevel:       10,
 		CWLLeagueID:     48000001,
 		CapitalLeagueID: intPtr(85000001),
-		MemberTags:      []string{"#A", "#B"},
+		MemberCount:     2,
+		Members:         []models.BasicClanMember{{Tag: "#A", Name: "Ay"}, {Tag: "#B", Name: "Bee"}},
 	}
 	current := clashy.Clan{
 		Tag:           "#CLAN",
 		Description:   "after",
 		Level:         11,
+		Points:        34000,
+		WarWinStreak:  7,
 		MemberCount:   2,
 		WarLeague:     clashy.League{ID: 48000002},
 		CapitalLeague: &clashy.League{ID: 85000002},
@@ -128,12 +140,21 @@ func TestBuildGlobalClanIngestOnlyUsesJoinLeaveForMembers(t *testing.T) {
 		},
 	}
 
-	ingest := buildGlobalClanIngest(current, previous, now)
+	ingest := globalClanIngestForTest(current, &previous, now)
 	if len(ingest.Clans) != 1 {
 		t.Fatalf("Clans len = %d, want 1", len(ingest.Clans))
 	}
+	if ingest.Clans[0].ClanPoints != 34000 || ingest.Clans[0].WarWinStreak != 7 {
+		t.Fatalf("current clan records should be stored on basic clan row: %#v", ingest.Clans[0])
+	}
 	if len(ingest.Players) != 2 || ingest.Players[0].ClanTag != "#CLAN" || ingest.Players[1].ClanTag != "#CLAN" {
 		t.Fatalf("player rows should carry source clan tag: %#v", ingest.Players)
+	}
+	nowPtr := now
+	if want := []models.ClanRecordRow{
+		{Tag: "#CLAN", ClanPoints: 34000, ClanPointsAt: &nowPtr, WarWinStreak: 7, WarWinStreakAt: &nowPtr},
+	}; !reflect.DeepEqual(ingest.ClanRecords, want) {
+		t.Fatalf("ClanRecords = %#v, want %#v", ingest.ClanRecords, want)
 	}
 	if len(ingest.JoinLeaves) != 2 {
 		t.Fatalf("JoinLeaves len = %d, want 2: %#v", len(ingest.JoinLeaves), ingest.JoinLeaves)
@@ -141,10 +162,10 @@ func TestBuildGlobalClanIngestOnlyUsesJoinLeaveForMembers(t *testing.T) {
 	if want := []string{"#CLAN"}; !reflect.DeepEqual(ingest.ActiveClanTags, want) {
 		t.Fatalf("ActiveClanTags = %#v, want %#v", ingest.ActiveClanTags, want)
 	}
-	if ingest.JoinLeaves[0].EventType != "leave" || ingest.JoinLeaves[0].PlayerTag != "#A" {
+	if ingest.JoinLeaves[0].EventType != "leave" || ingest.JoinLeaves[0].PlayerTag != "#A" || ingest.JoinLeaves[0].PlayerName != "Ay" {
 		t.Fatalf("unexpected first join/leave row: %#v", ingest.JoinLeaves[0])
 	}
-	if ingest.JoinLeaves[1].EventType != "join" || ingest.JoinLeaves[1].PlayerTag != "#C" || ingest.JoinLeaves[1].TownHallLevel != 16 {
+	if ingest.JoinLeaves[1].EventType != "join" || ingest.JoinLeaves[1].PlayerTag != "#C" || ingest.JoinLeaves[1].PlayerName != "Sea" || ingest.JoinLeaves[1].TownHallLevel != 16 {
 		t.Fatalf("unexpected second join/leave row: %#v", ingest.JoinLeaves[1])
 	}
 	if len(ingest.ClanChanges) != 4 {
@@ -157,11 +178,29 @@ func TestBuildGlobalClanIngestOnlyUsesJoinLeaveForMembers(t *testing.T) {
 	}
 }
 
+func TestClanRecordRowsSkipsMissingValues(t *testing.T) {
+	now := time.Date(2026, 5, 20, 10, 0, 0, 0, time.UTC)
+	if got := clanRecordRows(clashy.Clan{Tag: "#CLAN"}, models.BasicClanRow{}, now); len(got) != 0 {
+		t.Fatalf("zero-valued records should be skipped: %#v", got)
+	}
+	if got := clanRecordRows(clashy.Clan{Points: 100, WarWinStreak: 3}, models.BasicClanRow{}, now); len(got) != 0 {
+		t.Fatalf("records without clan tag should be skipped: %#v", got)
+	}
+	if got := clanRecordRows(
+		clashy.Clan{Tag: "#CLAN", Points: 100, WarWinStreak: 3},
+		models.BasicClanRow{RecordClanPoints: 100, RecordWarWinStreak: 3},
+		now,
+	); len(got) != 0 {
+		t.Fatalf("records that do not beat stored highs should be skipped: %#v", got)
+	}
+}
+
 func TestBuildGlobalClanIngestDoesNotMarkLeaveOnlyClanActive(t *testing.T) {
 	now := time.Date(2026, 5, 20, 10, 0, 0, 0, time.UTC)
 	previous := models.BasicClanRow{
-		Tag:        "#CLAN",
-		MemberTags: []string{"#A", "#B"},
+		Tag:         "#CLAN",
+		MemberCount: 2,
+		Members:     []models.BasicClanMember{{Tag: "#A", Name: "Ay"}, {Tag: "#B", Name: "Bee"}},
 	}
 	current := clashy.Clan{
 		Tag:         "#CLAN",
@@ -171,52 +210,62 @@ func TestBuildGlobalClanIngestDoesNotMarkLeaveOnlyClanActive(t *testing.T) {
 		},
 	}
 
-	ingest := buildGlobalClanIngest(current, previous, now)
+	ingest := globalClanIngestForTest(current, &previous, now)
 	if len(ingest.JoinLeaves) != 1 || ingest.JoinLeaves[0].EventType != "leave" {
 		t.Fatalf("expected one leave row: %#v", ingest.JoinLeaves)
+	}
+	if ingest.JoinLeaves[0].PlayerName != "Ay" {
+		t.Fatalf("leave row should use previous member name: %#v", ingest.JoinLeaves[0])
 	}
 	if len(ingest.ActiveClanTags) != 0 {
 		t.Fatalf("leave-only change should not mark active: %#v", ingest.ActiveClanTags)
 	}
 }
 
-func TestGlobalClanTargetMovesBetweenActiveAndInactive(t *testing.T) {
-	now := time.Date(2026, 5, 20, 10, 0, 0, 0, time.UTC)
-	previous := models.BasicClanRow{
-		Tag:         "#CLAN",
-		MemberCount: 10,
-		LastActive:  &now,
-		MemberTags:  []string{"#A"},
-	}
-	current := clashy.Clan{
-		Tag:         "#CLAN",
-		MemberCount: 2,
-		Members: []clashy.ClanMember{
-			{Tag: "#A", Name: "A", TownHall: 16},
-			{Tag: "#B", Name: "B", TownHall: 16},
-		},
-	}
-
-	ingest := buildGlobalClanIngest(current, previous, now)
-	moves := globalClanTargetMoves(current, previous, ingest, now)
-	if len(moves) != 1 || moves[0].Tag != "#CLAN" || moves[0].ToBucket != "inactive" || moves[0].Remove {
-		t.Fatalf("unexpected moves: %#v", moves)
-	}
-}
-
-func TestZeroMemberClanStoresRowAndRemovesTarget(t *testing.T) {
+func TestZeroMemberClanDeletesRow(t *testing.T) {
 	now := time.Date(2026, 5, 20, 10, 0, 0, 0, time.UTC)
 	current := clashy.Clan{Tag: "#CLAN", Name: "Deleted Clan", Level: 6, MemberCount: 0}
 
-	ingest := buildGlobalClanIngest(current, models.BasicClanRow{}, now)
-	if len(ingest.Clans) != 1 || ingest.Clans[0].Tag != "#CLAN" || ingest.Clans[0].MemberCount != 0 {
-		t.Fatalf("zero-member clan should still be stored: %#v", ingest.Clans)
+	ingest := globalClanIngestForTest(current, nil, now)
+	if len(ingest.Clans) != 0 {
+		t.Fatalf("zero-member clan should not be upserted: %#v", ingest.Clans)
 	}
-	if len(ingest.DeletedClanTags) != 0 {
-		t.Fatalf("zero-member clan should not be written as a delete: %#v", ingest.DeletedClanTags)
+	if want := []string{"#CLAN"}; !reflect.DeepEqual(ingest.DeletedClanTags, want) {
+		t.Fatalf("zero-member clan should be written as a delete: %#v", ingest.DeletedClanTags)
 	}
-	moves := globalClanTargetMoves(current, models.BasicClanRow{}, ingest, now)
-	if len(moves) != 1 || moves[0].Tag != "#CLAN" || !moves[0].Remove {
-		t.Fatalf("unexpected zero-member target moves: %#v", moves)
+}
+
+func TestBuildGlobalClanIngestSkipsHistoryForFirstHydration(t *testing.T) {
+	now := time.Date(2026, 5, 20, 10, 0, 0, 0, time.UTC)
+	previous := models.BasicClanRow{
+		Tag:         "#CLAN",
+		MemberCount: 0,
+	}
+	current := clashy.Clan{
+		Tag:           "#CLAN",
+		Name:          "Hydrated Clan",
+		Description:   "real description",
+		Level:         12,
+		MemberCount:   2,
+		WarLeague:     clashy.League{ID: 48000005},
+		CapitalLeague: &clashy.League{ID: 85000001},
+		Members: []clashy.ClanMember{
+			{Tag: "#A", Name: "Ay", TownHall: 15},
+			{Tag: "#B", Name: "Bee", TownHall: 16},
+		},
+	}
+
+	ingest := globalClanIngestForTest(current, &previous, now)
+	if len(ingest.Clans) != 1 || ingest.Clans[0].MemberCount != 2 {
+		t.Fatalf("hydrated clan should be upserted: %#v", ingest.Clans)
+	}
+	if len(ingest.JoinLeaves) != 0 {
+		t.Fatalf("first hydration should not emit join/leave history: %#v", ingest.JoinLeaves)
+	}
+	if len(ingest.ClanChanges) != 0 {
+		t.Fatalf("first hydration should not emit clan change history: %#v", ingest.ClanChanges)
+	}
+	if len(ingest.ActiveClanTags) != 0 {
+		t.Fatalf("first hydration should not mark active from synthetic joins: %#v", ingest.ActiveClanTags)
 	}
 }

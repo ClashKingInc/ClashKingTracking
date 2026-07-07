@@ -1,35 +1,42 @@
 package platform
 
 import (
-	"encoding/json"
-	"net/http"
 	"runtime"
 	"sync"
 	"time"
 )
 
 type DomainStats struct {
-	Name                   string        `json:"name"`
-	LastSuccess            time.Time     `json:"last_success,omitempty"`
-	LastError              string        `json:"last_error,omitempty"`
-	Requests               int64         `json:"requests"`
-	Writes                 int64         `json:"writes"`
-	Errors                 int64         `json:"errors"`
-	LastCycle              time.Duration `json:"last_cycle"`
-	LastLatency            time.Duration `json:"last_latency"`
-	AvgLatency             time.Duration `json:"avg_latency"`
-	QueueDepth             int           `json:"queue_depth"`
-	Healthy                bool          `json:"healthy"`
-	LastReadyChange        time.Time     `json:"last_ready_change,omitempty"`
-	ProcessingCount        int64         `json:"processing_count"`
-	TotalProcessTime       time.Duration `json:"total_process_time"`
-	StoreBatches           int64         `json:"store_batches"`
-	StoreRowsRequested     int64         `json:"store_rows_requested"`
-	StoreRowsAffected      int64         `json:"store_rows_affected"`
-	LastStoreRowsRequested int           `json:"last_store_rows_requested"`
-	LastStoreRowsAffected  int           `json:"last_store_rows_affected"`
-	AvgStoreMs             float64       `json:"avg_store_ms"`
-	LastStoreMs            float64       `json:"last_store_ms"`
+	Name                string        `json:"name"`
+	LastSuccess         time.Time     `json:"last_success,omitempty"`
+	LastError           string        `json:"last_error,omitempty"`
+	Requests            int64         `json:"requests"`
+	Writes              int64         `json:"writes"`
+	Errors              int64         `json:"errors"`
+	RequestLatencyTotal time.Duration `json:"request_latency_total"`
+	QueueDepth          int           `json:"queue_depth"`
+	Healthy             bool          `json:"healthy"`
+	LastReadyChange     time.Time     `json:"last_ready_change,omitempty"`
+	ProcessingCount     int64         `json:"processing_count"`
+	TotalProcessTime    time.Duration `json:"total_process_time"`
+	StoreBatches        int64         `json:"store_batches"`
+	StoreRowsRequested  int64         `json:"store_rows_requested"`
+	StoreRowsAffected   int64         `json:"store_rows_affected"`
+	StoreDurationTotal  time.Duration `json:"store_duration_total"`
+	TargetCount         int           `json:"target_count"`
+	TargetCycle         int64         `json:"target_cycle"`
+	TargetProcessed     int           `json:"target_processed"`
+}
+
+type RuntimeStats struct {
+	ObservedAt  time.Time     `json:"observed_at"`
+	StartedAt   time.Time     `json:"started_at"`
+	Uptime      time.Duration `json:"uptime"`
+	Goroutines  int           `json:"goroutines"`
+	AllocBytes  uint64        `json:"alloc_bytes"`
+	HeapObjects uint64        `json:"heap_objects"`
+	GCCycles    uint32        `json:"gc_cycles"`
+	Domains     []DomainStats `json:"domains"`
 }
 
 type Tracker struct {
@@ -61,12 +68,7 @@ func (t *Tracker) RecordRequest(name string, latency time.Duration, err error) {
 	defer t.mu.Unlock()
 	stats := t.domainLocked(name)
 	stats.Requests++
-	stats.LastLatency = latency
-	if stats.Requests == 1 {
-		stats.AvgLatency = latency
-	} else {
-		stats.AvgLatency = time.Duration((int64(stats.AvgLatency)*(stats.Requests-1) + int64(latency)) / stats.Requests)
-	}
+	stats.RequestLatencyTotal += latency
 	if err != nil {
 		stats.Errors++
 		stats.Healthy = false
@@ -79,7 +81,6 @@ func (t *Tracker) RecordProcess(name string, duration time.Duration) {
 	t.mu.Lock()
 	defer t.mu.Unlock()
 	stats := t.domainLocked(name)
-	stats.LastCycle = duration
 	stats.ProcessingCount++
 	stats.TotalProcessTime += duration
 	stats.LastSuccess = time.Now().UTC()
@@ -96,18 +97,37 @@ func (t *Tracker) RecordStore(name string, duration time.Duration, requestedRows
 	t.mu.Lock()
 	defer t.mu.Unlock()
 	stats := t.domainLocked(name)
-	elapsedMs := float64(duration) / float64(time.Millisecond)
 	stats.StoreBatches++
 	stats.StoreRowsRequested += int64(requestedRows)
 	stats.StoreRowsAffected += int64(affectedRows)
-	stats.LastStoreRowsRequested = requestedRows
-	stats.LastStoreRowsAffected = affectedRows
-	stats.LastStoreMs = elapsedMs
-	if stats.StoreBatches == 1 {
-		stats.AvgStoreMs = elapsedMs
-		return
+	stats.StoreDurationTotal += duration
+}
+
+func (t *Tracker) SetTrackingTargets(name string, count int) {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	stats := t.domainLocked(name)
+	stats.TargetCount = count
+	if stats.TargetCycle == 0 && count > 0 {
+		stats.TargetCycle = 1
 	}
-	stats.AvgStoreMs = (stats.AvgStoreMs*float64(stats.StoreBatches-1) + elapsedMs) / float64(stats.StoreBatches)
+	if stats.TargetProcessed > count {
+		stats.TargetProcessed = count
+	}
+}
+
+func (t *Tracker) RecordTrackedTarget(name string) {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	stats := t.domainLocked(name)
+	if stats.TargetCycle == 0 {
+		stats.TargetCycle = 1
+	}
+	stats.TargetProcessed++
+	if stats.TargetCount > 0 && stats.TargetProcessed >= stats.TargetCount {
+		stats.TargetCycle++
+		stats.TargetProcessed = 0
+	}
 }
 
 func (t *Tracker) SetReady(name string, healthy bool, detail string) {
@@ -129,59 +149,19 @@ func (t *Tracker) SetQueueDepth(name string, depth int) {
 	t.domainLocked(name).QueueDepth = depth
 }
 
-func (t *Tracker) HTTPMux() *http.ServeMux {
-	mux := http.NewServeMux()
-	mux.HandleFunc("/health/live", t.handleLive)
-	mux.HandleFunc("/health/ready", t.handleReady)
-	mux.HandleFunc("/stats", t.handleStats)
-	mux.HandleFunc("/stats/domains", t.handleDomains)
-	mux.HandleFunc("/stats/queues", t.handleQueues)
-	return mux
-}
-
-func (t *Tracker) handleLive(w http.ResponseWriter, _ *http.Request) {
-	writeJSON(w, http.StatusOK, map[string]any{
-		"status": "ok",
-		"uptime": time.Since(t.started).String(),
-	})
-}
-
-func (t *Tracker) handleReady(w http.ResponseWriter, _ *http.Request) {
-	domains := t.snapshotDomains()
-	ready := true
-	for _, stats := range domains {
-		if !stats.Healthy {
-			ready = false
-			break
-		}
-	}
-	status := http.StatusOK
-	if !ready {
-		status = http.StatusServiceUnavailable
-	}
-	writeJSON(w, status, map[string]any{"ready": ready, "domains": domains})
-}
-
-func (t *Tracker) handleStats(w http.ResponseWriter, _ *http.Request) {
+func (t *Tracker) Snapshot() RuntimeStats {
 	var mem runtime.MemStats
 	runtime.ReadMemStats(&mem)
-	writeJSON(w, http.StatusOK, map[string]any{
-		"uptime":       time.Since(t.started).String(),
-		"goroutines":   runtime.NumGoroutine(),
-		"alloc_bytes":  mem.Alloc,
-		"heap_objects": mem.HeapObjects,
-		"gc_cycles":    mem.NumGC,
-		"domains":      t.snapshotDomains(),
-		"queues":       t.snapshotQueues(),
-	})
-}
-
-func (t *Tracker) handleDomains(w http.ResponseWriter, _ *http.Request) {
-	writeJSON(w, http.StatusOK, t.snapshotDomains())
-}
-
-func (t *Tracker) handleQueues(w http.ResponseWriter, _ *http.Request) {
-	writeJSON(w, http.StatusOK, t.snapshotQueues())
+	return RuntimeStats{
+		ObservedAt:  time.Now().UTC(),
+		StartedAt:   t.started,
+		Uptime:      time.Since(t.started),
+		Goroutines:  runtime.NumGoroutine(),
+		AllocBytes:  mem.Alloc,
+		HeapObjects: mem.HeapObjects,
+		GCCycles:    mem.NumGC,
+		Domains:     t.snapshotDomains(),
+	}
 }
 
 func (t *Tracker) snapshotDomains() []DomainStats {
@@ -194,16 +174,6 @@ func (t *Tracker) snapshotDomains() []DomainStats {
 	return out
 }
 
-func (t *Tracker) snapshotQueues() map[string]int {
-	t.mu.RLock()
-	defer t.mu.RUnlock()
-	out := make(map[string]int, len(t.domains))
-	for name, stats := range t.domains {
-		out[name] = stats.QueueDepth
-	}
-	return out
-}
-
 func (t *Tracker) domainLocked(name string) *DomainStats {
 	stats := t.domains[name]
 	if stats == nil {
@@ -212,10 +182,4 @@ func (t *Tracker) domainLocked(name string) *DomainStats {
 		t.domains[name] = stats
 	}
 	return stats
-}
-
-func writeJSON(w http.ResponseWriter, status int, value any) {
-	w.Header().Set("Content-Type", "application/json")
-	w.WriteHeader(status)
-	_ = json.NewEncoder(w).Encode(value)
 }

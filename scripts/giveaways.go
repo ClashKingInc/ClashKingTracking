@@ -11,7 +11,6 @@ import (
 
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgxpool"
-	"go.opentelemetry.io/otel/attribute"
 )
 
 const giveawaysDomainName = "giveaways"
@@ -74,19 +73,10 @@ func newGiveawayStore(ctx context.Context, app *platform.App) (giveawayStore, er
 }
 
 func (d *giveawaysDomain) runCycle(ctx context.Context, app *platform.App) error {
-	ctx, span := platform.StartSpan(ctx, "giveaways.cycle",
-		attribute.String("domain", giveawaysDomainName),
-		attribute.String("operation", "scan"),
-	)
-	defer span.End()
-
 	transitions, err := d.doDueTransitions(ctx, time.Now().UTC())
 	if err != nil {
-		platform.RecordSpanError(span, err)
-		span.SetAttributes(platform.SpanErrorStatus(err))
 		return err
 	}
-	span.SetAttributes(attribute.Int("target.count", len(transitions)))
 	for _, transition := range transitions {
 		stored, ok, err := d.store.MarkTransition(ctx, transition)
 		if err != nil {
@@ -108,7 +98,6 @@ func (d *giveawaysDomain) runCycle(ctx context.Context, app *platform.App) error
 		app.Stats.RecordWrite(giveawaysDomainName, 1)
 	}
 	app.Stats.SetReady(giveawaysDomainName, true, "")
-	span.SetAttributes(platform.SpanErrorStatus(nil))
 	return nil
 }
 

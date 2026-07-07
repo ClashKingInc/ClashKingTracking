@@ -18,7 +18,6 @@ import (
 	"github.com/jackc/pgx/v5/pgxpool"
 	valkey "github.com/valkey-io/valkey-go"
 	"go.mongodb.org/mongo-driver/v2/bson"
-	"go.opentelemetry.io/otel/attribute"
 )
 
 type botClanFetchFunc[T any] func(context.Context, string) (*T, int, error)
@@ -45,7 +44,7 @@ const (
 type botClansDomain struct {
 	mu               sync.Mutex
 	scheduled        map[string]struct{}
-	targets          clashtracker.TargetStore
+	targets          clashtracker.TagStore
 	snapshots        botClanSnapshotStore
 	snapshotPrefix   string
 	cwlStateSnapshot string
@@ -71,11 +70,11 @@ func (d *botClansDomain) Run(ctx context.Context, app *platform.App) error {
 		return err
 	}
 	defer targetSource.Close()
-	targetSet, err := newScriptMemoryTargetSet(ctx, app, botClansDomainName, "targets", 15*time.Second, targetSource.List)
+	targetSet, err := newScriptMemoryTargetSet(ctx, app, botClansDomainName, "targets", time.Duration(app.Config.BotClanTargetRefreshSeconds)*time.Second, targetSource.List)
 	if err != nil {
 		return err
 	}
-	d.targets = targetSet.Store()
+	d.targets = targetSet.Tags()
 	d.snapshots = newBotClanSnapshotStore(app)
 	d.snapshotPrefix = app.Config.BotClanSnapshotPrefix
 	d.cwlStateSnapshot = app.Config.BotClanCWLStateSnapshot
@@ -106,6 +105,9 @@ func validateBotClansConfig(cfg platform.Config) error {
 	if cfg.BotClanRequestsPerSecond <= 0 {
 		return errors.New("botclans.requests_per_second must be greater than zero")
 	}
+	if cfg.BotClanTargetRefreshSeconds <= 0 {
+		return errors.New("botclans.target_refresh_seconds must be greater than zero")
+	}
 	if cfg.BotClanSnapshotPrefix == "" {
 		return errors.New("botclans.snapshot_prefix is required")
 	}
@@ -125,7 +127,7 @@ func validateBotClansConfig(cfg platform.Config) error {
 }
 
 type botClanTargetStore interface {
-	clashtracker.TargetStore
+	clashtracker.TagStore
 	Close() error
 }
 
@@ -213,14 +215,20 @@ func runBotClanTracker[T any](
 	handle func(context.Context, *platform.App, TrackedItem[T]) error,
 	rateLimit int,
 ) error {
-	runner, err := clashtracker.NewRunner[botClanTrackedValue[T], botClanTrackedValue[T]](clashtracker.Config[botClanTrackedValue[T], botClanTrackedValue[T]]{
-		TargetStore:       targetSet.Store(),
-		Store:             botClanTrackerStore[T]{},
+	progressName := trackingProgressName(botClansDomainName, group)
+	if err := targetSet.RegisterProgress(ctx, progressName); err != nil {
+		return err
+	}
+	tags := targetSet.Tags()
+	pager := targetSet.TargetPager()
+	runner, err := clashtracker.NewRunner[botClanTrackedValue[T]](clashtracker.Config[botClanTrackedValue[T]]{
+		Tags:              tags,
+		TargetPager:       pager,
 		RequestsPerSecond: rateLimit,
 		MaxInFlight:       rateLimit,
-		MinInterval:       15 * time.Second,
 		EmitInitial:       true,
 		Fetch: func(fetchCtx context.Context, target clashtracker.Target) (clashtracker.FetchResult[botClanTrackedValue[T]], error) {
+			defer targetSet.RecordTracked(progressName)
 			start := time.Now()
 			current, retry, err := fetch(fetchCtx, target.Key)
 			app.Stats.RecordRequest(botClansDomainName, time.Since(start), err)
@@ -237,10 +245,7 @@ func runBotClanTracker[T any](
 			}
 			return clashtracker.FetchResult[botClanTrackedValue[T]]{Value: value, RetryAfter: retryAfter}, nil
 		},
-		Project: func(value botClanTrackedValue[T]) (botClanTrackedValue[T], error) {
-			return value, nil
-		},
-		Diff: func(diffCtx context.Context, target clashtracker.Target, _, current botClanTrackedValue[T]) error {
+		Handle: func(diffCtx context.Context, target clashtracker.Target, _ *botClanTrackedValue[T], current botClanTrackedValue[T]) error {
 			return handle(diffCtx, app, TrackedItem[T]{
 				Group:   group,
 				Kind:    kind,
@@ -250,10 +255,13 @@ func runBotClanTracker[T any](
 				Retry:   current.Retry,
 			})
 		},
-		OnError: func(_ context.Context, target clashtracker.Target, err error) error {
+		OnFetchError: func(_ context.Context, target clashtracker.Target, err error) (clashtracker.FetchErrorDecision, error) {
 			app.Logger.Error("bot clan fetch failed", "group", group, "tag", target.Key, "err", err)
 			app.Stats.SetReady(botClansDomainName, false, err.Error())
-			return nil
+			if decision, ok := platform.ClashFetchErrorDecision(err); ok {
+				return decision, nil
+			}
+			return clashtracker.FetchErrorDecision{Action: clashtracker.FetchErrorSkip}, nil
 		},
 	})
 	if err != nil {
@@ -261,24 +269,6 @@ func runBotClanTracker[T any](
 	}
 	targetSet.SetRunner(runner)
 	return runner.Run(ctx)
-}
-
-type botClanTrackerStore[T any] struct{}
-
-func (botClanTrackerStore[T]) Load(context.Context, string) (botClanTrackedValue[T], bool, error) {
-	return botClanTrackedValue[T]{}, false, nil
-}
-
-func (botClanTrackerStore[T]) Store(context.Context, string, botClanTrackedValue[T], time.Duration) error {
-	return nil
-}
-
-func (botClanTrackerStore[T]) LoadBatch(context.Context, []string) (map[string]clashtracker.Snapshot[botClanTrackedValue[T]], error) {
-	return map[string]clashtracker.Snapshot[botClanTrackedValue[T]]{}, nil
-}
-
-func (botClanTrackerStore[T]) StoreBatch(context.Context, []clashtracker.StoredSnapshot[botClanTrackedValue[T]]) error {
-	return nil
 }
 
 func fetchClan(app *platform.App) botClanFetchFunc[clashy.Clan] {
@@ -321,15 +311,7 @@ func (d *botClansDomain) handleClanChange(ctx context.Context, app *platform.App
 	if item.Current == nil {
 		return nil
 	}
-	_, diffSpan := platform.StartSpan(ctx, "tracker.diff",
-		attribute.String("domain", botClansDomainName),
-		attribute.String("group", item.Group),
-		attribute.String("operation", "clan_compare"),
-	)
 	_, raw, hasPrevious, changed, err := botClanSnapshotChanged(ctx, d.snapshots, d.snapshotPrefix, "clan", item.Tag, *item.Current, item.Raw)
-	platform.RecordSpanError(diffSpan, err)
-	diffSpan.SetAttributes(platform.SpanErrorStatus(err))
-	diffSpan.End()
 	if err != nil {
 		return err
 	}
@@ -358,15 +340,7 @@ func (d *botClansDomain) handleWarChange(ctx context.Context, app *platform.App,
 	if err := d.scheduleWarReminders(ctx, app, item.Tag, current, item.Raw, "war"); err != nil {
 		return err
 	}
-	_, diffSpan := platform.StartSpan(ctx, "tracker.diff",
-		attribute.String("domain", botClansDomainName),
-		attribute.String("group", item.Group),
-		attribute.String("operation", "war_compare"),
-	)
 	previous, raw, hasPrevious, changed, err := botClanSnapshotChanged(ctx, d.snapshots, d.snapshotPrefix, "war", item.Tag, current, item.Raw)
-	platform.RecordSpanError(diffSpan, err)
-	diffSpan.SetAttributes(platform.SpanErrorStatus(err))
-	diffSpan.End()
 	if err != nil {
 		return err
 	}
@@ -415,15 +389,7 @@ func (d *botClansDomain) handleRaidChange(ctx context.Context, app *platform.App
 	if item.Current == nil {
 		return nil
 	}
-	_, diffSpan := platform.StartSpan(ctx, "tracker.diff",
-		attribute.String("domain", botClansDomainName),
-		attribute.String("group", item.Group),
-		attribute.String("operation", "raid_compare"),
-	)
 	previous, raw, hasPrevious, changed, err := botClanSnapshotChanged(ctx, d.snapshots, d.snapshotPrefix, "raid", item.Tag, *item.Current, item.Raw)
-	platform.RecordSpanError(diffSpan, err)
-	diffSpan.SetAttributes(platform.SpanErrorStatus(err))
-	diffSpan.End()
 	if err != nil {
 		return err
 	}
@@ -834,7 +800,7 @@ func (d *botClansDomain) runCWLLoop(ctx context.Context, app *platform.App, limi
 }
 
 func (d *botClansDomain) runCWLCycle(ctx context.Context, app *platform.App, limiter *clashtracker.Limiter) error {
-	tags, err := collectTargetStoreTags(ctx, d.targets)
+	tags, err := collectTagStoreTags(ctx, d.targets)
 	if err != nil {
 		return err
 	}
@@ -911,14 +877,17 @@ func (d *botClansDomain) processCWLTarget(ctx context.Context, app *platform.App
 }
 
 func (d *botClansDomain) fetchCWLGroup(ctx context.Context, app *platform.App, limiter *clashtracker.Limiter, tag string) (*clashy.ClanWarLeagueGroup, []byte, error) {
-	release, err := limiter.Acquire(ctx)
-	if err != nil {
-		return nil, nil, err
-	}
-	start := time.Now()
-	group, err := app.Clash.GetLeagueGroup(ctx, tag)
-	release()
-	app.Stats.RecordRequest(botClansDomainName, time.Since(start), err)
+	group, err := platform.RetryClashFetch(ctx, func(fetchCtx context.Context) (*clashy.ClanWarLeagueGroup, error) {
+		release, err := limiter.Acquire(fetchCtx)
+		if err != nil {
+			return nil, err
+		}
+		defer release()
+		start := time.Now()
+		group, err := app.Clash.GetLeagueGroup(fetchCtx, tag)
+		app.Stats.RecordRequest(botClansDomainName, time.Since(start), err)
+		return group, err
+	})
 	if err != nil {
 		return nil, nil, nil
 	}
@@ -926,14 +895,17 @@ func (d *botClansDomain) fetchCWLGroup(ctx context.Context, app *platform.App, l
 }
 
 func (d *botClansDomain) fetchCWLWar(ctx context.Context, app *platform.App, limiter *clashtracker.Limiter, warTag string) (*clashy.ClanWar, []byte, error) {
-	release, err := limiter.Acquire(ctx)
-	if err != nil {
-		return nil, nil, err
-	}
-	start := time.Now()
-	wars, err := app.Clash.GetLeagueWars(ctx, []string{warTag})
-	release()
-	app.Stats.RecordRequest(botClansDomainName, time.Since(start), err)
+	wars, err := platform.RetryClashFetch(ctx, func(fetchCtx context.Context) ([]clashy.ClanWar, error) {
+		release, err := limiter.Acquire(fetchCtx)
+		if err != nil {
+			return nil, err
+		}
+		defer release()
+		start := time.Now()
+		wars, err := app.Clash.GetLeagueWars(fetchCtx, []string{warTag})
+		app.Stats.RecordRequest(botClansDomainName, time.Since(start), err)
+		return wars, err
+	})
 	if err != nil || len(wars) == 0 {
 		return nil, nil, nil
 	}
@@ -1249,7 +1221,7 @@ func intContains(values []int, target int) bool {
 	return false
 }
 
-func collectTargetStoreTags(ctx context.Context, targets clashtracker.TargetStore) ([]string, error) {
+func collectTagStoreTags(ctx context.Context, targets clashtracker.TagStore) ([]string, error) {
 	if targets == nil {
 		return nil, nil
 	}

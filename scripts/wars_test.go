@@ -25,7 +25,8 @@ func TestWarQueueRejectsIncompleteStoreWork(t *testing.T) {
 	err := queue.Enqueue(warFetchRequest{
 		ClanTag:     "#A",
 		OpponentTag: "#B",
-		WarID:       "war",
+		ScheduleKey: "#A-#B-1",
+		WarID:       "018f4ad0-26c7-7b0d-9a4c-5b6c7d8e9f01",
 		PrepTime:    time.Now(),
 		EndTime:     time.Now().Add(time.Hour),
 		StoreOnly:   true,
@@ -36,7 +37,7 @@ func TestWarQueueRejectsIncompleteStoreWork(t *testing.T) {
 }
 
 func TestWarR2Key(t *testing.T) {
-	if got, want := warR2Key("#A-#B-123"), "wars/#A-#B-123.json.snappy"; got != want {
+	if got, want := warR2Key("018f4ad0-26c7-7b0d-9a4c-5b6c7d8e9f01"), "018f4ad0-26c7-7b0d-9a4c-5b6c7d8e9f01"; got != want {
 		t.Fatalf("warR2Key = %q, want %q", got, want)
 	}
 }
@@ -53,16 +54,38 @@ func TestWarTargetsSQLOnlyUsesPublicWarLogs(t *testing.T) {
 	}
 }
 
-func TestBuildWarIngestFlattensWar(t *testing.T) {
+func TestBuildWarIngestSchedulesActiveWar(t *testing.T) {
 	now := time.Now().UTC().Truncate(time.Second)
 	prep := now.Add(-time.Hour)
 	start := now
 	end := start.Add(24 * time.Hour)
 	war := sampleWar(prep, start, end)
 
-	ingest, err := buildWarIngest(war, "#AAA", false, "")
+	ingest, err := buildWarIngest(war, "#AAA", false, "", "", "")
 	if err != nil {
 		t.Fatal(err)
+	}
+	if len(ingest.IndexRows) != 0 || len(ingest.AttackRows) != 0 || len(ingest.Players) != 0 {
+		t.Fatalf("active war should only schedule final store: %#v", ingest)
+	}
+	if len(ingest.Schedules) != 1 || ingest.Schedules[0].ScheduleKey == "" || ingest.Schedules[0].WarID == "" || !ingest.Schedules[0].NextRunAt.Equal(end) {
+		t.Fatalf("unexpected schedule: %#v", ingest.Schedules)
+	}
+}
+
+func TestBuildWarIngestFinishedAddsR2Payload(t *testing.T) {
+	prep := time.Date(2026, 5, 24, 1, 0, 0, 0, time.UTC)
+	war := sampleWar(prep, prep.Add(time.Hour), prep.Add(2*time.Hour))
+
+	ingest, err := buildWarIngest(war, "#AAA", true, "#WAR", "#AAA-#BBB-1", "018f4ad0-26c7-7b0d-9a4c-5b6c7d8e9f01")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(ingest.Schedules) != 0 {
+		t.Fatalf("finished ingest should not reschedule: %#v", ingest.Schedules)
+	}
+	if ingest.FinishedScheduleKey != "#AAA-#BBB-1" || ingest.FinishedWarID != "018f4ad0-26c7-7b0d-9a4c-5b6c7d8e9f01" || len(ingest.RawWarJSON) == 0 {
+		t.Fatalf("missing finished object fields: %#v", ingest)
 	}
 	if len(ingest.IndexRows) != 2 {
 		t.Fatalf("IndexRows len = %d, want 2", len(ingest.IndexRows))
@@ -74,27 +97,21 @@ func TestBuildWarIngestFlattensWar(t *testing.T) {
 	if attack.AttackingClanTag != "#AAA" || attack.DefendingClanTag != "#BBB" || attack.AttackerTownHall != 16 || attack.DefenderTownHall != 15 {
 		t.Fatalf("unexpected attack row: %#v", attack)
 	}
-	if !attack.WarEndTime.Equal(end) {
-		t.Fatalf("attack war end time = %s, want %s", attack.WarEndTime, end)
-	}
-	if len(ingest.Schedules) != 1 || ingest.Schedules[0].WarID == "" || !ingest.Schedules[0].NextRunAt.Equal(end) {
-		t.Fatalf("unexpected schedule: %#v", ingest.Schedules)
-	}
 }
 
-func TestBuildWarIngestFinishedAddsR2Payload(t *testing.T) {
-	prep := time.Date(2026, 5, 24, 1, 0, 0, 0, time.UTC)
-	war := sampleWar(prep, prep.Add(time.Hour), prep.Add(2*time.Hour))
+func TestBuildWarIngestDoesNotScheduleEndedActiveWar(t *testing.T) {
+	now := time.Now().UTC().Truncate(time.Second)
+	war := sampleWar(now.Add(-3*time.Hour), now.Add(-2*time.Hour), now.Add(-time.Hour))
 
-	ingest, err := buildWarIngest(war, "#AAA", true, "#WAR")
+	ingest, err := buildWarIngest(war, "#AAA", false, "", "", "")
 	if err != nil {
 		t.Fatal(err)
 	}
 	if len(ingest.Schedules) != 0 {
-		t.Fatalf("finished ingest should not reschedule: %#v", ingest.Schedules)
+		t.Fatalf("ended active war should not schedule final store: %#v", ingest.Schedules)
 	}
-	if ingest.FinishedWarID == "" || ingest.R2Key != warR2Key(ingest.FinishedWarID) || len(ingest.RawWarJSON) == 0 {
-		t.Fatalf("missing finished object fields: %#v", ingest)
+	if len(ingest.IndexRows) != 0 || len(ingest.AttackRows) != 0 {
+		t.Fatalf("ended active war should be skipped until fetched as finished: %#v", ingest)
 	}
 }
 
@@ -125,10 +142,9 @@ func TestMemoryWarStoreShiftMaintenance(t *testing.T) {
 	store := newMemoryWarStore()
 	now := time.Date(2026, 5, 24, 1, 0, 0, 0, time.UTC)
 	err := store.Store(context.Background(), models.WarIngest{
-		IndexRows: []models.WarLogIndexRow{{WarID: "war", ClanTag: "#A", OpponentTag: "#B", PrepTime: now, EndTime: now.Add(time.Hour)}},
 		Schedules: []models.WarScheduleRow{{
-			WarID: "#A-#B-1", SourceClanTag: "#A", OpponentTag: "#B",
-			PrepTime: now, EndTime: now.Add(time.Hour), NextRunAt: now.Add(time.Hour), Status: warSchedulePending,
+			ScheduleKey: "#A-#B-1", WarID: "018f4ad0-26c7-7b0d-9a4c-5b6c7d8e9f01", SourceClanTag: "#A", OpponentTag: "#B",
+			PrepTime: now, EndTime: now.Add(time.Hour), NextRunAt: now.Add(time.Hour),
 		}},
 	})
 	if err != nil {

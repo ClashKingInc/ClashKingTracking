@@ -5,19 +5,20 @@ package scripts
 import (
 	"context"
 	"encoding/json"
+	"os"
 	"reflect"
 	"strings"
 	"testing"
 	"time"
 
 	"clashking_tracking/internal/platform"
-	"clashking_tracking/internal/utils"
 	"clashking_tracking/models"
 
 	clashy "github.com/clashkinginc/clashy.go"
+	clashtracker "github.com/clashkinginc/clashy.go/tracker"
 )
 
-func TestParseArmyColumnsAndHashIgnoresOrder(t *testing.T) {
+func TestParseArmyColumnsAndNormalizeIgnoresOrder(t *testing.T) {
 	left := parseArmyColumns("u10x0-2x1s4x35i3x53d1x70h0p4e8_14-1p9e39")
 	right := parseArmyColumns("h1p9e39-0p4e8_14d1x70i3x53s4x35u2x1-10x0")
 
@@ -43,8 +44,20 @@ func TestParseArmyColumnsAndHashIgnoresOrder(t *testing.T) {
 			t.Fatalf("right[%s] = %d, want %d", key, right[key], value)
 		}
 	}
-	if armyHash(left) != armyHash(right) {
-		t.Fatalf("hash should ignore army link ordering")
+	wantCode := "h0p4e8_14-1p9e39i3x53d1x70u10x0-2x1s4x35"
+	if got := normalizeArmyShareCode("u10x0-2x1s4x35i3x53d1x70h0p4e14_8-1p9e39"); got != wantCode {
+		t.Fatalf("normalized left = %q, want %q", got, wantCode)
+	}
+	if got := normalizeArmyShareCode("h1p9e39-0p4e8_14d1x70i3x53s4x35u2x1-10x0"); got != wantCode {
+		t.Fatalf("normalized right = %q, want %q", got, wantCode)
+	}
+}
+
+func TestNormalizeArmyShareCodeFromLink(t *testing.T) {
+	link := "https://link.clashofclans.com/en?action=CopyArmy&army=s1x120-4x35u4x65-10x8h6p16e49_35-1p9e17_48i2x65-1x5d1x9"
+	want := "h1p9e17_48-6p16e35_49i1x5-2x65d1x9u10x8-4x65s4x35-1x120"
+	if got := normalizeArmyShareCode(link); got != want {
+		t.Fatalf("normalized army = %q, want %q", got, want)
 	}
 }
 
@@ -117,16 +130,15 @@ func TestEntriesAfterTimestamp(t *testing.T) {
 	}
 }
 
-func TestActiveBattlelogTargetSQLUsesRecentActivity(t *testing.T) {
-	for _, want := range []string{
-		"FROM basic_player",
-		"last_activity >= now() - interval '10 days'",
-		"tag > $1",
-		"ORDER BY tag",
-	} {
-		if !strings.Contains(activeBattlelogTargetSQL, want) {
-			t.Fatalf("active target SQL missing %q: %s", want, activeBattlelogTargetSQL)
-		}
+func TestBattlelogTargetCursorRoundTrip(t *testing.T) {
+	ttl := time.Date(2026, 5, 20, 10, 0, 0, 123, time.UTC)
+	cursor := encodeBattlelogTargetCursor(ttl, "#PLAYER")
+	got, err := decodeBattlelogTargetCursor(cursor)
+	if err != nil {
+		t.Fatalf("decode cursor: %v", err)
+	}
+	if !got.Valid || !got.TTL.Equal(ttl) || got.Tag != "#PLAYER" {
+		t.Fatalf("unexpected cursor: %#v", got)
 	}
 }
 
@@ -136,119 +148,69 @@ func TestPlayerSnapshotKey(t *testing.T) {
 	}
 }
 
-func TestBattlelogStatsEligibility(t *testing.T) {
-	rows := []models.BattlelogRow{
-		{Attack: true, PlayerTH: 16, OpponentTH: 16, BattleType: "ranked"},
-		{Attack: true, PlayerTH: 16, OpponentTH: 15, BattleType: "ranked"},
-		{Attack: false, PlayerTH: 16, OpponentTH: 16, BattleType: "ranked"},
-		{Attack: true, PlayerTH: 16, OpponentTH: 16, BattleType: "friendly"},
-		{Attack: true, PlayerTH: 17, OpponentTH: 17, BattleType: "legend"},
+func TestBattlelogRowFromEntryStoresPlayerAndOpponentNames(t *testing.T) {
+	entry := clashy.BattleLogEntry{
+		OpponentPlayerTag:     "#OPP",
+		OpponentName:          "Opponent Name",
+		OpponentTownHallLevel: 16,
+		Duration:              173,
+		Timestamp:             clashTimestamp(time.Date(2026, 5, 20, 10, 0, 0, 0, time.UTC)),
 	}
 
-	searchRows := qualifyingDynamicSearchRows(rows)
-	if len(searchRows) != 2 {
-		t.Fatalf("qualifyingDynamicSearchRows len = %d, want 2", len(searchRows))
+	row := battlelogRowFromEntry("#PLAYER", entry)
+	if row.OpponentName != "Opponent Name" {
+		t.Fatalf("opponent name = %q, want %q", row.OpponentName, "Opponent Name")
 	}
-	if searchRows[0].BattleType != "ranked" || searchRows[1].BattleType != "legend" {
-		t.Fatalf("unexpected qualifying rows: %#v", searchRows)
+	if row.Duration != 173 {
+		t.Fatalf("duration = %d, want 173", row.Duration)
 	}
-
-	usage := attackRows(rows)
-	if len(usage) != 3 {
-		t.Fatalf("attackRows len = %d, want 3", len(usage))
+	if row.OpponentTH != 17 {
+		t.Fatalf("opponent th = %d, want 17", row.OpponentTH)
+	}
+	if row.ArmyShareCode != "" {
+		t.Fatalf("army share code = %q, want empty", row.ArmyShareCode)
 	}
 }
 
-func TestAccumulateItemRollups(t *testing.T) {
-	timestamp := time.Date(2026, 5, 17, 12, 0, 0, 0, time.UTC)
-	rows := []models.BattlelogRow{
-		{
-			Attack:      true,
-			PlayerTH:    16,
-			OpponentTH:  16,
-			LeagueID:    29000022,
-			BattleType:  "legend",
-			Stars:       3,
-			Timestamp:   timestamp,
-			ArmyColumns: map[string]uint16{"u_5": 7, "h_1": 1},
-		},
-		{
-			Attack:      true,
-			PlayerTH:    16,
-			OpponentTH:  15,
-			LeagueID:    29000022,
-			BattleType:  "legend",
-			Stars:       2,
-			Timestamp:   timestamp,
-			ArmyColumns: map[string]uint16{"u_5": 1},
-		},
-		{
-			Attack:      false,
-			PlayerTH:    16,
-			OpponentTH:  16,
-			LeagueID:    29000022,
-			BattleType:  "legend",
-			Stars:       0,
-			Timestamp:   timestamp,
-			ArmyColumns: map[string]uint16{"u_5": 1},
-		},
+func TestBattlelogBattleIDDedupesSwappedTagsAndAttackFlag(t *testing.T) {
+	timestamp := clashTimestamp(time.Date(2026, 5, 20, 10, 0, 0, 0, time.UTC))
+	attackEntry := clashy.BattleLogEntry{
+		BattleType:        clashy.BattleTypeRanked,
+		Attack:            true,
+		OpponentPlayerTag: "#DEFENDER",
+		Timestamp:         timestamp,
+	}
+	defenseEntry := clashy.BattleLogEntry{
+		BattleType:        clashy.BattleTypeRanked,
+		Attack:            false,
+		OpponentPlayerTag: "#ATTACKER",
+		Timestamp:         timestamp,
 	}
 
-	buffer := newItemRollupBuffer()
-	accumulateItemRollups(rows, &buffer)
-
-	if buffer.PendingAttacks != 2 {
-		t.Fatalf("PendingAttacks = %d, want 2", buffer.PendingAttacks)
-	}
-
-	usageKey := models.ItemRollupKey{
-		DayStart:   dayStart(timestamp),
-		PlayerTH:   16,
-		LeagueID:   29000022,
-		BattleType: "legend",
-		ItemKey:    "u_5",
-	}
-	if got := buffer.Usage[usageKey]; got != 2 {
-		t.Fatalf("usage u_5 = %d, want 2", got)
-	}
-
-	hitrateKey := models.ItemRollupKey{
-		DayStart:   dayStart(timestamp),
-		PlayerTH:   16,
-		LeagueID:   29000022,
-		BattleType: "legend",
-		ItemKey:    "u_5",
-	}
-	if got := buffer.Hitrate[hitrateKey]; got.Attacks != 1 || got.ThreeStars != 1 {
-		t.Fatalf("hitrate u_5 = %#v, want 1 attack and 1 three star", got)
+	left := battlelogBattleID("#ATTACKER", attackEntry)
+	right := battlelogBattleID("#DEFENDER", defenseEntry)
+	if left != right {
+		t.Fatalf("swapped player/opponent perspectives should share battle id: %s != %s", left, right)
 	}
 }
 
-func TestRollupDateHelpers(t *testing.T) {
-	value := time.Date(2026, 5, 16, 18, 30, 0, 0, time.UTC)
-	if got := dayStart(value); !got.Equal(time.Date(2026, 5, 16, 0, 0, 0, 0, time.UTC)) {
-		t.Fatalf("dayStart = %s", got)
+func TestBattlelogBattleIDUsesOnlyTagsAndTimestamp(t *testing.T) {
+	base := clashy.BattleLogEntry{
+		BattleType:        clashy.BattleTypeRanked,
+		OpponentPlayerTag: "#DEFENDER",
+		Timestamp:         clashTimestamp(time.Date(2026, 5, 20, 10, 0, 0, 0, time.UTC)),
 	}
-}
+	differentTimestamp := base
+	differentTimestamp.Timestamp = clashTimestamp(time.Date(2026, 5, 20, 10, 0, 1, 0, time.UTC))
+	differentType := base
+	differentType.BattleType = clashy.BattleTypeLegend
 
-func TestStarBuckets(t *testing.T) {
-	tests := []struct {
-		stars uint8
-		want  [4]uint64
-	}{
-		{0, [4]uint64{1, 0, 0, 0}},
-		{1, [4]uint64{0, 1, 0, 0}},
-		{2, [4]uint64{0, 0, 1, 0}},
-		{3, [4]uint64{0, 0, 0, 1}},
-		{4, [4]uint64{0, 0, 0, 0}},
+	baseID := battlelogBattleID("#ATTACKER", base)
+	if baseID == battlelogBattleID("#ATTACKER", differentTimestamp) {
+		t.Fatalf("battle id should change when timestamp changes")
 	}
-
-	for _, tt := range tests {
-		zeroStars, oneStars, twoStars, threeStars := starBuckets(models.BattlelogRow{Stars: tt.stars})
-		got := [4]uint64{zeroStars, oneStars, twoStars, threeStars}
-		if got != tt.want {
-			t.Fatalf("starBuckets(%d) = %#v, want %#v", tt.stars, got, tt.want)
-		}
+	if baseID != battlelogBattleID("#ATTACKER", differentType) {
+		t.Fatalf("battle id should ignore battle type")
 	}
 }
 
@@ -257,18 +219,18 @@ type fakeBattlelogStore struct {
 	calls  int
 }
 
-func (s *fakeBattlelogStore) NextTargetBatch(context.Context, int) (battlelogTargetBatch, error) {
-	return battlelogTargetBatch{}, nil
+func (s *fakeBattlelogStore) NextTargetPage(context.Context, string, string, int) (clashtracker.TargetPage, error) {
+	return clashtracker.TargetPage{}, nil
 }
 
-func (s *fakeBattlelogStore) CommitTargetBatch(context.Context, battlelogTargetBatch) error {
-	return nil
+func (s *fakeBattlelogStore) CountTargets(context.Context, string) (int, error) {
+	return 0, nil
 }
 
-func (s *fakeBattlelogStore) Store(_ context.Context, ingest models.BattlelogIngest) error {
+func (s *fakeBattlelogStore) Store(_ context.Context, ingest models.BattlelogIngest) (int, error) {
 	s.ingest = ingest
 	s.calls++
-	return nil
+	return len(ingest.Rows), nil
 }
 
 func (s *fakeBattlelogStore) Close() error { return nil }
@@ -281,7 +243,6 @@ func TestBattlelogsStorePersistsRowsAndNames(t *testing.T) {
 	}
 	ingest := models.BattlelogIngest{
 		Rows:        []models.BattlelogRow{{PlayerTag: "#PLAYER"}},
-		Players:     []models.BasicPlayerRow{{Tag: "#PLAYER", Name: "Current", TownHall: 16}},
 		Checkpoints: []models.BattlelogCheckpoint{{Tag: "#PLAYER", Timestamp: time.Date(2026, 5, 20, 10, 0, 0, 0, time.UTC)}},
 	}
 	if err := domain.store(context.Background(), app, ingest); err != nil {
@@ -290,17 +251,105 @@ func TestBattlelogsStorePersistsRowsAndNames(t *testing.T) {
 	if sink.calls != 1 {
 		t.Fatalf("sink calls = %d, want 1", sink.calls)
 	}
-	if len(sink.ingest.Rows) != 1 || len(sink.ingest.Players) != 1 || len(sink.ingest.Checkpoints) != 1 {
+	if len(sink.ingest.Rows) != 1 || len(sink.ingest.Checkpoints) != 1 {
 		t.Fatalf("unexpected stored ingest: %#v", sink.ingest)
 	}
 }
 
-func TestBasicPlayerUpsertSQLSkipsUnchangedProfiles(t *testing.T) {
-	if !strings.Contains(utils.UpsertBasicPlayerSQL, "basic_player.name IS DISTINCT FROM EXCLUDED.name") {
-		t.Fatalf("basic player upsert should skip unchanged profiles: %s", utils.UpsertBasicPlayerSQL)
+func TestMergeBattlelogIngestsKeepsLatestCheckpoint(t *testing.T) {
+	older := time.Date(2026, 6, 28, 10, 0, 0, 0, time.UTC)
+	newer := older.Add(time.Hour)
+	got := mergeBattlelogIngests([]models.BattlelogIngest{
+		{
+			Rows:        []models.BattlelogRow{{PlayerTag: "#A"}},
+			Checkpoints: []models.BattlelogCheckpoint{{Tag: "#A", Timestamp: older}},
+		},
+		{
+			Rows: []models.BattlelogRow{{PlayerTag: "#B"}},
+			Checkpoints: []models.BattlelogCheckpoint{
+				{Tag: "#A", Timestamp: newer},
+				{Tag: "#B", Timestamp: older},
+			},
+		},
+	})
+	if len(got.Rows) != 2 {
+		t.Fatalf("unexpected merged rows: %#v", got)
 	}
-	if strings.Contains(utils.UpsertBasicPlayerSQL, "last_updated") || strings.Contains(utils.UpsertBasicPlayerSQL, "last_activity") {
-		t.Fatalf("basic player upsert should not touch activity columns: %s", utils.UpsertBasicPlayerSQL)
+	if len(got.Checkpoints) != 2 {
+		t.Fatalf("checkpoint len = %d, want 2: %#v", len(got.Checkpoints), got.Checkpoints)
+	}
+	if got.Checkpoints[0].Tag != "#A" || !got.Checkpoints[0].Timestamp.Equal(newer) {
+		t.Fatalf("latest #A checkpoint not kept: %#v", got.Checkpoints)
+	}
+	if got.Checkpoints[1].Tag != "#B" || !got.Checkpoints[1].Timestamp.Equal(older) {
+		t.Fatalf("unexpected #B checkpoint: %#v", got.Checkpoints)
+	}
+}
+
+func TestTimescaleBattlelogStoreCopiesRowsThroughStage(t *testing.T) {
+	dsn := os.Getenv("TRACKING_INTEGRATION_TIMESCALE_URL")
+	if dsn == "" {
+		t.Skip("TRACKING_INTEGRATION_TIMESCALE_URL is not set")
+	}
+	ctx := context.Background()
+	store, err := newTimescaleBattlelogStore(ctx, dsn)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+
+	now := time.Now().UTC().Truncate(time.Millisecond)
+	entry := clashy.BattleLogEntry{
+		ArmyShareCode:         "u1x8",
+		OpponentPlayerTag:     "#CODEXOPP",
+		OpponentName:          "Smoke Opponent",
+		OpponentTownHallLevel: 16,
+		BattleType:            clashy.BattleTypeRanked,
+		Attack:                true,
+		Stars:                 3,
+		DestructionPercentage: 100,
+		Duration:              180,
+		Timestamp:             clashTimestamp(now),
+	}
+	row := battlelogRowFromEntry("#CODEXSMOKE", entry)
+	t.Cleanup(func() {
+		_, _ = store.pool.Exec(context.Background(), `DELETE FROM battlelogs WHERE battle_id = $1 AND timestamp = $2`, row.BattleID, row.Timestamp)
+		_, _ = store.pool.Exec(context.Background(), `DELETE FROM basic_player WHERE tag = '#CODEXSMOKE'`)
+	})
+	if _, err := store.pool.Exec(ctx, `
+		INSERT INTO basic_player (tag, name, league_id, clan_tag, townhall_level, battlelogs_tracking_ttl, trophies)
+		VALUES ('#CODEXSMOKE', 'Smoke Player', 105000035, NULL, 17, NULL, 5000)
+		ON CONFLICT (tag) DO UPDATE SET
+			name = EXCLUDED.name,
+			league_id = EXCLUDED.league_id,
+			townhall_level = EXCLUDED.townhall_level,
+			battlelogs_tracking_ttl = EXCLUDED.battlelogs_tracking_ttl,
+			trophies = EXCLUDED.trophies
+	`); err != nil {
+		t.Fatal(err)
+	}
+	inserted, err := store.Store(ctx, models.BattlelogIngest{Rows: []models.BattlelogRow{row}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if inserted != 1 {
+		t.Fatalf("inserted rows = %d, want 1", inserted)
+	}
+	var playerName string
+	var playerTH int
+	var armyCounts string
+	if err := store.pool.QueryRow(ctx, `
+		SELECT player_name, player_th, army_counts::text
+		FROM battlelogs
+		WHERE battle_id = $1 AND timestamp = $2
+	`, row.BattleID, row.Timestamp).Scan(&playerName, &playerTH, &armyCounts); err != nil {
+		t.Fatal(err)
+	}
+	if playerName != "Smoke Player" || playerTH != 17 {
+		t.Fatalf("joined player = %q TH%d, want Smoke Player TH17", playerName, playerTH)
+	}
+	if !strings.Contains(armyCounts, `"u_8": 1`) {
+		t.Fatalf("army_counts = %s, want u_8 count", armyCounts)
 	}
 }
 

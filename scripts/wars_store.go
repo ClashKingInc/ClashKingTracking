@@ -4,6 +4,7 @@ import (
 	"context"
 	"database/sql"
 	"encoding/json"
+	"errors"
 	"sync"
 	"time"
 
@@ -38,10 +39,9 @@ func (s *timescaleWarStore) Close() error {
 func (s *timescaleWarStore) LoadPendingSchedules(ctx context.Context) ([]models.WarScheduleRow, error) {
 	// Pending schedules are reloaded into the process-local timer wheel during Run startup.
 	rows, err := s.pool.Query(ctx, `
-		SELECT war_id, source_clan_tag, opponent_tag, prep_time, end_time, next_run_at,
-		       COALESCE(cwl_war_tag, ''), status, attempts, COALESCE(last_error, '')
+		SELECT schedule_key, war_id, source_clan_tag, opponent_tag, prep_time,
+		       end_time, next_run_at, COALESCE(war_tag, '')
 		FROM war_schedule
-		WHERE status IN ('pending', 'storing')
 		ORDER BY next_run_at
 	`)
 	if err != nil {
@@ -51,7 +51,7 @@ func (s *timescaleWarStore) LoadPendingSchedules(ctx context.Context) ([]models.
 	var out []models.WarScheduleRow
 	for rows.Next() {
 		var row models.WarScheduleRow
-		if err := rows.Scan(&row.WarID, &row.SourceClanTag, &row.OpponentTag, &row.PrepTime, &row.EndTime, &row.NextRunAt, &row.CWLWarTag, &row.Status, &row.Attempts, &row.LastError); err != nil {
+		if err := rows.Scan(&row.ScheduleKey, &row.WarID, &row.SourceClanTag, &row.OpponentTag, &row.PrepTime, &row.EndTime, &row.NextRunAt, &row.WarTag); err != nil {
 			return nil, err
 		}
 		out = append(out, row)
@@ -72,13 +72,22 @@ func (s *timescaleWarStore) Store(ctx context.Context, ingest models.WarIngest) 
 	if len(ingest.IndexRows) == 0 && len(ingest.AttackRows) == 0 && len(ingest.Players) == 0 && len(ingest.Schedules) == 0 && len(ingest.CWLGroups) == 0 {
 		return nil
 	}
-	// Write all durable SQL rows first. For finished wars, R2 and completion markers happen
-	// after this commit so a failed object upload leaves the schedule retryable.
 	tx, err := s.pool.Begin(ctx)
 	if err != nil {
 		return err
 	}
 	defer tx.Rollback(ctx)
+	if ingest.FinishedWarID != "" {
+		if err := s.prepareFinishedWar(ctx, tx, &ingest); err != nil {
+			return err
+		}
+		if ingest.FinishedWarID == "" {
+			return nil
+		}
+		if err := s.storeFinishedWarObject(ctx, ingest); err != nil {
+			return err
+		}
+	}
 	if err := utils.UpsertBasicPlayers(ctx, tx, ingest.Players, warsDomainName); err != nil {
 		return err
 	}
@@ -88,31 +97,48 @@ func (s *timescaleWarStore) Store(ctx context.Context, ingest models.WarIngest) 
 	if err := insertWarAttackRows(ctx, tx, ingest.AttackRows); err != nil {
 		return err
 	}
+	if err := touchWarAttackPlayers(ctx, tx, ingest.AttackRows); err != nil {
+		return err
+	}
 	if err := upsertWarSchedules(ctx, tx, ingest.Schedules); err != nil {
 		return err
 	}
 	if err := upsertCWLGroups(ctx, tx, ingest.CWLGroups); err != nil {
 		return err
 	}
-	if err := tx.Commit(ctx); err != nil {
-		return err
-	}
 	if ingest.FinishedWarID == "" {
-		return nil
+		return tx.Commit(ctx)
 	}
-	if err := s.storeFinishedWarObject(ctx, ingest); err != nil {
-		return err
-	}
-	// Marking complete is intentionally last: SQL rows and R2 must both be present first.
-	tx, err = s.pool.Begin(ctx)
-	if err != nil {
-		return err
-	}
-	defer tx.Rollback(ctx)
-	if err := markWarStored(ctx, tx, ingest.FinishedWarID, ingest.R2Key); err != nil {
+	if err := deleteWarSchedule(ctx, tx, ingest.FinishedScheduleKey); err != nil {
 		return err
 	}
 	return tx.Commit(ctx)
+}
+
+func (s *timescaleWarStore) prepareFinishedWar(ctx context.Context, tx pgx.Tx, ingest *models.WarIngest) error {
+	if ingest.FinishedScheduleKey == "" {
+		return nil
+	}
+	var canonicalWarID string
+	err := tx.QueryRow(ctx, `
+		SELECT war_id
+		FROM war_schedule
+		WHERE schedule_key = $1
+		FOR UPDATE
+	`, ingest.FinishedScheduleKey).Scan(&canonicalWarID)
+	if errors.Is(err, pgx.ErrNoRows) {
+		// Another timer/process already stored and cleared this schedule.
+		ingest.FinishedWarID = ""
+		ingest.IndexRows = nil
+		ingest.AttackRows = nil
+		ingest.Players = nil
+		return nil
+	}
+	if err != nil {
+		return err
+	}
+	rewriteWarIngestID(ingest, canonicalWarID)
+	return nil
 }
 
 func (s *timescaleWarStore) storeFinishedWarObject(ctx context.Context, ingest models.WarIngest) error {
@@ -121,7 +147,17 @@ func (s *timescaleWarStore) storeFinishedWarObject(ctx context.Context, ingest m
 	}
 	// R2 stores the full API payload; SQL keeps lookup and analytics rows.
 	compressed := utils.Compress(ingest.RawWarJSON)
-	return s.objects.PutObject(ctx, ingest.R2Key, compressed, "application/json")
+	return s.objects.PutObject(ctx, warR2Key(ingest.FinishedWarID), compressed, "application/json")
+}
+
+func rewriteWarIngestID(ingest *models.WarIngest, warID string) {
+	ingest.FinishedWarID = warID
+	for i := range ingest.IndexRows {
+		ingest.IndexRows[i].WarID = warID
+	}
+	for i := range ingest.AttackRows {
+		ingest.AttackRows[i].WarID = warID
+	}
 }
 
 func insertWarIndexRows(ctx context.Context, tx pgx.Tx, rows []models.WarLogIndexRow) error {
@@ -135,38 +171,34 @@ func insertWarIndexRows(ctx context.Context, tx pgx.Tx, rows []models.WarLogInde
 			continue
 		}
 		batch.Queue(`
-			INSERT INTO war_log_index (
+			INSERT INTO wars (
 				war_id, clan_tag, opponent_tag, prep_time, start_time, end_time,
-				clan_badge_url, opponent_badge_url, size, war_type, state,
-				battle_modifier, cwl_war_tag
+				size, war_type, state,
+				battle_modifier, war_tag
 			)
-			VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, NULLIF($13, ''))
+			VALUES ($1::uuid, $2, $3, $4, $5, $6, $7, $8, $9, $10, NULLIF($11, ''))
 			ON CONFLICT (war_id, clan_tag) DO UPDATE SET
 				opponent_tag = EXCLUDED.opponent_tag,
 				prep_time = EXCLUDED.prep_time,
 				start_time = EXCLUDED.start_time,
 				end_time = EXCLUDED.end_time,
-				clan_badge_url = EXCLUDED.clan_badge_url,
-				opponent_badge_url = EXCLUDED.opponent_badge_url,
 				size = EXCLUDED.size,
 				war_type = EXCLUDED.war_type,
 				state = EXCLUDED.state,
 				battle_modifier = EXCLUDED.battle_modifier,
-				cwl_war_tag = EXCLUDED.cwl_war_tag
+				war_tag = EXCLUDED.war_tag
 			WHERE
-				war_log_index.opponent_tag IS DISTINCT FROM EXCLUDED.opponent_tag OR
-				war_log_index.prep_time IS DISTINCT FROM EXCLUDED.prep_time OR
-				war_log_index.start_time IS DISTINCT FROM EXCLUDED.start_time OR
-				war_log_index.end_time IS DISTINCT FROM EXCLUDED.end_time OR
-				war_log_index.clan_badge_url IS DISTINCT FROM EXCLUDED.clan_badge_url OR
-				war_log_index.opponent_badge_url IS DISTINCT FROM EXCLUDED.opponent_badge_url OR
-				war_log_index.size IS DISTINCT FROM EXCLUDED.size OR
-				war_log_index.war_type IS DISTINCT FROM EXCLUDED.war_type OR
-				war_log_index.state IS DISTINCT FROM EXCLUDED.state OR
-				war_log_index.battle_modifier IS DISTINCT FROM EXCLUDED.battle_modifier OR
-				war_log_index.cwl_war_tag IS DISTINCT FROM EXCLUDED.cwl_war_tag
+				wars.opponent_tag IS DISTINCT FROM EXCLUDED.opponent_tag OR
+				wars.prep_time IS DISTINCT FROM EXCLUDED.prep_time OR
+				wars.start_time IS DISTINCT FROM EXCLUDED.start_time OR
+				wars.end_time IS DISTINCT FROM EXCLUDED.end_time OR
+				wars.size IS DISTINCT FROM EXCLUDED.size OR
+				wars.war_type IS DISTINCT FROM EXCLUDED.war_type OR
+				wars.state IS DISTINCT FROM EXCLUDED.state OR
+				wars.battle_modifier IS DISTINCT FROM EXCLUDED.battle_modifier OR
+				wars.war_tag IS DISTINCT FROM EXCLUDED.war_tag
 		`, row.WarID, row.ClanTag, row.OpponentTag, row.PrepTime, row.StartTime, row.EndTime,
-			row.ClanBadgeURL, row.OpponentBadgeURL, row.Size, row.WarType, row.State, row.BattleModifier, row.CWLWarTag)
+			row.Size, row.WarType, row.State, row.BattleModifier, row.WarTag)
 	}
 	return utils.SendBatch(ctx, tx, batch)
 }
@@ -182,18 +214,19 @@ func insertWarAttackRows(ctx context.Context, tx pgx.Tx, rows []models.WarAttack
 			continue
 		}
 		batch.Queue(`
-			INSERT INTO war_attack_events (
+			INSERT INTO war_attacks (
 				war_id, war_end_time, war_type, war_size, attacking_clan_tag, defending_clan_tag,
-				attacker_tag, defender_tag, attacker_townhall, defender_townhall,
+				attacker_tag, defender_tag, defender_name, attacker_townhall, defender_townhall,
 				attacker_map_position, defender_map_position, stars, destruction_percentage,
 				duration, attack_order, battle_modifier
 			)
-			VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17)
+			VALUES ($1::uuid, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18)
 			ON CONFLICT (war_id, war_end_time, attacker_tag, defender_tag, attack_order) DO UPDATE SET
 				war_type = EXCLUDED.war_type,
 				war_size = EXCLUDED.war_size,
 				attacking_clan_tag = EXCLUDED.attacking_clan_tag,
 				defending_clan_tag = EXCLUDED.defending_clan_tag,
+				defender_name = EXCLUDED.defender_name,
 				attacker_townhall = EXCLUDED.attacker_townhall,
 				defender_townhall = EXCLUDED.defender_townhall,
 				attacker_map_position = EXCLUDED.attacker_map_position,
@@ -203,40 +236,63 @@ func insertWarAttackRows(ctx context.Context, tx pgx.Tx, rows []models.WarAttack
 				duration = EXCLUDED.duration,
 				battle_modifier = EXCLUDED.battle_modifier
 		`, row.WarID, row.WarEndTime, row.WarType, row.WarSize, row.AttackingClanTag, row.DefendingClanTag,
-			row.AttackerTag, row.DefenderTag, row.AttackerTownHall, row.DefenderTownHall,
+			row.AttackerTag, row.DefenderTag, row.DefenderName, row.AttackerTownHall, row.DefenderTownHall,
 			row.AttackerMapPosition, row.DefenderMapPosition, row.Stars, row.DestructionPercentage,
 			row.Duration, row.AttackOrder, row.BattleModifier)
 	}
 	return utils.SendBatch(ctx, tx, batch)
 }
 
+func touchWarAttackPlayers(ctx context.Context, tx pgx.Tx, rows []models.WarAttackRow) error {
+	if len(rows) == 0 {
+		return nil
+	}
+	seen := make(map[string]struct{}, len(rows))
+	tags := make([]string, 0, len(rows))
+	for _, row := range rows {
+		if row.AttackerTag == "" {
+			continue
+		}
+		if _, ok := seen[row.AttackerTag]; ok {
+			continue
+		}
+		seen[row.AttackerTag] = struct{}{}
+		tags = append(tags, row.AttackerTag)
+	}
+	if len(tags) == 0 {
+		return nil
+	}
+	_, err := tx.Exec(ctx, `
+		UPDATE basic_player
+		SET battlelogs_tracking_ttl = now()
+		WHERE tag = ANY($1)
+	`, tags)
+	return err
+}
+
 func upsertWarSchedules(ctx context.Context, tx pgx.Tx, rows []models.WarScheduleRow) error {
 	if len(rows) == 0 {
 		return nil
 	}
-	// Completed schedules are terminal; a stale active-war ingest should not reopen them.
 	batch := &pgx.Batch{}
 	for _, row := range rows {
-		if row.WarID == "" || row.SourceClanTag == "" || row.OpponentTag == "" || row.PrepTime.IsZero() || row.EndTime.IsZero() || row.NextRunAt.IsZero() {
+		if row.ScheduleKey == "" || row.WarID == "" || row.SourceClanTag == "" || row.OpponentTag == "" || row.PrepTime.IsZero() || row.EndTime.IsZero() || row.NextRunAt.IsZero() {
 			continue
 		}
 		batch.Queue(`
 			INSERT INTO war_schedule (
-				war_id, source_clan_tag, opponent_tag, prep_time, end_time, next_run_at,
-				cwl_war_tag, status
+				schedule_key, war_id, source_clan_tag, opponent_tag, prep_time,
+				end_time, next_run_at, war_tag
 			)
-			VALUES ($1, $2, $3, $4, $5, $6, NULLIF($7, ''), $8)
-			ON CONFLICT (war_id) DO UPDATE SET
+			VALUES ($1, $2::uuid, $3, $4, $5, $6, $7, NULLIF($8, ''))
+			ON CONFLICT (schedule_key) DO UPDATE SET
 				source_clan_tag = EXCLUDED.source_clan_tag,
 				opponent_tag = EXCLUDED.opponent_tag,
 				prep_time = EXCLUDED.prep_time,
 				end_time = EXCLUDED.end_time,
 				next_run_at = EXCLUDED.next_run_at,
-				cwl_war_tag = EXCLUDED.cwl_war_tag,
-				status = EXCLUDED.status,
-				updated_at = now()
-			WHERE war_schedule.status <> 'complete'
-		`, row.WarID, row.SourceClanTag, row.OpponentTag, row.PrepTime, row.EndTime, row.NextRunAt, row.CWLWarTag, warSchedulePending)
+				war_tag = EXCLUDED.war_tag
+		`, row.ScheduleKey, row.WarID, row.SourceClanTag, row.OpponentTag, row.PrepTime, row.EndTime, row.NextRunAt, row.WarTag)
 	}
 	return utils.SendBatch(ctx, tx, batch)
 }
@@ -281,21 +337,11 @@ func upsertCWLGroups(ctx context.Context, tx pgx.Tx, rows []models.CWLGroupRow) 
 	return utils.SendBatch(ctx, tx, batch)
 }
 
-func markWarStored(ctx context.Context, tx pgx.Tx, warID, key string) error {
-	// The same R2 key is written to both perspective rows for lookup by either clan.
-	_, err := tx.Exec(ctx, `
-		UPDATE war_log_index
-		SET r2_key = $2, stored_at = now()
-		WHERE war_id = $1
-	`, warID, key)
-	if err != nil {
-		return err
+func deleteWarSchedule(ctx context.Context, tx pgx.Tx, scheduleKey string) error {
+	if scheduleKey == "" {
+		return nil
 	}
-	_, err = tx.Exec(ctx, `
-		UPDATE war_schedule
-		SET status = $2, updated_at = now(), last_error = NULL
-		WHERE war_id = $1
-	`, warID, warScheduleComplete)
+	_, err := tx.Exec(ctx, `DELETE FROM war_schedule WHERE schedule_key = $1`, scheduleKey)
 	return err
 }
 
@@ -305,17 +351,7 @@ func (s *timescaleWarStore) ShiftMaintenance(ctx context.Context, duration time.
 	_, err := s.pool.Exec(ctx, `
 		UPDATE war_schedule
 		SET next_run_at = next_run_at + ($1 * interval '1 second'),
-		    end_time = end_time + ($1 * interval '1 second'),
-		    updated_at = now()
-		WHERE status IN ('pending', 'storing')
-	`, int(duration.Seconds()))
-	if err != nil {
-		return err
-	}
-	_, err = s.pool.Exec(ctx, `
-		UPDATE war_log_index
-		SET end_time = end_time + ($1 * interval '1 second')
-		WHERE stored_at IS NULL
+		    end_time = end_time + ($1 * interval '1 second')
 	`, int(duration.Seconds()))
 	return err
 }
@@ -347,9 +383,7 @@ func (s *memoryWarStore) LoadPendingSchedules(context.Context) ([]models.WarSche
 	defer s.mu.Unlock()
 	out := make([]models.WarScheduleRow, 0, len(s.schedules))
 	for _, schedule := range s.schedules {
-		if schedule.Status == warSchedulePending || schedule.Status == "storing" {
-			out = append(out, schedule)
-		}
+		out = append(out, schedule)
 	}
 	return out, nil
 }
@@ -368,6 +402,13 @@ func (s *memoryWarStore) LoadCWLLeague(_ context.Context, tag string) (int, erro
 func (s *memoryWarStore) Store(_ context.Context, ingest models.WarIngest) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	if ingest.FinishedWarID != "" && ingest.FinishedScheduleKey != "" {
+		if schedule, ok := s.schedules[ingest.FinishedScheduleKey]; ok {
+			rewriteWarIngestID(&ingest, schedule.WarID)
+		} else {
+			return nil
+		}
+	}
 	for _, row := range ingest.IndexRows {
 		s.indexRows[row.WarID+"|"+row.ClanTag] = row
 	}
@@ -376,26 +417,15 @@ func (s *memoryWarStore) Store(_ context.Context, ingest models.WarIngest) error
 		s.attacks[key] = row
 	}
 	for _, row := range ingest.Schedules {
-		s.schedules[row.WarID] = row
+		s.schedules[row.ScheduleKey] = row
 	}
 	for _, row := range ingest.CWLGroups {
 		s.cwlGroups[row.CWLID] = row
 	}
 	if ingest.FinishedWarID != "" {
 		// Mirror the production ordering closely enough for store-ordering unit tests.
-		s.objects[ingest.R2Key] = utils.Compress(ingest.RawWarJSON)
-		for key, row := range s.indexRows {
-			if row.WarID == ingest.FinishedWarID {
-				now := time.Now().UTC()
-				row.R2Key = ingest.R2Key
-				row.StoredAt = &now
-				s.indexRows[key] = row
-			}
-		}
-		if schedule, ok := s.schedules[ingest.FinishedWarID]; ok {
-			schedule.Status = warScheduleComplete
-			s.schedules[ingest.FinishedWarID] = schedule
-		}
+		s.objects[warR2Key(ingest.FinishedWarID)] = utils.Compress(ingest.RawWarJSON)
+		delete(s.schedules, ingest.FinishedScheduleKey)
 	}
 	return nil
 }
@@ -404,18 +434,9 @@ func (s *memoryWarStore) ShiftMaintenance(_ context.Context, duration time.Durat
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	for id, schedule := range s.schedules {
-		if schedule.Status != warSchedulePending && schedule.Status != "storing" {
-			continue
-		}
 		schedule.NextRunAt = schedule.NextRunAt.Add(duration)
 		schedule.EndTime = schedule.EndTime.Add(duration)
 		s.schedules[id] = schedule
-	}
-	for key, row := range s.indexRows {
-		if row.StoredAt == nil {
-			row.EndTime = row.EndTime.Add(duration)
-			s.indexRows[key] = row
-		}
 	}
 	return nil
 }

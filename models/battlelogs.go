@@ -7,11 +7,13 @@ import (
 )
 
 type BasicPlayerRow struct {
-	Tag      string
-	Name     string
-	LeagueID int
-	ClanTag  string
-	TownHall int
+	Tag          string
+	Name         string
+	LeagueID     int
+	ClanTag      string
+	ClanTagKnown bool
+	TownHall     int
+	Trophies     int
 }
 
 type BattlelogCheckpoint struct {
@@ -21,18 +23,16 @@ type BattlelogCheckpoint struct {
 
 type BattlelogIngest struct {
 	Rows        []BattlelogRow
-	Players     []BasicPlayerRow
 	Checkpoints []BattlelogCheckpoint
 }
 
 type BattlelogRow struct {
 	BattleID              uuid.UUID
-	ArmyHash              uint64
+	ArmyShareCode         string
 	PlayerTag             string
-	PlayerTH              uint8
 	OpponentTag           string
+	OpponentName          string
 	OpponentTH            uint8
-	LeagueID              uint32
 	BattleType            string
 	Attack                bool
 	Stars                 uint8
@@ -40,22 +40,7 @@ type BattlelogRow struct {
 	Gold                  uint32
 	Elixir                uint32
 	DarkElixir            uint32
+	Duration              uint16
 	Timestamp             time.Time
 	ArmyColumns           map[string]uint16
-}
-
-type ItemRollupKey struct {
-	DayStart   time.Time
-	PlayerTH   int16
-	LeagueID   int32
-	BattleType string
-	ItemKey    string
-}
-
-type ItemHitrateCounts struct {
-	Attacks    int64
-	ZeroStars  int64
-	OneStars   int64
-	TwoStars   int64
-	ThreeStars int64
 }

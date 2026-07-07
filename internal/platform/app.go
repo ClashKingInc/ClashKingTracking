@@ -5,13 +5,12 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
-	"net/http"
 	"os"
 	"sync"
+	"time"
 
 	clashy "github.com/clashkinginc/clashy.go"
 	valkey "github.com/valkey-io/valkey-go"
-	sdktrace "go.opentelemetry.io/otel/sdk/trace"
 )
 
 type Domain interface {
@@ -20,29 +19,21 @@ type Domain interface {
 }
 
 type App struct {
-	Config         Config
-	Logger         *slog.Logger
-	Store          Store
-	Valkey         valkey.Client
-	Clash          *clashy.Client
-	R2             ObjectStore
-	Stats          *Tracker
-	Scheduler      *Scheduler
-	tracerProvider *sdktrace.TracerProvider
-	httpSrv        *http.Server
+	Config      Config
+	Logger      *slog.Logger
+	Store       Store
+	Valkey      valkey.Client
+	Clash       *clashy.Client
+	R2          ObjectStore
+	Stats       *Tracker
+	StatsWriter *TimescaleStatsWriter
+	Scheduler   *Scheduler
 }
 
 func New(ctx context.Context, cfg Config) (*App, error) {
 	logger := slog.New(slog.NewJSONHandler(os.Stdout, &slog.HandlerOptions{Level: slog.LevelInfo}))
-	tracerProvider, err := newTracerProvider(ctx, cfg)
-	if err != nil {
-		return nil, err
-	}
 	store, err := newStore(ctx, cfg)
 	if err != nil {
-		if tracerProvider != nil {
-			_ = tracerProvider.Shutdown(ctx)
-		}
 		return nil, err
 	}
 	if needsClashClient(cfg) && cfg.ProxyURL == "" {
@@ -57,13 +48,21 @@ func New(ctx context.Context, cfg Config) (*App, error) {
 		})
 		if err != nil {
 			_ = store.Close(ctx)
-			if tracerProvider != nil {
-				_ = tracerProvider.Shutdown(ctx)
-			}
 			return nil, err
 		}
 	}
 	stats := NewTracker()
+	var statsWriter *TimescaleStatsWriter
+	if shouldPersistStats(cfg) {
+		statsWriter, err = NewTimescaleStatsWriter(ctx, cfg.TimescaleURL, stats, cfg.Script, time.Duration(cfg.StatsTimescaleFlushSeconds)*time.Second)
+		if err != nil {
+			if valkeyClient != nil {
+				valkeyClient.Close()
+			}
+			_ = store.Close(ctx)
+			return nil, err
+		}
+	}
 	var clashClient *clashy.Client
 	if needsClashClient(cfg) {
 		proxyLimit := proxyConnectionLimit(cfg)
@@ -78,10 +77,10 @@ func New(ctx context.Context, cfg Config) (*App, error) {
 			if valkeyClient != nil {
 				valkeyClient.Close()
 			}
-			_ = store.Close(ctx)
-			if tracerProvider != nil {
-				_ = tracerProvider.Shutdown(ctx)
+			if statsWriter != nil {
+				statsWriter.Close()
 			}
+			_ = store.Close(ctx)
 			return nil, err
 		}
 	}
@@ -96,39 +95,27 @@ func New(ctx context.Context, cfg Config) (*App, error) {
 			if valkeyClient != nil {
 				valkeyClient.Close()
 			}
-			_ = store.Close(ctx)
-			if tracerProvider != nil {
-				_ = tracerProvider.Shutdown(ctx)
+			if statsWriter != nil {
+				statsWriter.Close()
 			}
+			_ = store.Close(ctx)
 			return nil, err
 		}
 	} else if cfg.R2MockUpload {
 		objectStore = MockObjectStore{}
 	}
 	app := &App{
-		Config:         cfg,
-		Logger:         logger,
-		Store:          store,
-		Valkey:         valkeyClient,
-		Clash:          clashClient,
-		R2:             objectStore,
-		Stats:          stats,
-		Scheduler:      NewScheduler(),
-		tracerProvider: tracerProvider,
-		httpSrv: &http.Server{
-			Addr:    cfg.HTTPAddr,
-			Handler: stats.HTTPMux(),
-		},
+		Config:      cfg,
+		Logger:      logger,
+		Store:       store,
+		Valkey:      valkeyClient,
+		Clash:       clashClient,
+		R2:          objectStore,
+		Stats:       stats,
+		StatsWriter: statsWriter,
+		Scheduler:   NewScheduler(),
 	}
 	return app, nil
-}
-
-func (a *App) StartHTTP() {
-	go func() {
-		if err := a.httpSrv.ListenAndServe(); err != nil && !errors.Is(err, http.ErrServerClosed) {
-			a.Logger.Error("http server exited", "err", err)
-		}
-	}()
 }
 
 func (a *App) Close(ctx context.Context) error {
@@ -138,20 +125,19 @@ func (a *App) Close(ctx context.Context) error {
 	if a.Clash != nil {
 		_ = a.Clash.Close()
 	}
-	if err := a.httpSrv.Shutdown(ctx); err != nil {
-		return err
+	if a.StatsWriter != nil {
+		a.StatsWriter.Close()
 	}
 	if err := a.Store.Close(ctx); err != nil {
 		return err
-	}
-	if a.tracerProvider != nil {
-		return a.tracerProvider.Shutdown(ctx)
 	}
 	return nil
 }
 
 func Run(ctx context.Context, app *App, domains []Domain) error {
-	app.StartHTTP()
+	if app.StatsWriter != nil {
+		go app.StatsWriter.Run(ctx, app.Logger)
+	}
 	schedulerCtx, cancelScheduler := context.WithCancel(ctx)
 	defer cancelScheduler()
 	go func() {
@@ -185,6 +171,10 @@ func Run(ctx context.Context, app *App, domains []Domain) error {
 	return nil
 }
 
+func shouldPersistStats(cfg Config) bool {
+	return !cfg.MockDB && !cfg.DryRun && cfg.TimescaleURL != "" && cfg.StatsTimescaleFlushSeconds > 0
+}
+
 func newStore(ctx context.Context, cfg Config) (Store, error) {
 	// Dry-run and mock-db both use the in-memory store so writes can be exercised safely.
 	if cfg.MockDB || cfg.DryRun || cfg.StatsMongoURI == "" || cfg.StaticMongoURI == "" {
@@ -197,9 +187,12 @@ func proxyConnectionLimit(cfg Config) int {
 	rate := max(
 		cfg.GlobalClanPriorityRequestsPerSecond+cfg.GlobalClanNonPriorityRequestsPerSecond,
 		cfg.BattlelogRequestsPerSecond,
+		cfg.BattlelogPriorityRequestsPerSecond,
 		cfg.WarRequestsPerSecond,
 		cfg.BotClanRequestsPerSecond,
 		cfg.BotPlayerRequestsPerSecond,
+		cfg.BasicPlayerRequestsPerSecond,
+		cfg.LeaderboardRequestsPerSecond,
 	)
 	if rate <= 0 {
 		return 100
@@ -209,7 +202,7 @@ func proxyConnectionLimit(cfg Config) int {
 
 func needsClashClient(cfg Config) bool {
 	switch cfg.Script {
-	case "globalclans", "botplayers", "botclans", "wars", "scheduled", "battlelogs":
+	case "globalclans", "botplayers", "basicplayers", "botclans", "wars", "scheduled", "battlelogs", "leaderboards":
 		return true
 	default:
 		return false

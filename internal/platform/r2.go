@@ -13,6 +13,7 @@ import (
 	"net/url"
 	"sort"
 	"strings"
+	"sync"
 	"time"
 )
 
@@ -31,9 +32,9 @@ type R2ObjectStore struct {
 	accessKeyID     string
 	secretAccessKey string
 	bucket          string
-	prefix          string
 	client          *http.Client
 	now             func() time.Time
+	limiter         *requestRateLimiter
 }
 
 func NewR2ObjectStore(cfg Config) (*R2ObjectStore, error) {
@@ -52,9 +53,9 @@ func NewR2ObjectStore(cfg Config) (*R2ObjectStore, error) {
 		accessKeyID:     cfg.R2AccessKeyID,
 		secretAccessKey: cfg.R2SecretAccessKey,
 		bucket:          strings.Trim(cfg.R2Bucket, "/"),
-		prefix:          strings.Trim(cfg.R2Prefix, "/"),
-		client:          http.DefaultClient,
+		client:          newR2HTTPClient(cfg.R2RequestsPerSecond),
 		now:             time.Now,
+		limiter:         newRequestRateLimiter(cfg.R2RequestsPerSecond),
 	}, nil
 }
 
@@ -62,10 +63,12 @@ func (s *R2ObjectStore) PutObject(ctx context.Context, key string, payload []byt
 	if s == nil {
 		return errors.New("r2 object store is not configured")
 	}
-	key = strings.TrimLeft(key, "/")
-	if s.prefix != "" {
-		key = s.prefix + "/" + key
+	if s.limiter != nil {
+		if err := s.limiter.Wait(ctx); err != nil {
+			return err
+		}
 	}
+	key = strings.TrimLeft(key, "/")
 	target := *s.endpoint
 	target.Path = "/" + s.bucket + "/" + key
 	if contentType == "" {
@@ -90,6 +93,61 @@ func (s *R2ObjectStore) PutObject(ctx context.Context, key string, payload []byt
 	}
 	body, _ := io.ReadAll(io.LimitReader(resp.Body, 4096))
 	return fmt.Errorf("r2 put %s failed: status=%d body=%s", key, resp.StatusCode, strings.TrimSpace(string(body)))
+}
+
+func newR2HTTPClient(requestsPerSecond int) *http.Client {
+	maxConns := max(1, requestsPerSecond*3)
+	return &http.Client{
+		Transport: &http.Transport{
+			Proxy:                 http.ProxyFromEnvironment,
+			MaxIdleConns:          maxConns,
+			MaxIdleConnsPerHost:   maxConns,
+			MaxConnsPerHost:       maxConns,
+			IdleConnTimeout:       90 * time.Second,
+			TLSHandshakeTimeout:   10 * time.Second,
+			ExpectContinueTimeout: 1 * time.Second,
+		},
+		Timeout: 30 * time.Second,
+	}
+}
+
+type requestRateLimiter struct {
+	mu       sync.Mutex
+	interval time.Duration
+	next     time.Time
+}
+
+func newRequestRateLimiter(requestsPerSecond int) *requestRateLimiter {
+	if requestsPerSecond <= 0 {
+		return nil
+	}
+	return &requestRateLimiter{interval: time.Second / time.Duration(requestsPerSecond)}
+}
+
+func (l *requestRateLimiter) Wait(ctx context.Context) error {
+	if l == nil || l.interval <= 0 {
+		return nil
+	}
+	now := time.Now()
+	l.mu.Lock()
+	if l.next.Before(now) {
+		l.next = now
+	}
+	waitUntil := l.next
+	l.next = l.next.Add(l.interval)
+	l.mu.Unlock()
+	wait := time.Until(waitUntil)
+	if wait <= 0 {
+		return nil
+	}
+	timer := time.NewTimer(wait)
+	defer timer.Stop()
+	select {
+	case <-ctx.Done():
+		return ctx.Err()
+	case <-timer.C:
+		return nil
+	}
 }
 
 func (s *R2ObjectStore) sign(req *http.Request, payload []byte) error {

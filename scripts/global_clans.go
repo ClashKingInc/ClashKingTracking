@@ -7,6 +7,7 @@ import (
 	"errors"
 	"fmt"
 	"sort"
+	"strings"
 	"sync"
 	"time"
 
@@ -19,17 +20,17 @@ import (
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgconn"
 	"github.com/jackc/pgx/v5/pgxpool"
-	"go.opentelemetry.io/otel/attribute"
 )
 
 const (
 	globalClansDomainName = "globalclans"
 	unrankedWarLeagueID   = 48000000
 
-	globalClanAsyncWriteBatchSize     = 200
-	globalClanAsyncWriteQueueSize     = 2000
-	globalClanAsyncWriteFlushInterval = 500 * time.Millisecond
-	globalClanTargetRefreshInterval   = 24 * time.Hour
+	globalClanDiffBatchSize           = 100
+	globalClanAsyncWriteWorkers       = 2
+	globalClanAsyncWriteBatchSize     = 4
+	globalClanAsyncWriteQueueSize     = 16
+	globalClanAsyncWriteFlushInterval = 250 * time.Millisecond
 )
 
 const activeGlobalClanTargetSQL = `
@@ -56,23 +57,6 @@ const inactiveGlobalClanTargetSQL = `
 	LIMIT $2
 `
 
-const upsertGlobalClanBasicPlayerSQL = `
-	INSERT INTO basic_player (
-		tag, name, league_id, clan_tag, townhall_level
-	)
-	VALUES ($1, $2, NULLIF($3, 0), $4, $5)
-	ON CONFLICT (tag) DO UPDATE SET
-		name = EXCLUDED.name,
-		league_id = EXCLUDED.league_id,
-		clan_tag = EXCLUDED.clan_tag,
-		townhall_level = EXCLUDED.townhall_level
-	WHERE
-		basic_player.name IS DISTINCT FROM EXCLUDED.name OR
-		basic_player.league_id IS DISTINCT FROM EXCLUDED.league_id OR
-		basic_player.clan_tag IS DISTINCT FROM EXCLUDED.clan_tag OR
-		basic_player.townhall_level IS DISTINCT FROM EXCLUDED.townhall_level
-`
-
 type globalClansDomain struct {
 	store globalClanStore
 }
@@ -85,7 +69,8 @@ type globalClanGroup struct {
 }
 
 type globalClanStore interface {
-	ListTargetTags(context.Context, string, int) ([]string, error)
+	NextTargetPage(context.Context, string, string, int) (clashtracker.TargetPage, error)
+	CountTargetTags(context.Context, string) (int, error)
 	Load(context.Context, []string) (map[string]models.BasicClanRow, error)
 	Store(context.Context, models.GlobalClanIngest) (globalClanStoreResult, error)
 	Close() error
@@ -102,36 +87,24 @@ type globalClanSnapshot struct {
 	FetchedAt time.Time
 }
 
-type globalClanTargetStores struct {
-	active   *scriptMemoryTargetSet
-	inactive *scriptMemoryTargetSet
-}
-
-type globalClanTargetMove struct {
-	Tag      string
-	ToBucket string
-	Remove   bool
-}
-
 type globalClanTrackerStore struct {
-	store   globalClanStore
-	app     *platform.App
-	group   string
-	targets *globalClanTargetStores
-	writer  *globalClanAsyncWriter
+	store globalClanStore
 }
 
 type globalClanAsyncWriter struct {
-	app     *platform.App
-	store   globalClanStore
-	targets *globalClanTargetStores
-	jobs    chan globalClanWriteJob
+	app   *platform.App
+	store globalClanStore
+	jobs  chan globalClanWriteJob
 }
 
 type globalClanWriteJob struct {
 	Group  string
 	Ingest models.GlobalClanIngest
-	Moves  []globalClanTargetMove
+}
+
+type globalClanTargetPager struct {
+	store  globalClanStore
+	bucket string
 }
 
 func NewGlobalClansDomain() platform.Domain { return &globalClansDomain{} }
@@ -150,18 +123,13 @@ func (d *globalClansDomain) Run(ctx context.Context, app *platform.App) error {
 	defer store.Close()
 
 	// Priority and non-priority clans are independent loops so low-value scans cannot starve
-	// active clans. Targets are owned by the target stores; database tables only hold
-	// fetched snapshots and derived history.
+	// active clans. Targets are streamed from SQL pages instead of loading every
+	// inactive clan into the generic tracker heap.
 	groups := globalClanGroups(app.Config)
 
-	targetStores, err := d.openTargetStores(ctx, app, groups)
-	if err != nil {
-		return err
-	}
-	writer := newGlobalClanAsyncWriter(app, store, targetStores)
+	writer := newGlobalClanAsyncWriter(app, store)
 	go writer.run(ctx)
-	targetStores.run(ctx)
-	return d.runGroups(ctx, app, groups, targetStores, writer)
+	return d.runGroups(ctx, app, groups, writer)
 }
 
 func globalClanGroups(cfg platform.Config) []globalClanGroup {
@@ -195,6 +163,9 @@ func validateGlobalClanConfig(cfg platform.Config) error {
 	if cfg.GlobalClanNonPriorityRequestsPerSecond <= 0 {
 		return errors.New("globalclans.non_priority_requests_per_second must be greater than zero when globalclans is enabled")
 	}
+	if cfg.GlobalClanTargetRefreshSeconds <= 0 {
+		return errors.New("globalclans.target_refresh_seconds must be greater than zero when globalclans is enabled")
+	}
 	if cfg.TargetPageMultiplier <= 0 {
 		return errors.New("target_page_multiplier must be greater than zero when globalclans is enabled")
 	}
@@ -207,48 +178,14 @@ func validateGlobalClanConfig(cfg platform.Config) error {
 	return nil
 }
 
-func (d *globalClansDomain) openTargetStores(
-	ctx context.Context,
-	app *platform.App,
-	groups []globalClanGroup,
-) (*globalClanTargetStores, error) {
-	targetStores := &globalClanTargetStores{}
-	for _, group := range groups {
-		bucket := group.Bucket
-		targetSet, err := newScriptMemoryTargetSet(ctx, app, globalClansDomainName, group.Name, globalClanTargetRefreshInterval, func(loadCtx context.Context) ([]clashtracker.Target, error) {
-			tags, err := d.store.ListTargetTags(loadCtx, bucket, group.RequestsPerSecond*app.Config.TargetPageMultiplier)
-			if err != nil {
-				return nil, err
-			}
-			targets := make([]clashtracker.Target, 0, len(tags))
-			for _, tag := range tags {
-				targets = append(targets, clashtracker.Target{Key: tag})
-			}
-			return targets, nil
-		})
-		if err != nil {
-			return nil, err
-		}
-		switch group.Bucket {
-		case "inactive":
-			targetStores.inactive = targetSet
-		default:
-			targetStores.active = targetSet
-		}
-	}
-	return targetStores, nil
-}
-
 func newGlobalClanAsyncWriter(
 	app *platform.App,
 	store globalClanStore,
-	targets *globalClanTargetStores,
 ) *globalClanAsyncWriter {
 	return &globalClanAsyncWriter{
-		app:     app,
-		store:   store,
-		targets: targets,
-		jobs:    make(chan globalClanWriteJob, globalClanAsyncWriteQueueSize),
+		app:   app,
+		store: store,
+		jobs:  make(chan globalClanWriteJob, globalClanAsyncWriteQueueSize),
 	}
 }
 
@@ -266,6 +203,19 @@ func (w *globalClanAsyncWriter) enqueue(ctx context.Context, job globalClanWrite
 }
 
 func (w *globalClanAsyncWriter) run(ctx context.Context) {
+	var wg sync.WaitGroup
+	for i := 0; i < globalClanAsyncWriteWorkers; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			w.runWorker(ctx)
+		}()
+	}
+	<-ctx.Done()
+	wg.Wait()
+}
+
+func (w *globalClanAsyncWriter) runWorker(ctx context.Context) {
 	timer := time.NewTimer(globalClanAsyncWriteFlushInterval)
 	defer timer.Stop()
 	batch := make([]globalClanWriteJob, 0, globalClanAsyncWriteBatchSize)
@@ -316,89 +266,17 @@ func (w *globalClanAsyncWriter) recordQueueDepth(inBatch int) {
 	w.app.Stats.SetQueueDepth(globalClansDomainName, len(w.jobs)+inBatch)
 }
 
-func (s *globalClanTargetStores) run(ctx context.Context) {
-	if s == nil {
-		return
-	}
-	go s.active.Run(ctx)
-	go s.inactive.Run(ctx)
-}
-
-func (s *globalClanTargetStores) forBucket(bucket string) clashtracker.TargetStore {
-	if s == nil {
-		return clashtracker.NewMemoryTargetStore()
-	}
-	if bucket == "inactive" {
-		if s.inactive != nil {
-			return s.inactive.Store()
-		}
-		return clashtracker.NewMemoryTargetStore()
-	}
-	if s.active != nil {
-		return s.active.Store()
-	}
-	return clashtracker.NewMemoryTargetStore()
-}
-
-func (s *globalClanTargetStores) setRunner(bucket string, runner *clashtracker.Runner[*clashy.Clan, globalClanSnapshot]) {
-	if s == nil {
-		return
-	}
-	if bucket == "inactive" {
-		if s.inactive != nil {
-			s.inactive.SetRunner(runner)
-		}
-		return
-	}
-	if s.active != nil {
-		s.active.SetRunner(runner)
-	}
-}
-
-func (s *globalClanTargetStores) add(ctx context.Context, bucket string, target clashtracker.Target) error {
-	if s == nil {
-		return nil
-	}
-	if bucket == "inactive" {
-		if s.inactive == nil {
-			return nil
-		}
-		return s.inactive.Add(ctx, target)
-	}
-	if s.active == nil {
-		return nil
-	}
-	return s.active.Add(ctx, target)
-}
-
-func (s *globalClanTargetStores) remove(ctx context.Context, bucket string, key string) error {
-	if s == nil {
-		return nil
-	}
-	if bucket == "inactive" {
-		if s.inactive == nil {
-			return nil
-		}
-		return s.inactive.Remove(ctx, key)
-	}
-	if s.active == nil {
-		return nil
-	}
-	return s.active.Remove(ctx, key)
-}
-
 func (d *globalClansDomain) runGroups(
 	ctx context.Context,
 	app *platform.App,
 	groups []globalClanGroup,
-	targetStores *globalClanTargetStores,
 	writer *globalClanAsyncWriter,
 ) error {
 	errCh := make(chan error, len(groups))
 	for _, group := range groups {
 		group := group
 		go func() {
-			errCh <- d.runGroup(ctx, app, group, targetStores, writer)
+			errCh <- d.runGroup(ctx, app, group, writer)
 		}()
 	}
 	select {
@@ -413,94 +291,108 @@ func (d *globalClansDomain) runGroup(
 	ctx context.Context,
 	app *platform.App,
 	group globalClanGroup,
-	targetStores *globalClanTargetStores,
 	writer *globalClanAsyncWriter,
 ) error {
-	ctx, span := platform.StartSpan(ctx, "tracker.group",
-		attribute.String("domain", globalClansDomainName),
-		attribute.String("group", group.Name),
-	)
-	defer span.End()
-
-	minInterval := 5 * time.Second
-	store := &globalClanTrackerStore{
-		store:   d.store,
-		app:     app,
-		group:   group.Name,
-		targets: targetStores,
-		writer:  writer,
+	statsName := trackingProgressName(globalClansDomainName, group.Name)
+	if count, err := d.store.CountTargetTags(ctx, group.Bucket); err == nil {
+		app.Stats.SetTrackingTargets(statsName, count)
+	} else {
+		app.Logger.Error("global clan target count failed", "group", group.Name, "err", err)
 	}
-	runner, err := clashtracker.NewRunner[*clashy.Clan, globalClanSnapshot](clashtracker.Config[*clashy.Clan, globalClanSnapshot]{
-		TargetStore:       targetStores.forBucket(group.Bucket),
-		Store:             store,
+	trackerStore := &globalClanTrackerStore{store: d.store}
+	runner, err := clashtracker.NewRunner[globalClanSnapshot](clashtracker.Config[globalClanSnapshot]{
+		TargetPager:       globalClanTargetPager{store: d.store, bucket: group.Bucket},
+		TargetPageSize:    group.RequestsPerSecond * app.Config.TargetPageMultiplier,
+		ResultBatchSize:   globalClanDiffBatchSize,
 		RequestsPerSecond: group.RequestsPerSecond,
 		MaxInFlight:       group.MaxInFlight,
-		MinInterval:       minInterval,
+		Cache:             trackerStore,
 		EmitInitial:       true,
-		Fetch: func(fetchCtx context.Context, target clashtracker.Target) (clashtracker.FetchResult[*clashy.Clan], error) {
+		Fetch: func(fetchCtx context.Context, target clashtracker.Target) (clashtracker.FetchResult[globalClanSnapshot], error) {
 			clan, err := fetchGlobalClan(fetchCtx, app, group.Name, target.Key)
-			return clashtracker.FetchResult[*clashy.Clan]{Value: clan}, err
-		},
-		Project: func(clan *clashy.Clan) (globalClanSnapshot, error) {
-			if clan == nil {
-				return globalClanSnapshot{}, nil
+			app.Stats.RecordTrackedTarget(statsName)
+			if err != nil {
+				return clashtracker.FetchResult[globalClanSnapshot]{}, err
 			}
-			if clan.Tag == "" && clan.Name == "" {
-				return globalClanSnapshot{}, fmt.Errorf("empty clan payload")
+			if clan == nil || (clan.Tag == "" && clan.Name == "") {
+				return clashtracker.FetchResult[globalClanSnapshot]{}, fmt.Errorf("empty clan payload")
 			}
-			return globalClanSnapshot{
+			current := globalClanSnapshot{
 				Clan:      *clan,
 				Row:       basicClanRow(*clan),
 				FetchedAt: time.Now().UTC(),
-			}, nil
+			}
+			return clashtracker.FetchResult[globalClanSnapshot]{Value: current}, nil
 		},
-		Diff: func(ctx context.Context, _ clashtracker.Target, previous, current globalClanSnapshot) error {
-			ingest := buildGlobalClanIngest(current.Clan, previous.Row, current.FetchedAt)
-			moves := globalClanTargetMoves(current.Clan, previous.Row, ingest, current.FetchedAt)
-			return store.writer.enqueue(ctx, globalClanWriteJob{
-				Group:  store.group,
-				Ingest: ingest,
-				Moves:  moves,
-			})
-		},
-		OnError: func(_ context.Context, target clashtracker.Target, err error) error {
-			app.Logger.Error("global clan fetch failed", "tag", target.Key, "err", err)
-			app.Stats.SetReady(globalClansDomainName, false, err.Error())
-			if platform.IsNonFatalClashError(err) {
+		HandleBatch: func(handleCtx context.Context, values []clashtracker.HandledValue[globalClanSnapshot]) error {
+			var ingest models.GlobalClanIngest
+			for _, value := range values {
+				currentIngest := buildGlobalClanIngest(value.Current, value.Previous)
+				ingest = mergeGlobalClanIngest(ingest, currentIngest)
+			}
+			if globalClanIngestWriteCount(ingest) == 0 {
 				return nil
 			}
-			return err
+			return writer.enqueue(handleCtx, globalClanWriteJob{
+				Group:  group.Name,
+				Ingest: ingest,
+			})
+		},
+		OnFetchError: func(_ context.Context, target clashtracker.Target, err error) (clashtracker.FetchErrorDecision, error) {
+			app.Logger.Error("global clan fetch failed", "tag", target.Key, "err", err)
+			app.Stats.SetReady(globalClansDomainName, false, err.Error())
+			if decision, ok := platform.ClashFetchErrorDecision(err); ok {
+				return decision, nil
+			}
+			return clashtracker.FetchErrorDecision{Action: clashtracker.FetchErrorStop}, nil
 		},
 	})
 	if err != nil {
-		platform.RecordSpanError(span, err)
-		span.SetAttributes(platform.SpanErrorStatus(err))
 		return err
 	}
-	targetStores.setRunner(group.Bucket, runner)
 	err = runner.Run(ctx)
 	if err != nil {
 		app.Stats.SetReady(globalClansDomainName, false, err.Error())
-		platform.RecordSpanError(span, err)
-		span.SetAttributes(platform.SpanErrorStatus(err))
 		return err
 	}
 	app.Stats.SetReady(globalClansDomainName, true, "")
-	span.SetAttributes(platform.SpanErrorStatus(nil))
 	return nil
+}
+
+func buildGlobalClanIngest(current globalClanSnapshot, previous *globalClanSnapshot) models.GlobalClanIngest {
+	if current.Clan.MemberCount <= 0 {
+		return models.GlobalClanIngest{DeletedClanTags: []string{current.Clan.Tag}}
+	}
+
+	var previousRow models.BasicClanRow
+	if previous != nil {
+		previousRow = previous.Row
+	}
+	ingest := models.GlobalClanIngest{
+		Clans:       []models.BasicClanRow{current.Row},
+		Players:     basicPlayerRows(current.Clan.Tag, current.Clan.Members),
+		ClanRecords: clanRecordRows(current.Clan, previousRow, current.FetchedAt),
+	}
+	if previous != nil && !isGlobalClanFirstHydration(previous.Row, current.Clan) {
+		// Joins are the only member movement that marks a clan active. Leave-only
+		// changes are still persisted, but they should not promote a clan into
+		// the priority polling bucket.
+		ingest.JoinLeaves = joinLeaveRows(previous.Row, current.Clan, current.FetchedAt)
+		if hasJoin(ingest.JoinLeaves) {
+			ingest.ActiveClanTags = []string{current.Clan.Tag}
+		}
+		ingest.ClanChanges = clanChangeRows(previous.Row, current.Row, current.FetchedAt)
+	}
+	return ingest
+}
+
+func isGlobalClanFirstHydration(previous models.BasicClanRow, current clashy.Clan) bool {
+	return previous.MemberCount <= 0 && current.MemberCount > 0
 }
 
 func fetchGlobalClan(ctx context.Context, app *platform.App, group, tag string) (*clashy.Clan, error) {
 	start := time.Now()
-	fetchCtx, span := platform.StartSpan(ctx, "clash.fetch",
-		attribute.String("domain", globalClansDomainName),
-		attribute.String("group", group),
-		attribute.String("operation", "clan"),
-	)
-	clan, err := app.Clash.GetClan(fetchCtx, tag)
-	platform.RecordSpanError(span, err)
-	span.SetAttributes(platform.SpanErrorStatus(err))
-	span.End()
+	clan, err := app.Clash.GetClan(ctx, tag)
 	app.Stats.RecordRequest(globalClansDomainName, time.Since(start), err)
 	if err != nil || clan == nil {
 		return clan, err
@@ -517,8 +409,27 @@ func (s *globalClanTrackerStore) Load(ctx context.Context, key string) (globalCl
 	return globalClanSnapshot{Row: row}, ok, nil
 }
 
-func (s *globalClanTrackerStore) Store(context.Context, string, globalClanSnapshot, time.Duration) error {
-	return nil
+func (s *globalClanTrackerStore) LoadBatch(ctx context.Context, keys []string) (map[string]clashtracker.LoadedValue[globalClanSnapshot], error) {
+	loaded, err := s.store.Load(ctx, uniqueStrings(keys))
+	if err != nil {
+		return nil, err
+	}
+	out := make(map[string]clashtracker.LoadedValue[globalClanSnapshot], len(loaded))
+	for key, row := range loaded {
+		out[key] = clashtracker.LoadedValue[globalClanSnapshot]{
+			Value: globalClanSnapshot{Row: row},
+			Found: true,
+		}
+	}
+	return out, nil
+}
+
+func (p globalClanTargetPager) NextPage(ctx context.Context, cursor string, limit int) (clashtracker.TargetPage, error) {
+	return p.store.NextTargetPage(ctx, p.bucket, cursor, limit)
+}
+
+func (p globalClanTargetPager) Count(ctx context.Context) (int, error) {
+	return p.store.CountTargetTags(ctx, p.bucket)
 }
 
 func (w *globalClanAsyncWriter) writeBatch(ctx context.Context, jobs []globalClanWriteJob) error {
@@ -527,28 +438,15 @@ func (w *globalClanAsyncWriter) writeBatch(ctx context.Context, jobs []globalCla
 	}
 	group := jobs[0].Group
 	var ingest models.GlobalClanIngest
-	var moves []globalClanTargetMove
 	for _, job := range jobs {
 		if job.Group != group {
 			group = "mixed"
 		}
 		ingest = mergeGlobalClanIngest(ingest, job.Ingest)
-		moves = append(moves, job.Moves...)
 	}
 	if globalClanIngestWriteCount(ingest) == 0 {
-		if err := applyGlobalClanTargetMoves(ctx, w.targets, moves); err != nil {
-			return err
-		}
 		return nil
 	}
-	ctx, span := platform.StartSpan(ctx, "globalclans.store",
-		attribute.String("domain", globalClansDomainName),
-		attribute.String("group", group),
-		attribute.String("operation", "store_clans"),
-		attribute.Int("jobs.count", len(jobs)),
-		attribute.Int("rows.count", globalClanIngestWriteCount(ingest)),
-	)
-	defer span.End()
 	requestedWrites := globalClanIngestWriteCount(ingest)
 	storeStart := time.Now()
 	result, err := w.store.Store(ctx, ingest)
@@ -564,12 +462,6 @@ func (w *globalClanAsyncWriter) writeBatch(ctx context.Context, jobs []globalCla
 				"err", err,
 			)
 		}
-		platform.RecordSpanError(span, err)
-		span.SetAttributes(
-			attribute.Int("write.requested", requestedWrites),
-			attribute.Float64("store.duration_ms", durationMillis(storeDuration)),
-			platform.SpanErrorStatus(err),
-		)
 		return err
 	}
 	w.app.Stats.RecordStore(globalClansDomainName, storeDuration, requestedWrites, result.WriteCount)
@@ -583,69 +475,10 @@ func (w *globalClanAsyncWriter) writeBatch(ctx context.Context, jobs []globalCla
 		)
 	}
 	w.app.Stats.RecordWrite(globalClansDomainName, result.WriteCount)
-	if err := applyGlobalClanTargetMoves(ctx, w.targets, moves); err != nil {
-		platform.RecordSpanError(span, err)
-		span.SetAttributes(
-			attribute.Int("write.count", result.WriteCount),
-			attribute.Int("write.requested", requestedWrites),
-			attribute.Float64("store.duration_ms", durationMillis(storeDuration)),
-			platform.SpanErrorStatus(err),
-		)
-		return err
-	}
 	if err := publishGlobalClanEvents(ctx, w.app, group, result.EventClans); err != nil {
-		platform.RecordSpanError(span, err)
-		span.SetAttributes(
-			attribute.Int("write.count", result.WriteCount),
-			attribute.Int("write.requested", requestedWrites),
-			attribute.Float64("store.duration_ms", durationMillis(storeDuration)),
-			platform.SpanErrorStatus(err),
-		)
 		return err
 	}
 	w.app.Stats.SetReady(globalClansDomainName, true, "")
-	span.SetAttributes(
-		attribute.Int("write.count", result.WriteCount),
-		attribute.Int("write.requested", requestedWrites),
-		attribute.Int("jobs.count", len(jobs)),
-		attribute.Float64("store.duration_ms", durationMillis(storeDuration)),
-		platform.SpanErrorStatus(nil),
-	)
-	return nil
-}
-
-func applyGlobalClanTargetMoves(ctx context.Context, stores *globalClanTargetStores, moves []globalClanTargetMove) error {
-	if stores == nil || len(moves) == 0 {
-		return nil
-	}
-	for _, move := range moves {
-		if move.Tag == "" {
-			continue
-		}
-		switch {
-		case move.Remove:
-			if err := stores.remove(ctx, "active", move.Tag); err != nil {
-				return err
-			}
-			if err := stores.remove(ctx, "inactive", move.Tag); err != nil {
-				return err
-			}
-		case move.ToBucket == "inactive":
-			if err := stores.remove(ctx, "active", move.Tag); err != nil {
-				return err
-			}
-			if err := stores.add(ctx, "inactive", clashtracker.Target{Key: move.Tag}); err != nil {
-				return err
-			}
-		default:
-			if err := stores.remove(ctx, "inactive", move.Tag); err != nil {
-				return err
-			}
-			if err := stores.add(ctx, "active", clashtracker.Target{Key: move.Tag}); err != nil {
-				return err
-			}
-		}
-	}
 	return nil
 }
 
@@ -654,129 +487,21 @@ func durationMillis(value time.Duration) float64 {
 }
 
 func publishGlobalClanEvents(ctx context.Context, app *platform.App, group string, clans []models.BasicClanRow) error {
-	ctx, span := platform.StartSpan(ctx, "valkey.events.xadd.batch",
-		attribute.String("domain", globalClansDomainName),
-		attribute.String("group", group),
-		attribute.String("operation", "xadd"),
-		attribute.Int("event.count", len(clans)),
-	)
-	defer span.End()
-	start := time.Now()
-	publishCount := 0
-	errorCount := 0
-	var publishTotal time.Duration
-	var publishMax time.Duration
-	var publishErr error
 	for _, clan := range clans {
-		publishStart := time.Now()
-		err := app.PublishEvent(ctx, platform.Event{
+		if err := app.PublishEvent(ctx, platform.Event{
 			Topic:   "clan",
 			ClanTag: clan.Tag,
 			Value:   map[string]any{"tag": clan.Tag, "name": clan.Name},
-		})
-		latency := time.Since(publishStart)
-		publishCount++
-		publishTotal += latency
-		if latency > publishMax {
-			publishMax = latency
-		}
-		if err != nil {
-			errorCount++
-			publishErr = err
-			break
+		}); err != nil {
+			return err
 		}
 	}
-	publishAverage := 0.0
-	if publishCount > 0 {
-		publishAverage = durationMillis(publishTotal) / float64(publishCount)
-	}
-	platform.RecordSpanError(span, publishErr)
-	span.SetAttributes(
-		attribute.Int("event.published.count", publishCount-errorCount),
-		attribute.Int("event.error.count", errorCount),
-		attribute.Float64("event.duration.sum_ms", durationMillis(publishTotal)),
-		attribute.Float64("event.duration.avg_ms", publishAverage),
-		attribute.Float64("event.duration.max_ms", durationMillis(publishMax)),
-		attribute.Float64("batch.wall_ms", durationMillis(time.Since(start))),
-		platform.SpanErrorStatus(publishErr),
-	)
-	return publishErr
+	return nil
 }
 
 func globalClanIngestWriteCount(ingest models.GlobalClanIngest) int {
-	return len(ingest.Clans) + len(ingest.Players) + len(ingest.ActiveClanTags) +
+	return len(ingest.Clans) + len(ingest.Players) + len(ingest.ClanRecords) + len(ingest.ActiveClanTags) +
 		len(ingest.DeletedClanTags) + len(ingest.ClanChanges) + len(ingest.JoinLeaves)
-}
-
-func buildGlobalClanIngest(current clashy.Clan, previous models.BasicClanRow, now time.Time) models.GlobalClanIngest {
-	row := basicClanRow(current)
-	ingest := models.GlobalClanIngest{
-		Clans:   []models.BasicClanRow{row},
-		Players: basicPlayerRows(current.Tag, current.Members),
-	}
-	if previous.Tag == "" {
-		return ingest
-	}
-	// Joins are the only member movement that marks a clan active. Leave-only changes are
-	// still persisted, but they should not promote a clan into the priority polling bucket.
-	ingest.JoinLeaves = joinLeaveRows(previous, current, now)
-	if hasJoin(ingest.JoinLeaves) {
-		ingest.ActiveClanTags = []string{current.Tag}
-	}
-	ingest.ClanChanges = clanChangeRows(previous, row, now)
-	return ingest
-}
-
-func globalClanTargetMoves(
-	current clashy.Clan,
-	previous models.BasicClanRow,
-	ingest models.GlobalClanIngest,
-	now time.Time,
-) []globalClanTargetMove {
-	tag := current.Tag
-	if tag == "" {
-		return nil
-	}
-	if len(ingest.DeletedClanTags) > 0 {
-		return []globalClanTargetMove{{Tag: tag, Remove: true}}
-	}
-
-	previousBucket := ""
-	if previous.Tag != "" {
-		previousBucket = globalClanBucket(previous, now)
-	}
-	currentBucket := globalClanCurrentBucket(current, previous, hasJoin(ingest.JoinLeaves), now)
-	if currentBucket == "" {
-		return []globalClanTargetMove{{Tag: tag, Remove: true}}
-	}
-	if currentBucket == previousBucket {
-		return nil
-	}
-	return []globalClanTargetMove{{Tag: tag, ToBucket: currentBucket}}
-}
-
-func globalClanCurrentBucket(current clashy.Clan, previous models.BasicClanRow, joined bool, now time.Time) string {
-	if current.MemberCount <= 0 {
-		return ""
-	}
-	if current.MemberCount <= 5 {
-		return "inactive"
-	}
-	if joined {
-		return "active"
-	}
-	if previous.Tag == "" {
-		return "inactive"
-	}
-	return globalClanBucket(previous, now)
-}
-
-func globalClanBucket(row models.BasicClanRow, now time.Time) string {
-	cutoff := now.Add(-7 * 24 * time.Hour)
-	if isActiveGlobalClan(row, cutoff) {
-		return "active"
-	}
-	return "inactive"
 }
 
 func basicClanRow(clan clashy.Clan) models.BasicClanRow {
@@ -787,9 +512,11 @@ func basicClanRow(clan clashy.Clan) models.BasicClanRow {
 		ClanLevel:      clan.Level,
 		PublicWarLog:   clan.PublicWarLog,
 		WarWins:        clan.WarWins,
+		WarWinStreak:   clan.WarWinStreak,
+		ClanPoints:     clan.Points,
 		MemberCount:    clan.MemberCount,
-		BadgeURL:       clan.Badge.URL(),
-		MemberTags:     memberTags(clan.Members),
+		BadgeURL:       badgeToken(clan.Badge),
+		Members:        memberSnapshot(clan.Members),
 		TroopsDonated:  totalDonated(clan.Members),
 		TroopsReceived: totalReceived(clan.Members),
 		CWLLeagueID:    unrankedWarLeagueID,
@@ -806,10 +533,25 @@ func basicClanRow(clan clashy.Clan) models.BasicClanRow {
 	return row
 }
 
+func badgeToken(badge clashy.Badge) string {
+	for _, raw := range []string{badge.Large, badge.Medium, badge.Small} {
+		raw = strings.TrimSpace(raw)
+		raw = strings.TrimSuffix(raw, ".png")
+		if idx := strings.LastIndex(raw, "/"); idx >= 0 {
+			raw = raw[idx+1:]
+		}
+		if raw != "" {
+			return raw
+		}
+	}
+	return ""
+}
+
 func joinLeaveRows(previous models.BasicClanRow, current clashy.Clan, now time.Time) []models.JoinLeaveRow {
 	currentMembers := clanMembersByTag(current.Members)
-	currentTags := stringSet(memberTags(current.Members))
-	previousTags := stringSet(previous.MemberTags)
+	currentTags := stringSet(memberTagsFromSnapshot(memberSnapshot(current.Members)))
+	previousTags := stringSet(memberTagsFromSnapshot(previous.Members))
+	previousNames := memberNamesByTag(previous.Members)
 	var out []models.JoinLeaveRow
 	for tag := range currentTags {
 		if _, ok := previousTags[tag]; ok {
@@ -821,6 +563,7 @@ func joinLeaveRows(previous models.BasicClanRow, current clashy.Clan, now time.T
 			EventType:     "join",
 			ClanTag:       current.Tag,
 			PlayerTag:     tag,
+			PlayerName:    member.Name,
 			TownHallLevel: member.TownHall,
 		})
 	}
@@ -829,10 +572,11 @@ func joinLeaveRows(previous models.BasicClanRow, current clashy.Clan, now time.T
 			continue
 		}
 		out = append(out, models.JoinLeaveRow{
-			EventTime: now,
-			EventType: "leave",
-			ClanTag:   current.Tag,
-			PlayerTag: tag,
+			EventTime:  now,
+			EventType:  "leave",
+			ClanTag:    current.Tag,
+			PlayerTag:  tag,
+			PlayerName: previousNames[tag],
 		})
 	}
 	sort.Slice(out, func(i, j int) bool {
@@ -873,11 +617,31 @@ func clanChangeRows(previous, current models.BasicClanRow, now time.Time) []mode
 func mergeGlobalClanIngest(left, right models.GlobalClanIngest) models.GlobalClanIngest {
 	left.Clans = append(left.Clans, right.Clans...)
 	left.Players = append(left.Players, right.Players...)
+	left.ClanRecords = append(left.ClanRecords, right.ClanRecords...)
 	left.ActiveClanTags = append(left.ActiveClanTags, right.ActiveClanTags...)
 	left.DeletedClanTags = append(left.DeletedClanTags, right.DeletedClanTags...)
 	left.ClanChanges = append(left.ClanChanges, right.ClanChanges...)
 	left.JoinLeaves = append(left.JoinLeaves, right.JoinLeaves...)
 	return left
+}
+
+func clanRecordRows(clan clashy.Clan, previous models.BasicClanRow, now time.Time) []models.ClanRecordRow {
+	if clan.Tag == "" {
+		return nil
+	}
+	row := models.ClanRecordRow{Tag: clan.Tag}
+	if clan.Points > previous.RecordClanPoints {
+		row.ClanPoints = clan.Points
+		row.ClanPointsAt = &now
+	}
+	if clan.WarWinStreak > previous.RecordWarWinStreak {
+		row.WarWinStreak = clan.WarWinStreak
+		row.WarWinStreakAt = &now
+	}
+	if row.ClanPoints == 0 && row.WarWinStreak == 0 {
+		return nil
+	}
+	return []models.ClanRecordRow{row}
 }
 
 func hasJoin(rows []models.JoinLeaveRow) bool {
@@ -901,19 +665,21 @@ func basicPlayerRows(clanTag string, members []clashy.ClanMember) []models.Basic
 		}
 		seen[member.Tag] = struct{}{}
 		out = append(out, models.BasicPlayerRow{
-			Tag:      member.Tag,
-			Name:     member.Name,
-			LeagueID: member.LeagueTier.ID,
-			ClanTag:  clanTag,
-			TownHall: member.TownHall,
+			Tag:          member.Tag,
+			Name:         member.Name,
+			LeagueID:     member.LeagueTier.ID,
+			ClanTag:      clanTag,
+			ClanTagKnown: true,
+			TownHall:     member.TownHall,
+			Trophies:     member.Trophies,
 		})
 	}
 	sort.Slice(out, func(i, j int) bool { return out[i].Tag < out[j].Tag })
 	return out
 }
 
-func memberTags(members []clashy.ClanMember) []string {
-	out := make([]string, 0, len(members))
+func memberSnapshot(members []clashy.ClanMember) []models.BasicClanMember {
+	out := make([]models.BasicClanMember, 0, len(members))
 	seen := make(map[string]struct{}, len(members))
 	for _, member := range members {
 		if member.Tag == "" {
@@ -923,9 +689,29 @@ func memberTags(members []clashy.ClanMember) []string {
 			continue
 		}
 		seen[member.Tag] = struct{}{}
-		out = append(out, member.Tag)
+		out = append(out, models.BasicClanMember{Tag: member.Tag, Name: member.Name})
 	}
-	sort.Strings(out)
+	sort.Slice(out, func(i, j int) bool { return out[i].Tag < out[j].Tag })
+	return out
+}
+
+func memberTagsFromSnapshot(members []models.BasicClanMember) []string {
+	out := make([]string, 0, len(members))
+	for _, member := range members {
+		if member.Tag != "" {
+			out = append(out, member.Tag)
+		}
+	}
+	return out
+}
+
+func memberNamesByTag(members []models.BasicClanMember) map[string]string {
+	out := make(map[string]string, len(members))
+	for _, member := range members {
+		if member.Tag != "" {
+			out[member.Tag] = member.Name
+		}
+	}
 	return out
 }
 
@@ -1028,38 +814,45 @@ func (s *timescaleGlobalClanStore) Close() error {
 	return nil
 }
 
-func (s *timescaleGlobalClanStore) ListTargetTags(ctx context.Context, bucket string, pageSize int) ([]string, error) {
-	if pageSize <= 0 {
-		pageSize = 1000
+func (s *timescaleGlobalClanStore) NextTargetPage(ctx context.Context, bucket string, cursor string, limit int) (clashtracker.TargetPage, error) {
+	if limit <= 0 {
+		limit = 1000
 	}
-	ctx, span := platform.StartSpan(ctx, "timescale.basic_clan.targets",
-		attribute.String("domain", globalClansDomainName),
-		attribute.String("group", bucket),
-		attribute.String("operation", "seed_basic_clan_targets"),
-		attribute.Int("batch.size", pageSize),
-	)
-	defer span.End()
+	tags, nextCursor, err := s.scanClanBucket(ctx, bucket, cursor, limit)
+	if err != nil {
+		return clashtracker.TargetPage{}, err
+	}
+	targets := make([]clashtracker.Target, 0, len(tags))
+	for _, tag := range tags {
+		targets = append(targets, clashtracker.Target{Key: tag})
+	}
+	return clashtracker.TargetPage{Targets: targets, NextCursor: nextCursor}, nil
+}
 
-	var out []string
-	cursor := ""
-	for {
-		tags, nextCursor, err := s.scanClanBucket(ctx, bucket, cursor, pageSize)
-		if err != nil {
-			platform.RecordSpanError(span, err)
-			span.SetAttributes(platform.SpanErrorStatus(err))
-			return nil, err
-		}
-		out = append(out, tags...)
-		if nextCursor == "" {
-			break
-		}
-		cursor = nextCursor
+func (s *timescaleGlobalClanStore) CountTargetTags(ctx context.Context, bucket string) (int, error) {
+	query := `
+		SELECT count(*)
+		FROM basic_clan
+		WHERE member_count > 5
+		  AND last_active >= now() - interval '7 days'
+	`
+	if bucket == "inactive" {
+		query = `
+			SELECT count(*)
+			FROM basic_clan
+			WHERE member_count > 0
+			  AND (
+			    member_count <= 5
+			    OR last_active IS NULL
+			    OR last_active < now() - interval '7 days'
+			  )
+		`
 	}
-	span.SetAttributes(
-		attribute.Int("target.count", len(out)),
-		platform.SpanErrorStatus(nil),
-	)
-	return out, nil
+	var count int
+	if err := s.pool.QueryRow(ctx, query).Scan(&count); err != nil {
+		return 0, err
+	}
+	return count, nil
 }
 
 func (s *timescaleGlobalClanStore) scanClanBucket(ctx context.Context, bucket, cursor string, limit int) ([]string, string, error) {
@@ -1106,23 +899,18 @@ func (s *timescaleGlobalClanStore) Load(ctx context.Context, tags []string) (map
 	if len(tags) == 0 {
 		return out, nil
 	}
-	ctx, span := platform.StartSpan(ctx, "timescale.basic_clan.load",
-		attribute.String("domain", globalClansDomainName),
-		attribute.String("operation", "load_basic_clans"),
-		attribute.Int("target.count", len(tags)),
-	)
-	defer span.End()
 	rows, err := s.pool.Query(ctx, `
 		SELECT
-			tag, name, description, clan_level, location_id, cwl_league_id, capital_league_id,
-			public_war_log, war_wins, member_count, badge_url, troops_donated,
-			troops_received, member_tags, last_active
-		FROM basic_clan
-		WHERE tag = ANY($1)
+			c.tag, c.name, c.description, c.clan_level, c.location_id, c.cwl_league_id, c.capital_league_id,
+			c.public_war_log, c.war_wins, c.war_win_streak, c.clan_points,
+			COALESCE(r.war_win_streak, 0), r.war_win_streak_at,
+			COALESCE(r.clan_points, 0), r.clan_points_at, c.member_count, c.badge_token, c.troops_donated,
+			c.troops_received, c.members, c.last_active
+		FROM basic_clan c
+		LEFT JOIN clan_records r ON r.tag = c.tag
+		WHERE c.tag = ANY($1)
 	`, tags)
 	if err != nil {
-		platform.RecordSpanError(span, err)
-		span.SetAttributes(platform.SpanErrorStatus(err))
 		return nil, err
 	}
 	defer rows.Close()
@@ -1132,27 +920,38 @@ func (s *timescaleGlobalClanStore) Load(ctx context.Context, tags []string) (map
 		var cwlLeagueID int
 		var capitalLeagueID sql.NullInt64
 		var lastActive sql.NullTime
+		var recordWarWinStreakAt sql.NullTime
+		var recordClanPointsAt sql.NullTime
+		var membersPayload []byte
 		if err := rows.Scan(
 			&row.Tag, &row.Name, &row.Description, &row.ClanLevel, &locationID, &cwlLeagueID, &capitalLeagueID,
-			&row.PublicWarLog, &row.WarWins, &row.MemberCount, &row.BadgeURL, &row.TroopsDonated,
-			&row.TroopsReceived, &row.MemberTags, &lastActive,
+			&row.PublicWarLog, &row.WarWins, &row.WarWinStreak, &row.ClanPoints,
+			&row.RecordWarWinStreak, &recordWarWinStreakAt,
+			&row.RecordClanPoints, &recordClanPointsAt, &row.MemberCount, &row.BadgeURL, &row.TroopsDonated,
+			&row.TroopsReceived, &membersPayload, &lastActive,
 		); err != nil {
-			platform.RecordSpanError(span, err)
-			span.SetAttributes(platform.SpanErrorStatus(err))
 			return nil, err
+		}
+		if len(membersPayload) > 0 {
+			if err := json.Unmarshal(membersPayload, &row.Members); err != nil {
+				return nil, err
+			}
 		}
 		row.LocationID = optionalIntFromSQL(locationID)
 		row.CWLLeagueID = cwlLeagueID
 		row.CapitalLeagueID = optionalIntFromSQL(capitalLeagueID)
+		if recordWarWinStreakAt.Valid {
+			row.RecordWarWinStreakAt = &recordWarWinStreakAt.Time
+		}
+		if recordClanPointsAt.Valid {
+			row.RecordClanPointsAt = &recordClanPointsAt.Time
+		}
 		if lastActive.Valid {
 			row.LastActive = &lastActive.Time
 		}
 		out[row.Tag] = row
 	}
-	err = rows.Err()
-	platform.RecordSpanError(span, err)
-	span.SetAttributes(attribute.Int("rows.count", len(out)), platform.SpanErrorStatus(err))
-	return out, err
+	return out, rows.Err()
 }
 
 func (s *timescaleGlobalClanStore) Store(ctx context.Context, ingest models.GlobalClanIngest) (globalClanStoreResult, error) {
@@ -1160,82 +959,63 @@ func (s *timescaleGlobalClanStore) Store(ctx context.Context, ingest models.Glob
 	if requestedWrites == 0 {
 		return globalClanStoreResult{}, nil
 	}
-	ctx, span := platform.StartSpan(ctx, "timescale.globalclans.store",
-		attribute.String("domain", globalClansDomainName),
-		attribute.String("operation", "store_global_clans"),
-		attribute.Int("write.count", requestedWrites),
-	)
-	defer span.End()
 	tx, err := s.pool.Begin(ctx)
 	if err != nil {
-		platform.RecordSpanError(span, err)
-		span.SetAttributes(platform.SpanErrorStatus(err))
 		return globalClanStoreResult{}, err
 	}
 	defer tx.Rollback(ctx)
 
-	// Players are written before join/leave history because that insert joins basic_player.
 	result := globalClanStoreResult{}
 	count, err := upsertGlobalClanBasicPlayers(ctx, tx, ingest.Players)
 	if err != nil {
-		platform.RecordSpanError(span, err)
-		span.SetAttributes(platform.SpanErrorStatus(err))
 		return globalClanStoreResult{}, err
 	}
 	result.WriteCount += count
 	count, err = insertClanChanges(ctx, tx, ingest.ClanChanges)
 	if err != nil {
-		platform.RecordSpanError(span, err)
-		span.SetAttributes(platform.SpanErrorStatus(err))
 		return globalClanStoreResult{}, err
 	}
 	result.WriteCount += count
 	count, err = insertJoinLeaves(ctx, tx, ingest.JoinLeaves)
 	if err != nil {
-		platform.RecordSpanError(span, err)
-		span.SetAttributes(platform.SpanErrorStatus(err))
 		return globalClanStoreResult{}, err
 	}
 	result.WriteCount += count
 	count, err = deleteBasicClans(ctx, tx, ingest.DeletedClanTags)
 	if err != nil {
-		platform.RecordSpanError(span, err)
-		span.SetAttributes(platform.SpanErrorStatus(err))
 		return globalClanStoreResult{}, err
 	}
 	result.WriteCount += count
 	changedClans, count, err := upsertBasicClans(ctx, tx, ingest.Clans)
 	if err != nil {
-		platform.RecordSpanError(span, err)
-		span.SetAttributes(platform.SpanErrorStatus(err))
 		return globalClanStoreResult{}, err
 	}
 	result.WriteCount += count
 	result.EventClans = changedClans
+	count, err = upsertClanRecords(ctx, tx, ingest.ClanRecords)
+	if err != nil {
+		return globalClanStoreResult{}, err
+	}
+	result.WriteCount += count
 	count, err = updateActiveClans(ctx, tx, ingest.ActiveClanTags)
 	if err != nil {
-		platform.RecordSpanError(span, err)
-		span.SetAttributes(platform.SpanErrorStatus(err))
 		return globalClanStoreResult{}, err
 	}
 	result.WriteCount += count
 	if err := tx.Commit(ctx); err != nil {
-		platform.RecordSpanError(span, err)
-		span.SetAttributes(platform.SpanErrorStatus(err))
 		return globalClanStoreResult{}, err
 	}
-	span.SetAttributes(attribute.Int("rows.affected", result.WriteCount), platform.SpanErrorStatus(nil))
 	return result, nil
 }
 
 const upsertBasicClanSQL = `
 	INSERT INTO basic_clan (
 		tag, name, description, clan_level, location_id, cwl_league_id, capital_league_id,
-		public_war_log, war_wins, member_count, badge_url, troops_donated,
-		troops_received, member_tags
+		public_war_log, war_wins, war_win_streak, clan_points, member_count, badge_token, troops_donated,
+		troops_received, members
 	)
 	VALUES (
-		$1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14
+		$1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16::jsonb
 	)
 	ON CONFLICT (tag) DO UPDATE SET
 		name = EXCLUDED.name,
@@ -1246,11 +1026,13 @@ const upsertBasicClanSQL = `
 		capital_league_id = EXCLUDED.capital_league_id,
 		public_war_log = EXCLUDED.public_war_log,
 		war_wins = EXCLUDED.war_wins,
+		war_win_streak = EXCLUDED.war_win_streak,
+		clan_points = EXCLUDED.clan_points,
 		member_count = EXCLUDED.member_count,
-		badge_url = EXCLUDED.badge_url,
+		badge_token = EXCLUDED.badge_token,
 		troops_donated = EXCLUDED.troops_donated,
 		troops_received = EXCLUDED.troops_received,
-		member_tags = EXCLUDED.member_tags
+		members = EXCLUDED.members
 	WHERE
 		basic_clan.name IS DISTINCT FROM EXCLUDED.name OR
 		basic_clan.description IS DISTINCT FROM EXCLUDED.description OR
@@ -1260,11 +1042,13 @@ const upsertBasicClanSQL = `
 		basic_clan.capital_league_id IS DISTINCT FROM EXCLUDED.capital_league_id OR
 		basic_clan.public_war_log IS DISTINCT FROM EXCLUDED.public_war_log OR
 		basic_clan.war_wins IS DISTINCT FROM EXCLUDED.war_wins OR
+		basic_clan.war_win_streak IS DISTINCT FROM EXCLUDED.war_win_streak OR
+		basic_clan.clan_points IS DISTINCT FROM EXCLUDED.clan_points OR
 		basic_clan.member_count IS DISTINCT FROM EXCLUDED.member_count OR
-		basic_clan.badge_url IS DISTINCT FROM EXCLUDED.badge_url OR
+		basic_clan.badge_token IS DISTINCT FROM EXCLUDED.badge_token OR
 		basic_clan.troops_donated IS DISTINCT FROM EXCLUDED.troops_donated OR
 		basic_clan.troops_received IS DISTINCT FROM EXCLUDED.troops_received OR
-		basic_clan.member_tags IS DISTINCT FROM EXCLUDED.member_tags
+		basic_clan.members IS DISTINCT FROM EXCLUDED.members
 `
 
 func upsertBasicClans(ctx context.Context, tx pgx.Tx, clans []models.BasicClanRow) ([]models.BasicClanRow, int, error) {
@@ -1273,13 +1057,17 @@ func upsertBasicClans(ctx context.Context, tx pgx.Tx, clans []models.BasicClanRo
 	}
 	batch := &pgx.Batch{}
 	for _, clan := range clans {
+		membersPayload, err := json.Marshal(clan.Members)
+		if err != nil {
+			return nil, 0, err
+		}
 		batch.Queue(upsertBasicClanSQL,
 			clan.Tag, clan.Name, clan.Description, clan.ClanLevel,
 			optionalIntValue(clan.LocationID),
 			clan.CWLLeagueID,
 			optionalIntValue(clan.CapitalLeagueID),
-			clan.PublicWarLog, clan.WarWins, clan.MemberCount, clan.BadgeURL, clan.TroopsDonated,
-			clan.TroopsReceived, clan.MemberTags,
+			clan.PublicWarLog, clan.WarWins, clan.WarWinStreak, clan.ClanPoints, clan.MemberCount, clan.BadgeURL, clan.TroopsDonated,
+			clan.TroopsReceived, string(membersPayload),
 		)
 	}
 	results := tx.SendBatch(ctx, batch)
@@ -1330,21 +1118,108 @@ func deleteBasicClans(ctx context.Context, tx pgx.Tx, tags []string) (int, error
 	return utils.SendBatchCount(ctx, tx, batch)
 }
 
+func upsertClanRecords(ctx context.Context, tx pgx.Tx, rows []models.ClanRecordRow) (int, error) {
+	if len(rows) == 0 {
+		return 0, nil
+	}
+	batch := &pgx.Batch{}
+	for _, row := range rows {
+		if row.Tag == "" || (row.ClanPoints <= 0 && row.WarWinStreak <= 0) {
+			continue
+		}
+		batch.Queue(`
+			INSERT INTO clan_records (tag, clan_points, clan_points_at, war_win_streak, war_win_streak_at)
+			VALUES ($1, $2, $3, $4, $5)
+			ON CONFLICT (tag) DO UPDATE SET
+				clan_points = CASE
+					WHEN EXCLUDED.clan_points > clan_records.clan_points THEN EXCLUDED.clan_points
+					ELSE clan_records.clan_points
+				END,
+				clan_points_at = CASE
+					WHEN EXCLUDED.clan_points > clan_records.clan_points THEN EXCLUDED.clan_points_at
+					ELSE clan_records.clan_points_at
+				END,
+				war_win_streak = CASE
+					WHEN EXCLUDED.war_win_streak > clan_records.war_win_streak THEN EXCLUDED.war_win_streak
+					ELSE clan_records.war_win_streak
+				END,
+				war_win_streak_at = CASE
+					WHEN EXCLUDED.war_win_streak > clan_records.war_win_streak THEN EXCLUDED.war_win_streak_at
+					ELSE clan_records.war_win_streak_at
+				END
+			WHERE
+				EXCLUDED.clan_points > clan_records.clan_points OR
+				EXCLUDED.war_win_streak > clan_records.war_win_streak
+			`, row.Tag, row.ClanPoints, row.ClanPointsAt, row.WarWinStreak, row.WarWinStreakAt)
+	}
+	return utils.SendBatchCount(ctx, tx, batch)
+}
+
 func upsertGlobalClanBasicPlayers(ctx context.Context, tx pgx.Tx, players []models.BasicPlayerRow) (int, error) {
 	if len(players) == 0 {
 		return 0, nil
 	}
-	batch := &pgx.Batch{}
-	for _, player := range players {
-		batch.Queue(upsertGlobalClanBasicPlayerSQL,
-			player.Tag,
-			player.Name,
-			player.LeagueID,
-			player.ClanTag,
-			player.TownHall,
-		)
+	if _, err := tx.Exec(ctx, `
+		CREATE TEMP TABLE global_clan_basic_player_stage (
+			tag text NOT NULL,
+			name text NOT NULL,
+			league_id integer NOT NULL,
+			clan_tag text NOT NULL,
+			townhall_level integer NOT NULL,
+			trophies integer NOT NULL
+		) ON COMMIT DROP
+	`); err != nil {
+		return 0, err
 	}
-	return utils.SendBatchCount(ctx, tx, batch)
+	_, err := tx.CopyFrom(
+		ctx,
+		pgx.Identifier{"global_clan_basic_player_stage"},
+		[]string{"tag", "name", "league_id", "clan_tag", "townhall_level", "trophies"},
+		pgx.CopyFromSlice(len(players), func(i int) ([]any, error) {
+			player := players[i]
+			return []any{
+				player.Tag,
+				player.Name,
+				player.LeagueID,
+				player.ClanTag,
+				player.TownHall,
+				player.Trophies,
+			}, nil
+		}),
+	)
+	if err != nil {
+		return 0, err
+	}
+	tag, err := tx.Exec(ctx, `
+		INSERT INTO basic_player (
+			tag, name, league_id, clan_tag, townhall_level, trophies
+		)
+		SELECT DISTINCT ON (tag)
+			tag,
+			name,
+			NULLIF(league_id, 0),
+			clan_tag,
+			townhall_level,
+			trophies
+		FROM global_clan_basic_player_stage
+		WHERE tag <> ''
+		  AND name <> ''
+		  AND townhall_level > 0
+		ORDER BY tag
+		ON CONFLICT (tag) DO UPDATE SET
+			name = EXCLUDED.name,
+			league_id = COALESCE(EXCLUDED.league_id, basic_player.league_id),
+			clan_tag = EXCLUDED.clan_tag,
+			townhall_level = EXCLUDED.townhall_level,
+			trophies = CASE WHEN EXCLUDED.trophies > 0 THEN EXCLUDED.trophies ELSE basic_player.trophies END
+		WHERE
+			basic_player.name IS DISTINCT FROM EXCLUDED.name OR
+			basic_player.league_id IS DISTINCT FROM COALESCE(EXCLUDED.league_id, basic_player.league_id) OR
+			basic_player.clan_tag IS DISTINCT FROM EXCLUDED.clan_tag OR
+			basic_player.townhall_level IS DISTINCT FROM EXCLUDED.townhall_level OR
+			(EXCLUDED.trophies > 0 AND basic_player.trophies IS DISTINCT FROM EXCLUDED.trophies)
+	`)
+	return int(tag.RowsAffected()), err
 }
 
 func insertJoinLeaves(ctx context.Context, tx pgx.Tx, rows []models.JoinLeaveRow) (int, error) {
@@ -1358,12 +1233,10 @@ func insertJoinLeaves(ctx context.Context, tx pgx.Tx, rows []models.JoinLeaveRow
 		}
 		batch.Queue(`
 			INSERT INTO join_leave_history (
-				event_time, event_type, clan_tag, player_tag, townhall_level
+				"time", "type", clan_tag, player_tag, townhall_level, player_name
 			)
-			SELECT $1, $2, $3, p.tag, p.townhall_level
-			FROM basic_player p
-			WHERE p.tag = $4
-			`, row.EventTime, row.EventType, row.ClanTag, row.PlayerTag)
+			VALUES ($1, $2, $3, $4, $5, NULLIF($6, ''))
+			`, row.EventTime, row.EventType, row.ClanTag, row.PlayerTag, row.TownHallLevel, row.PlayerName)
 	}
 	return utils.SendBatchCount(ctx, tx, batch)
 }
@@ -1422,6 +1295,45 @@ func (s *memoryGlobalClanStore) ListTargetTags(_ context.Context, bucket string,
 	return tags, nil
 }
 
+func (s *memoryGlobalClanStore) NextTargetPage(ctx context.Context, bucket string, cursor string, limit int) (clashtracker.TargetPage, error) {
+	tags, err := s.ListTargetTags(ctx, bucket, limit)
+	if err != nil {
+		return clashtracker.TargetPage{}, err
+	}
+	start := 0
+	if cursor != "" {
+		start = sort.SearchStrings(tags, cursor)
+		for start < len(tags) && tags[start] <= cursor {
+			start++
+		}
+	}
+	if start >= len(tags) {
+		return clashtracker.TargetPage{}, nil
+	}
+	end := start + limit
+	if limit <= 0 || end > len(tags) {
+		end = len(tags)
+	}
+	page := append([]string(nil), tags[start:end]...)
+	nextCursor := ""
+	if end < len(tags) {
+		nextCursor = page[len(page)-1]
+	}
+	targets := make([]clashtracker.Target, 0, len(page))
+	for _, tag := range page {
+		targets = append(targets, clashtracker.Target{Key: tag})
+	}
+	return clashtracker.TargetPage{Targets: targets, NextCursor: nextCursor}, nil
+}
+
+func (s *memoryGlobalClanStore) CountTargetTags(ctx context.Context, bucket string) (int, error) {
+	tags, err := s.ListTargetTags(ctx, bucket, 0)
+	if err != nil {
+		return 0, err
+	}
+	return len(tags), nil
+}
+
 func (s *memoryGlobalClanStore) Load(_ context.Context, tags []string) (map[string]models.BasicClanRow, error) {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
@@ -1447,6 +1359,10 @@ func (s *memoryGlobalClanStore) Store(_ context.Context, ingest models.GlobalCla
 	for _, row := range ingest.Clans {
 		if existing, ok := s.rows[row.Tag]; ok && row.LastActive == nil {
 			row.LastActive = existing.LastActive
+			row.RecordWarWinStreak = existing.RecordWarWinStreak
+			row.RecordWarWinStreakAt = existing.RecordWarWinStreakAt
+			row.RecordClanPoints = existing.RecordClanPoints
+			row.RecordClanPointsAt = existing.RecordClanPointsAt
 			if !basicClanRowsEqual(existing, row) {
 				result.EventClans = append(result.EventClans, row)
 				result.WriteCount++
@@ -1456,6 +1372,18 @@ func (s *memoryGlobalClanStore) Store(_ context.Context, ingest models.GlobalCla
 			result.WriteCount++
 		}
 		s.rows[row.Tag] = row
+	}
+	for _, record := range ingest.ClanRecords {
+		row := s.rows[record.Tag]
+		if record.ClanPoints > row.RecordClanPoints {
+			row.RecordClanPoints = record.ClanPoints
+			row.RecordClanPointsAt = record.ClanPointsAt
+		}
+		if record.WarWinStreak > row.RecordWarWinStreak {
+			row.RecordWarWinStreak = record.WarWinStreak
+			row.RecordWarWinStreakAt = record.WarWinStreakAt
+		}
+		s.rows[record.Tag] = row
 	}
 	now := time.Now().UTC()
 	for _, tag := range uniqueStrings(ingest.ActiveClanTags) {
@@ -1468,6 +1396,7 @@ func (s *memoryGlobalClanStore) Store(_ context.Context, ingest models.GlobalCla
 		result.WriteCount++
 	}
 	result.WriteCount += len(ingest.Players) + len(ingest.ClanChanges) + len(ingest.JoinLeaves)
+	result.WriteCount += len(ingest.ClanRecords)
 	return result, nil
 }
 
@@ -1481,14 +1410,16 @@ func basicClanRowsEqual(left, right models.BasicClanRow) bool {
 		optionalIntEqual(left.CapitalLeagueID, right.CapitalLeagueID) &&
 		left.PublicWarLog == right.PublicWarLog &&
 		left.WarWins == right.WarWins &&
+		left.WarWinStreak == right.WarWinStreak &&
+		left.ClanPoints == right.ClanPoints &&
 		left.MemberCount == right.MemberCount &&
 		left.BadgeURL == right.BadgeURL &&
 		left.TroopsDonated == right.TroopsDonated &&
 		left.TroopsReceived == right.TroopsReceived &&
-		stringSlicesEqual(left.MemberTags, right.MemberTags)
+		memberSlicesEqual(left.Members, right.Members)
 }
 
-func stringSlicesEqual(left, right []string) bool {
+func memberSlicesEqual(left, right []models.BasicClanMember) bool {
 	if len(left) != len(right) {
 		return false
 	}

@@ -75,6 +75,39 @@ func TestShouldStoreLeaderboardKindSkipsCapitalExceptTuesday(t *testing.T) {
 	}
 }
 
+func TestPreviousRankedSeasonIDUsesMondayFiveUTC(t *testing.T) {
+	before := time.Date(2026, 6, 22, 11, 59, 0, 0, time.UTC)
+	if _, ok := previousRankedSeasonID(before); ok {
+		t.Fatal("ranked sync should wait until Monday noon UTC")
+	}
+	after := time.Date(2026, 6, 22, 12, 0, 0, 0, time.UTC)
+	seasonID, ok := previousRankedSeasonID(after)
+	if !ok {
+		t.Fatal("ranked sync should be ready after Monday noon UTC")
+	}
+	want := time.Date(2026, 6, 15, 5, 0, 0, 0, time.UTC).Unix()
+	if seasonID != want {
+		t.Fatalf("seasonID = %d, want %d", seasonID, want)
+	}
+}
+
+func TestRankedGroupMemberRowsUseMemberOrderAsPlacement(t *testing.T) {
+	group := &clashy.LeagueTierGroup{Members: []clashy.LeagueTierGroupMember{
+		{PlayerTag: "#A", PlayerName: "A", ClanTag: "#C", ClanName: "Clan", LeagueTrophies: 500, AttackWinCount: 1, DefenseLoseCount: 2},
+		{PlayerTag: "#B", PlayerName: "B", LeagueTrophies: 450, AttackWinCount: 3, DefenseLoseCount: 4},
+	}}
+	rows := rankedGroupMemberRows("#GROUP", 1781499600, 105000028, group)
+	if len(rows) != 2 {
+		t.Fatalf("rows = %d, want 2", len(rows))
+	}
+	if rows[0].Placement != 1 || rows[1].Placement != 2 {
+		t.Fatalf("placements = %d/%d, want 1/2", rows[0].Placement, rows[1].Placement)
+	}
+	if rows[0].GroupTag != "#GROUP" || rows[0].LeagueTierID != 105000028 || rows[0].LeagueTrophies != 500 {
+		t.Fatalf("unexpected first row: %#v", rows[0])
+	}
+}
+
 func TestLeaderboardSnapshotItemsExtractsQueryableRows(t *testing.T) {
 	date := time.Date(2026, 6, 1, 0, 0, 0, 0, time.UTC)
 	got := leaderboardSnapshotItems("clan_trophies", "global", date, []clashy.RankedClan{{
