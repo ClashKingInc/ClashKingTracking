@@ -61,6 +61,10 @@ type Config struct {
 	MobilePushFCMBearerToken               string
 	MobilePushFCMProjectID                 string
 	MobilePushTokenKey                     string
+	MobilePushHTTPAddr                     string
+	MobilePushScanSeconds                  int
+	MobilePushAdminToken                   string
+	BunnyAccessKey                         string
 	RunOnce                                bool
 	DryRun                                 bool
 	MockDB                                 bool
@@ -116,6 +120,7 @@ type jsonConfig struct {
 	Scheduled            jsonScheduledConfig   `json:"scheduled"`
 	Giveaways            jsonGiveawaysConfig   `json:"giveaways"`
 	Reddit               jsonRedditConfig      `json:"reddit"`
+	MobilePush           jsonMobilePushConfig  `json:"mobile_push"`
 }
 
 type jsonOTELConfig struct {
@@ -177,6 +182,11 @@ type jsonRedditConfig struct {
 	Limit       int `json:"limit"`
 }
 
+type jsonMobilePushConfig struct {
+	HTTPAddr    string `json:"http_addr"`
+	ScanSeconds int    `json:"scan_seconds"`
+}
+
 func loadConfigFile(path string) (Config, error) {
 	if strings.TrimSpace(path) == "" {
 		return Config{}, errors.New("config path is required")
@@ -224,6 +234,8 @@ func loadConfigFile(path string) (Config, error) {
 		GiveawayScanSeconds:                    file.Giveaways.ScanSeconds,
 		RedditPollSeconds:                      file.Reddit.PollSeconds,
 		RedditLimit:                            file.Reddit.Limit,
+		MobilePushHTTPAddr:                     file.MobilePush.HTTPAddr,
+		MobilePushScanSeconds:                  file.MobilePush.ScanSeconds,
 	}, nil
 }
 
@@ -249,6 +261,8 @@ func applySecretEnv(cfg *Config) {
 	if cfg.MobilePushTokenKey == "" {
 		overrideString(&cfg.MobilePushTokenKey, "ENCRYPTION_KEY")
 	}
+	overrideString(&cfg.MobilePushAdminToken, "MOBILE_PUSH_ADMIN_TOKEN")
+	overrideString(&cfg.BunnyAccessKey, "BUNNY_ACCESS_KEY")
 }
 
 func deriveConfig(cfg *Config) {
