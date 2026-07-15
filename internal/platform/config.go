@@ -40,6 +40,7 @@ type Config struct {
 	R2SecretAccessKey                      string
 	R2Bucket                               string
 	R2Prefix                               string
+	R2PublicBaseURL                        string
 	R2MockUpload                           bool
 	EventStreamName                        string
 	EventStreamGroup                       string
@@ -59,6 +60,7 @@ type Config struct {
 	MobilePushAPNSBearerToken              string
 	MobilePushAPNSBundleID                 string
 	MobilePushFCMBearerToken               string
+	MobilePushFCMServiceAccountJSON        string
 	MobilePushFCMProjectID                 string
 	MobilePushTokenKey                     string
 	MobilePushHTTPAddr                     string
@@ -249,6 +251,7 @@ func applySecretEnv(cfg *Config) {
 	overrideString(&cfg.R2SecretAccessKey, "R2_SECRET_ACCESS_KEY")
 	overrideString(&cfg.R2Bucket, "R2_BUCKET")
 	overrideString(&cfg.R2Prefix, "R2_PREFIX")
+	overrideString(&cfg.R2PublicBaseURL, "R2_PUBLIC_BASE_URL")
 	overrideString(&cfg.RedditClientID, "REDDIT_CLIENT_ID")
 	overrideString(&cfg.RedditSecret, "REDDIT_CLIENT_SECRET")
 	overrideString(&cfg.RedditUsername, "REDDIT_USERNAME")
@@ -256,6 +259,7 @@ func applySecretEnv(cfg *Config) {
 	overrideString(&cfg.MobilePushAPNSBearerToken, "MOBILE_PUSH_APNS_BEARER_TOKEN")
 	overrideString(&cfg.MobilePushAPNSBundleID, "MOBILE_PUSH_APNS_BUNDLE_ID")
 	overrideString(&cfg.MobilePushFCMBearerToken, "MOBILE_PUSH_FCM_BEARER_TOKEN")
+	overrideString(&cfg.MobilePushFCMServiceAccountJSON, "MOBILE_PUSH_FCM_SERVICE_ACCOUNT_JSON")
 	overrideString(&cfg.MobilePushFCMProjectID, "MOBILE_PUSH_FCM_PROJECT_ID")
 	overrideString(&cfg.MobilePushTokenKey, "MOBILE_PUSH_TOKEN_KEY")
 	if cfg.MobilePushTokenKey == "" {

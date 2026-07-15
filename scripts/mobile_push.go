@@ -98,6 +98,41 @@ func (d *mobilePushDomain) runCycle(ctx context.Context, app *platform.App) erro
 		app.Stats.RecordWrite(mobilePushDomainName, 1)
 	}
 
+	retries, err := d.store.DuePushRetries(ctx, now)
+	if err != nil {
+		return err
+	}
+	for _, post := range retries {
+		if _, _, err := deliverPostPush(ctx, app, d.store, post, "retry"); err != nil {
+			app.Logger.Warn("mobile_push: automatic retry failed", "post_id", post.ID, "err", err)
+		}
+	}
+
+	campaigns, err := d.store.DueCampaigns(ctx, now)
+	if err != nil {
+		return err
+	}
+	for _, campaign := range campaigns {
+		devices, loadErr := d.store.DevicesForPlatforms(ctx, campaign.Platforms)
+		if loadErr != nil {
+			app.Logger.Warn("mobile_push: campaign audience failed", "campaign_id", campaign.ID, "err", loadErr)
+			continue
+		}
+		route := valueOr(campaign.TargetRoute, "")
+		sent, skipped := sendPushToDevices(ctx, app, devices, pushMessage{Title: campaign.Title, Body: campaign.Body, Data: map[string]string{"campaign_id": campaign.ID, "type": "admin_campaign", "route": route}})
+		status := "failed"
+		if len(devices) == 0 {
+			status = "no_audience"
+		} else if sent == len(devices) {
+			status = "sent"
+		} else if sent > 0 {
+			status = "partial"
+		}
+		if err := d.store.RecordCampaignDelivery(ctx, campaign, now, len(devices), sent, skipped, status); err != nil {
+			app.Logger.Warn("mobile_push: campaign delivery record failed", "campaign_id", campaign.ID, "err", err)
+		}
+	}
+
 	expired, err := d.store.DueExpirations(ctx, now)
 	if err != nil {
 		return err
@@ -133,26 +168,40 @@ func publishAndNotify(ctx context.Context, app *platform.App, store mobilePushSt
 		return result, nil
 	}
 
-	devices, err := store.DevicesForPlatforms(ctx, updated.Platforms)
+	sent, skipped, err := deliverPostPush(ctx, app, store, updated, "publish")
 	if err != nil {
-		// The post is already live; a device-lookup failure shouldn't undo that.
-		app.Logger.Warn("mobile_push: failed to load devices for push", "post_id", updated.ID, "err", err)
-		return result, nil
+		app.Logger.Warn("mobile_push: push attempt failed", "post_id", updated.ID, "err", err)
 	}
-
-	title := valueOr(updated.PushTitle, updated.Title)
-	body := valueOr(updated.PushBody, updated.Summary)
-	sent, skipped := sendPushToDevices(ctx, app, devices, pushMessage{
-		Title: title,
-		Body:  body,
-		Data:  map[string]string{"post_id": updated.ID, "type": "admin_post"},
-	})
 	result.PushSent = sent
 	result.PushSkipped = skipped
-	if sent > 0 || skipped > 0 {
-		_ = store.MarkPushSent(ctx, updated.ID)
-	}
 	return result, nil
+}
+
+func deliverPostPush(ctx context.Context, app *platform.App, store mobilePushStore, post models.AdminPost, trigger string) (int, int, error) {
+	devices, err := store.DevicesForPlatforms(ctx, post.Platforms)
+	if err != nil {
+		_, _ = store.RecordDeliveryAttempt(ctx, models.AdminPostDeliveryAttempt{PostID: post.ID, Trigger: trigger, Status: "failed", ErrorSummary: err.Error()})
+		return 0, 0, err
+	}
+	sent, skipped := sendPushToDevices(ctx, app, devices, pushMessage{
+		Title: valueOr(post.PushTitle, post.Title), Body: valueOr(post.PushBody, post.Summary),
+		Data: map[string]string{"post_id": post.ID, "type": "admin_post", "route": "/posts/" + post.ID},
+	})
+	status := "failed"
+	if len(devices) == 0 {
+		status = "no_audience"
+	} else if sent == len(devices) {
+		status = "sent"
+	} else if sent > 0 {
+		status = "partial"
+	}
+	_, recordErr := store.RecordDeliveryAttempt(ctx, models.AdminPostDeliveryAttempt{
+		PostID: post.ID, Trigger: trigger, EligibleCount: len(devices), SentCount: sent, SkippedCount: skipped, Status: status,
+	})
+	if sent > 0 {
+		_ = store.MarkPushSent(ctx, post.ID)
+	}
+	return sent, skipped, recordErr
 }
 
 // bunnyUpload mirrors clashking-api/internal/routes/cdn.go's BunnyCDN PUT
