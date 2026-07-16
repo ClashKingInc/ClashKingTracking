@@ -3,45 +3,16 @@ package utils
 import (
 	"crypto/aes"
 	"crypto/cipher"
-	"crypto/rand"
 	"crypto/sha256"
 	"encoding/base64"
-	"encoding/hex"
 	"errors"
-	"io"
 	"strings"
 )
 
-// Mirrors clashking-api/internal/utils/secret.go exactly (AES-GCM,
-// SHA-256(key), "v1." prefix) so ciphertext written by that service — e.g.
-// mobile_push_devices.token_ciphertext — decrypts correctly here.
+// Matches the AES-GCM format written by clashking-api so encrypted device
+// tokens can be consumed by the push delivery worker.
 
 const encryptedSecretPrefix = "v1."
-
-func EncryptSecret(value, key string) (string, error) {
-	if strings.TrimSpace(value) == "" {
-		return "", errors.New("secret value is required")
-	}
-	if strings.TrimSpace(key) == "" {
-		return "", errors.New("encryption key is required")
-	}
-
-	keyHash := sha256.Sum256([]byte(key))
-	block, err := aes.NewCipher(keyHash[:])
-	if err != nil {
-		return "", err
-	}
-	gcm, err := cipher.NewGCM(block)
-	if err != nil {
-		return "", err
-	}
-	nonce := make([]byte, gcm.NonceSize())
-	if _, err := io.ReadFull(rand.Reader, nonce); err != nil {
-		return "", err
-	}
-	sealed := gcm.Seal(nonce, nonce, []byte(value), nil)
-	return encryptedSecretPrefix + base64.RawURLEncoding.EncodeToString(sealed), nil
-}
 
 func DecryptSecret(value, key string) (string, error) {
 	if !strings.HasPrefix(value, encryptedSecretPrefix) {
@@ -69,9 +40,4 @@ func DecryptSecret(value, key string) (string, error) {
 		return "", err
 	}
 	return string(plain), nil
-}
-
-func SecretHash(value string) string {
-	sum := sha256.Sum256([]byte(value))
-	return hex.EncodeToString(sum[:])
 }

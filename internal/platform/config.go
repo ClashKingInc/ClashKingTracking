@@ -6,7 +6,6 @@ import (
 	"flag"
 	"fmt"
 	"os"
-	"strconv"
 	"strings"
 
 	"github.com/joho/godotenv"
@@ -310,16 +309,5 @@ func deriveConfig(cfg *Config) {
 func overrideString(target *string, key string) {
 	if value := os.Getenv(key); value != "" {
 		*target = value
-	}
-}
-
-func overrideBool(target *bool, key string) {
-	value := strings.TrimSpace(os.Getenv(key))
-	if value == "" {
-		return
-	}
-	parsed, err := strconv.ParseBool(value)
-	if err == nil {
-		*target = parsed
 	}
 }
