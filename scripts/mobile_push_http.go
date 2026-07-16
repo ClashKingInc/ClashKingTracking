@@ -1,15 +1,18 @@
 package scripts
 
 import (
+	"context"
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
+	"net"
 	"net/http"
 	"net/url"
 	"path/filepath"
+	"regexp"
 	"strconv"
 	"strings"
 	"time"
@@ -40,6 +43,10 @@ func newMobilePushHTTPServer(app *platform.App, store mobilePushStore) *http.Ser
 	mux := http.NewServeMux()
 
 	mux.HandleFunc("GET /posts/public", h.listPublicPosts)
+	mux.HandleFunc("GET /auth/discord/start", h.discordLogin)
+	mux.HandleFunc("GET /auth/discord/callback", h.discordCallback)
+	mux.HandleFunc("POST /auth/logout", h.requireAdmin(h.logout))
+	mux.HandleFunc("GET /auth/me", h.requireAdmin(h.me))
 	mux.HandleFunc("GET /posts", h.requireAdmin(h.listPosts))
 	mux.HandleFunc("POST /posts", h.requireAdmin(h.createPost))
 	mux.HandleFunc("GET /posts/{id}", h.requireAdmin(h.getPost))
@@ -57,6 +64,14 @@ func newMobilePushHTTPServer(app *platform.App, store mobilePushStore) *http.Ser
 	mux.HandleFunc("POST /push/test", h.requireAdmin(h.sendTestPush))
 	mux.HandleFunc("GET /push/audience", h.requireAdmin(h.testPushAudience))
 	mux.HandleFunc("GET /campaigns", h.requireAdmin(h.listCampaigns))
+	mux.HandleFunc("POST /campaigns", h.requireAdmin(h.createCampaign))
+	mux.HandleFunc("PATCH /campaigns/{id}", h.requireAdmin(h.updateCampaign))
+	mux.HandleFunc("GET /admin/dashboard", h.requireAdmin(h.adminDashboard))
+	mux.HandleFunc("GET /admin/proxy/stats", h.requireAdmin(h.proxyStats))
+	mux.HandleFunc("GET /admin/audit", h.requireAdmin(h.listAuditEvents))
+	mux.HandleFunc("GET /feature-flags", h.requireAdmin(h.listFeatureFlags))
+	mux.HandleFunc("POST /feature-flags", h.requireAdmin(h.createFeatureFlag))
+	mux.HandleFunc("PATCH /feature-flags/{key}", h.requireAdmin(h.updateFeatureFlag))
 
 	return &http.Server{
 		Addr:    app.Config.MobilePushHTTPAddr,
@@ -64,10 +79,172 @@ func newMobilePushHTTPServer(app *platform.App, store mobilePushStore) *http.Ser
 	}
 }
 
+func (h *mobilePushHandlers) listAuditEvents(w http.ResponseWriter, r *http.Request) {
+	limit := 100
+	if raw := r.URL.Query().Get("limit"); raw != "" {
+		parsed, err := strconv.Atoi(raw)
+		if err != nil || parsed < 1 || parsed > 500 {
+			writeError(w, http.StatusBadRequest, "limit must be between 1 and 500")
+			return
+		}
+		limit = parsed
+	}
+	events, err := h.store.ListAuditEvents(r.Context(), limit, r.URL.Query().Get("resource_type"), r.URL.Query().Get("actor"))
+	if err != nil {
+		writeError(w, http.StatusInternalServerError, err.Error())
+		return
+	}
+	writeJSON(w, http.StatusOK, events)
+}
+
+func (h *mobilePushHandlers) recordAudit(r *http.Request, action, resourceType, resourceID, summary string, metadata map[string]any) {
+	actor := "discord-admin"
+	if admin, ok := adminFromRequest(r); ok {
+		actor = admin.User.Username + " (Discord " + admin.User.DiscordUserID + ")"
+	}
+	h.recordAuditAs(r, actor, action, resourceType, resourceID, summary, metadata)
+}
+
+func (h *mobilePushHandlers) recordAuditAs(r *http.Request, actor, action, resourceType, resourceID, summary string, metadata map[string]any) {
+	ipAddress := strings.TrimSpace(r.Header.Get("CF-Connecting-IP"))
+	if ipAddress == "" {
+		ipAddress, _, _ = net.SplitHostPort(r.RemoteAddr)
+		if ipAddress == "" {
+			ipAddress = r.RemoteAddr
+		}
+	}
+	err := h.store.RecordAuditEvent(r.Context(), models.AdminAuditEventInput{Actor: actor, Action: action,
+		ResourceType: resourceType, ResourceID: resourceID, Summary: summary, Metadata: metadata,
+		IPAddress: ipAddress, UserAgent: r.UserAgent()})
+	if err != nil {
+		h.app.Logger.Error("mobile_push: audit event failed", "action", action, "resource_id", resourceID, "err", err)
+	}
+}
+
+func (h *mobilePushHandlers) listFeatureFlags(w http.ResponseWriter, r *http.Request) {
+	flags, err := h.store.ListFeatureFlags(r.Context())
+	if err != nil {
+		writeError(w, http.StatusInternalServerError, err.Error())
+		return
+	}
+	writeJSON(w, http.StatusOK, flags)
+}
+
+func (h *mobilePushHandlers) createFeatureFlag(w http.ResponseWriter, r *http.Request) {
+	input, err := decodeFeatureFlagInput(r.Body)
+	if err != nil {
+		writeError(w, http.StatusBadRequest, err.Error())
+		return
+	}
+	if err := validateFeatureFlagInput(input, true); err != nil {
+		writeError(w, http.StatusBadRequest, err.Error())
+		return
+	}
+	flag, err := h.store.CreateFeatureFlag(r.Context(), input)
+	if err != nil {
+		writeError(w, http.StatusInternalServerError, err.Error())
+		return
+	}
+	h.recordAudit(r, "feature_flag.create", "feature_flag", flag.Key, "Created feature flag "+flag.Name, map[string]any{"enabled": flag.Enabled, "rollout_percentage": flag.RolloutPercentage})
+	writeJSON(w, http.StatusCreated, flag)
+}
+
+func (h *mobilePushHandlers) updateFeatureFlag(w http.ResponseWriter, r *http.Request) {
+	input, err := decodeFeatureFlagInput(r.Body)
+	if err != nil {
+		writeError(w, http.StatusBadRequest, err.Error())
+		return
+	}
+	if err := validateFeatureFlagInput(input, false); err != nil {
+		writeError(w, http.StatusBadRequest, err.Error())
+		return
+	}
+	flag, found, err := h.store.UpdateFeatureFlag(r.Context(), r.PathValue("key"), input)
+	if err != nil {
+		writeError(w, http.StatusInternalServerError, err.Error())
+		return
+	}
+	if !found {
+		writeError(w, http.StatusNotFound, "feature flag not found")
+		return
+	}
+	h.recordAudit(r, "feature_flag.update", "feature_flag", flag.Key, "Updated feature flag "+flag.Name, map[string]any{"enabled": flag.Enabled, "rollout_percentage": flag.RolloutPercentage})
+	writeJSON(w, http.StatusOK, flag)
+}
+
+func decodeFeatureFlagInput(reader io.Reader) (models.AdminFeatureFlagInput, error) {
+	var raw map[string]json.RawMessage
+	if err := json.NewDecoder(reader).Decode(&raw); err != nil {
+		return models.AdminFeatureFlagInput{}, err
+	}
+	data, _ := json.Marshal(raw)
+	var input models.AdminFeatureFlagInput
+	if err := json.Unmarshal(data, &input); err != nil {
+		return input, err
+	}
+	if value, ok := raw["minAppVersion"]; ok && string(value) == "null" {
+		input.ClearMinAppVersion = true
+	}
+	if value, ok := raw["startsAt"]; ok && string(value) == "null" {
+		input.ClearStartsAt = true
+	}
+	if value, ok := raw["endsAt"]; ok && string(value) == "null" {
+		input.ClearEndsAt = true
+	}
+	return input, nil
+}
+
+func validateFeatureFlagInput(input models.AdminFeatureFlagInput, creating bool) error {
+	if creating && (input.Key == nil || strings.TrimSpace(*input.Key) == "") {
+		return errors.New("key is required")
+	}
+	if creating && (input.Name == nil || strings.TrimSpace(*input.Name) == "") {
+		return errors.New("name is required")
+	}
+	if input.Key != nil {
+		matched, _ := regexp.MatchString(`^[a-z][a-z0-9_]{2,63}$`, strings.TrimSpace(*input.Key))
+		if !matched {
+			return errors.New("key must use lowercase letters, numbers, and underscores")
+		}
+	}
+	if input.RolloutPercentage != nil && (*input.RolloutPercentage < 0 || *input.RolloutPercentage > 100) {
+		return errors.New("rolloutPercentage must be between 0 and 100")
+	}
+	if input.PublicExposure != nil && *input.PublicExposure != "safe" && *input.PublicExposure != "sensitive" {
+		return errors.New("publicExposure must be safe or sensitive")
+	}
+	if len(input.Platforms) > 0 {
+		for _, platform := range input.Platforms {
+			if platform != "ios" && platform != "android" && platform != "web" {
+				return errors.New("unsupported platform")
+			}
+		}
+	}
+	return nil
+}
+
+func (h *mobilePushHandlers) adminDashboard(w http.ResponseWriter, r *http.Request) {
+	days := 30
+	if raw := r.URL.Query().Get("days"); raw != "" {
+		parsed, err := strconv.Atoi(raw)
+		if err != nil || parsed < 1 || parsed > 365 {
+			writeError(w, http.StatusBadRequest, "days must be between 1 and 365")
+			return
+		}
+		days = parsed
+	}
+	snapshot, err := h.store.AdminDashboard(r.Context(), days, time.Now().UTC())
+	if err != nil {
+		writeError(w, http.StatusInternalServerError, err.Error())
+		return
+	}
+	writeJSON(w, http.StatusOK, snapshot)
+}
+
 func withCORS(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Access-Control-Allow-Origin", "*")
-		w.Header().Set("Access-Control-Allow-Headers", "Authorization, Content-Type")
+		w.Header().Set("Access-Control-Allow-Headers", "Authorization, Content-Type, X-Admin-Actor")
 		w.Header().Set("Access-Control-Allow-Methods", "GET, POST, PATCH, DELETE, OPTIONS")
 		if r.Method == http.MethodOptions {
 			w.WriteHeader(http.StatusNoContent)
@@ -77,21 +254,27 @@ func withCORS(next http.Handler) http.Handler {
 	})
 }
 
-// requireAdmin checks Authorization: Bearer <MobilePushAdminToken> when that
-// token is configured. Unset means open — matches the optional-token
-// pattern already used by the Python admin-api for this same class of
-// local/admin tool.
+// requireAdmin accepts only a database-backed session issued after Discord
+// verified one of the two allowlisted user IDs.
 func (h *mobilePushHandlers) requireAdmin(next http.HandlerFunc) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
-		token := h.app.Config.MobilePushAdminToken
-		if token != "" {
-			header := r.Header.Get("Authorization")
-			if header != "Bearer "+token {
-				writeError(w, http.StatusUnauthorized, "invalid or missing admin token")
-				return
-			}
+		rawToken := bearerToken(r)
+		if rawToken == "" {
+			writeError(w, http.StatusUnauthorized, "invalid or missing admin session")
+			return
 		}
-		next(w, r)
+		tokenHash := sessionTokenHash(rawToken)
+		session, found, err := h.store.GetAdminSession(r.Context(), tokenHash, time.Now().UTC())
+		if err != nil {
+			writeError(w, http.StatusInternalServerError, "unable to validate admin session")
+			return
+		}
+		if !found {
+			writeError(w, http.StatusUnauthorized, "invalid or missing admin session")
+			return
+		}
+		ctx := context.WithValue(r.Context(), adminContextKey{}, authenticatedAdmin{User: session.User, TokenHash: tokenHash})
+		next(w, r.WithContext(ctx))
 	}
 }
 
@@ -111,6 +294,56 @@ func (h *mobilePushHandlers) listCampaigns(w http.ResponseWriter, r *http.Reques
 		return
 	}
 	writeJSON(w, http.StatusOK, campaigns)
+}
+
+func (h *mobilePushHandlers) createCampaign(w http.ResponseWriter, r *http.Request) {
+	input, err := decodeCampaignInput(r.Body)
+	if err != nil {
+		writeError(w, http.StatusBadRequest, "invalid request body")
+		return
+	}
+	if input.Title == nil || strings.TrimSpace(*input.Title) == "" {
+		writeError(w, http.StatusBadRequest, "title is required")
+		return
+	}
+	if input.Body == nil || strings.TrimSpace(*input.Body) == "" {
+		writeError(w, http.StatusBadRequest, "body is required")
+		return
+	}
+	if err := validateCampaignInput(input); err != nil {
+		writeError(w, http.StatusBadRequest, err.Error())
+		return
+	}
+	campaign, err := h.store.CreateCampaign(r.Context(), input)
+	if err != nil {
+		writeError(w, http.StatusInternalServerError, err.Error())
+		return
+	}
+	h.recordAudit(r, "campaign.create", "campaign", campaign.ID, "Created campaign "+campaign.Title, map[string]any{"status": campaign.Status, "trigger_type": campaign.TriggerType})
+	writeJSON(w, http.StatusCreated, campaign)
+}
+
+func (h *mobilePushHandlers) updateCampaign(w http.ResponseWriter, r *http.Request) {
+	input, err := decodeCampaignInput(r.Body)
+	if err != nil {
+		writeError(w, http.StatusBadRequest, "invalid request body")
+		return
+	}
+	if err := validateCampaignInput(input); err != nil {
+		writeError(w, http.StatusBadRequest, err.Error())
+		return
+	}
+	campaign, found, err := h.store.UpdateCampaign(r.Context(), r.PathValue("id"), input)
+	if err != nil {
+		writeError(w, http.StatusInternalServerError, err.Error())
+		return
+	}
+	if !found {
+		writeError(w, http.StatusNotFound, "campaign not found")
+		return
+	}
+	h.recordAudit(r, "campaign.update", "campaign", campaign.ID, "Updated campaign "+campaign.Title, map[string]any{"status": campaign.Status, "trigger_type": campaign.TriggerType})
+	writeJSON(w, http.StatusOK, campaign)
 }
 
 func (h *mobilePushHandlers) listPublicPosts(w http.ResponseWriter, r *http.Request) {
@@ -158,6 +391,7 @@ func (h *mobilePushHandlers) createPost(w http.ResponseWriter, r *http.Request) 
 		writeError(w, http.StatusInternalServerError, err.Error())
 		return
 	}
+	h.recordAudit(r, "post.create", "post", post.ID, "Created post "+post.Title, map[string]any{"status": post.Status, "presentation_type": post.PresentationType})
 	writeJSON(w, http.StatusCreated, post)
 }
 
@@ -180,6 +414,7 @@ func (h *mobilePushHandlers) updatePost(w http.ResponseWriter, r *http.Request) 
 		writeError(w, http.StatusNotFound, "post not found")
 		return
 	}
+	h.recordAudit(r, "post.update", "post", post.ID, "Updated post "+post.Title, map[string]any{"status": post.Status, "revision": post.RevisionNumber})
 	writeJSON(w, http.StatusOK, post)
 }
 
@@ -204,6 +439,7 @@ func (h *mobilePushHandlers) duplicatePost(w http.ResponseWriter, r *http.Reques
 		writeError(w, http.StatusInternalServerError, err.Error())
 		return
 	}
+	h.recordAudit(r, "post.duplicate", "post", copy.ID, "Duplicated post "+post.Title, map[string]any{"source_post_id": post.ID})
 	writeJSON(w, http.StatusCreated, copy)
 }
 
@@ -245,6 +481,7 @@ func (h *mobilePushHandlers) restorePostRevision(w http.ResponseWriter, r *http.
 		writeError(w, http.StatusNotFound, "post not found")
 		return
 	}
+	h.recordAudit(r, "post.restore", "post", restored.ID, "Restored post revision", map[string]any{"revision": revisionNumber})
 	writeJSON(w, http.StatusOK, restored)
 }
 
@@ -305,6 +542,30 @@ func decodeAdminPostInput(reader io.Reader) (models.AdminPostInput, error) {
 	return input, nil
 }
 
+func decodeCampaignInput(reader io.Reader) (models.NotificationCampaignInput, error) {
+	raw, err := io.ReadAll(reader)
+	if err != nil {
+		return models.NotificationCampaignInput{}, err
+	}
+	var input models.NotificationCampaignInput
+	if err := json.Unmarshal(raw, &input); err != nil {
+		return models.NotificationCampaignInput{}, err
+	}
+	var fields map[string]json.RawMessage
+	if err := json.Unmarshal(raw, &fields); err != nil {
+		return models.NotificationCampaignInput{}, err
+	}
+	isNull := func(name string) bool {
+		value, ok := fields[name]
+		return ok && string(value) == "null"
+	}
+	input.ClearTargetRoute = isNull("target_route")
+	input.ClearDayOfMonth = isNull("day_of_month")
+	input.ClearSendAt = isNull("send_at")
+	input.ClearSendTime = isNull("send_time")
+	return input, nil
+}
+
 func validatePostInput(input models.AdminPostInput) error {
 	if input.Title != nil && strings.TrimSpace(*input.Title) == "" {
 		return errors.New("title cannot be empty")
@@ -333,6 +594,61 @@ func validatePostInput(input models.AdminPostInput) error {
 		return err
 	}
 	return nil
+}
+
+func validateCampaignInput(input models.NotificationCampaignInput) error {
+	if input.Title != nil && strings.TrimSpace(*input.Title) == "" {
+		return errors.New("title cannot be empty")
+	}
+	if input.Body != nil && strings.TrimSpace(*input.Body) == "" {
+		return errors.New("body cannot be empty")
+	}
+	allowedPlatforms := map[string]bool{"ios": true, "android": true, "web": true}
+	for _, platform := range input.Platforms {
+		if !allowedPlatforms[platform] {
+			return fmt.Errorf("unsupported platform: %s", platform)
+		}
+	}
+	if input.Platforms != nil && len(input.Platforms) == 0 {
+		return errors.New("at least one platform is required")
+	}
+	for _, locale := range input.TargetLocales {
+		if normalizeCampaignLocale(locale) == "" {
+			return fmt.Errorf("unsupported locale: %s", locale)
+		}
+	}
+	if input.Status != nil && !allowedValue(*input.Status, "draft", "scheduled", "sent", "paused") {
+		return errors.New("status must be draft, scheduled, sent, or paused")
+	}
+	if input.TriggerType != nil && !allowedValue(*input.TriggerType, "manual", "monthly") {
+		return errors.New("trigger_type must be manual or monthly")
+	}
+	if input.DayOfMonth != nil && (*input.DayOfMonth < 1 || *input.DayOfMonth > 28) {
+		return errors.New("day_of_month must be between 1 and 28")
+	}
+	if input.SendTime != nil && !validCampaignSendTime(*input.SendTime) {
+		return errors.New("send_time must use HH:mm format")
+	}
+	return nil
+}
+
+func validCampaignSendTime(value string) bool {
+	parts := strings.Split(strings.TrimSpace(value), ":")
+	if len(parts) != 2 || len(parts[0]) != 2 || len(parts[1]) != 2 {
+		return false
+	}
+	hour, hourErr := strconv.Atoi(parts[0])
+	minute, minuteErr := strconv.Atoi(parts[1])
+	return hourErr == nil && minuteErr == nil && hour >= 0 && hour <= 23 && minute >= 0 && minute <= 59
+}
+
+func allowedValue(value string, allowed ...string) bool {
+	for _, item := range allowed {
+		if value == item {
+			return true
+		}
+	}
+	return false
 }
 
 func validatePostPresentation(presentationType string, storyURL *string, showOnHome, pinnedOnHome bool) error {
@@ -365,6 +681,7 @@ func (h *mobilePushHandlers) archivePost(w http.ResponseWriter, r *http.Request)
 		writeError(w, http.StatusNotFound, "post not found")
 		return
 	}
+	h.recordAudit(r, "post.archive", "post", r.PathValue("id"), "Archived post", nil)
 	w.WriteHeader(http.StatusNoContent)
 }
 
@@ -392,6 +709,7 @@ func (h *mobilePushHandlers) publishPost(w http.ResponseWriter, r *http.Request)
 		writeError(w, http.StatusInternalServerError, err.Error())
 		return
 	}
+	h.recordAudit(r, "post.publish", "post", result.ID, "Published post "+result.Title, map[string]any{"push_sent": result.PushSent, "push_skipped": result.PushSkipped})
 	writeJSON(w, http.StatusOK, result)
 }
 
@@ -416,6 +734,7 @@ func (h *mobilePushHandlers) pushPost(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusInternalServerError, err.Error())
 		return
 	}
+	h.recordAudit(r, "post.push", "post", post.ID, "Sent post notification "+post.Title, map[string]any{"sent": sent, "skipped": skipped})
 	writeJSON(w, http.StatusOK, map[string]int{"push_sent": sent, "push_skipped": skipped})
 }
 
@@ -429,7 +748,7 @@ func (h *mobilePushHandlers) audience(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusNotFound, "post not found")
 		return
 	}
-	count, err := h.store.AudienceCount(r.Context(), post.Platforms)
+	count, err := h.store.AudienceCount(r.Context(), post.Platforms, nil)
 	if err != nil {
 		writeError(w, http.StatusInternalServerError, err.Error())
 		return
@@ -475,11 +794,13 @@ func (h *mobilePushHandlers) uploadMedia(w http.ResponseWriter, r *http.Request)
 }
 
 type testPushInput struct {
-	CampaignID  string   `json:"campaign_id"`
-	Title       string   `json:"title"`
-	Body        string   `json:"body"`
-	TargetRoute string   `json:"target_route"`
-	Platforms   []string `json:"platforms"`
+	CampaignID    string                                            `json:"campaign_id"`
+	Title         string                                            `json:"title"`
+	Body          string                                            `json:"body"`
+	TargetRoute   string                                            `json:"target_route"`
+	Platforms     []string                                          `json:"platforms"`
+	TargetLocales []string                                          `json:"target_locales"`
+	Translations  map[string]models.NotificationCampaignTranslation `json:"translations"`
 }
 
 func (h *mobilePushHandlers) testPushAudience(w http.ResponseWriter, r *http.Request) {
@@ -487,7 +808,11 @@ func (h *mobilePushHandlers) testPushAudience(w http.ResponseWriter, r *http.Req
 	if len(platforms) == 0 || (len(platforms) == 1 && platforms[0] == "") {
 		platforms = []string{"ios", "android"}
 	}
-	devices, err := h.store.DevicesForPlatforms(r.Context(), platforms)
+	locales := strings.Split(strings.TrimSpace(r.URL.Query().Get("locales")), ",")
+	if len(locales) == 1 && locales[0] == "" {
+		locales = nil
+	}
+	devices, err := h.store.DevicesForPlatforms(r.Context(), platforms, locales)
 	if err != nil {
 		writeError(w, http.StatusInternalServerError, err.Error())
 		return
@@ -516,7 +841,7 @@ func (h *mobilePushHandlers) sendTestPush(w http.ResponseWriter, r *http.Request
 	if len(input.Platforms) == 0 {
 		input.Platforms = []string{"ios", "android"}
 	}
-	devices, err := h.store.DevicesForPlatforms(r.Context(), input.Platforms)
+	devices, err := h.store.DevicesForPlatforms(r.Context(), input.Platforms, input.TargetLocales)
 	if err != nil {
 		writeError(w, http.StatusInternalServerError, err.Error())
 		return
@@ -531,9 +856,19 @@ func (h *mobilePushHandlers) sendTestPush(w http.ResponseWriter, r *http.Request
 	if strings.TrimSpace(input.TargetRoute) != "" {
 		data["route"] = input.TargetRoute
 	}
-	sent, skipped := sendPushToDevices(r.Context(), h.app, sandboxDevices, pushMessage{
-		Title: input.Title, Body: input.Body, Data: data,
+	sent, skipped := sendLocalizedPush(r.Context(), h.app, sandboxDevices, func(locale string) pushMessage {
+		title, body := input.Title, input.Body
+		if translation, ok := input.Translations[locale]; ok {
+			if translation.Title != "" {
+				title = translation.Title
+			}
+			if translation.Body != "" {
+				body = translation.Body
+			}
+		}
+		return pushMessage{Title: title, Body: body, Data: data}
 	})
+	h.recordAudit(r, "push.test", "campaign", input.CampaignID, "Sent sandbox test notification", map[string]any{"eligible": len(sandboxDevices), "sent": sent, "skipped": skipped})
 	writeJSON(w, http.StatusOK, map[string]int{
 		"push_sent": sent, "push_skipped": skipped, "eligible_devices": len(sandboxDevices),
 	})

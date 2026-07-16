@@ -113,13 +113,24 @@ func (d *mobilePushDomain) runCycle(ctx context.Context, app *platform.App) erro
 		return err
 	}
 	for _, campaign := range campaigns {
-		devices, loadErr := d.store.DevicesForPlatforms(ctx, campaign.Platforms)
+		devices, loadErr := d.store.DevicesForPlatforms(ctx, campaign.Platforms, campaign.TargetLocales)
 		if loadErr != nil {
 			app.Logger.Warn("mobile_push: campaign audience failed", "campaign_id", campaign.ID, "err", loadErr)
 			continue
 		}
 		route := valueOr(campaign.TargetRoute, "")
-		sent, skipped := sendPushToDevices(ctx, app, devices, pushMessage{Title: campaign.Title, Body: campaign.Body, Data: map[string]string{"campaign_id": campaign.ID, "type": "admin_campaign", "route": route}})
+		sent, skipped := sendLocalizedPush(ctx, app, devices, func(locale string) pushMessage {
+			title, body := campaign.Title, campaign.Body
+			if translation, ok := campaign.Translations[locale]; ok {
+				if translation.Title != "" {
+					title = translation.Title
+				}
+				if translation.Body != "" {
+					body = translation.Body
+				}
+			}
+			return pushMessage{Title: title, Body: body, Data: map[string]string{"campaign_id": campaign.ID, "type": "admin_campaign", "route": route}}
+		})
 		status := "failed"
 		if len(devices) == 0 {
 			status = "no_audience"
@@ -178,14 +189,26 @@ func publishAndNotify(ctx context.Context, app *platform.App, store mobilePushSt
 }
 
 func deliverPostPush(ctx context.Context, app *platform.App, store mobilePushStore, post models.AdminPost, trigger string) (int, int, error) {
-	devices, err := store.DevicesForPlatforms(ctx, post.Platforms)
+	devices, err := store.DevicesForPlatforms(ctx, post.Platforms, nil)
 	if err != nil {
 		_, _ = store.RecordDeliveryAttempt(ctx, models.AdminPostDeliveryAttempt{PostID: post.ID, Trigger: trigger, Status: "failed", ErrorSummary: err.Error()})
 		return 0, 0, err
 	}
-	sent, skipped := sendPushToDevices(ctx, app, devices, pushMessage{
-		Title: valueOr(post.PushTitle, post.Title), Body: valueOr(post.PushBody, post.Summary),
-		Data: map[string]string{"post_id": post.ID, "type": "admin_post", "route": "/posts/" + post.ID},
+	sent, skipped := sendLocalizedPush(ctx, app, devices, func(locale string) pushMessage {
+		title, body := valueOr(post.PushTitle, post.Title), valueOr(post.PushBody, post.Summary)
+		if translation, ok := post.Translations[locale]; ok {
+			if translation.PushTitle != "" {
+				title = translation.PushTitle
+			} else if translation.Title != "" {
+				title = translation.Title
+			}
+			if translation.PushBody != "" {
+				body = translation.PushBody
+			} else if translation.Summary != "" {
+				body = translation.Summary
+			}
+		}
+		return pushMessage{Title: title, Body: body, Data: map[string]string{"post_id": post.ID, "type": "admin_post", "route": "/posts/" + post.ID}}
 	})
 	status := "failed"
 	if len(devices) == 0 {
@@ -202,6 +225,24 @@ func deliverPostPush(ctx context.Context, app *platform.App, store mobilePushSto
 		_ = store.MarkPushSent(ctx, post.ID)
 	}
 	return sent, skipped, recordErr
+}
+
+func sendLocalizedPush(ctx context.Context, app *platform.App, devices []models.PushDevice, messageForLocale func(string) pushMessage) (int, int) {
+	groups := map[string][]models.PushDevice{}
+	for _, device := range devices {
+		locale := normalizeCampaignLocale(device.Locale)
+		if locale == "" {
+			locale = "en"
+		}
+		groups[locale] = append(groups[locale], device)
+	}
+	sent, skipped := 0, 0
+	for locale, localizedDevices := range groups {
+		groupSent, groupSkipped := sendPushToDevices(ctx, app, localizedDevices, messageForLocale(locale))
+		sent += groupSent
+		skipped += groupSkipped
+	}
+	return sent, skipped
 }
 
 // bunnyUpload mirrors clashking-api/internal/routes/cdn.go's BunnyCDN PUT

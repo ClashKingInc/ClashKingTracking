@@ -76,6 +76,7 @@ type botClansDomain struct {
 	snapshots        botClanSnapshotStore
 	snapshotPrefix   string
 	cwlStateSnapshot string
+	raids            *timescaleRaidStore
 }
 
 func NewBotClansDomain() platform.Domain {
@@ -102,6 +103,12 @@ func (d *botClansDomain) Run(ctx context.Context, app *platform.App) error {
 	d.snapshots = newBotClanSnapshotStore(app)
 	d.snapshotPrefix = app.Config.BotClanSnapshotPrefix
 	d.cwlStateSnapshot = app.Config.BotClanCWLStateSnapshot
+	raids, err := newRaidStore(ctx, app)
+	if err != nil {
+		return err
+	}
+	d.raids = raids
+	defer d.raids.Close()
 
 	if app.Config.RunOnce {
 		return d.runOnce(ctx, app)
@@ -388,6 +395,9 @@ func (d *botClansDomain) handleRaidChange(ctx context.Context, app *platform.App
 		return nil
 	}
 	if err := app.Store.Stats().Collection("capital_cache").UpdateOne(ctx, bson.M{"tag": item.Tag}, bson.M{"$set": bson.M{"data": string(raw)}}, true); err != nil {
+		return err
+	}
+	if err := d.raids.StoreRaid(ctx, item.Tag, *item.Current, raw); err != nil {
 		return err
 	}
 	if !hasPrevious {

@@ -6,6 +6,7 @@ import (
 	"flag"
 	"fmt"
 	"os"
+	"strconv"
 	"strings"
 
 	"github.com/joho/godotenv"
@@ -65,7 +66,11 @@ type Config struct {
 	MobilePushTokenKey                     string
 	MobilePushHTTPAddr                     string
 	MobilePushScanSeconds                  int
-	MobilePushAdminToken                   string
+	MobilePushDiscordClientID              string
+	MobilePushDiscordClientSecret          string
+	MobilePushDiscordRedirectURL           string
+	MobilePushAdminPanelURL                string
+	MobilePushProxyStatsURL                string
 	BunnyAccessKey                         string
 	RunOnce                                bool
 	DryRun                                 bool
@@ -265,11 +270,30 @@ func applySecretEnv(cfg *Config) {
 	if cfg.MobilePushTokenKey == "" {
 		overrideString(&cfg.MobilePushTokenKey, "ENCRYPTION_KEY")
 	}
-	overrideString(&cfg.MobilePushAdminToken, "MOBILE_PUSH_ADMIN_TOKEN")
+	overrideString(&cfg.MobilePushDiscordClientID, "MOBILE_PUSH_DISCORD_CLIENT_ID")
+	overrideString(&cfg.MobilePushDiscordClientSecret, "MOBILE_PUSH_DISCORD_CLIENT_SECRET")
+	if cfg.MobilePushDiscordClientID == "" {
+		overrideString(&cfg.MobilePushDiscordClientID, "DISCORD_CLIENT_ID")
+	}
+	if cfg.MobilePushDiscordClientSecret == "" {
+		overrideString(&cfg.MobilePushDiscordClientSecret, "DISCORD_CLIENT_SECRET")
+	}
+	overrideString(&cfg.MobilePushDiscordRedirectURL, "MOBILE_PUSH_DISCORD_REDIRECT_URL")
+	overrideString(&cfg.MobilePushAdminPanelURL, "MOBILE_PUSH_ADMIN_PANEL_URL")
+	overrideString(&cfg.MobilePushProxyStatsURL, "MOBILE_PUSH_PROXY_STATS_URL")
 	overrideString(&cfg.BunnyAccessKey, "BUNNY_ACCESS_KEY")
 }
 
 func deriveConfig(cfg *Config) {
+	if cfg.MobilePushProxyStatsURL == "" {
+		cfg.MobilePushProxyStatsURL = "https://proxy.clashk.ing/stats"
+	}
+	if cfg.MobilePushDiscordRedirectURL == "" {
+		cfg.MobilePushDiscordRedirectURL = "http://localhost:8090/auth/discord/callback"
+	}
+	if cfg.MobilePushAdminPanelURL == "" {
+		cfg.MobilePushAdminPanelURL = "http://localhost:5173"
+	}
 	cfg.GlobalClanMaxInFlight = cfg.GlobalClanPriorityRequestsPerSecond
 	cfg.WarMaxInFlight = cfg.WarRequestsPerSecond
 	if cfg.BotClanRequestsPerSecond == 0 {
@@ -286,5 +310,16 @@ func deriveConfig(cfg *Config) {
 func overrideString(target *string, key string) {
 	if value := os.Getenv(key); value != "" {
 		*target = value
+	}
+}
+
+func overrideBool(target *bool, key string) {
+	value := strings.TrimSpace(os.Getenv(key))
+	if value == "" {
+		return
+	}
+	parsed, err := strconv.ParseBool(value)
+	if err == nil {
+		*target = parsed
 	}
 }
