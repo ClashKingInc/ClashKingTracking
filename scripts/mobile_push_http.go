@@ -936,7 +936,7 @@ func (h *mobilePushHandlers) uploadStory(w http.ResponseWriter, r *http.Request)
 	key := fmt.Sprintf("admin-stories/%s/v%d-%s.html", slug, version, uuid.New().String())
 	provider := "r2"
 	publicURL := ""
-	if h.app.R2 != nil && h.app.Config.R2PublicBaseURL != "" {
+	if isPersistentR2Store(h.app.R2) && h.app.Config.R2PublicBaseURL != "" {
 		if err := h.app.R2.PutObject(r.Context(), key, data, "text/html; charset=utf-8"); err != nil {
 			writeError(w, http.StatusInternalServerError, "failed to upload story to R2")
 			return
@@ -959,6 +959,11 @@ func (h *mobilePushHandlers) uploadStory(w http.ResponseWriter, r *http.Request)
 		URL: publicURL, Version: version, StorageProvider: provider, Key: key,
 		SizeBytes: len(data), Checksum: hex.EncodeToString(digest[:]),
 	})
+}
+
+func isPersistentR2Store(store platform.ObjectStore) bool {
+	_, ok := store.(*platform.R2ObjectStore)
+	return ok
 }
 
 func safeStorySlug(value string) string {

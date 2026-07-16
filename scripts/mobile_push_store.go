@@ -525,7 +525,9 @@ func (s *timescaleMobilePushStore) UpdatePost(ctx context.Context, id string, in
 		// Moving an already-live post into the future must temporarily unpublish
 		// it. The scheduler will make it live again when starts_at is reached.
 		status = "scheduled"
-	} else if current.Status == "draft" || current.Status == "scheduled" {
+	} else if current.Status == "draft" {
+		// Keep due scheduled posts eligible for the scheduler. Editing a post
+		// after starts_at must not silently remove it from DuePosts.
 		status = "draft"
 	}
 	row := s.pool.QueryRow(ctx, `
@@ -1213,7 +1215,7 @@ func (s *memoryMobilePushStore) UpdatePost(_ context.Context, id string, input m
 	}
 	if post.StartsAt != nil && post.StartsAt.After(time.Now().UTC()) {
 		post.Status = "scheduled"
-	} else if post.Status == "draft" || post.Status == "scheduled" {
+	} else if post.Status == "draft" {
 		post.Status = "draft"
 	}
 	post.UpdatedAt = time.Now().UTC()

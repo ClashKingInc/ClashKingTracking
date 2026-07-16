@@ -678,8 +678,10 @@ func upsertPlayerSeasonStats(
 			)
 			VALUES (
 				$1, $2, $3, $4, $5, $6, $7, $8,
-				jsonb_build_object('donated', $4::int, 'received', $5::int),
-				to_jsonb($7::int)
+				jsonb_build_object(
+					$2::text, jsonb_build_object('donated', $4::int, 'received', $5::int)
+				),
+				jsonb_build_object($2::text, $7::int)
 			)
 			ON CONFLICT (player_tag, season, clan_tag) DO UPDATE SET
 				donated = player_season_stats.donated + EXCLUDED.donated,
@@ -695,11 +697,13 @@ func upsertPlayerSeasonStats(
 				-- keep the donations/activity jsonb in sync with the scalar columns
 				-- the API reads donations.<season>.{donated,received} and activity.<season>
 				donations = jsonb_build_object(
-					'donated', player_season_stats.donated + EXCLUDED.donated,
-					'received', player_season_stats.received + EXCLUDED.received
+					$2::text, jsonb_build_object(
+						'donated', player_season_stats.donated + EXCLUDED.donated,
+						'received', player_season_stats.received + EXCLUDED.received
+					)
 				),
-				activity = to_jsonb(
-					player_season_stats.activity_score + EXCLUDED.activity_score
+				activity = jsonb_build_object(
+					$2::text, player_season_stats.activity_score + EXCLUDED.activity_score
 				),
 				updated_at = now()
 		`, row.PlayerTag, row.Season, row.ClanTag, row.Donated, row.Received,

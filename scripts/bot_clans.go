@@ -381,7 +381,7 @@ func (d *botClansDomain) handleRaidChange(ctx context.Context, app *platform.App
 		attribute.String("group", item.Group),
 		attribute.String("operation", "raid_compare"),
 	)
-	previous, raw, hasPrevious, changed, err := botClanSnapshotChanged(ctx, d.snapshots, d.snapshotPrefix, "raid", item.Tag, *item.Current, item.Raw)
+	previous, raw, hasPrevious, changed, err := botClanSnapshotCompared(ctx, d.snapshots, d.snapshotPrefix, "raid", item.Tag, *item.Current, item.Raw)
 	platform.RecordSpanError(diffSpan, err)
 	diffSpan.SetAttributes(platform.SpanErrorStatus(err))
 	diffSpan.End()
@@ -398,6 +398,11 @@ func (d *botClansDomain) handleRaidChange(ctx context.Context, app *platform.App
 		return err
 	}
 	if err := d.raids.StoreRaid(ctx, item.Tag, *item.Current, raw); err != nil {
+		return err
+	}
+	// Advance the snapshot only after durable raid persistence succeeds. This
+	// leaves a failed write visible as a change on the next poll so it retries.
+	if err := d.snapshots.StoreRaw(ctx, botClanSnapshotKey(d.snapshotPrefix, "raid", item.Tag), raw); err != nil {
 		return err
 	}
 	if !hasPrevious {
@@ -494,6 +499,25 @@ func botClanSnapshotChanged[T any](
 	current T,
 	raw []byte,
 ) (*T, []byte, bool, bool, error) {
+	previous, raw, hasPrevious, changed, err := botClanSnapshotCompared(ctx, store, prefix, kind, tag, current, raw)
+	if err != nil || !changed {
+		return previous, raw, hasPrevious, changed, err
+	}
+	if err := store.StoreRaw(ctx, botClanSnapshotKey(prefix, kind, tag), raw); err != nil {
+		return nil, raw, hasPrevious, false, err
+	}
+	return previous, raw, hasPrevious, true, nil
+}
+
+func botClanSnapshotCompared[T any](
+	ctx context.Context,
+	store botClanSnapshotStore,
+	prefix string,
+	kind string,
+	tag string,
+	current T,
+	raw []byte,
+) (*T, []byte, bool, bool, error) {
 	if len(raw) == 0 {
 		raw = jsonBytes(current)
 	}
@@ -504,9 +528,6 @@ func botClanSnapshotChanged[T any](
 	}
 	if hasPrevious && bytes.Equal(previousRaw, raw) {
 		return nil, raw, true, false, nil
-	}
-	if err := store.StoreRaw(ctx, key, raw); err != nil {
-		return nil, raw, hasPrevious, false, err
 	}
 	var previous *T
 	if hasPrevious {

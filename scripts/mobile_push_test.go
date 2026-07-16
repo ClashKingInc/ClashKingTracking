@@ -65,6 +65,34 @@ func TestMovingLivePostIntoFutureReschedulesIt(t *testing.T) {
 	}
 }
 
+func TestEditingDueScheduledPostKeepsItScheduled(t *testing.T) {
+	store := newMemoryMobilePushStore()
+	past := time.Now().UTC().Add(-time.Minute)
+	post, err := store.CreatePost(context.Background(), models.AdminPostInput{
+		Title: ptr("Post"), Summary: ptr("Summary"), StartsAt: &past,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	post.Status = "scheduled"
+	store.posts[post.ID] = post
+
+	newTitle := "Updated post"
+	updated, found, err := store.UpdatePost(context.Background(), post.ID, models.AdminPostInput{Title: &newTitle})
+	if err != nil || !found {
+		t.Fatalf("update failed: found=%v err=%v", found, err)
+	}
+	if updated.Status != "scheduled" {
+		t.Fatalf("due post status = %q, want scheduled", updated.Status)
+	}
+}
+
+func TestMockObjectStoreIsNotPersistent(t *testing.T) {
+	if isPersistentR2Store(platform.MockObjectStore{}) {
+		t.Fatal("mock object store must not be used to produce public story URLs")
+	}
+}
+
 func ptr[T any](value T) *T { return &value }
 
 func TestMergeAdminPostClearsNullableFields(t *testing.T) {
