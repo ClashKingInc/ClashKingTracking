@@ -266,14 +266,7 @@ func (d *botPlayersDomain) doPlayer(
 		}},
 		ProfileChanges: changes,
 		SeasonStats:    stats,
-		CurrentStats: &models.PlayerCurrentStatRow{
-			PlayerTag:     player.Tag,
-			ClanTag:       clan,
-			Name:          player.Name,
-			TownHallLevel: player.TownHall,
-			LastOnlineAt:  lastOnline,
-		},
-		LastOnlineAt: lastOnline,
+		LastOnlineAt:   lastOnline,
 		Event: models.Event{
 			Topic: "player",
 			Key:   clan,
@@ -582,9 +575,6 @@ func (s *timescaleBotPlayerStore) StoreIngest(
 	if err := upsertPlayerSeasonStats(ctx, tx, ingest.SeasonStats); err != nil {
 		return err
 	}
-	if err := upsertPlayerCurrentStats(ctx, tx, ingest.CurrentStats, ingest.SnapshotRaw); err != nil {
-		return err
-	}
 	if ingest.LastOnlineAt != nil && ingest.SnapshotTag != "" {
 		if _, err := tx.Exec(ctx, updatePlayerLastActivitySQL, *ingest.LastOnlineAt, ingest.SnapshotTag); err != nil {
 			return err
@@ -674,15 +664,9 @@ func upsertPlayerSeasonStats(
 		batch.Queue(`
 			INSERT INTO player_season_stats (
 				player_tag, season, clan_tag, donated, received, capital_gold_donos,
-				activity_score, last_online_at, donations, activity
+				activity_score, last_online_at
 			)
-			VALUES (
-				$1, $2, $3, $4, $5, $6, $7, $8,
-				jsonb_build_object(
-					$2::text, jsonb_build_object('donated', $4::int, 'received', $5::int)
-				),
-				jsonb_build_object($2::text, $7::int)
-			)
+			VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
 			ON CONFLICT (player_tag, season, clan_tag) DO UPDATE SET
 				donated = player_season_stats.donated + EXCLUDED.donated,
 				received = player_season_stats.received + EXCLUDED.received,
@@ -694,59 +678,11 @@ func upsertPlayerSeasonStats(
 					player_season_stats.last_online_at,
 					EXCLUDED.last_online_at
 				),
-				-- keep the donations/activity jsonb in sync with the scalar columns
-				-- the API reads donations.<season>.{donated,received} and activity.<season>
-				donations = jsonb_build_object(
-					$2::text, jsonb_build_object(
-						'donated', player_season_stats.donated + EXCLUDED.donated,
-						'received', player_season_stats.received + EXCLUDED.received
-					)
-				),
-				activity = jsonb_build_object(
-					$2::text, player_season_stats.activity_score + EXCLUDED.activity_score
-				),
 				updated_at = now()
 		`, row.PlayerTag, row.Season, row.ClanTag, row.Donated, row.Received,
 			row.CapitalGoldDonos, row.ActivityScore, row.LastOnlineAt)
 	}
 	return utils.SendBatch(ctx, tx, batch)
-}
-
-// upsertPlayerCurrentStats writes the current-state snapshot read by the API's
-// player/leaderboard/activity routes. It owns the scalar columns + data jsonb only;
-// legends/donations/activity jsonb are left untouched (DB default '{}' on insert),
-// so a future writer can populate them without this one clobbering them on update.
-// data is the full CoC player object — the same bytes as the valkey snapshot, so
-// the caller passes ingest.SnapshotRaw rather than carrying a second copy.
-func upsertPlayerCurrentStats(
-	ctx context.Context,
-	tx pgx.Tx,
-	row *models.PlayerCurrentStatRow,
-	data []byte,
-) error {
-	if row == nil || row.PlayerTag == "" {
-		return nil
-	}
-	if len(data) == 0 {
-		data = []byte("{}")
-	}
-	_, err := tx.Exec(ctx, `
-		INSERT INTO player_current_stats (
-			player_tag, clan_tag, name, townhall_level, last_online_at, data, updated_at
-		)
-		VALUES ($1, NULLIF($2, ''), $3, NULLIF($4, 0), $5, $6::jsonb, now())
-		ON CONFLICT (player_tag) DO UPDATE SET
-			clan_tag = EXCLUDED.clan_tag,
-			name = EXCLUDED.name,
-			townhall_level = EXCLUDED.townhall_level,
-			last_online_at = GREATEST(
-				player_current_stats.last_online_at,
-				EXCLUDED.last_online_at
-			),
-			data = EXCLUDED.data,
-			updated_at = now()
-	`, row.PlayerTag, row.ClanTag, row.Name, row.TownHallLevel, row.LastOnlineAt, string(data))
-	return err
 }
 
 type memoryBotPlayerStore struct {
