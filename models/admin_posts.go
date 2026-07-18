@@ -27,7 +27,7 @@ type AdminPostTranslation struct {
 	PushBody   string      `json:"push_body,omitempty"`
 }
 
-// AdminPost mirrors the admin_posts table (clashking-devkit/database/timescale/009_mobile_posts_notifications.sql).
+// AdminPost mirrors the admin_posts table (clashking-devkit/database/timescale/017_mobile_admin_operations.sql).
 type AdminPost struct {
 	ID                string                          `json:"id"`
 	Slug              string                          `json:"slug"`
