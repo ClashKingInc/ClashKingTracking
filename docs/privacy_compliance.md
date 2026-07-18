@@ -1,6 +1,6 @@
 # Privacy Compliance Notes
 
-ClashKing Tracking on `feat/golang` is a background data collection and processing service. It does not expose an authenticated user privacy API itself, but it reads and writes data that can be personal when linked to a Discord account, device, roster, or Clash of Clans player tag.
+ClashKing Tracking is a background data collection and processing service. It does not expose an authenticated user privacy API itself, but it reads and writes data that can be personal when linked to a Discord account, device, roster, or Clash of Clans player tag.
 
 ## Data handled here
 
