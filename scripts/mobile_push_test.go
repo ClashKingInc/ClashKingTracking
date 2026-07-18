@@ -28,6 +28,27 @@ func TestStoryReplacementCreatesRestorableRevision(t *testing.T) {
 	}
 }
 
+func TestPostRevisionUsesEditingActor(t *testing.T) {
+	store := newMemoryMobilePushStore()
+	post, err := store.CreatePost(context.Background(), models.AdminPostInput{
+		Title: ptr("Post"), Summary: ptr("Summary"), CreatedBy: ptr("Alice"),
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	newTitle := "Edited"
+	if _, _, err := store.UpdatePost(context.Background(), post.ID, models.AdminPostInput{Title: &newTitle, CreatedBy: ptr("Bob")}); err != nil {
+		t.Fatal(err)
+	}
+	revisions, err := store.ListPostRevisions(context.Background(), post.ID)
+	if err != nil || len(revisions) != 1 {
+		t.Fatalf("revisions = %d, err=%v", len(revisions), err)
+	}
+	if revisions[0].CreatedBy != "Bob" {
+		t.Fatalf("revision actor = %q, want Bob", revisions[0].CreatedBy)
+	}
+}
+
 func TestMovingLivePostIntoFutureReschedulesIt(t *testing.T) {
 	store := newMemoryMobilePushStore()
 	post, err := store.CreatePost(context.Background(), models.AdminPostInput{

@@ -175,6 +175,7 @@ func (s *timescaleMobilePushStore) AdminDashboard(ctx context.Context, days int,
 			  AND p.device_id = mobile_push_devices.device_id
 			  AND p.environment = mobile_push_devices.environment
 			  AND p.enabled
+			  AND 'announcements' = ANY(p.enabled_types)
 		)),
 		count(*) FILTER (WHERE enabled AND last_seen_at >= $1::timestamptz - interval '24 hours'),
 		count(*) FILTER (WHERE enabled AND last_seen_at >= $1::timestamptz - interval '7 days')
@@ -466,7 +467,7 @@ func (s *timescaleMobilePushStore) UpdatePost(ctx context.Context, id string, in
 		INSERT INTO admin_post_revisions (post_id, revision_number, snapshot, created_by)
 		VALUES ($1, $2, $3::jsonb, $4)
 		ON CONFLICT (post_id, revision_number) DO NOTHING`,
-		id, current.RevisionNumber, string(snapshot), current.CreatedBy,
+		id, current.RevisionNumber, string(snapshot), valueOr(input.CreatedBy, current.CreatedBy),
 	); err != nil {
 		return models.AdminPost{}, false, err
 	}
@@ -1248,7 +1249,7 @@ func (s *memoryMobilePushStore) UpdatePost(_ context.Context, id string, input m
 		return models.AdminPost{}, false, nil
 	}
 	snapshot, _ := json.Marshal(post)
-	s.revisions[id] = append(s.revisions[id], models.AdminPostRevision{ID: uniqueSlug("revision"), PostID: id, RevisionNumber: post.RevisionNumber, Snapshot: snapshot, CreatedBy: post.CreatedBy, CreatedAt: time.Now().UTC()})
+	s.revisions[id] = append(s.revisions[id], models.AdminPostRevision{ID: uniqueSlug("revision"), PostID: id, RevisionNumber: post.RevisionNumber, Snapshot: snapshot, CreatedBy: valueOr(input.CreatedBy, post.CreatedBy), CreatedAt: time.Now().UTC()})
 	post = mergeAdminPost(post, input)
 	post.RevisionNumber++
 	if !sameOptionalString(s.posts[id].StoryURL, post.StoryURL) && post.StoryURL != nil {
