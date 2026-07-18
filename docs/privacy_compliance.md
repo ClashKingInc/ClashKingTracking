@@ -1,6 +1,6 @@
 # Privacy Compliance Notes
 
-ClashKing Tracking is a background data collection and processing service. It does not expose an authenticated user privacy API itself, but it reads and writes data that can be personal when linked to a Discord account, device, roster, or Clash of Clans player tag. Its separate admin API uses revocable administrator sessions and must never accept ClashKingAPI user or integration tokens.
+ClashKing Tracking is a background data collection and processing service. It exposes no user or administrator API, but it reads and writes data that can be personal when linked to a Discord account, device, roster, or Clash of Clans player tag. User privacy routes belong to ClashKingAPI; the separate Go administrator API and its revocable Discord sessions belong to ClashKingAdminPanel. Tracking must never accept either API's bearer tokens.
 
 ## Data handled here
 
@@ -23,7 +23,7 @@ Verified access and deletion requests are initiated through the API/dashboard/bo
 
 1. Removing Discord-user keyed preferences from `user_settings`.
 2. Removing or anonymizing Discord-linked player links, reminders, roster references, open tickets, and support records owned by the requester.
-3. Coordinating removal of mobile push/device records from the canonical API data store without exposing a user deletion route from the admin API.
+3. Coordinating removal of mobile push/device records from the canonical API data store without exposing user or administrator routes from the worker.
 4. Preserving public Clash of Clans history only when it is no longer tied to the requester.
 5. Keeping only minimal audit/security evidence required for abuse prevention or legal obligations.
 
