@@ -71,6 +71,83 @@ func TestEditingDueScheduledPostKeepsItScheduled(t *testing.T) {
 	}
 }
 
+func TestClearingScheduledStartReturnsPostToDraft(t *testing.T) {
+	store := newMemoryMobilePushStore()
+	future := time.Now().UTC().Add(time.Hour)
+	post, err := store.CreatePost(context.Background(), models.AdminPostInput{
+		Title: ptr("Post"), Summary: ptr("Summary"), StartsAt: &future,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	updated, found, err := store.UpdatePost(context.Background(), post.ID, models.AdminPostInput{ClearStartsAt: true})
+	if err != nil || !found {
+		t.Fatalf("clear start failed: found=%v err=%v", found, err)
+	}
+	if updated.Status != "draft" || updated.StartsAt != nil {
+		t.Fatalf("cleared post = %#v, want draft without starts_at", updated)
+	}
+}
+
+func TestDuePostsSkipExpiredPublicationWindows(t *testing.T) {
+	store := newMemoryMobilePushStore()
+	past := time.Now().UTC().Add(-time.Hour)
+	ended := time.Now().UTC().Add(-time.Minute)
+	post, err := store.CreatePost(context.Background(), models.AdminPostInput{
+		Title: ptr("Expired"), Summary: ptr("Summary"), StartsAt: &past, EndsAt: &ended,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	post.Status = "scheduled"
+	store.posts[post.ID] = post
+	due, err := store.DuePosts(context.Background(), time.Now().UTC())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(due) != 0 {
+		t.Fatalf("expired post was returned as due: %#v", due)
+	}
+}
+
+func TestCampaignClaimPreventsDuplicateAndRetriesFailures(t *testing.T) {
+	store := newMemoryMobilePushStore()
+	now := time.Now().UTC()
+	sendAt := now.Add(-time.Minute)
+	campaign := models.NotificationCampaign{ID: "campaign", Status: "scheduled", TriggerType: "manual", SendAt: &sendAt}
+	store.campaigns[campaign.ID] = campaign
+
+	claimed, err := store.ClaimDueCampaigns(context.Background(), now)
+	if err != nil || len(claimed) != 1 {
+		t.Fatalf("first claim = %d, err=%v", len(claimed), err)
+	}
+	claimed, err = store.ClaimDueCampaigns(context.Background(), now.Add(time.Minute))
+	if err != nil || len(claimed) != 0 {
+		t.Fatalf("duplicate claim = %d, err=%v", len(claimed), err)
+	}
+	if err := store.RecordCampaignDelivery(context.Background(), campaign, now, 1, 0, 1, "failed"); err != nil {
+		t.Fatal(err)
+	}
+	claimed, err = store.ClaimDueCampaigns(context.Background(), now.Add(6*time.Minute))
+	if err != nil || len(claimed) != 1 {
+		t.Fatalf("retry claim = %d, err=%v", len(claimed), err)
+	}
+}
+
+func TestPartialPostDeliveryRemainsRetryable(t *testing.T) {
+	store := newMemoryMobilePushStore()
+	now := time.Now().UTC()
+	post := models.AdminPost{ID: "post", Status: "live", AlsoPushOnPublish: true}
+	store.posts[post.ID] = post
+	store.attempts[post.ID] = []models.AdminPostDeliveryAttempt{{
+		PostID: post.ID, AttemptNumber: 1, Status: "partial", AttemptedAt: now.Add(-3 * time.Minute),
+	}}
+	retries, err := store.DuePushRetries(context.Background(), now)
+	if err != nil || len(retries) != 1 {
+		t.Fatalf("partial retries = %d, err=%v", len(retries), err)
+	}
+}
+
 func ptr[T any](value T) *T { return &value }
 
 func TestMergeAdminPostClearsNullableFields(t *testing.T) {

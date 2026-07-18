@@ -21,7 +21,7 @@ type mobilePushStore interface {
 	Close()
 	RecordDeliveryAttempt(ctx context.Context, attempt models.AdminPostDeliveryAttempt) (models.AdminPostDeliveryAttempt, error)
 	DuePushRetries(ctx context.Context, now time.Time) ([]models.AdminPost, error)
-	DueCampaigns(ctx context.Context, now time.Time) ([]models.NotificationCampaign, error)
+	ClaimDueCampaigns(ctx context.Context, now time.Time) ([]models.NotificationCampaign, error)
 	RecordCampaignDelivery(ctx context.Context, campaign models.NotificationCampaign, now time.Time, eligible, sent, skipped int, status string) error
 	DuePosts(ctx context.Context, now time.Time) ([]models.AdminPost, error)
 	MarkPublished(ctx context.Context, id string) (models.AdminPost, error)
@@ -498,7 +498,9 @@ func (s *timescaleMobilePushStore) UpdatePost(ctx context.Context, id string, in
 		return models.AdminPost{}, false, err
 	}
 	status := merged.Status
-	if merged.StartsAt != nil && merged.StartsAt.After(time.Now().UTC()) {
+	if merged.StartsAt == nil && current.Status == "scheduled" {
+		status = "draft"
+	} else if merged.StartsAt != nil && merged.StartsAt.After(time.Now().UTC()) {
 		// Moving an already-live post into the future must temporarily unpublish
 		// it. The scheduler will make it live again when starts_at is reached.
 		status = "scheduled"
@@ -672,7 +674,7 @@ func (s *timescaleMobilePushStore) DuePushRetries(ctx context.Context, now time.
 		  AND EXISTS (
 			SELECT 1 FROM admin_post_delivery_attempts a WHERE a.post_id = p.id
 			  AND a.attempt_number = (SELECT max(a2.attempt_number) FROM admin_post_delivery_attempts a2 WHERE a2.post_id = p.id)
-			  AND a.status = 'failed' AND a.attempt_number < 3 AND a.attempted_at <= $1 - interval '2 minutes'
+			  AND a.status IN ('failed', 'partial') AND a.attempt_number < 3 AND a.attempted_at <= $1 - interval '2 minutes'
 		  )`, now)
 	if err != nil {
 		return nil, err
@@ -868,8 +870,13 @@ func normalizeCampaignLocale(value string) string {
 	return value
 }
 
-func (s *timescaleMobilePushStore) DueCampaigns(ctx context.Context, now time.Time) ([]models.NotificationCampaign, error) {
-	rows, err := s.pool.Query(ctx, `SELECT `+campaignColumns+` FROM admin_notification_campaigns
+func (s *timescaleMobilePushStore) ClaimDueCampaigns(ctx context.Context, now time.Time) ([]models.NotificationCampaign, error) {
+	tx, err := s.pool.Begin(ctx)
+	if err != nil {
+		return nil, err
+	}
+	defer tx.Rollback(ctx)
+	rows, err := tx.Query(ctx, `SELECT `+campaignColumns+` FROM admin_notification_campaigns
 		WHERE status = 'scheduled' AND (
 			(trigger_type = 'manual' AND send_at IS NOT NULL AND send_at <= $1) OR
 			(trigger_type = 'monthly' AND day_of_month <= extract(day from $1)::integer
@@ -879,27 +886,58 @@ func (s *timescaleMobilePushStore) DueCampaigns(ctx context.Context, now time.Ti
 				OR send_time IS NULL
 				OR send_time <= to_char($1 AT TIME ZONE 'UTC', 'HH24:MI')
 			 ))
-		)`, now)
+		) FOR UPDATE SKIP LOCKED`, now)
 	if err != nil {
 		return nil, err
 	}
-	defer rows.Close()
-	out := []models.NotificationCampaign{}
+	due := []models.NotificationCampaign{}
 	for rows.Next() {
 		campaign, err := scanCampaign(rows)
 		if err != nil {
+			rows.Close()
 			return nil, err
 		}
-		out = append(out, campaign)
+		due = append(due, campaign)
 	}
-	return out, rows.Err()
+	if err := rows.Err(); err != nil {
+		rows.Close()
+		return nil, err
+	}
+	rows.Close()
+
+	claimed := make([]models.NotificationCampaign, 0, len(due))
+	for _, campaign := range due {
+		tag, err := tx.Exec(ctx, `INSERT INTO admin_campaign_delivery_attempts
+			(campaign_id, scheduled_for, eligible_count, sent_count, skipped_count, status, attempted_at)
+			VALUES ($1, $2::date, 0, 0, 0, 'processing', $3)
+			ON CONFLICT (campaign_id, scheduled_for) DO UPDATE SET status='processing', attempted_at=$3
+			WHERE admin_campaign_delivery_attempts.status IN ('failed', 'partial', 'processing')
+			  AND admin_campaign_delivery_attempts.attempted_at <= $3 - interval '5 minutes'`,
+			campaign.ID, campaignScheduledFor(campaign, now), now)
+		if err != nil {
+			return nil, err
+		}
+		if tag.RowsAffected() > 0 {
+			claimed = append(claimed, campaign)
+		}
+	}
+	if err := tx.Commit(ctx); err != nil {
+		return nil, err
+	}
+	return claimed, nil
 }
 
 func (s *timescaleMobilePushStore) RecordCampaignDelivery(ctx context.Context, campaign models.NotificationCampaign, now time.Time, eligible, sent, skipped int, status string) error {
-	_, err := s.pool.Exec(ctx, `INSERT INTO admin_campaign_delivery_attempts (campaign_id, scheduled_for, eligible_count, sent_count, skipped_count, status)
-		VALUES ($1, $2::date, $3, $4, $5, $6) ON CONFLICT (campaign_id, scheduled_for) DO NOTHING`, campaign.ID, now, eligible, sent, skipped, status)
+	_, err := s.pool.Exec(ctx, `INSERT INTO admin_campaign_delivery_attempts
+		(campaign_id, scheduled_for, eligible_count, sent_count, skipped_count, status, attempted_at)
+		VALUES ($1, $2::date, $3, $4, $5, $6, $7)
+		ON CONFLICT (campaign_id, scheduled_for) DO UPDATE SET eligible_count=$3, sent_count=$4,
+			skipped_count=$5, status=$6, attempted_at=$7`, campaign.ID, campaignScheduledFor(campaign, now), eligible, sent, skipped, status, now)
 	if err != nil {
 		return err
+	}
+	if status != "sent" && status != "no_audience" {
+		return nil
 	}
 	if campaign.TriggerType == "monthly" {
 		_, err = s.pool.Exec(ctx, `UPDATE admin_notification_campaigns SET last_sent_at = $2, updated_at = now() WHERE id = $1`, campaign.ID, now)
@@ -907,6 +945,17 @@ func (s *timescaleMobilePushStore) RecordCampaignDelivery(ctx context.Context, c
 		_, err = s.pool.Exec(ctx, `UPDATE admin_notification_campaigns SET last_sent_at = $2, status = 'sent', updated_at = now() WHERE id = $1`, campaign.ID, now)
 	}
 	return err
+}
+
+func campaignScheduledFor(campaign models.NotificationCampaign, now time.Time) time.Time {
+	if campaign.TriggerType == "manual" && campaign.SendAt != nil {
+		return campaign.SendAt.UTC()
+	}
+	day := now.UTC().Day()
+	if campaign.DayOfMonth != nil {
+		day = *campaign.DayOfMonth
+	}
+	return time.Date(now.UTC().Year(), now.UTC().Month(), day, 0, 0, 0, 0, time.UTC)
 }
 
 func (s *timescaleMobilePushStore) ArchivePost(ctx context.Context, id string) (bool, error) {
@@ -918,7 +967,7 @@ func (s *timescaleMobilePushStore) ArchivePost(ctx context.Context, id string) (
 }
 
 func (s *timescaleMobilePushStore) DuePosts(ctx context.Context, now time.Time) ([]models.AdminPost, error) {
-	rows, err := s.pool.Query(ctx, "SELECT "+adminPostColumns+" FROM admin_posts WHERE status = 'scheduled' AND starts_at <= $1", now)
+	rows, err := s.pool.Query(ctx, "SELECT "+adminPostColumns+" FROM admin_posts WHERE status = 'scheduled' AND starts_at <= $1 AND (ends_at IS NULL OR ends_at > $1)", now)
 	if err != nil {
 		return nil, err
 	}
@@ -1089,15 +1138,17 @@ func validatePostPresentation(presentationType string, storyURL *string, showOnH
 // memoryMobilePushStore is the MockDB/DryRun worker fallback used for local
 // iteration without Postgres.
 type memoryMobilePushStore struct {
-	posts     map[string]models.AdminPost
-	revisions map[string][]models.AdminPostRevision
-	attempts  map[string][]models.AdminPostDeliveryAttempt
-	campaigns map[string]models.NotificationCampaign
+	posts            map[string]models.AdminPost
+	revisions        map[string][]models.AdminPostRevision
+	attempts         map[string][]models.AdminPostDeliveryAttempt
+	campaigns        map[string]models.NotificationCampaign
+	campaignClaims   map[string]time.Time
+	campaignStatuses map[string]string
 }
 
 func newMemoryMobilePushStore() *memoryMobilePushStore {
 	store := &memoryMobilePushStore{
-		posts: map[string]models.AdminPost{}, revisions: map[string][]models.AdminPostRevision{}, attempts: map[string][]models.AdminPostDeliveryAttempt{}, campaigns: map[string]models.NotificationCampaign{},
+		posts: map[string]models.AdminPost{}, revisions: map[string][]models.AdminPostRevision{}, attempts: map[string][]models.AdminPostDeliveryAttempt{}, campaigns: map[string]models.NotificationCampaign{}, campaignClaims: map[string]time.Time{}, campaignStatuses: map[string]string{},
 	}
 	now := time.Now().UTC()
 	day := 1
@@ -1206,7 +1257,9 @@ func (s *memoryMobilePushStore) UpdatePost(_ context.Context, id string, input m
 			post.StoryHistory = append(append([]string{}, s.posts[id].StoryHistory...), *s.posts[id].StoryURL)
 		}
 	}
-	if post.StartsAt != nil && post.StartsAt.After(time.Now().UTC()) {
+	if post.StartsAt == nil && s.posts[id].Status == "scheduled" {
+		post.Status = "draft"
+	} else if post.StartsAt != nil && post.StartsAt.After(time.Now().UTC()) {
 		post.Status = "scheduled"
 	} else if post.Status == "draft" {
 		post.Status = "draft"
@@ -1257,7 +1310,7 @@ func (s *memoryMobilePushStore) DuePushRetries(_ context.Context, now time.Time)
 		}
 		last := attempts[len(attempts)-1]
 		post := s.posts[id]
-		if post.Status == "live" && post.AlsoPushOnPublish && post.PushSentAt == nil && last.Status == "failed" && last.AttemptNumber < 3 && !last.AttemptedAt.After(now.Add(-2*time.Minute)) {
+		if post.Status == "live" && post.AlsoPushOnPublish && post.PushSentAt == nil && (last.Status == "failed" || last.Status == "partial") && last.AttemptNumber < 3 && !last.AttemptedAt.After(now.Add(-2*time.Minute)) {
 			out = append(out, post)
 		}
 	}
@@ -1298,17 +1351,23 @@ func (s *memoryMobilePushStore) UpdateCampaign(_ context.Context, id string, inp
 	return campaign, true, nil
 }
 
-func (s *memoryMobilePushStore) DueCampaigns(_ context.Context, now time.Time) ([]models.NotificationCampaign, error) {
+func (s *memoryMobilePushStore) ClaimDueCampaigns(_ context.Context, now time.Time) ([]models.NotificationCampaign, error) {
 	out := []models.NotificationCampaign{}
 	for _, campaign := range s.campaigns {
 		if campaign.Status != "scheduled" {
 			continue
 		}
-		if campaign.TriggerType == "manual" && campaign.SendAt != nil && !campaign.SendAt.After(now) {
-			out = append(out, campaign)
-		}
-		if monthlyCampaignDue(campaign, now) {
-			out = append(out, campaign)
+		due := campaign.TriggerType == "manual" && campaign.SendAt != nil && !campaign.SendAt.After(now)
+		due = due || monthlyCampaignDue(campaign, now)
+		claimKey := campaign.ID + ":" + campaignScheduledFor(campaign, now).Format("2006-01-02")
+		if due {
+			lastClaim, claimed := s.campaignClaims[claimKey]
+			lastStatus := s.campaignStatuses[claimKey]
+			if !claimed || ((lastStatus == "failed" || lastStatus == "partial" || lastStatus == "processing") && !lastClaim.After(now.Add(-5*time.Minute))) {
+				s.campaignClaims[claimKey] = now
+				s.campaignStatuses[claimKey] = "processing"
+				out = append(out, campaign)
+			}
 		}
 	}
 	return out, nil
@@ -1327,7 +1386,13 @@ func monthlyCampaignDue(campaign models.NotificationCampaign, now time.Time) boo
 	return strings.TrimSpace(*campaign.SendTime) <= now.UTC().Format("15:04")
 }
 
-func (s *memoryMobilePushStore) RecordCampaignDelivery(_ context.Context, campaign models.NotificationCampaign, now time.Time, _, _, _ int, _ string) error {
+func (s *memoryMobilePushStore) RecordCampaignDelivery(_ context.Context, campaign models.NotificationCampaign, now time.Time, _, _, _ int, status string) error {
+	claimKey := campaign.ID + ":" + campaignScheduledFor(campaign, now).Format("2006-01-02")
+	s.campaignClaims[claimKey] = now
+	s.campaignStatuses[claimKey] = status
+	if status != "sent" && status != "no_audience" {
+		return nil
+	}
 	campaign.LastSentAt = &now
 	if campaign.TriggerType == "manual" {
 		campaign.Status = "sent"
@@ -1349,7 +1414,7 @@ func (s *memoryMobilePushStore) ArchivePost(_ context.Context, id string) (bool,
 func (s *memoryMobilePushStore) DuePosts(_ context.Context, now time.Time) ([]models.AdminPost, error) {
 	out := []models.AdminPost{}
 	for _, post := range s.posts {
-		if post.Status == "scheduled" && post.StartsAt != nil && !post.StartsAt.After(now) {
+		if post.Status == "scheduled" && post.StartsAt != nil && !post.StartsAt.After(now) && (post.EndsAt == nil || post.EndsAt.After(now)) {
 			out = append(out, post)
 		}
 	}

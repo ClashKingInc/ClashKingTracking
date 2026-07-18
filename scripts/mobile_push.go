@@ -87,7 +87,7 @@ func (d *mobilePushDomain) runCycle(ctx context.Context, app *platform.App) erro
 		}
 	}
 
-	campaigns, err := d.store.DueCampaigns(ctx, now)
+	campaigns, err := d.store.ClaimDueCampaigns(ctx, now)
 	if err != nil {
 		return err
 	}
@@ -198,7 +198,7 @@ func deliverPostPush(ctx context.Context, app *platform.App, store mobilePushSto
 	_, recordErr := store.RecordDeliveryAttempt(ctx, models.AdminPostDeliveryAttempt{
 		PostID: post.ID, Trigger: trigger, EligibleCount: len(devices), SentCount: sent, SkippedCount: skipped, Status: status,
 	})
-	if sent > 0 {
+	if status == "sent" || status == "no_audience" {
 		_ = store.MarkPushSent(ctx, post.ID)
 	}
 	return sent, skipped, recordErr
