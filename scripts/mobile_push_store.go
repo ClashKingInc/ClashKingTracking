@@ -20,7 +20,7 @@ import (
 type mobilePushStore interface {
 	Close()
 	RecordDeliveryAttempt(ctx context.Context, attempt models.AdminPostDeliveryAttempt) (models.AdminPostDeliveryAttempt, error)
-	DuePushRetries(ctx context.Context, now time.Time) ([]models.AdminPost, error)
+	ClaimDuePushRetries(ctx context.Context, now time.Time) ([]models.AdminPost, error)
 	ClaimDueCampaigns(ctx context.Context, now time.Time) ([]models.NotificationCampaign, error)
 	RecordCampaignDelivery(ctx context.Context, campaign models.NotificationCampaign, now time.Time, eligible, sent, skipped int, status string) error
 	DuePosts(ctx context.Context, now time.Time) ([]models.AdminPost, error)
@@ -669,27 +669,46 @@ func (s *timescaleMobilePushStore) ListDeliveryAttempts(ctx context.Context, id 
 	return out, rows.Err()
 }
 
-func (s *timescaleMobilePushStore) DuePushRetries(ctx context.Context, now time.Time) ([]models.AdminPost, error) {
-	rows, err := s.pool.Query(ctx, `SELECT `+adminPostColumns+` FROM admin_posts p
+func (s *timescaleMobilePushStore) ClaimDuePushRetries(ctx context.Context, now time.Time) ([]models.AdminPost, error) {
+	tx, err := s.pool.Begin(ctx)
+	if err != nil {
+		return nil, err
+	}
+	defer tx.Rollback(ctx)
+	rows, err := tx.Query(ctx, `SELECT `+adminPostColumns+` FROM admin_posts p
 		WHERE p.status = 'live' AND p.also_push_on_publish = true AND p.push_sent_at IS NULL
+		  AND p.updated_at <= $1 - interval '2 minutes'
 		  AND EXISTS (
 			SELECT 1 FROM admin_post_delivery_attempts a WHERE a.post_id = p.id
 			  AND a.attempt_number = (SELECT max(a2.attempt_number) FROM admin_post_delivery_attempts a2 WHERE a2.post_id = p.id)
 			  AND a.status IN ('failed', 'partial') AND a.attempt_number < 3 AND a.attempted_at <= $1 - interval '2 minutes'
-		  )`, now)
+			  ) FOR UPDATE SKIP LOCKED`, now)
 	if err != nil {
 		return nil, err
 	}
-	defer rows.Close()
 	out := []models.AdminPost{}
 	for rows.Next() {
 		post, err := scanAdminPost(rows)
 		if err != nil {
+			rows.Close()
 			return nil, err
 		}
 		out = append(out, post)
 	}
-	return out, rows.Err()
+	if err := rows.Err(); err != nil {
+		rows.Close()
+		return nil, err
+	}
+	rows.Close()
+	for _, post := range out {
+		if _, err := tx.Exec(ctx, "UPDATE admin_posts SET updated_at=$2 WHERE id=$1", post.ID, now); err != nil {
+			return nil, err
+		}
+	}
+	if err := tx.Commit(ctx); err != nil {
+		return nil, err
+	}
+	return out, nil
 }
 
 const campaignColumns = `id, campaign_key, title, body, target_route, platforms, target_locales, translations, status, trigger_type, day_of_month, send_at, send_time, last_sent_at, created_by, created_at, updated_at`
@@ -1303,7 +1322,7 @@ func (s *memoryMobilePushStore) ListDeliveryAttempts(_ context.Context, id strin
 	return attempts, nil
 }
 
-func (s *memoryMobilePushStore) DuePushRetries(_ context.Context, now time.Time) ([]models.AdminPost, error) {
+func (s *memoryMobilePushStore) ClaimDuePushRetries(_ context.Context, now time.Time) ([]models.AdminPost, error) {
 	out := []models.AdminPost{}
 	for id, attempts := range s.attempts {
 		if len(attempts) == 0 {
@@ -1311,7 +1330,9 @@ func (s *memoryMobilePushStore) DuePushRetries(_ context.Context, now time.Time)
 		}
 		last := attempts[len(attempts)-1]
 		post := s.posts[id]
-		if post.Status == "live" && post.AlsoPushOnPublish && post.PushSentAt == nil && (last.Status == "failed" || last.Status == "partial") && last.AttemptNumber < 3 && !last.AttemptedAt.After(now.Add(-2*time.Minute)) {
+		if post.Status == "live" && post.AlsoPushOnPublish && post.PushSentAt == nil && (last.Status == "failed" || last.Status == "partial") && last.AttemptNumber < 3 && !last.AttemptedAt.After(now.Add(-2*time.Minute)) && !post.UpdatedAt.After(now.Add(-2*time.Minute)) {
+			post.UpdatedAt = now
+			s.posts[id] = post
 			out = append(out, post)
 		}
 	}

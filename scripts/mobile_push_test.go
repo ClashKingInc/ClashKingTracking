@@ -163,9 +163,13 @@ func TestPartialPostDeliveryRemainsRetryable(t *testing.T) {
 	store.attempts[post.ID] = []models.AdminPostDeliveryAttempt{{
 		PostID: post.ID, AttemptNumber: 1, Status: "partial", AttemptedAt: now.Add(-3 * time.Minute),
 	}}
-	retries, err := store.DuePushRetries(context.Background(), now)
+	retries, err := store.ClaimDuePushRetries(context.Background(), now)
 	if err != nil || len(retries) != 1 {
 		t.Fatalf("partial retries = %d, err=%v", len(retries), err)
+	}
+	retries, err = store.ClaimDuePushRetries(context.Background(), now.Add(time.Minute))
+	if err != nil || len(retries) != 0 {
+		t.Fatalf("duplicate partial retry claim = %d, err=%v", len(retries), err)
 	}
 }
 

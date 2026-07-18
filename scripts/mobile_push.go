@@ -77,7 +77,7 @@ func (d *mobilePushDomain) runCycle(ctx context.Context, app *platform.App) erro
 		app.Stats.RecordWrite(mobilePushDomainName, 1)
 	}
 
-	retries, err := d.store.DuePushRetries(ctx, now)
+	retries, err := d.store.ClaimDuePushRetries(ctx, now)
 	if err != nil {
 		return err
 	}
