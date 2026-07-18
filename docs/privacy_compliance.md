@@ -7,7 +7,8 @@ ClashKing Tracking is a background data collection and processing service. It ex
 - Clash of Clans player tags, clan tags, names, rankings, war/battle logs, raid data, activity signals, and leaderboard/history snapshots.
 - Server configuration, reminders, user settings, bookmarked players/clans, and account-link dependent processing.
 - Reddit community metadata used by tracking jobs, including author names and avatars where displayed.
-- Operational traces and event streams controlled by `retention_seconds`.
+- Operational event streams, whose Valkey retention is controlled by `retention_seconds`.
+- OpenTelemetry traces, whose retention must be configured and bounded independently in the OTLP backend.
 
 ## Global privacy rules
 
