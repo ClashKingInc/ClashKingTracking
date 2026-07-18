@@ -2,11 +2,9 @@ module clashking_tracking
 
 go 1.25.0
 
-replace github.com/clashkinginc/clashy.go => ../../GolandProjects/clashy.go
-
 require (
 	github.com/cespare/xxhash/v2 v2.3.0
-	github.com/clashkinginc/clashy.go v0.1.2
+	github.com/clashkinginc/clashy.go v0.1.10-0.20260716212204-6322cf105faf
 	github.com/golang/snappy v1.0.0
 	github.com/google/uuid v1.6.0
 	github.com/jackc/pgx/v5 v5.9.2

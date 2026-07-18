@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"net/url"
 	"regexp"
 	"strconv"
 	"strings"
@@ -18,40 +19,16 @@ import (
 
 type mobilePushStore interface {
 	Close()
-	UpsertDiscordAdminUser(ctx context.Context, profile models.DiscordAdminProfile) (models.AdminUser, error)
-	CreateAdminSession(ctx context.Context, userID, tokenHash, ipAddress, userAgent string, expiresAt time.Time) (models.AdminSession, error)
-	GetAdminSession(ctx context.Context, tokenHash string, now time.Time) (models.AdminSession, bool, error)
-	DeleteAdminSession(ctx context.Context, tokenHash string) error
-	DeleteAdminUserSessions(ctx context.Context, userID string) error
-	AdminDashboard(ctx context.Context, days int, now time.Time) (models.AdminDashboardSnapshot, error)
-	ListFeatureFlags(ctx context.Context) ([]models.AdminFeatureFlag, error)
-	CreateFeatureFlag(ctx context.Context, input models.AdminFeatureFlagInput) (models.AdminFeatureFlag, error)
-	UpdateFeatureFlag(ctx context.Context, key string, input models.AdminFeatureFlagInput) (models.AdminFeatureFlag, bool, error)
-	RecordAuditEvent(ctx context.Context, input models.AdminAuditEventInput) error
-	ListAuditEvents(ctx context.Context, limit int, resourceType, actor string) ([]models.AdminAuditEvent, error)
-	ListPosts(ctx context.Context, status string) ([]models.AdminPost, error)
-	GetPost(ctx context.Context, id string) (models.AdminPost, bool, error)
-	CreatePost(ctx context.Context, input models.AdminPostInput) (models.AdminPost, error)
-	UpdatePost(ctx context.Context, id string, input models.AdminPostInput) (models.AdminPost, bool, error)
-	ListPostRevisions(ctx context.Context, id string) ([]models.AdminPostRevision, error)
-	GetPostRevision(ctx context.Context, id string, revision int) (models.AdminPostRevision, bool, error)
 	RecordDeliveryAttempt(ctx context.Context, attempt models.AdminPostDeliveryAttempt) (models.AdminPostDeliveryAttempt, error)
-	ListDeliveryAttempts(ctx context.Context, id string) ([]models.AdminPostDeliveryAttempt, error)
 	DuePushRetries(ctx context.Context, now time.Time) ([]models.AdminPost, error)
-	ListCampaigns(ctx context.Context) ([]models.NotificationCampaign, error)
-	CreateCampaign(ctx context.Context, input models.NotificationCampaignInput) (models.NotificationCampaign, error)
-	UpdateCampaign(ctx context.Context, id string, input models.NotificationCampaignInput) (models.NotificationCampaign, bool, error)
 	DueCampaigns(ctx context.Context, now time.Time) ([]models.NotificationCampaign, error)
 	RecordCampaignDelivery(ctx context.Context, campaign models.NotificationCampaign, now time.Time, eligible, sent, skipped int, status string) error
-	ArchivePost(ctx context.Context, id string) (bool, error)
 	DuePosts(ctx context.Context, now time.Time) ([]models.AdminPost, error)
 	MarkPublished(ctx context.Context, id string) (models.AdminPost, error)
 	DueExpirations(ctx context.Context, now time.Time) ([]models.AdminPost, error)
 	MarkExpired(ctx context.Context, id string) error
 	MarkPushSent(ctx context.Context, id string) error
-	PublicPosts(ctx context.Context, now time.Time) ([]models.AdminPost, error)
 	DevicesForPlatforms(ctx context.Context, platforms []string, locales []string) ([]models.PushDevice, error)
-	AudienceCount(ctx context.Context, platforms []string, locales []string) (int, error)
 }
 
 const featureFlagColumns = `flag_key, name, description, enabled, rollout_percentage, min_app_version,
@@ -1089,22 +1066,38 @@ func valueOr[T any](value *T, fallback T) T {
 	return *value
 }
 
-// memoryMobilePushStore is the MockDB/DryRun fallback: same interface, no
-// database, so the HTTP API and scheduler both stay runnable for quick
-// local iteration without Postgres.
+func validatePostPresentation(presentationType string, storyURL *string, showOnHome, pinnedOnHome bool) error {
+	if presentationType != "article" && presentationType != "story" {
+		return errors.New("presentation_type must be article or story")
+	}
+	if pinnedOnHome && !showOnHome {
+		return errors.New("a pinned post must be shown on home")
+	}
+	if presentationType != "story" {
+		return nil
+	}
+	if storyURL == nil || strings.TrimSpace(*storyURL) == "" {
+		return errors.New("story_url is required for a story post")
+	}
+	parsed, err := url.Parse(strings.TrimSpace(*storyURL))
+	if err != nil || parsed.Scheme != "https" || parsed.Host == "" {
+		return errors.New("story_url must be a valid HTTPS URL")
+	}
+	return nil
+}
+
+// memoryMobilePushStore is the MockDB/DryRun worker fallback used for local
+// iteration without Postgres.
 type memoryMobilePushStore struct {
-	posts         map[string]models.AdminPost
-	revisions     map[string][]models.AdminPostRevision
-	attempts      map[string][]models.AdminPostDeliveryAttempt
-	campaigns     map[string]models.NotificationCampaign
-	auditEvents   []models.AdminAuditEvent
-	adminUsers    map[string]models.AdminUser
-	adminSessions map[string]models.AdminSession
+	posts     map[string]models.AdminPost
+	revisions map[string][]models.AdminPostRevision
+	attempts  map[string][]models.AdminPostDeliveryAttempt
+	campaigns map[string]models.NotificationCampaign
 }
 
 func newMemoryMobilePushStore() *memoryMobilePushStore {
 	store := &memoryMobilePushStore{
-		posts: map[string]models.AdminPost{}, revisions: map[string][]models.AdminPostRevision{}, attempts: map[string][]models.AdminPostDeliveryAttempt{}, campaigns: map[string]models.NotificationCampaign{}, adminUsers: map[string]models.AdminUser{}, adminSessions: map[string]models.AdminSession{},
+		posts: map[string]models.AdminPost{}, revisions: map[string][]models.AdminPostRevision{}, attempts: map[string][]models.AdminPostDeliveryAttempt{}, campaigns: map[string]models.NotificationCampaign{},
 	}
 	now := time.Now().UTC()
 	day := 1

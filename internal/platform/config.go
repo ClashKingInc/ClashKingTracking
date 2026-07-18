@@ -63,14 +63,7 @@ type Config struct {
 	MobilePushFCMServiceAccountJSON        string
 	MobilePushFCMProjectID                 string
 	MobilePushTokenKey                     string
-	MobilePushHTTPAddr                     string
 	MobilePushScanSeconds                  int
-	MobilePushDiscordClientID              string
-	MobilePushDiscordClientSecret          string
-	MobilePushDiscordRedirectURL           string
-	MobilePushAdminPanelURL                string
-	MobilePushProxyStatsURL                string
-	BunnyAccessKey                         string
 	RunOnce                                bool
 	DryRun                                 bool
 	MockDB                                 bool
@@ -189,8 +182,7 @@ type jsonRedditConfig struct {
 }
 
 type jsonMobilePushConfig struct {
-	HTTPAddr    string `json:"http_addr"`
-	ScanSeconds int    `json:"scan_seconds"`
+	ScanSeconds int `json:"scan_seconds"`
 }
 
 func loadConfigFile(path string) (Config, error) {
@@ -240,7 +232,6 @@ func loadConfigFile(path string) (Config, error) {
 		GiveawayScanSeconds:                    file.Giveaways.ScanSeconds,
 		RedditPollSeconds:                      file.Reddit.PollSeconds,
 		RedditLimit:                            file.Reddit.Limit,
-		MobilePushHTTPAddr:                     file.MobilePush.HTTPAddr,
 		MobilePushScanSeconds:                  file.MobilePush.ScanSeconds,
 	}, nil
 }
@@ -269,30 +260,9 @@ func applySecretEnv(cfg *Config) {
 	if cfg.MobilePushTokenKey == "" {
 		overrideString(&cfg.MobilePushTokenKey, "ENCRYPTION_KEY")
 	}
-	overrideString(&cfg.MobilePushDiscordClientID, "MOBILE_PUSH_DISCORD_CLIENT_ID")
-	overrideString(&cfg.MobilePushDiscordClientSecret, "MOBILE_PUSH_DISCORD_CLIENT_SECRET")
-	if cfg.MobilePushDiscordClientID == "" {
-		overrideString(&cfg.MobilePushDiscordClientID, "DISCORD_CLIENT_ID")
-	}
-	if cfg.MobilePushDiscordClientSecret == "" {
-		overrideString(&cfg.MobilePushDiscordClientSecret, "DISCORD_CLIENT_SECRET")
-	}
-	overrideString(&cfg.MobilePushDiscordRedirectURL, "MOBILE_PUSH_DISCORD_REDIRECT_URL")
-	overrideString(&cfg.MobilePushAdminPanelURL, "MOBILE_PUSH_ADMIN_PANEL_URL")
-	overrideString(&cfg.MobilePushProxyStatsURL, "MOBILE_PUSH_PROXY_STATS_URL")
-	overrideString(&cfg.BunnyAccessKey, "BUNNY_ACCESS_KEY")
 }
 
 func deriveConfig(cfg *Config) {
-	if cfg.MobilePushProxyStatsURL == "" {
-		cfg.MobilePushProxyStatsURL = "https://proxy.clashk.ing/stats"
-	}
-	if cfg.MobilePushDiscordRedirectURL == "" {
-		cfg.MobilePushDiscordRedirectURL = "http://localhost:8090/auth/discord/callback"
-	}
-	if cfg.MobilePushAdminPanelURL == "" {
-		cfg.MobilePushAdminPanelURL = "http://localhost:5173"
-	}
 	cfg.GlobalClanMaxInFlight = cfg.GlobalClanPriorityRequestsPerSecond
 	cfg.WarMaxInFlight = cfg.WarRequestsPerSecond
 	if cfg.BotClanRequestsPerSecond == 0 {

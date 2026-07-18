@@ -56,7 +56,6 @@
     "limit": 10
   },
   "mobile_push": {
-    "http_addr": ":8090",
     "scan_seconds": 15
   }
 }

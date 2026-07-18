@@ -2,28 +2,12 @@ package scripts
 
 import (
 	"context"
-	"strings"
 	"testing"
 	"time"
 
 	"clashking_tracking/internal/platform"
 	"clashking_tracking/models"
 )
-
-func TestDecodeAdminPostInputTracksExplicitNulls(t *testing.T) {
-	input, err := decodeAdminPostInput(strings.NewReader(`{
-		"title":"Post",
-		"starts_at":null,
-		"target_route":null,
-		"push_body":null
-	}`))
-	if err != nil {
-		t.Fatal(err)
-	}
-	if !input.ClearStartsAt || !input.ClearTargetRoute || !input.ClearPushBody {
-		t.Fatalf("explicit null fields were not retained: %#v", input)
-	}
-}
 
 func TestStoryReplacementCreatesRestorableRevision(t *testing.T) {
 	store := newMemoryMobilePushStore()
@@ -87,12 +71,6 @@ func TestEditingDueScheduledPostKeepsItScheduled(t *testing.T) {
 	}
 }
 
-func TestMockObjectStoreIsNotPersistent(t *testing.T) {
-	if isPersistentR2Store(platform.MockObjectStore{}) {
-		t.Fatal("mock object store must not be used to produce public story URLs")
-	}
-}
-
 func ptr[T any](value T) *T { return &value }
 
 func TestMergeAdminPostClearsNullableFields(t *testing.T) {
@@ -144,19 +122,5 @@ func TestFCMServiceAccountJSONIsValidated(t *testing.T) {
 	app := &platform.App{Config: platform.Config{MobilePushFCMServiceAccountJSON: "{"}}
 	if _, err := fcmAccessToken(app); err == nil {
 		t.Fatal("invalid FCM service-account JSON must be rejected")
-	}
-}
-
-func TestStoryPresentationRequiresHTTPSURL(t *testing.T) {
-	httpURL := "http://example.com/story.html"
-	if err := validatePostPresentation("story", &httpURL, true, false); err == nil {
-		t.Fatal("story URLs must use HTTPS")
-	}
-	httpsURL := "https://example.com/story.html"
-	if err := validatePostPresentation("story", &httpsURL, true, true); err != nil {
-		t.Fatalf("valid pinned story rejected: %v", err)
-	}
-	if err := validatePostPresentation("article", nil, false, true); err == nil {
-		t.Fatal("a hidden post cannot remain pinned")
 	}
 }
