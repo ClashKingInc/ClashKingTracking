@@ -4,6 +4,7 @@ package scripts
 
 import (
 	"encoding/json"
+	"strings"
 	"testing"
 	"time"
 
@@ -28,6 +29,25 @@ func TestGiveawayTransitionEventShape(t *testing.T) {
 	}
 	if transition.Event.Value["type"] != "giveaway_start" {
 		t.Fatalf("event value = %+v", transition.Event.Value)
+	}
+}
+
+func TestGiveawayEventPayloadUsesEveryRetainedTypedColumn(t *testing.T) {
+	implicitRowSerializer := "to_json" + "b("
+	if strings.Contains(dueGiveawaysSQL, implicitRowSerializer) || strings.Contains(markGiveawayTransitionSQL, implicitRowSerializer) {
+		t.Fatal("giveaway events must not serialize the database row implicitly")
+	}
+	for _, field := range []string{
+		"id", "server_id", "prize", "channel_id", "status", "start_time", "end_time", "winners",
+		"mentions", "text_above_embed", "text_in_embed", "text_on_end", "image_url",
+		"profile_picture_required", "coc_account_required", "roles_mode", "roles", "boosters",
+		"entries", "winners_list", "updated", "message_id", "event_pending", "event_pending_at",
+		"created_at", "updated_at",
+	} {
+		key := "'" + field + "', " + field
+		if !strings.Contains(giveawayEventPayloadSQL, key) {
+			t.Fatalf("typed event payload omits %q: %s", field, giveawayEventPayloadSQL)
+		}
 	}
 }
 

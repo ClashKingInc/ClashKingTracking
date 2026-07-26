@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"reflect"
 	"strconv"
 	"time"
@@ -19,28 +20,71 @@ import (
 
 const scheduledDomainName = "scheduled"
 const leaderboardKindCapital = "capital"
+const currentClanRankingLimit = 200
 
 type leaderboardLoader func(context.Context, *clashy.Client, string) (any, error)
+type currentClanRankingLoader func(context.Context, *clashy.Client, string, clashy.PageOptions) ([]clashy.RankedClan, error)
 
 var leaderboardPaths = []struct {
 	Kind string
 	Load leaderboardLoader
 }{
 	{Kind: "clan_trophies", Load: func(ctx context.Context, client *clashy.Client, locationID string) (any, error) {
-		return client.GetLocationClansByLocationID(ctx, locationID, 0, "", "")
+		return client.GetLocationClansByLocationID(ctx, locationID, clashy.PageOptions{})
 	}},
 	{Kind: "clan_versus_trophies", Load: func(ctx context.Context, client *clashy.Client, locationID string) (any, error) {
-		return client.GetLocationClansBuilderBaseByLocationID(ctx, locationID, 0, "", "")
+		return client.GetLocationClansBuilderBaseByLocationID(ctx, locationID, clashy.PageOptions{})
 	}},
 	{Kind: leaderboardKindCapital, Load: func(ctx context.Context, client *clashy.Client, locationID string) (any, error) {
-		return client.GetLocationClansCapitalByLocationID(ctx, locationID, 0, "", "")
+		return client.GetLocationClansCapitalByLocationID(ctx, locationID, clashy.PageOptions{})
 	}},
 	{Kind: "player_trophies", Load: func(ctx context.Context, client *clashy.Client, locationID string) (any, error) {
-		return client.GetLocationPlayersByLocationID(ctx, locationID, 0, "", "")
+		return client.GetLocationPlayersByLocationID(ctx, locationID, clashy.PageOptions{})
 	}},
 	{Kind: "player_versus_trophies", Load: func(ctx context.Context, client *clashy.Client, locationID string) (any, error) {
-		return client.GetLocationPlayersBuilderBaseByLocationID(ctx, locationID, 0, "", "")
+		return client.GetLocationPlayersBuilderBaseByLocationID(ctx, locationID, clashy.PageOptions{})
 	}},
+}
+
+var currentClanRankingPaths = []struct {
+	RankingType string
+	Load        currentClanRankingLoader
+	Points      func(clashy.RankedClan) int
+}{
+	{
+		RankingType: "home",
+		Load: func(ctx context.Context, client *clashy.Client, locationID string, page clashy.PageOptions) ([]clashy.RankedClan, error) {
+			return client.GetLocationClansByLocationID(ctx, locationID, page)
+		},
+		Points: func(clan clashy.RankedClan) int { return clan.Points },
+	},
+	{
+		RankingType: "builder_base",
+		Load: func(ctx context.Context, client *clashy.Client, locationID string, page clashy.PageOptions) ([]clashy.RankedClan, error) {
+			return client.GetLocationClansBuilderBaseByLocationID(ctx, locationID, page)
+		},
+		Points: func(clan clashy.RankedClan) int { return clan.BuilderBasePoints },
+	},
+	{
+		RankingType: "capital",
+		Load: func(ctx context.Context, client *clashy.Client, locationID string, page clashy.PageOptions) ([]clashy.RankedClan, error) {
+			return client.GetLocationClansCapitalByLocationID(ctx, locationID, page)
+		},
+		Points: func(clan clashy.RankedClan) int { return clan.CapitalPoints },
+	},
+}
+
+type currentClanRankingRow struct {
+	ClanTag   string
+	Rank      int
+	Points    int
+	UpdatedAt time.Time
+}
+
+type currentClanRankingGroup struct {
+	RankingType string
+	LocationID  string
+	Rows        []currentClanRankingRow
 }
 
 type scheduledDomain struct {
@@ -51,6 +95,7 @@ type scheduledDomain struct {
 type scheduledStore interface {
 	Close()
 	StoreSnapshots(context.Context, []models.LeaderboardSnapshotItemRow) error
+	ReplaceCurrentClanRankingGroup(context.Context, currentClanRankingGroup) (int, error)
 	ListRankedGroupTargets(context.Context) ([]string, error)
 	StorePlayerProfiles(context.Context, []models.PlayerProfileIngest, *time.Time) (int, error)
 	DeletePlayers(context.Context, []string) error
@@ -99,25 +144,39 @@ func validateScheduledConfig(cfg platform.Config) error {
 
 func newScheduledStore(ctx context.Context, app *platform.App) (scheduledStore, error) {
 	if app.Config.MockDB || app.Config.DryRun || app.Config.TimescaleURL == "" {
-		return memoryScheduledStore{}, nil
+		return newMemoryScheduledStore(), nil
 	}
 	return newTimescaleScheduledStore(ctx, app.Config.TimescaleURL)
 }
 
 func (d *scheduledDomain) runCycle(ctx context.Context, app *platform.App) error {
-	items, err := d.doLeaderboardSnapshots(ctx, app)
+	locationIDs, err := d.loadLeaderboardLocationIDs(ctx, app)
 	if err != nil {
 		return err
 	}
-	if err := d.store.StoreSnapshots(ctx, items); err != nil {
-		return err
-	}
-	app.Stats.RecordWrite(scheduledDomainName, len(items))
-	groupWrites, err := d.doRankedGroupDiscovery(ctx, app, time.Now().UTC())
+	now := time.Now().UTC()
+	var cycleErrors []error
+	items, err := d.doLeaderboardSnapshots(ctx, app, locationIDs, now)
 	if err != nil {
-		return err
+		cycleErrors = append(cycleErrors, err)
+	} else if err := d.store.StoreSnapshots(ctx, items); err != nil {
+		cycleErrors = append(cycleErrors, err)
+	} else {
+		app.Stats.RecordWrite(scheduledDomainName, len(items))
+	}
+	currentRankingWrites, err := d.doCurrentClanRankings(ctx, app, locationIDs, now)
+	app.Stats.RecordWrite(scheduledDomainName, currentRankingWrites)
+	if err != nil {
+		cycleErrors = append(cycleErrors, err)
+	}
+	groupWrites, err := d.doRankedGroupDiscovery(ctx, app, now)
+	if err != nil {
+		cycleErrors = append(cycleErrors, err)
 	}
 	app.Stats.RecordWrite(scheduledDomainName, groupWrites)
+	if err := errors.Join(cycleErrors...); err != nil {
+		return err
+	}
 	app.Stats.SetReady(scheduledDomainName, true, "")
 	return nil
 }
@@ -313,22 +372,29 @@ func previousRankedSeasonID(now time.Time) (int64, bool) {
 	return currentSeasonStart.AddDate(0, 0, -7).Unix(), true
 }
 
-func (d *scheduledDomain) doLeaderboardSnapshots(
+func (d *scheduledDomain) loadLeaderboardLocationIDs(
 	ctx context.Context,
 	app *platform.App,
-) ([]models.LeaderboardSnapshotItemRow, error) {
+) ([]string, error) {
 	locations, err := platform.RetryClashFetch(ctx, func(fetchCtx context.Context) ([]clashy.Location, error) {
 		start := time.Now()
-		locations, err := app.Clash.SearchLocations(fetchCtx, 0, "", "")
+		locations, err := app.Clash.SearchLocations(fetchCtx, clashy.PageOptions{})
 		app.Stats.RecordRequest(scheduledDomainName, time.Since(start), err)
 		return locations, err
 	})
 	if err != nil {
 		return nil, err
 	}
-	now := time.Now().UTC()
+	return leaderboardLocationIDs(locations), nil
+}
+
+func (d *scheduledDomain) doLeaderboardSnapshots(
+	ctx context.Context,
+	app *platform.App,
+	locationIDs []string,
+	now time.Time,
+) ([]models.LeaderboardSnapshotItemRow, error) {
 	date := dayStart(now)
-	locationIDs := leaderboardLocationIDs(locations)
 	itemRows := make([]models.LeaderboardSnapshotItemRow, 0, len(leaderboardPaths)*len(locationIDs)*200)
 	for _, locationID := range locationIDs {
 		for _, item := range leaderboardPaths {
@@ -353,16 +419,133 @@ func (d *scheduledDomain) doLeaderboardSnapshots(
 	return itemRows, nil
 }
 
+func (d *scheduledDomain) doCurrentClanRankings(
+	ctx context.Context,
+	app *platform.App,
+	locationIDs []string,
+	updatedAt time.Time,
+) (int, error) {
+	writes := 0
+	var groupErrors []error
+	for _, locationID := range locationIDs {
+		for _, path := range currentClanRankingPaths {
+			rankings, err := platform.RetryClashFetch(ctx, func(fetchCtx context.Context) ([]clashy.RankedClan, error) {
+				start := time.Now()
+				rankings, err := path.Load(fetchCtx, app.Clash, locationID, clashy.PageOptions{Limit: currentClanRankingLimit})
+				app.Stats.RecordRequest(scheduledDomainName, time.Since(start), err)
+				return rankings, err
+			})
+			if err != nil {
+				groupErrors = append(groupErrors, fmt.Errorf("fetch %s clan rankings for %s: %w", path.RankingType, locationID, err))
+				continue
+			}
+			group, err := currentClanRankingGroupFromResponse(
+				path.RankingType,
+				locationID,
+				rankings,
+				path.Points,
+				updatedAt,
+			)
+			if err != nil {
+				groupErrors = append(groupErrors, err)
+				continue
+			}
+			count, err := d.store.ReplaceCurrentClanRankingGroup(ctx, group)
+			if err != nil {
+				groupErrors = append(groupErrors, fmt.Errorf("replace %s clan rankings for %s: %w", path.RankingType, locationID, err))
+				continue
+			}
+			writes += count
+		}
+	}
+	return writes, errors.Join(groupErrors...)
+}
+
+func currentClanRankingGroupFromResponse(
+	rankingType string,
+	locationID string,
+	rankings []clashy.RankedClan,
+	points func(clashy.RankedClan) int,
+	updatedAt time.Time,
+) (currentClanRankingGroup, error) {
+	group := currentClanRankingGroup{
+		RankingType: rankingType,
+		LocationID:  locationID,
+		Rows:        make([]currentClanRankingRow, 0, len(rankings)),
+	}
+	if !validCurrentClanRankingType(rankingType) {
+		return currentClanRankingGroup{}, fmt.Errorf("unsupported clan ranking type %q", rankingType)
+	}
+	if locationID != "global" {
+		if _, err := strconv.Atoi(locationID); err != nil {
+			return currentClanRankingGroup{}, fmt.Errorf("invalid clan ranking location %q", locationID)
+		}
+	}
+	if len(rankings) > currentClanRankingLimit {
+		return currentClanRankingGroup{}, fmt.Errorf(
+			"oversized %s clan rankings for %s: got %d rows, limit %d",
+			rankingType,
+			locationID,
+			len(rankings),
+			currentClanRankingLimit,
+		)
+	}
+	seenTags := make(map[string]struct{}, len(rankings))
+	seenRanks := make(map[int]struct{}, len(rankings))
+	for _, ranking := range rankings {
+		score := points(ranking)
+		if ranking.Tag == "" || ranking.Rank < 1 || ranking.Rank > currentClanRankingLimit || score < 0 {
+			return currentClanRankingGroup{}, fmt.Errorf(
+				"incomplete %s clan ranking row for %s: tag %q rank %d points %d",
+				rankingType,
+				locationID,
+				ranking.Tag,
+				ranking.Rank,
+				score,
+			)
+		}
+		if _, ok := seenTags[ranking.Tag]; ok {
+			return currentClanRankingGroup{}, fmt.Errorf("duplicate clan %s in %s rankings for %s", ranking.Tag, rankingType, locationID)
+		}
+		if _, ok := seenRanks[ranking.Rank]; ok {
+			return currentClanRankingGroup{}, fmt.Errorf("duplicate rank %d in %s rankings for %s", ranking.Rank, rankingType, locationID)
+		}
+		seenTags[ranking.Tag] = struct{}{}
+		seenRanks[ranking.Rank] = struct{}{}
+		group.Rows = append(group.Rows, currentClanRankingRow{
+			ClanTag:   ranking.Tag,
+			Rank:      ranking.Rank,
+			Points:    score,
+			UpdatedAt: updatedAt.UTC(),
+		})
+	}
+	return group, nil
+}
+
+func validCurrentClanRankingType(value string) bool {
+	switch value {
+	case "home", "builder_base", "capital":
+		return true
+	default:
+		return false
+	}
+}
+
 func dayStart(value time.Time) time.Time {
 	return time.Date(value.Year(), value.Month(), value.Day(), 0, 0, 0, 0, time.UTC)
 }
 
 func leaderboardLocationIDs(locations []clashy.Location) []string {
 	out := make([]string, 0, len(locations)+1)
+	seen := make(map[int]struct{}, len(locations))
 	for _, location := range locations {
 		if location.ID == 0 {
 			continue
 		}
+		if _, ok := seen[location.ID]; ok {
+			continue
+		}
+		seen[location.ID] = struct{}{}
 		out = append(out, strconv.Itoa(location.ID))
 	}
 	return append(out, "global")
@@ -456,34 +639,129 @@ func (s *timescaleScheduledStore) StoreSnapshots(
 	if len(items) == 0 {
 		return nil
 	}
-	batch := &pgx.Batch{}
-	for _, item := range items {
-		raw, _ := json.Marshal(item.Data)
-		batch.Queue(`
-			INSERT INTO leaderboard_snapshot_items (
-				kind, location_id, date, tag, name, rank, data
-			)
-			VALUES ($1, $2, $3, $4, $5, $6, $7::jsonb)
-			ON CONFLICT (kind, location_id, date, tag) DO UPDATE SET
-				name = EXCLUDED.name,
-				rank = EXCLUDED.rank,
-				data = EXCLUDED.data
-			WHERE
-				leaderboard_snapshot_items.name IS DISTINCT FROM EXCLUDED.name OR
-				leaderboard_snapshot_items.rank IS DISTINCT FROM EXCLUDED.rank OR
-				leaderboard_snapshot_items.data IS DISTINCT FROM EXCLUDED.data
-		`, item.Kind, item.LocationID, item.Date, item.Tag, item.Name, item.Rank, string(raw))
-	}
 	tx, err := s.pool.Begin(ctx)
 	if err != nil {
 		return err
 	}
 	defer tx.Rollback(ctx)
-	err = utils.SendBatch(ctx, tx, batch)
-	if err == nil {
-		err = tx.Commit(ctx)
+	if _, err := tx.Exec(ctx, `
+		CREATE TEMP TABLE leaderboard_snapshot_items_stage
+		(LIKE leaderboard_snapshot_items)
+		ON COMMIT DROP
+	`); err != nil {
+		return err
 	}
-	return err
+	_, err = tx.CopyFrom(
+		ctx,
+		pgx.Identifier{"leaderboard_snapshot_items_stage"},
+		[]string{"kind", "location_id", "date", "tag", "name", "rank", "data"},
+		pgx.CopyFromSlice(len(items), func(index int) ([]any, error) {
+			item := items[index]
+			raw, err := json.Marshal(item.Data)
+			if err != nil {
+				return nil, err
+			}
+			return []any{item.Kind, item.LocationID, item.Date, item.Tag, item.Name, item.Rank, string(raw)}, nil
+		}),
+	)
+	if err != nil {
+		return err
+	}
+	if _, err := tx.Exec(ctx, `
+		INSERT INTO leaderboard_snapshot_items (
+			kind, location_id, date, tag, name, rank, data
+		)
+		SELECT kind, location_id, date, tag, name, rank, data
+		FROM leaderboard_snapshot_items_stage
+		ON CONFLICT (kind, location_id, date, tag) DO UPDATE SET
+			name = EXCLUDED.name,
+			rank = EXCLUDED.rank,
+			data = EXCLUDED.data
+		WHERE
+			leaderboard_snapshot_items.name IS DISTINCT FROM EXCLUDED.name OR
+			leaderboard_snapshot_items.rank IS DISTINCT FROM EXCLUDED.rank OR
+			leaderboard_snapshot_items.data IS DISTINCT FROM EXCLUDED.data
+	`); err != nil {
+		return err
+	}
+	return tx.Commit(ctx)
+}
+
+const replaceCurrentClanRankingGroupSQL = `
+	INSERT INTO clan_rankings_current (
+		clan_tag, ranking_type, location_id, rank, points, updated_at
+	)
+	SELECT clan_tag, $1, $2, rank, points, updated_at
+	FROM clan_rankings_current_stage
+	ON CONFLICT (clan_tag, ranking_type, location_id) DO UPDATE SET
+		rank = EXCLUDED.rank,
+		points = EXCLUDED.points,
+		updated_at = EXCLUDED.updated_at
+`
+
+const deleteStaleCurrentClanRankingGroupSQL = `
+	DELETE FROM clan_rankings_current AS current
+	WHERE current.ranking_type = $1
+	  AND current.location_id = $2
+	  AND NOT EXISTS (
+		SELECT 1
+		FROM clan_rankings_current_stage AS stage
+		WHERE stage.clan_tag = current.clan_tag
+	  )
+`
+
+func (s *timescaleScheduledStore) ReplaceCurrentClanRankingGroup(
+	ctx context.Context,
+	group currentClanRankingGroup,
+) (int, error) {
+	if len(group.Rows) > currentClanRankingLimit {
+		return 0, fmt.Errorf(
+			"refusing oversized %s clan ranking replacement for %s: got %d rows, limit %d",
+			group.RankingType,
+			group.LocationID,
+			len(group.Rows),
+			currentClanRankingLimit,
+		)
+	}
+	tx, err := s.pool.Begin(ctx)
+	if err != nil {
+		return 0, err
+	}
+	defer tx.Rollback(ctx)
+	if _, err := tx.Exec(ctx, `
+		CREATE TEMP TABLE clan_rankings_current_stage (
+			clan_tag text NOT NULL,
+			rank integer NOT NULL,
+			points integer NOT NULL,
+			updated_at timestamp with time zone NOT NULL
+		) ON COMMIT DROP
+	`); err != nil {
+		return 0, err
+	}
+	if len(group.Rows) > 0 {
+		if _, err := tx.CopyFrom(
+			ctx,
+			pgx.Identifier{"clan_rankings_current_stage"},
+			[]string{"clan_tag", "rank", "points", "updated_at"},
+			pgx.CopyFromSlice(len(group.Rows), func(index int) ([]any, error) {
+				row := group.Rows[index]
+				return []any{row.ClanTag, row.Rank, row.Points, row.UpdatedAt}, nil
+			}),
+		); err != nil {
+			return 0, err
+		}
+	}
+	if _, err := tx.Exec(ctx, replaceCurrentClanRankingGroupSQL, group.RankingType, group.LocationID); err != nil {
+		return 0, err
+	}
+	commandTag, err := tx.Exec(ctx, deleteStaleCurrentClanRankingGroupSQL, group.RankingType, group.LocationID)
+	if err != nil {
+		return 0, err
+	}
+	if err := tx.Commit(ctx); err != nil {
+		return 0, err
+	}
+	return len(group.Rows) + int(commandTag.RowsAffected()), nil
 }
 
 func (s *timescaleScheduledStore) ListRankedGroupTargets(ctx context.Context) ([]string, error) {
@@ -636,34 +914,59 @@ func (s *timescaleScheduledStore) MissingRankedGroupPlayers(ctx context.Context,
 	return tags, rows.Err()
 }
 
-type memoryScheduledStore struct{}
+type memoryScheduledStore struct {
+	currentClanRankings map[string]map[string]currentClanRankingRow
+}
 
-func (memoryScheduledStore) Close() {}
+func newMemoryScheduledStore() *memoryScheduledStore {
+	return &memoryScheduledStore{currentClanRankings: make(map[string]map[string]currentClanRankingRow)}
+}
 
-func (memoryScheduledStore) StoreSnapshots(
+func (*memoryScheduledStore) Close() {}
+
+func (*memoryScheduledStore) StoreSnapshots(
 	context.Context,
 	[]models.LeaderboardSnapshotItemRow,
 ) error {
 	return nil
 }
 
-func (memoryScheduledStore) ListRankedGroupTargets(context.Context) ([]string, error) {
+func (s *memoryScheduledStore) ReplaceCurrentClanRankingGroup(
+	_ context.Context,
+	group currentClanRankingGroup,
+) (int, error) {
+	key := group.RankingType + "\x00" + group.LocationID
+	replacement := make(map[string]currentClanRankingRow, len(group.Rows))
+	for _, row := range group.Rows {
+		replacement[row.ClanTag] = row
+	}
+	stale := 0
+	for clanTag := range s.currentClanRankings[key] {
+		if _, ok := replacement[clanTag]; !ok {
+			stale++
+		}
+	}
+	s.currentClanRankings[key] = replacement
+	return len(replacement) + stale, nil
+}
+
+func (*memoryScheduledStore) ListRankedGroupTargets(context.Context) ([]string, error) {
 	return nil, nil
 }
 
-func (memoryScheduledStore) StorePlayerProfiles(context.Context, []models.PlayerProfileIngest, *time.Time) (int, error) {
+func (*memoryScheduledStore) StorePlayerProfiles(context.Context, []models.PlayerProfileIngest, *time.Time) (int, error) {
 	return 0, nil
 }
 
-func (memoryScheduledStore) DeletePlayers(context.Context, []string) error {
+func (*memoryScheduledStore) DeletePlayers(context.Context, []string) error {
 	return nil
 }
 
-func (memoryScheduledStore) StoreRankedLeagueGroupMembers(context.Context, []models.RankedLeagueGroupMemberRow) (int, error) {
+func (*memoryScheduledStore) StoreRankedLeagueGroupMembers(context.Context, []models.RankedLeagueGroupMemberRow) (int, error) {
 	return 0, nil
 }
 
-func (memoryScheduledStore) MissingRankedGroupPlayers(context.Context, int64) ([]string, error) {
+func (*memoryScheduledStore) MissingRankedGroupPlayers(context.Context, int64) ([]string, error) {
 	return nil, nil
 }
 

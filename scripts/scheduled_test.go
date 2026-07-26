@@ -5,6 +5,8 @@ package scripts
 import (
 	"encoding/json"
 	"reflect"
+	"strconv"
+	"strings"
 	"testing"
 	"time"
 
@@ -41,11 +43,162 @@ func TestJSONAnyNormalizesStructPayloads(t *testing.T) {
 func TestLeaderboardLocationIDsAddsGlobal(t *testing.T) {
 	got := leaderboardLocationIDs([]clashy.Location{
 		{ID: 32000006, Name: "International"},
+		{ID: 0, Name: "Invalid"},
 		{ID: 32000007, Name: "Afghanistan"},
+		{ID: 32000006, Name: "Duplicate"},
 	})
 	want := []string{"32000006", "32000007", "global"}
 	if !reflect.DeepEqual(got, want) {
 		t.Fatalf("leaderboardLocationIDs = %#v, want %#v", got, want)
+	}
+}
+
+func TestCurrentClanRankingPathsUseExactTypes(t *testing.T) {
+	got := make([]string, 0, len(currentClanRankingPaths))
+	for _, path := range currentClanRankingPaths {
+		got = append(got, path.RankingType)
+	}
+	if want := []string{"home", "builder_base", "capital"}; !reflect.DeepEqual(got, want) {
+		t.Fatalf("current clan ranking types = %#v, want %#v", got, want)
+	}
+}
+
+func TestCurrentClanRankingGroupAcceptsAuthoritativeResponsesUpToTop200(t *testing.T) {
+	now := time.Date(2026, 7, 24, 12, 0, 0, 0, time.UTC)
+	rankings := rankedClansForCurrentTest()
+	cases := []struct {
+		rankingType string
+		points      func(clashy.RankedClan) int
+		want        int
+	}{
+		{rankingType: "home", points: func(row clashy.RankedClan) int { return row.Points }, want: 50001},
+		{rankingType: "builder_base", points: func(row clashy.RankedClan) int { return row.BuilderBasePoints }, want: 40001},
+		{rankingType: "capital", points: func(row clashy.RankedClan) int { return row.CapitalPoints }, want: 3001},
+	}
+	for _, tc := range cases {
+		t.Run(tc.rankingType, func(t *testing.T) {
+			group, err := currentClanRankingGroupFromResponse(tc.rankingType, "global", rankings, tc.points, now)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if group.RankingType != tc.rankingType || group.LocationID != "global" || len(group.Rows) != currentClanRankingLimit {
+				t.Fatalf("unexpected group: %#v", group)
+			}
+			if row := group.Rows[0]; row.ClanTag != "#CLAN001" || row.Rank != 1 || row.Points != tc.want || !row.UpdatedAt.Equal(now) {
+				t.Fatalf("unexpected first row: %#v", row)
+			}
+		})
+	}
+}
+
+func TestCurrentClanRankingGroupAcceptsShortAndEmptyAuthoritativeResponses(t *testing.T) {
+	now := time.Date(2026, 7, 24, 12, 0, 0, 0, time.UTC)
+	points := func(row clashy.RankedClan) int { return row.Points }
+	valid := rankedClansForCurrentTest()
+	for name, rankings := range map[string][]clashy.RankedClan{
+		"short": valid[:37],
+		"empty": {},
+	} {
+		t.Run(name, func(t *testing.T) {
+			group, err := currentClanRankingGroupFromResponse("home", "32000006", rankings, points, now)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if len(group.Rows) != len(rankings) {
+				t.Fatalf("stored rows = %d, want all %d authoritative rows", len(group.Rows), len(rankings))
+			}
+		})
+	}
+}
+
+func TestCurrentClanRankingGroupRejectsInvalidResponses(t *testing.T) {
+	now := time.Date(2026, 7, 24, 12, 0, 0, 0, time.UTC)
+	points := func(row clashy.RankedClan) int { return row.Points }
+	valid := rankedClansForCurrentTest()
+	tests := map[string][]clashy.RankedClan{
+		"oversized":       append(append([]clashy.RankedClan(nil), valid...), clashy.RankedClan{Clan: clashy.Clan{Tag: "#EXTRA", Points: 1}, Rank: 201}),
+		"duplicate_tag":   append([]clashy.RankedClan(nil), valid...),
+		"duplicate_rank":  append([]clashy.RankedClan(nil), valid...),
+		"negative_points": append([]clashy.RankedClan(nil), valid...),
+	}
+	tests["duplicate_tag"][1].Tag = tests["duplicate_tag"][0].Tag
+	tests["duplicate_rank"][1].Rank = tests["duplicate_rank"][0].Rank
+	tests["negative_points"][0].Points = -1
+	for name, rankings := range tests {
+		t.Run(name, func(t *testing.T) {
+			if _, err := currentClanRankingGroupFromResponse("home", "32000006", rankings, points, now); err == nil {
+				t.Fatal("invalid ranking response was accepted")
+			}
+		})
+	}
+	zeroPoints := append([]clashy.RankedClan(nil), valid[:1]...)
+	zeroPoints[0].Points = 0
+	if _, err := currentClanRankingGroupFromResponse("home", "32000006", zeroPoints, points, now); err != nil {
+		t.Fatalf("authoritative zero-point row was rejected: %v", err)
+	}
+	if _, err := currentClanRankingGroupFromResponse("players", "global", valid, points, now); err == nil {
+		t.Fatal("unsupported player ranking type was accepted")
+	}
+	if _, err := currentClanRankingGroupFromResponse("home", "us", valid, points, now); err == nil {
+		t.Fatal("non-numeric local location was accepted")
+	}
+}
+
+func TestMemoryScheduledStoreReplacesOnlyRequestedClanRankingGroup(t *testing.T) {
+	store := newMemoryScheduledStore()
+	now := time.Date(2026, 7, 24, 12, 0, 0, 0, time.UTC)
+	groups := []currentClanRankingGroup{
+		{RankingType: "home", LocationID: "global", Rows: []currentClanRankingRow{{ClanTag: "#OLD", Rank: 1, Points: 10, UpdatedAt: now}}},
+		{RankingType: "builder_base", LocationID: "global", Rows: []currentClanRankingRow{{ClanTag: "#BUILDER", Rank: 1, Points: 20, UpdatedAt: now}}},
+		{RankingType: "home", LocationID: "32000006", Rows: []currentClanRankingRow{{ClanTag: "#LOCAL", Rank: 1, Points: 30, UpdatedAt: now}}},
+	}
+	for _, group := range groups {
+		if _, err := store.ReplaceCurrentClanRankingGroup(t.Context(), group); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if _, err := store.ReplaceCurrentClanRankingGroup(t.Context(), currentClanRankingGroup{
+		RankingType: "home",
+		LocationID:  "global",
+		Rows:        []currentClanRankingRow{{ClanTag: "#NEW", Rank: 1, Points: 40, UpdatedAt: now}},
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if got := store.currentClanRankings["home\x00global"]; len(got) != 1 || got["#NEW"].Points != 40 {
+		t.Fatalf("home/global group was not replaced: %#v", got)
+	}
+	if got := store.currentClanRankings["builder_base\x00global"]; len(got) != 1 || got["#BUILDER"].Points != 20 {
+		t.Fatalf("builder/global group was touched: %#v", got)
+	}
+	if got := store.currentClanRankings["home\x0032000006"]; len(got) != 1 || got["#LOCAL"].Points != 30 {
+		t.Fatalf("home/local group was touched: %#v", got)
+	}
+	if _, err := store.ReplaceCurrentClanRankingGroup(t.Context(), currentClanRankingGroup{
+		RankingType: "home",
+		LocationID:  "global",
+		Rows:        nil,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if got := store.currentClanRankings["home\x00global"]; len(got) != 0 {
+		t.Fatalf("authoritative empty group did not clear stale rows: %#v", got)
+	}
+	if got := store.currentClanRankings["builder_base\x00global"]; len(got) != 1 || got["#BUILDER"].Points != 20 {
+		t.Fatalf("empty home/global replacement touched another group: %#v", got)
+	}
+}
+
+func TestCurrentClanRankingSQLScopesReplacementToOneGroup(t *testing.T) {
+	if !strings.Contains(replaceCurrentClanRankingGroupSQL, "ON CONFLICT (clan_tag, ranking_type, location_id)") {
+		t.Fatalf("upsert does not use the decision 10 primary key: %s", replaceCurrentClanRankingGroupSQL)
+	}
+	for _, predicate := range []string{"current.ranking_type = $1", "current.location_id = $2"} {
+		if !strings.Contains(deleteStaleCurrentClanRankingGroupSQL, predicate) {
+			t.Fatalf("stale delete missing group predicate %q: %s", predicate, deleteStaleCurrentClanRankingGroupSQL)
+		}
+	}
+	if !strings.Contains(deleteStaleCurrentClanRankingGroupSQL, "stage.clan_tag = current.clan_tag") {
+		t.Fatalf("stale delete does not preserve staged clan tags: %s", deleteStaleCurrentClanRankingGroupSQL)
 	}
 }
 
@@ -59,6 +212,22 @@ func TestLeaderboardPayloadHasItems(t *testing.T) {
 	if !leaderboardPayloadHasItems(struct{ Name string }{Name: "not a leaderboard slice"}) {
 		t.Fatal("non-collection payloads should be stored")
 	}
+}
+
+func rankedClansForCurrentTest() []clashy.RankedClan {
+	out := make([]clashy.RankedClan, 0, currentClanRankingLimit)
+	for rank := 1; rank <= currentClanRankingLimit; rank++ {
+		out = append(out, clashy.RankedClan{
+			Clan: clashy.Clan{
+				Tag:               "#CLAN" + strconv.Itoa(1000 + rank)[1:],
+				Points:            50000 + rank,
+				BuilderBasePoints: 40000 + rank,
+				CapitalPoints:     3000 + rank,
+			},
+			Rank: rank,
+		})
+	}
+	return out
 }
 
 func TestShouldStoreLeaderboardKindSkipsCapitalExceptTuesday(t *testing.T) {

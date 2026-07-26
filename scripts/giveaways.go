@@ -174,29 +174,60 @@ func (s *timescaleGiveawayStore) ClearPendingEvent(ctx context.Context, id strin
 	return err
 }
 
+// giveawayEventPayloadSQL is the complete bot event contract built only from
+// retained typed giveaway columns. Keep the existing snake_case database keys.
+const giveawayEventPayloadSQL = `jsonb_build_object(
+	'id', id,
+	'server_id', server_id,
+	'prize', prize,
+	'channel_id', channel_id,
+	'status', status,
+	'start_time', start_time,
+	'end_time', end_time,
+	'winners', winners,
+	'mentions', mentions,
+	'text_above_embed', text_above_embed,
+	'text_in_embed', text_in_embed,
+	'text_on_end', text_on_end,
+	'image_url', image_url,
+	'profile_picture_required', profile_picture_required,
+	'coc_account_required', coc_account_required,
+	'roles_mode', roles_mode,
+	'roles', roles,
+	'boosters', boosters,
+	'entries', entries,
+	'winners_list', winners_list,
+	'updated', updated,
+	'message_id', message_id,
+	'event_pending', event_pending,
+	'event_pending_at', event_pending_at,
+	'created_at', created_at,
+	'updated_at', updated_at
+)`
+
 const dueGiveawaysSQL = `
 	WITH pending AS (
 		SELECT event_pending AS kind, status AS from_status, status AS to_status,
-			id, server_id, status, updated, start_time, end_time, to_jsonb(giveaways) AS data,
+			id, server_id, status, updated, start_time, end_time, ` + giveawayEventPayloadSQL + ` AS data,
 			true AS event_due
 		FROM giveaways
 		WHERE event_pending IS NOT NULL
 	),
 	due AS (
 		SELECT 'giveaway_start' AS kind, 'scheduled' AS from_status, 'ongoing' AS to_status,
-			id, server_id, status, updated, start_time, end_time, to_jsonb(giveaways) AS data,
+			id, server_id, status, updated, start_time, end_time, ` + giveawayEventPayloadSQL + ` AS data,
 			false AS event_due
 		FROM giveaways
 		WHERE start_time <= $1 AND status = 'scheduled' AND event_pending IS NULL
 		UNION ALL
 		SELECT 'giveaway_end' AS kind, 'ongoing' AS from_status, 'ended' AS to_status,
-			id, server_id, status, updated, start_time, end_time, to_jsonb(giveaways) AS data,
+			id, server_id, status, updated, start_time, end_time, ` + giveawayEventPayloadSQL + ` AS data,
 			false AS event_due
 		FROM giveaways
 		WHERE end_time <= $1 AND status = 'ongoing' AND event_pending IS NULL
 		UNION ALL
 		SELECT 'giveaway_update' AS kind, 'ongoing' AS from_status, 'ongoing' AS to_status,
-			id, server_id, status, updated, start_time, end_time, to_jsonb(giveaways) AS data,
+			id, server_id, status, updated, start_time, end_time, ` + giveawayEventPayloadSQL + ` AS data,
 			false AS event_due
 		FROM giveaways
 		WHERE status = 'ongoing' AND updated = true AND event_pending IS NULL
@@ -217,7 +248,7 @@ const markGiveawayTransitionSQL = `
 		updated_at = now()
 	WHERE id = $1 AND status = $2 AND event_pending IS NULL
 	RETURNING $4 AS kind, $2 AS from_status, $3 AS to_status,
-		id, server_id, status, updated, start_time, end_time, to_jsonb(giveaways) AS data,
+		id, server_id, status, updated, start_time, end_time, ` + giveawayEventPayloadSQL + ` AS data,
 		true AS event_due
 `
 
