@@ -10,6 +10,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"log/slog"
 	"net/http"
 	"strings"
 	"time"
@@ -67,7 +68,8 @@ func (d *mobileEventsDomain) Run(ctx context.Context, app *platform.App) error {
 		client: app.Valkey,
 		cfg:    app.Config,
 		pool:   pool,
-		http:   http.DefaultClient,
+		http:   &http.Client{Timeout: 15 * time.Second},
+		logger: app.Logger,
 	}
 	if err := worker.ensureGroup(ctx); err != nil {
 		return err
@@ -76,7 +78,13 @@ func (d *mobileEventsDomain) Run(ctx context.Context, app *platform.App) error {
 		if err := ctx.Err(); err != nil {
 			return err
 		}
-		entries, err := worker.read(ctx)
+		entries, err := worker.claimPending(ctx)
+		if err == nil && len(entries) == 0 {
+			entries, err = worker.readPending(ctx)
+		}
+		if err == nil && len(entries) == 0 {
+			entries, err = worker.read(ctx)
+		}
 		if err != nil {
 			if valkey.IsValkeyNil(err) {
 				continue
@@ -96,10 +104,26 @@ func validateMobileEventsConfig(cfg platform.Config, client valkey.Client) error
 	if cfg.EventStreamName == "" {
 		return errors.New("events.stream is required for mobilepush")
 	}
+	if cfg.EventStreamReclaimIdleSeconds <= 0 {
+		return errors.New("events.reclaim_idle_seconds must be greater than zero for mobilepush")
+	}
 	if cfg.TimescaleURL == "" {
 		return errors.New("TIMESCALE_URL is required for mobilepush")
 	}
-	if (cfg.MobilePushAPNSBearerToken != "" || cfg.MobilePushFCMBearerToken != "") && cfg.MobilePushTokenKey == "" {
+	hasAPNSToken := cfg.MobilePushAPNSBearerToken != ""
+	hasAPNSBundle := cfg.MobilePushAPNSBundleID != ""
+	if hasAPNSToken != hasAPNSBundle {
+		return errors.New("both MOBILE_PUSH_APNS_BEARER_TOKEN and MOBILE_PUSH_APNS_BUNDLE_ID are required for APNS")
+	}
+	hasFCMToken := cfg.MobilePushFCMBearerToken != ""
+	hasFCMProject := cfg.MobilePushFCMProjectID != ""
+	if hasFCMToken != hasFCMProject {
+		return errors.New("both MOBILE_PUSH_FCM_BEARER_TOKEN and MOBILE_PUSH_FCM_PROJECT_ID are required for FCM")
+	}
+	if !hasAPNSToken && !hasFCMToken {
+		return errors.New("APNS or FCM credentials are required for mobilepush")
+	}
+	if cfg.MobilePushTokenKey == "" {
 		return errors.New("MOBILE_PUSH_TOKEN_KEY or ENCRYPTION_KEY is required for mobilepush delivery")
 	}
 	return nil
@@ -110,6 +134,7 @@ type mobileEventsWorker struct {
 	cfg    platform.Config
 	pool   *pgxpool.Pool
 	http   *http.Client
+	logger *slog.Logger
 }
 
 func (w *mobileEventsWorker) group() string {
@@ -151,6 +176,44 @@ func (w *mobileEventsWorker) read(ctx context.Context) ([]valkey.XRangeEntry, er
 		return nil, err
 	}
 	return result[w.cfg.EventStreamName], nil
+}
+
+func (w *mobileEventsWorker) readPending(ctx context.Context) ([]valkey.XRangeEntry, error) {
+	result, err := w.client.Do(ctx, w.client.B().Xreadgroup().
+		Group(w.group(), w.consumer()).
+		Count(50).
+		Streams().
+		Key(w.cfg.EventStreamName).
+		Id("0").
+		Build(),
+	).AsXRead()
+	if err != nil {
+		return nil, err
+	}
+	return result[w.cfg.EventStreamName], nil
+}
+
+func (w *mobileEventsWorker) claimPending(ctx context.Context) ([]valkey.XRangeEntry, error) {
+	minIdle := fmt.Sprintf("%d", w.cfg.EventStreamReclaimIdleSeconds*1000)
+	values, err := w.client.Do(ctx, w.client.B().Xautoclaim().
+		Key(w.cfg.EventStreamName).
+		Group(w.group()).
+		Consumer(w.consumer()).
+		MinIdleTime(minIdle).
+		Start("0-0").
+		Count(50).
+		Build(),
+	).ToArray()
+	if err != nil {
+		if valkey.IsValkeyNil(err) {
+			return nil, nil
+		}
+		return nil, err
+	}
+	if len(values) < 2 {
+		return nil, nil
+	}
+	return values[1].AsXRange()
 }
 
 func (w *mobileEventsWorker) processEntries(ctx context.Context, entries []valkey.XRangeEntry) error {
@@ -198,11 +261,11 @@ func (w *mobileEventsWorker) processEvent(ctx context.Context, event mobileWarEv
 		switch sub.Provider {
 		case "apns":
 			if err := w.sendAPNSNotification(ctx, sub.Environment, token, title, body); err != nil {
-				return err
+				w.logDeliveryError("mobile APNS delivery failed", "clan_tag", event.ClanTag, "err", err)
 			}
 		case "fcm":
 			if err := w.sendFCMNotification(ctx, token, title, body); err != nil {
-				return err
+				w.logDeliveryError("mobile FCM delivery failed", "clan_tag", event.ClanTag, "err", err)
 			}
 		}
 	}
@@ -263,7 +326,8 @@ func (w *mobileEventsWorker) updateLiveActivities(ctx context.Context, event mob
 			continue
 		}
 		if err := w.sendAPNSLiveActivity(ctx, activity.Environment, token, payload); err != nil {
-			return err
+			w.logDeliveryError("mobile live activity delivery failed", "activity_id", activity.ID, "clan_tag", event.ClanTag, "err", err)
+			continue
 		}
 		if _, err := w.pool.Exec(ctx, `
 			UPDATE mobile_live_activities
@@ -274,6 +338,12 @@ func (w *mobileEventsWorker) updateLiveActivities(ctx context.Context, event mob
 		}
 	}
 	return rows.Err()
+}
+
+func (w *mobileEventsWorker) logDeliveryError(message string, args ...any) {
+	if w.logger != nil {
+		w.logger.Error(message, args...)
+	}
 }
 
 func mobileEventFromEntry(entry valkey.XRangeEntry) (mobileWarEvent, bool) {

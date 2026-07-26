@@ -173,6 +173,37 @@ func TestPartialPostDeliveryRemainsRetryable(t *testing.T) {
 	}
 }
 
+func TestQueuedManualPostDeliveryCompletesClaimedAttempt(t *testing.T) {
+	store := newMemoryMobilePushStore()
+	now := time.Now().UTC()
+	post := models.AdminPost{ID: "post", Status: "live", AlsoPushOnPublish: false}
+	store.posts[post.ID] = post
+	store.attempts[post.ID] = []models.AdminPostDeliveryAttempt{{
+		ID: "attempt", PostID: post.ID, AttemptNumber: 1, Trigger: "manual", Status: "queued", AttemptedAt: now,
+	}}
+
+	claimed, err := store.ClaimDuePushRetries(context.Background(), now)
+	if err != nil || len(claimed) != 1 {
+		t.Fatalf("queued claim = %d, err=%v", len(claimed), err)
+	}
+	if got := store.attempts[post.ID]; len(got) != 1 || got[0].Status != "processing" {
+		t.Fatalf("processing attempts = %#v", got)
+	}
+
+	recorded, err := store.RecordDeliveryAttempt(context.Background(), models.AdminPostDeliveryAttempt{
+		PostID: post.ID, Trigger: "retry", EligibleCount: 1, SentCount: 1, Status: "sent",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if recorded.AttemptNumber != 1 || recorded.Trigger != "manual" {
+		t.Fatalf("recorded attempt = %#v", recorded)
+	}
+	if got := store.attempts[post.ID]; len(got) != 1 || got[0].Status != "sent" {
+		t.Fatalf("completed attempts = %#v", got)
+	}
+}
+
 func ptr[T any](value T) *T { return &value }
 
 func TestMergeAdminPostClearsNullableFields(t *testing.T) {

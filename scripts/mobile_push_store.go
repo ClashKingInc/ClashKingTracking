@@ -642,10 +642,25 @@ func (s *timescaleMobilePushStore) GetPostRevision(ctx context.Context, id strin
 }
 
 func (s *timescaleMobilePushStore) RecordDeliveryAttempt(ctx context.Context, attempt models.AdminPostDeliveryAttempt) (models.AdminPostDeliveryAttempt, error) {
-	err := s.pool.QueryRow(ctx, `INSERT INTO admin_post_delivery_attempts
-		(post_id, attempt_number, trigger, eligible_count, sent_count, skipped_count, status, error_summary)
-		VALUES ($1, COALESCE((SELECT max(attempt_number) + 1 FROM admin_post_delivery_attempts WHERE post_id = $1), 1), $2, $3, $4, $5, $6, $7)
-		RETURNING id, post_id, attempt_number, trigger, eligible_count, sent_count, skipped_count, status, error_summary, attempted_at`,
+	err := s.pool.QueryRow(ctx, `WITH updated AS (
+			UPDATE admin_post_delivery_attempts
+			SET eligible_count=$3, sent_count=$4, skipped_count=$5, status=$6, error_summary=$7, attempted_at=now()
+			WHERE id = (
+				SELECT id FROM admin_post_delivery_attempts
+				WHERE post_id=$1 AND status='processing'
+				ORDER BY attempt_number DESC LIMIT 1
+			)
+			RETURNING id, post_id, attempt_number, trigger, eligible_count, sent_count, skipped_count, status, error_summary, attempted_at
+		), inserted AS (
+			INSERT INTO admin_post_delivery_attempts
+				(post_id, attempt_number, trigger, eligible_count, sent_count, skipped_count, status, error_summary)
+			SELECT $1, COALESCE((SELECT max(attempt_number) + 1 FROM admin_post_delivery_attempts WHERE post_id = $1), 1), $2, $3, $4, $5, $6, $7
+			WHERE NOT EXISTS (SELECT 1 FROM updated)
+			RETURNING id, post_id, attempt_number, trigger, eligible_count, sent_count, skipped_count, status, error_summary, attempted_at
+		)
+		SELECT * FROM updated
+		UNION ALL
+		SELECT * FROM inserted`,
 		attempt.PostID, attempt.Trigger, attempt.EligibleCount, attempt.SentCount, attempt.SkippedCount, attempt.Status, attempt.ErrorSummary).
 		Scan(&attempt.ID, &attempt.PostID, &attempt.AttemptNumber, &attempt.Trigger, &attempt.EligibleCount, &attempt.SentCount, &attempt.SkippedCount, &attempt.Status, &attempt.ErrorSummary, &attempt.AttemptedAt)
 	return attempt, err
@@ -676,12 +691,16 @@ func (s *timescaleMobilePushStore) ClaimDuePushRetries(ctx context.Context, now 
 	}
 	defer tx.Rollback(ctx)
 	rows, err := tx.Query(ctx, `SELECT `+adminPostColumns+` FROM admin_posts p
-		WHERE p.status = 'live' AND p.also_push_on_publish = true AND p.push_sent_at IS NULL
-		  AND p.updated_at <= $1 - interval '2 minutes'
+		WHERE p.status = 'live' AND p.push_sent_at IS NULL
 		  AND EXISTS (
 			SELECT 1 FROM admin_post_delivery_attempts a WHERE a.post_id = p.id
 			  AND a.attempt_number = (SELECT max(a2.attempt_number) FROM admin_post_delivery_attempts a2 WHERE a2.post_id = p.id)
-			  AND a.status IN ('failed', 'partial') AND a.attempt_number < 3 AND a.attempted_at <= $1 - interval '2 minutes'
+			  AND a.status IN ('queued', 'processing', 'failed', 'partial') AND a.attempt_number < 4
+			  AND (
+				a.status = 'queued'
+				OR (a.status IN ('failed', 'partial') AND a.attempted_at <= $1 - interval '2 minutes')
+				OR (a.status = 'processing' AND a.attempted_at <= $1 - interval '5 minutes')
+			  )
 			  ) FOR UPDATE SKIP LOCKED`, now)
 	if err != nil {
 		return nil, err
@@ -701,7 +720,25 @@ func (s *timescaleMobilePushStore) ClaimDuePushRetries(ctx context.Context, now 
 	}
 	rows.Close()
 	for _, post := range out {
-		if _, err := tx.Exec(ctx, "UPDATE admin_posts SET updated_at=$2 WHERE id=$1", post.ID, now); err != nil {
+		if _, err := tx.Exec(ctx, `WITH latest AS (
+				SELECT post_id, attempt_number, status
+				FROM admin_post_delivery_attempts
+				WHERE post_id=$1
+				ORDER BY attempt_number DESC
+				LIMIT 1
+				FOR UPDATE
+			), retry AS (
+				INSERT INTO admin_post_delivery_attempts
+					(post_id, attempt_number, trigger, eligible_count, sent_count, skipped_count, status, attempted_at)
+				SELECT post_id, attempt_number + 1, 'retry', 0, 0, 0, 'processing', $2
+				FROM latest
+				WHERE status IN ('failed', 'partial')
+			)
+			UPDATE admin_post_delivery_attempts
+			SET status='processing', attempted_at=$2
+			WHERE post_id=$1
+			  AND attempt_number=(SELECT attempt_number FROM latest)
+			  AND status IN ('queued', 'processing')`, post.ID, now); err != nil {
 			return nil, err
 		}
 	}
@@ -1068,6 +1105,7 @@ func (s *timescaleMobilePushStore) DevicesForPlatforms(ctx context.Context, plat
 		 AND p.device_id = d.device_id
 		 AND p.environment = d.environment
 		WHERE d.enabled = true
+		  AND d.environment = 'production'
 		  AND d.authorization_status IN ('authorized', 'provisional')
 		  AND d.platform = ANY($1)
 		  AND p.enabled = true
@@ -1307,10 +1345,20 @@ func (s *memoryMobilePushStore) GetPostRevision(_ context.Context, id string, re
 }
 
 func (s *memoryMobilePushStore) RecordDeliveryAttempt(_ context.Context, attempt models.AdminPostDeliveryAttempt) (models.AdminPostDeliveryAttempt, error) {
+	attempts := s.attempts[attempt.PostID]
+	if len(attempts) > 0 && attempts[len(attempts)-1].Status == "processing" {
+		attempt.ID = attempts[len(attempts)-1].ID
+		attempt.AttemptNumber = attempts[len(attempts)-1].AttemptNumber
+		attempt.Trigger = attempts[len(attempts)-1].Trigger
+		attempt.AttemptedAt = time.Now().UTC()
+		attempts[len(attempts)-1] = attempt
+		s.attempts[attempt.PostID] = attempts
+		return attempt, nil
+	}
 	attempt.ID = uniqueSlug("attempt")
-	attempt.AttemptNumber = len(s.attempts[attempt.PostID]) + 1
+	attempt.AttemptNumber = len(attempts) + 1
 	attempt.AttemptedAt = time.Now().UTC()
-	s.attempts[attempt.PostID] = append(s.attempts[attempt.PostID], attempt)
+	s.attempts[attempt.PostID] = append(attempts, attempt)
 	return attempt, nil
 }
 
@@ -1330,11 +1378,28 @@ func (s *memoryMobilePushStore) ClaimDuePushRetries(_ context.Context, now time.
 		}
 		last := attempts[len(attempts)-1]
 		post := s.posts[id]
-		if post.Status == "live" && post.AlsoPushOnPublish && post.PushSentAt == nil && (last.Status == "failed" || last.Status == "partial") && last.AttemptNumber < 3 && !last.AttemptedAt.After(now.Add(-2*time.Minute)) && !post.UpdatedAt.After(now.Add(-2*time.Minute)) {
-			post.UpdatedAt = now
-			s.posts[id] = post
-			out = append(out, post)
+		if post.Status != "live" || post.PushSentAt != nil || last.AttemptNumber >= 4 {
+			continue
 		}
+		due := last.Status == "queued" ||
+			((last.Status == "failed" || last.Status == "partial") && !last.AttemptedAt.After(now.Add(-2*time.Minute))) ||
+			(last.Status == "processing" && !last.AttemptedAt.After(now.Add(-5*time.Minute)))
+		if !due {
+			continue
+		}
+		if last.Status == "failed" || last.Status == "partial" {
+			last = models.AdminPostDeliveryAttempt{
+				ID: uniqueSlug("attempt"), PostID: id, AttemptNumber: last.AttemptNumber + 1,
+				Trigger: "retry", Status: "processing", AttemptedAt: now,
+			}
+			s.attempts[id] = append(attempts, last)
+		} else {
+			last.Status = "processing"
+			last.AttemptedAt = now
+			attempts[len(attempts)-1] = last
+			s.attempts[id] = attempts
+		}
+		out = append(out, post)
 	}
 	return out, nil
 }
