@@ -14,13 +14,11 @@ import (
 	"clashking_tracking/internal/utils"
 
 	clashy "github.com/clashkinginc/clashy.go"
-	clashtracker "github.com/clashkinginc/clashy.go/tracker"
 	"github.com/jackc/pgx/v5/pgxpool"
 	valkey "github.com/valkey-io/valkey-go"
-	"go.mongodb.org/mongo-driver/v2/bson"
 )
 
-type botClanFetchFunc[T any] func(context.Context, string) (*T, int, error)
+type botClanFetchFunc[T any] func(context.Context, string) (*T, error)
 
 type TrackedItem[T any] struct {
 	Group   string
@@ -28,26 +26,82 @@ type TrackedItem[T any] struct {
 	Tag     string
 	Current *T
 	Raw     []byte
-	Retry   int
-}
-
-type botClanTrackedValue[T any] struct {
-	Current *T
-	Raw     []byte
-	Retry   int
 }
 
 const (
-	botClansDomainName = "botclans"
+	botClansDomainName        = "botclans"
+	botClanReminderTTL        = time.Minute
+	botClanReminderRetryDelay = time.Minute
+	capitalRaidCacheGrace     = 10 * time.Minute
 )
+
+var replaceCapitalRaidCacheScript = valkey.NewLuaScript(`
+	local clan_tag = ARGV[2]
+	local expires_at_ms = ARGV[3]
+	local member_key_prefix = ARGV[4]
+	local previous_members = redis.call('SMEMBERS', KEYS[2])
+
+	for _, player_tag in ipairs(previous_members) do
+		local member_key = member_key_prefix .. player_tag
+		if redis.call('GET', member_key) == clan_tag then
+			redis.call('DEL', member_key)
+		end
+	end
+
+	redis.call('DEL', KEYS[1], KEYS[2])
+	redis.call('SET', KEYS[1], ARGV[1], 'PXAT', expires_at_ms)
+
+	for index = 5, #ARGV do
+		local player_tag = ARGV[index]
+		redis.call('SADD', KEYS[2], player_tag)
+		redis.call('SET', member_key_prefix .. player_tag, clan_tag, 'PXAT', expires_at_ms)
+	end
+
+	if #ARGV >= 5 then
+		redis.call('PEXPIREAT', KEYS[2], expires_at_ms)
+	end
+
+	return #ARGV - 4
+`)
+
+var deleteCapitalRaidCacheScript = valkey.NewLuaScript(`
+	local clan_tag = ARGV[1]
+	local member_key_prefix = ARGV[2]
+	local previous_members = redis.call('SMEMBERS', KEYS[2])
+
+	for _, player_tag in ipairs(previous_members) do
+		local member_key = member_key_prefix .. player_tag
+		if redis.call('GET', member_key) == clan_tag then
+			redis.call('DEL', member_key)
+		end
+	end
+
+	return redis.call('DEL', KEYS[1], KEYS[2])
+`)
+
+type cachedWarReminders struct {
+	loadedAt time.Time
+	values   []warReminder
+}
+
+type cachedRaidReminders struct {
+	loadedAt time.Time
+	values   []raidReminder
+}
 
 type botClansDomain struct {
 	mu               sync.Mutex
 	scheduled        map[string]struct{}
-	targets          clashtracker.TagStore
+	targetsMu        sync.RWMutex
+	targets          []string
 	snapshots        botClanSnapshotStore
 	snapshotPrefix   string
 	cwlStateSnapshot string
+	store            botClanStore
+	capitalRaids     capitalRaidCache
+	reminderMu       sync.Mutex
+	warReminders     map[string]cachedWarReminders
+	raidReminders    map[string]cachedRaidReminders
 }
 
 func NewBotClansDomain() platform.Domain {
@@ -56,6 +110,9 @@ func NewBotClansDomain() platform.Domain {
 		snapshots: &memoryBotClanSnapshotStore{
 			values: make(map[string][]byte),
 		},
+		capitalRaids:  newMemoryCapitalRaidCache("botclans:snapshot:", time.Now),
+		warReminders:  make(map[string]cachedWarReminders),
+		raidReminders: make(map[string]cachedRaidReminders),
 	}
 }
 
@@ -65,40 +122,49 @@ func (d *botClansDomain) Run(ctx context.Context, app *platform.App) error {
 	if err := validateBotClansConfig(app.Config); err != nil {
 		return err
 	}
-	targetSource, err := newBotClanTargetStore(ctx, app)
+	store, err := newBotClanStore(ctx, app)
 	if err != nil {
 		return err
 	}
-	defer targetSource.Close()
-	targetSet, err := newScriptMemoryTargetSet(ctx, app, botClansDomainName, "targets", time.Duration(app.Config.BotClanTargetRefreshSeconds)*time.Second, targetSource.List)
+	defer store.Close()
+	d.store = store
+	targets, err := store.ListTargets(ctx)
 	if err != nil {
 		return err
 	}
-	d.targets = targetSet.Tags()
+	d.replaceTargets(app, targets)
 	d.snapshots = newBotClanSnapshotStore(app)
 	d.snapshotPrefix = app.Config.BotClanSnapshotPrefix
 	d.cwlStateSnapshot = app.Config.BotClanCWLStateSnapshot
+	d.capitalRaids = newCapitalRaidCache(app, d.snapshotPrefix)
 
 	rateLimit := app.Config.BotClanRequestsPerSecond
-	errCh := make(chan error, 4)
-	go func() {
-		errCh <- runBotClanTracker(ctx, app, targetSet, "clans", "clan", fetchClan(app), d.handleClanChange, rateLimit)
-	}()
-	go func() {
-		errCh <- runBotClanTracker(ctx, app, targetSet, "wars", "war", fetchWar(app), d.handleWarChange, rateLimit)
-	}()
-	go func() {
-		errCh <- runBotClanTracker(ctx, app, targetSet, "raids", "raid", fetchRaid(app), d.handleRaidChange, rateLimit)
-	}()
-	go targetSet.Run(ctx)
-	cwlLimiter, err := clashtracker.NewLimiter(rateLimit, rateLimit)
+	limiter, err := newTrackingLimiter(rateLimit)
 	if err != nil {
 		return err
 	}
+	trackerCtx, stopTrackers := context.WithCancel(ctx)
+	defer stopTrackers()
+	errCh := make(chan error, 4)
 	go func() {
-		errCh <- d.runCWLLoop(ctx, app, cwlLimiter)
+		errCh <- runBotClanTracker(trackerCtx, app, d, "clans", "clan", fetchClan(app), d.handleClanChange, limiter, rateLimit)
 	}()
-	return <-errCh
+	go func() {
+		errCh <- runBotClanTracker(trackerCtx, app, d, "wars", "war", fetchWar(app), d.handleWarChange, limiter, rateLimit)
+	}()
+	go func() {
+		errCh <- runBotClanTracker(trackerCtx, app, d, "raids", "raid", fetchRaid(app), d.handleRaidChange, limiter, rateLimit)
+	}()
+	go d.runTargetRefreshLoop(trackerCtx, app, store)
+	go func() {
+		errCh <- d.runCWLLoop(trackerCtx, app, limiter)
+	}()
+	firstErr := <-errCh
+	stopTrackers()
+	for range 3 {
+		<-errCh
+	}
+	return firstErr
 }
 
 func validateBotClansConfig(cfg platform.Config) error {
@@ -126,34 +192,70 @@ func validateBotClansConfig(cfg platform.Config) error {
 	return nil
 }
 
-type botClanTargetStore interface {
-	clashtracker.TagStore
-	Close() error
+type warReminder struct {
+	TriggerTime      string
+	MinutesRemaining int
 }
 
-type timescaleBotClanTargetStore struct {
+type raidReminder struct {
+	ID               string
+	ServerID         string
+	ClanTag          string
+	ChannelID        string
+	TriggerTime      string
+	MinutesRemaining int
+	CustomText       string
+	TownHalls        []int
+	Roles            []string
+	WarTypes         []string
+	AttackThreshold  int
+}
+
+func (r raidReminder) eventData() map[string]any {
+	return map[string]any{
+		"_id":              r.ID,
+		"server":           r.ServerID,
+		"type":             "Clan Capital",
+		"clan":             r.ClanTag,
+		"channel":          r.ChannelID,
+		"time":             r.TriggerTime,
+		"custom_text":      r.CustomText,
+		"townhalls":        r.TownHalls,
+		"roles":            r.Roles,
+		"types":            r.WarTypes,
+		"attack_threshold": r.AttackThreshold,
+	}
+}
+
+type botClanStore interface {
+	ListTargets(context.Context) ([]string, error)
+	ListWarReminders(context.Context, string) ([]warReminder, error)
+	ListRaidReminders(context.Context, string) ([]raidReminder, error)
+	Close()
+}
+
+type timescaleBotClanStore struct {
 	pool *pgxpool.Pool
 }
 
-func newBotClanTargetStore(ctx context.Context, app *platform.App) (botClanTargetStore, error) {
+func newBotClanStore(ctx context.Context, app *platform.App) (botClanStore, error) {
 	if app.Config.MockDB || app.Config.DryRun || app.Config.TimescaleURL == "" {
-		return memoryBotClanTargetStore{}, nil
+		return memoryBotClanStore{}, nil
 	}
 	pool, err := pgxpool.New(ctx, app.Config.TimescaleURL)
 	if err != nil {
 		return nil, err
 	}
-	return &timescaleBotClanTargetStore{pool: pool}, nil
+	return &timescaleBotClanStore{pool: pool}, nil
 }
 
-func (s *timescaleBotClanTargetStore) Close() error {
+func (s *timescaleBotClanStore) Close() {
 	if s != nil && s.pool != nil {
 		s.pool.Close()
 	}
-	return nil
 }
 
-func (s *timescaleBotClanTargetStore) List(ctx context.Context) ([]clashtracker.Target, error) {
+func (s *timescaleBotClanStore) ListTargets(ctx context.Context) ([]string, error) {
 	rows, err := s.pool.Query(ctx, `
 		SELECT DISTINCT tag
 		FROM server_clans
@@ -164,146 +266,212 @@ func (s *timescaleBotClanTargetStore) List(ctx context.Context) ([]clashtracker.
 		return nil, err
 	}
 	defer rows.Close()
-	var out []clashtracker.Target
+	var out []string
 	for rows.Next() {
 		var tag string
 		if err := rows.Scan(&tag); err != nil {
 			return nil, err
 		}
-		out = append(out, clashtracker.Target{Key: tag})
+		out = append(out, tag)
 	}
 	return out, rows.Err()
 }
 
-func (s *timescaleBotClanTargetStore) Add(context.Context, ...clashtracker.Target) error {
-	return nil
+func (s *timescaleBotClanStore) ListWarReminders(ctx context.Context, clanTag string) ([]warReminder, error) {
+	rows, err := s.pool.Query(ctx, `
+		SELECT DISTINCT COALESCE(trigger_time, ''), minutes_remaining
+		FROM reminders
+		WHERE clan_tag = $1 AND type = 1
+		ORDER BY minutes_remaining DESC
+	`, clanTag)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var out []warReminder
+	for rows.Next() {
+		var reminder warReminder
+		if err := rows.Scan(&reminder.TriggerTime, &reminder.MinutesRemaining); err != nil {
+			return nil, err
+		}
+		if reminder.TriggerTime == "" {
+			reminder.TriggerTime = strconv.Itoa(reminder.MinutesRemaining) + "min"
+		}
+		out = append(out, reminder)
+	}
+	return out, rows.Err()
 }
 
-func (s *timescaleBotClanTargetStore) Remove(context.Context, ...string) error {
-	return nil
+func (s *timescaleBotClanStore) ListRaidReminders(ctx context.Context, clanTag string) ([]raidReminder, error) {
+	rows, err := s.pool.Query(ctx, `
+		SELECT id::text, server_id, clan_tag, COALESCE(channel_id, ''),
+			COALESCE(trigger_time, ''), minutes_remaining, custom_text,
+			COALESCE(townhalls, '{}'::integer[]), roles, war_type_names,
+			COALESCE(trigger_threshold, 1)
+		FROM reminders
+		WHERE clan_tag = $1 AND type = 2
+		ORDER BY id
+	`, clanTag)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var out []raidReminder
+	for rows.Next() {
+		var reminder raidReminder
+		if err := rows.Scan(
+			&reminder.ID,
+			&reminder.ServerID,
+			&reminder.ClanTag,
+			&reminder.ChannelID,
+			&reminder.TriggerTime,
+			&reminder.MinutesRemaining,
+			&reminder.CustomText,
+			&reminder.TownHalls,
+			&reminder.Roles,
+			&reminder.WarTypes,
+			&reminder.AttackThreshold,
+		); err != nil {
+			return nil, err
+		}
+		if reminder.TriggerTime == "" {
+			reminder.TriggerTime = strconv.Itoa(reminder.MinutesRemaining) + "min"
+		}
+		out = append(out, reminder)
+	}
+	return out, rows.Err()
 }
 
-type memoryBotClanTargetStore struct {
+type memoryBotClanStore struct {
 	tags []string
 }
 
-func (s memoryBotClanTargetStore) Close() error { return nil }
+func (s memoryBotClanStore) Close() {}
 
-func (s memoryBotClanTargetStore) List(context.Context) ([]clashtracker.Target, error) {
-	targets := make([]clashtracker.Target, 0, len(s.tags))
-	for _, tag := range s.tags {
-		targets = append(targets, clashtracker.Target{Key: tag})
+func (s memoryBotClanStore) ListTargets(context.Context) ([]string, error) {
+	return append([]string(nil), s.tags...), nil
+}
+
+func (memoryBotClanStore) ListWarReminders(context.Context, string) ([]warReminder, error) {
+	return nil, nil
+}
+
+func (memoryBotClanStore) ListRaidReminders(context.Context, string) ([]raidReminder, error) {
+	return nil, nil
+}
+
+func (d *botClansDomain) targetTags() []string {
+	d.targetsMu.RLock()
+	defer d.targetsMu.RUnlock()
+	return append([]string(nil), d.targets...)
+}
+
+func (d *botClansDomain) replaceTargets(app *platform.App, targets []string) {
+	d.targetsMu.Lock()
+	d.targets = append(d.targets[:0], targets...)
+	d.targetsMu.Unlock()
+	for _, group := range []string{"clans", "wars", "raids"} {
+		app.Stats.SetTrackingTargets(trackingProgressName(botClansDomainName, group), len(targets))
 	}
-	return targets, nil
 }
 
-func (s memoryBotClanTargetStore) Add(context.Context, ...clashtracker.Target) error {
-	return nil
-}
-
-func (s memoryBotClanTargetStore) Remove(context.Context, ...string) error {
-	return nil
+func (d *botClansDomain) runTargetRefreshLoop(ctx context.Context, app *platform.App, source botClanStore) {
+	interval := time.Duration(app.Config.BotClanTargetRefreshSeconds) * time.Second
+	ticker := time.NewTicker(interval)
+	defer ticker.Stop()
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-ticker.C:
+		}
+		targets, err := source.ListTargets(ctx)
+		if err != nil {
+			app.Logger.Error("bot clan target refresh failed", "err", err)
+			app.Stats.SetReady(botClansDomainName, false, err.Error())
+			continue
+		}
+		d.replaceTargets(app, targets)
+		app.Logger.Info("refreshed bot clan targets", "count", len(targets))
+	}
 }
 
 func runBotClanTracker[T any](
 	ctx context.Context,
 	app *platform.App,
-	targetSet *scriptMemoryTargetSet,
+	domain *botClansDomain,
 	group string,
 	kind string,
 	fetch botClanFetchFunc[T],
 	handle func(context.Context, *platform.App, TrackedItem[T]) error,
+	limiter *clashy.Limiter,
 	rateLimit int,
 ) error {
 	progressName := trackingProgressName(botClansDomainName, group)
-	if err := targetSet.RegisterProgress(ctx, progressName); err != nil {
-		return err
-	}
-	tags := targetSet.Tags()
-	pager := targetSet.TargetPager()
-	runner, err := clashtracker.NewRunner[botClanTrackedValue[T]](clashtracker.Config[botClanTrackedValue[T]]{
-		Tags:              tags,
-		TargetPager:       pager,
-		RequestsPerSecond: rateLimit,
-		MaxInFlight:       rateLimit,
-		EmitInitial:       true,
-		Fetch: func(fetchCtx context.Context, target clashtracker.Target) (clashtracker.FetchResult[botClanTrackedValue[T]], error) {
-			defer targetSet.RecordTracked(progressName)
-			start := time.Now()
-			current, retry, err := fetch(fetchCtx, target.Key)
-			app.Stats.RecordRequest(botClansDomainName, time.Since(start), err)
+	for {
+		tags := domain.targetTags()
+		if len(tags) == 0 {
+			if err := sleepOrDone(ctx, time.Second); err != nil {
+				return err
+			}
+			continue
+		}
+		if err := runBounded(ctx, platform.RequestConcurrency(rateLimit), tags, func(workerCtx context.Context, tag string) error {
+			current, err := retryLimitedClashFetch(workerCtx, limiter, func(fetchCtx context.Context) (*T, error) {
+				start := time.Now()
+				current, err := fetch(fetchCtx, tag)
+				app.Stats.RecordRequest(botClansDomainName, time.Since(start), err)
+				return current, err
+			})
+			app.Stats.RecordTrackedTarget(progressName)
 			if err != nil {
-				return clashtracker.FetchResult[botClanTrackedValue[T]]{}, err
+				app.Logger.Error("bot clan fetch failed", "group", group, "tag", tag, "err", err)
+				app.Stats.SetReady(botClansDomainName, false, err.Error())
+				if _, ok := platform.ClashFetchRetryPolicy(err); ok || workerCtx.Err() != nil {
+					return err
+				}
+				return nil
 			}
-			value := botClanTrackedValue[T]{Current: current, Retry: retry}
+			var raw []byte
 			if current != nil {
-				value.Raw = jsonBytes(current)
+				raw = jsonBytes(current)
 			}
-			retryAfter := 15 * time.Second
-			if retry > 0 {
-				retryAfter = time.Duration(retry) * time.Second
-			}
-			return clashtracker.FetchResult[botClanTrackedValue[T]]{Value: value, RetryAfter: retryAfter}, nil
-		},
-		Handle: func(diffCtx context.Context, target clashtracker.Target, _ *botClanTrackedValue[T], current botClanTrackedValue[T]) error {
-			return handle(diffCtx, app, TrackedItem[T]{
+			return handle(workerCtx, app, TrackedItem[T]{
 				Group:   group,
 				Kind:    kind,
-				Tag:     target.Key,
-				Current: current.Current,
-				Raw:     current.Raw,
-				Retry:   current.Retry,
+				Tag:     tag,
+				Current: current,
+				Raw:     raw,
 			})
-		},
-		OnFetchError: func(_ context.Context, target clashtracker.Target, err error) (clashtracker.FetchErrorDecision, error) {
-			app.Logger.Error("bot clan fetch failed", "group", group, "tag", target.Key, "err", err)
-			app.Stats.SetReady(botClansDomainName, false, err.Error())
-			if decision, ok := platform.ClashFetchErrorDecision(err); ok {
-				return decision, nil
-			}
-			return clashtracker.FetchErrorDecision{Action: clashtracker.FetchErrorSkip}, nil
-		},
-	})
-	if err != nil {
-		return err
+		}); err != nil {
+			return err
+		}
 	}
-	targetSet.SetRunner(runner)
-	return runner.Run(ctx)
 }
 
 func fetchClan(app *platform.App) botClanFetchFunc[clashy.Clan] {
-	return func(ctx context.Context, tag string) (*clashy.Clan, int, error) {
-		clan, err := app.Clash.GetClan(ctx, tag)
-		retry := 0
-		if clan != nil {
-			retry = clan.RetryAfter()
-		}
-		return clan, retry, err
+	return func(ctx context.Context, tag string) (*clashy.Clan, error) {
+		return app.Clash.GetClan(ctx, tag)
 	}
 }
 
 func fetchWar(app *platform.App) botClanFetchFunc[clashy.ClanWar] {
-	return func(ctx context.Context, tag string) (*clashy.ClanWar, int, error) {
-		war, err := app.Clash.GetClanWar(ctx, tag)
-		retry := 0
-		if war != nil {
-			retry = war.RetryAfter()
-		}
-		return war, retry, err
+	return func(ctx context.Context, tag string) (*clashy.ClanWar, error) {
+		return app.Clash.GetClanWar(ctx, tag)
 	}
 }
 
 func fetchRaid(app *platform.App) botClanFetchFunc[clashy.RaidLogEntry] {
-	return func(ctx context.Context, tag string) (*clashy.RaidLogEntry, int, error) {
-		raids, err := app.Clash.GetRaidLog(ctx, tag, 1, "", "")
+	return func(ctx context.Context, tag string) (*clashy.RaidLogEntry, error) {
+		raids, err := app.Clash.GetRaidLog(ctx, tag, clashy.PageOptions{Limit: 1})
 		if err != nil {
-			return nil, 0, err
+			return nil, err
 		}
 		if len(raids) == 0 {
-			return &clashy.RaidLogEntry{}, 0, nil
+			return &clashy.RaidLogEntry{}, nil
 		}
 		raid := raids[0]
-		return &raid, raid.RetryAfter(), nil
+		return &raid, nil
 	}
 }
 
@@ -311,22 +479,24 @@ func (d *botClansDomain) handleClanChange(ctx context.Context, app *platform.App
 	if item.Current == nil {
 		return nil
 	}
-	_, raw, hasPrevious, changed, err := botClanSnapshotChanged(ctx, d.snapshots, d.snapshotPrefix, "clan", item.Tag, *item.Current, item.Raw)
+	_, raw, hasPrevious, changed, err := loadBotClanSnapshotChange(ctx, d.snapshots, d.snapshotPrefix, "clan", item.Tag, *item.Current, item.Raw)
 	if err != nil {
 		return err
 	}
-	if !hasPrevious || !changed {
+	if !changed {
 		return nil
 	}
-	app.Stats.SetReady(botClansDomainName, true, "")
-	if err := app.PublishEvent(ctx, platform.Event{
-		Topic:   "clan",
-		ClanTag: item.Tag,
-		Value:   map[string]any{"type": "clan_update", "raw": string(raw)},
-	}); err != nil {
-		return err
+	if hasPrevious {
+		app.Stats.SetReady(botClansDomainName, true, "")
+		if err := app.PublishEvent(ctx, platform.Event{
+			Topic:   "clan",
+			ClanTag: item.Tag,
+			Value:   map[string]any{"type": "clan_update", "raw": string(raw)},
+		}); err != nil {
+			return err
+		}
 	}
-	return nil
+	return d.snapshots.StoreRaw(ctx, botClanSnapshotKey(d.snapshotPrefix, "clan", item.Tag), raw)
 }
 
 func (d *botClansDomain) handleWarChange(ctx context.Context, app *platform.App, item TrackedItem[clashy.ClanWar]) error {
@@ -340,56 +510,65 @@ func (d *botClansDomain) handleWarChange(ctx context.Context, app *platform.App,
 	if err := d.scheduleWarReminders(ctx, app, item.Tag, current, item.Raw, "war"); err != nil {
 		return err
 	}
-	previous, raw, hasPrevious, changed, err := botClanSnapshotChanged(ctx, d.snapshots, d.snapshotPrefix, "war", item.Tag, current, item.Raw)
+	previous, raw, hasPrevious, changed, err := loadBotClanSnapshotChange(ctx, d.snapshots, d.snapshotPrefix, "war", item.Tag, current, item.Raw)
 	if err != nil {
 		return err
 	}
-	if !hasPrevious || !changed {
+	if !changed {
 		return nil
 	}
-
-	app.Stats.SetReady(botClansDomainName, true, "")
-	if err := app.PublishEvent(ctx, platform.Event{
-		Topic:   "war",
-		ClanTag: item.Tag,
-		Value:   map[string]any{"type": "war_update", "raw": string(raw)},
-	}); err != nil {
-		return err
-	}
-	if previous == nil {
-		return nil
-	}
-	if !sameWarIdentity(*previous, current) {
-		return app.PublishEvent(ctx, platform.Event{
-			Topic:   "war",
-			ClanTag: item.Tag,
-			Value:   map[string]any{"type": "new_war", "new_war": string(raw), "clan_tag": item.Tag},
-		})
-	}
-	if attacks := newWarAttacks(*previous, current); len(attacks) > 0 {
+	if hasPrevious {
+		app.Stats.SetReady(botClansDomainName, true, "")
 		if err := app.PublishEvent(ctx, platform.Event{
 			Topic:   "war",
 			ClanTag: item.Tag,
-			Value:   map[string]any{"type": "new_attacks", "war": string(raw), "attacks": attacks, "clan_tag": item.Tag},
+			Value:   map[string]any{"type": "war_update", "raw": string(raw)},
 		}); err != nil {
 			return err
 		}
+		if previous != nil {
+			if !sameWarIdentity(*previous, current) {
+				if err := app.PublishEvent(ctx, platform.Event{
+					Topic:   "war",
+					ClanTag: item.Tag,
+					Value:   map[string]any{"type": "new_war", "new_war": string(raw), "clan_tag": item.Tag},
+				}); err != nil {
+					return err
+				}
+			} else {
+				if attacks := newWarAttacks(*previous, current); len(attacks) > 0 {
+					if err := app.PublishEvent(ctx, platform.Event{
+						Topic:   "war",
+						ClanTag: item.Tag,
+						Value:   map[string]any{"type": "new_attacks", "war": string(raw), "attacks": attacks, "clan_tag": item.Tag},
+					}); err != nil {
+						return err
+					}
+				}
+				if previous.State != current.State {
+					if err := app.PublishEvent(ctx, platform.Event{
+						Topic:   "war",
+						ClanTag: item.Tag,
+						Value:   map[string]any{"type": "war_state", "old_state": previous.State, "new_state": current.State, "war": string(raw), "clan_tag": item.Tag},
+					}); err != nil {
+						return err
+					}
+				}
+			}
+		}
 	}
-	if previous.State != current.State {
-		return app.PublishEvent(ctx, platform.Event{
-			Topic:   "war",
-			ClanTag: item.Tag,
-			Value:   map[string]any{"type": "war_state", "old_state": previous.State, "new_state": current.State, "war": string(raw), "clan_tag": item.Tag},
-		})
-	}
-	return nil
+	return d.snapshots.StoreRaw(ctx, botClanSnapshotKey(d.snapshotPrefix, "war", item.Tag), raw)
 }
 
 func (d *botClansDomain) handleRaidChange(ctx context.Context, app *platform.App, item TrackedItem[clashy.RaidLogEntry]) error {
 	if item.Current == nil {
 		return nil
 	}
-	previous, raw, hasPrevious, changed, err := botClanSnapshotChanged(ctx, d.snapshots, d.snapshotPrefix, "raid", item.Tag, *item.Current, item.Raw)
+	expiresAt, ok := capitalRaidCacheExpiry(*item.Current, time.Now().UTC())
+	if !ok {
+		return d.capitalRaids.Delete(ctx, item.Tag)
+	}
+	previous, raw, hasPrevious, changed, err := loadCapitalRaidCacheChange(ctx, d.capitalRaids, item.Tag, *item.Current, item.Raw)
 	if err != nil {
 		return err
 	}
@@ -397,29 +576,285 @@ func (d *botClansDomain) handleRaidChange(ctx context.Context, app *platform.App
 		return err
 	}
 	if !changed {
-		return nil
+		return d.capitalRaids.Replace(ctx, item.Tag, capitalRaidParticipantTags(*item.Current), raw, expiresAt)
 	}
-	if err := app.Store.Stats().Collection("capital_cache").UpdateOne(ctx, bson.M{"tag": item.Tag}, bson.M{"$set": bson.M{"data": string(raw)}}, true); err != nil {
-		return err
-	}
-	if !hasPrevious {
-		return nil
-	}
-	app.Stats.RecordWrite(botClansDomainName, 1)
-	app.Stats.SetReady(botClansDomainName, true, "")
-	if err := app.PublishEvent(ctx, platform.Event{
-		Topic:   "capital",
-		ClanTag: item.Tag,
-		Value:   map[string]any{"type": "raid_update", "raw": string(raw)},
-	}); err != nil {
-		return err
-	}
-	if previous != nil {
-		if err := d.publishRaidDiffEvents(ctx, app, item.Tag, *previous, *item.Current, raw); err != nil {
+	if hasPrevious {
+		app.Stats.RecordWrite(botClansDomainName, 1)
+		app.Stats.SetReady(botClansDomainName, true, "")
+		if err := app.PublishEvent(ctx, platform.Event{
+			Topic:   "capital",
+			ClanTag: item.Tag,
+			Value:   map[string]any{"type": "raid_update", "raw": string(raw)},
+		}); err != nil {
 			return err
+		}
+		if previous != nil {
+			if err := d.publishRaidDiffEvents(ctx, app, item.Tag, *previous, *item.Current, raw); err != nil {
+				return err
+			}
+		}
+	}
+	return d.capitalRaids.Replace(ctx, item.Tag, capitalRaidParticipantTags(*item.Current), raw, expiresAt)
+}
+
+type capitalRaidCache interface {
+	LoadRaw(context.Context, string) ([]byte, bool, error)
+	Replace(context.Context, string, []string, []byte, time.Time) error
+	Delete(context.Context, string) error
+}
+
+type valkeyCapitalRaidCache struct {
+	client valkey.Client
+	prefix string
+}
+
+type memoryCapitalRaidCacheEntry struct {
+	compressed []byte
+	expiresAt  time.Time
+	members    map[string]struct{}
+}
+
+type memoryCapitalRaidMemberMapping struct {
+	clanTag   string
+	expiresAt time.Time
+}
+
+type memoryCapitalRaidCache struct {
+	mu       sync.Mutex
+	prefix   string
+	now      func() time.Time
+	entries  map[string]memoryCapitalRaidCacheEntry
+	mappings map[string]memoryCapitalRaidMemberMapping
+}
+
+func newCapitalRaidCache(app *platform.App, prefix string) capitalRaidCache {
+	if app.Valkey != nil {
+		return valkeyCapitalRaidCache{client: app.Valkey, prefix: prefix}
+	}
+	return newMemoryCapitalRaidCache(prefix, time.Now)
+}
+
+func newMemoryCapitalRaidCache(prefix string, now func() time.Time) *memoryCapitalRaidCache {
+	return &memoryCapitalRaidCache{
+		prefix:   prefix,
+		now:      now,
+		entries:  make(map[string]memoryCapitalRaidCacheEntry),
+		mappings: make(map[string]memoryCapitalRaidMemberMapping),
+	}
+}
+
+func (s valkeyCapitalRaidCache) LoadRaw(ctx context.Context, clanTag string) ([]byte, bool, error) {
+	value, err := s.client.Do(ctx, s.client.B().Get().Key(capitalRaidPayloadKey(s.prefix, clanTag)).Build()).ToString()
+	if err != nil {
+		if valkey.IsValkeyNil(err) {
+			return nil, false, nil
+		}
+		return nil, false, err
+	}
+	raw, err := utils.Decompress([]byte(value))
+	if err != nil {
+		return nil, false, err
+	}
+	return raw, true, nil
+}
+
+func (s valkeyCapitalRaidCache) Replace(
+	ctx context.Context,
+	clanTag string,
+	participantTags []string,
+	raw []byte,
+	expiresAt time.Time,
+) error {
+	if !expiresAt.After(time.Now()) {
+		return errors.New("capital raid cache expiry must be in the future")
+	}
+	args := []string{
+		string(utils.Compress(raw)),
+		clanTag,
+		strconv.FormatInt(expiresAt.UTC().UnixMilli(), 10),
+		capitalRaidMemberKeyPrefix(s.prefix),
+	}
+	args = append(args, participantTags...)
+	return replaceCapitalRaidCacheScript.Exec(
+		ctx,
+		s.client,
+		[]string{
+			capitalRaidPayloadKey(s.prefix, clanTag),
+			capitalRaidParticipantSetKey(s.prefix, clanTag),
+		},
+		args,
+	).Error()
+}
+
+func (s valkeyCapitalRaidCache) Delete(ctx context.Context, clanTag string) error {
+	return deleteCapitalRaidCacheScript.Exec(
+		ctx,
+		s.client,
+		[]string{
+			capitalRaidPayloadKey(s.prefix, clanTag),
+			capitalRaidParticipantSetKey(s.prefix, clanTag),
+		},
+		[]string{clanTag, capitalRaidMemberKeyPrefix(s.prefix)},
+	).Error()
+}
+
+func (s *memoryCapitalRaidCache) LoadRaw(_ context.Context, clanTag string) ([]byte, bool, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.removeExpiredLocked(s.now().UTC())
+	entry, ok := s.entries[clanTag]
+	if !ok {
+		return nil, false, nil
+	}
+	raw, err := utils.Decompress(entry.compressed)
+	if err != nil {
+		return nil, false, err
+	}
+	return raw, true, nil
+}
+
+func (s *memoryCapitalRaidCache) Replace(
+	_ context.Context,
+	clanTag string,
+	participantTags []string,
+	raw []byte,
+	expiresAt time.Time,
+) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	now := s.now().UTC()
+	expiresAt = expiresAt.UTC()
+	s.removeExpiredLocked(now)
+	if !expiresAt.After(now) {
+		return errors.New("capital raid cache expiry must be in the future")
+	}
+	if previous, ok := s.entries[clanTag]; ok {
+		for playerTag := range previous.members {
+			if mapping, exists := s.mappings[playerTag]; exists && mapping.clanTag == clanTag {
+				delete(s.mappings, playerTag)
+			}
+		}
+	}
+	members := make(map[string]struct{}, len(participantTags))
+	for _, playerTag := range participantTags {
+		members[playerTag] = struct{}{}
+		s.mappings[playerTag] = memoryCapitalRaidMemberMapping{
+			clanTag:   clanTag,
+			expiresAt: expiresAt,
+		}
+	}
+	s.entries[clanTag] = memoryCapitalRaidCacheEntry{
+		compressed: utils.Compress(raw),
+		expiresAt:  expiresAt,
+		members:    members,
+	}
+	return nil
+}
+
+func (s *memoryCapitalRaidCache) Delete(_ context.Context, clanTag string) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.removeExpiredLocked(s.now().UTC())
+	entry, ok := s.entries[clanTag]
+	if !ok {
+		return nil
+	}
+	delete(s.entries, clanTag)
+	for playerTag := range entry.members {
+		if mapping, exists := s.mappings[playerTag]; exists && mapping.clanTag == clanTag {
+			delete(s.mappings, playerTag)
 		}
 	}
 	return nil
+}
+
+func (s *memoryCapitalRaidCache) removeExpiredLocked(now time.Time) {
+	for clanTag, entry := range s.entries {
+		if entry.expiresAt.After(now) {
+			continue
+		}
+		delete(s.entries, clanTag)
+		for playerTag := range entry.members {
+			if mapping, ok := s.mappings[playerTag]; ok && mapping.clanTag == clanTag {
+				delete(s.mappings, playerTag)
+			}
+		}
+	}
+	for playerTag, mapping := range s.mappings {
+		if !mapping.expiresAt.After(now) {
+			delete(s.mappings, playerTag)
+		}
+	}
+}
+
+func capitalRaidPayloadKey(prefix, clanTag string) string {
+	return botClanSnapshotKey(prefix, "raid", clanTag)
+}
+
+func capitalRaidParticipantSetKey(prefix, clanTag string) string {
+	return prefix + "raid-members:" + clanTag
+}
+
+func capitalRaidMemberKeyPrefix(prefix string) string {
+	return prefix + "raid-member:"
+}
+
+func capitalRaidMemberKey(prefix, playerTag string) string {
+	return capitalRaidMemberKeyPrefix(prefix) + playerTag
+}
+
+func capitalRaidCacheExpiry(raid clashy.RaidLogEntry, now time.Time) (time.Time, bool) {
+	if raid.EndTime == nil || raid.EndTime.Time.IsZero() {
+		return time.Time{}, false
+	}
+	expiresAt := raid.EndTime.Time.UTC().Add(capitalRaidCacheGrace)
+	if !expiresAt.After(now.UTC()) {
+		return time.Time{}, false
+	}
+	return expiresAt, true
+}
+
+func capitalRaidParticipantTags(raid clashy.RaidLogEntry) []string {
+	seen := make(map[string]struct{}, len(raid.Members))
+	tags := make([]string, 0, len(raid.Members))
+	for _, member := range raid.Members {
+		if member.Tag == "" {
+			continue
+		}
+		if _, ok := seen[member.Tag]; ok {
+			continue
+		}
+		seen[member.Tag] = struct{}{}
+		tags = append(tags, member.Tag)
+	}
+	return tags
+}
+
+func loadCapitalRaidCacheChange(
+	ctx context.Context,
+	cache capitalRaidCache,
+	clanTag string,
+	current clashy.RaidLogEntry,
+	raw []byte,
+) (*clashy.RaidLogEntry, []byte, bool, bool, error) {
+	if len(raw) == 0 {
+		raw = jsonBytes(current)
+	}
+	previousRaw, hasPrevious, err := cache.LoadRaw(ctx, clanTag)
+	if err != nil {
+		return nil, raw, false, false, err
+	}
+	if hasPrevious && bytes.Equal(previousRaw, raw) {
+		return nil, raw, true, false, nil
+	}
+	var previous *clashy.RaidLogEntry
+	if hasPrevious {
+		var decoded clashy.RaidLogEntry
+		if err := json.Unmarshal(previousRaw, &decoded); err == nil {
+			previous = &decoded
+		}
+	}
+	return previous, raw, hasPrevious, true, nil
 }
 
 type botClanSnapshotStore interface {
@@ -487,7 +922,7 @@ func botClanSnapshotKey(prefix, kind, tag string) string {
 	return prefix + kind + ":" + tag
 }
 
-func botClanSnapshotChanged[T any](
+func loadBotClanSnapshotChange[T any](
 	ctx context.Context,
 	store botClanSnapshotStore,
 	prefix string,
@@ -506,9 +941,6 @@ func botClanSnapshotChanged[T any](
 	}
 	if hasPrevious && bytes.Equal(previousRaw, raw) {
 		return nil, raw, true, false, nil
-	}
-	if err := store.StoreRaw(ctx, key, raw); err != nil {
-		return nil, raw, hasPrevious, false, err
 	}
 	var previous *T
 	if hasPrevious {
@@ -569,88 +1001,65 @@ func warAttackKey(attack clashy.WarAttack) string {
 }
 
 func (d *botClansDomain) scheduleWarReminders(ctx context.Context, app *platform.App, clanTag string, war clashy.ClanWar, raw []byte, kind string) error {
-	if war.EndTime == nil || war.EndTime.Time.IsZero() || app.Scheduler == nil || app.Store == nil {
+	if war.EndTime == nil || war.EndTime.Time.IsZero() || app.Scheduler == nil || d.store == nil {
 		return nil
 	}
 	if len(raw) == 0 {
 		raw = jsonBytes(war)
 	}
-	reminderTimes, err := app.Store.Static().Collection("reminders").DistinctStrings(ctx, "time", bson.M{"clan": clanTag, "type": "War"})
+	reminders, err := d.loadWarReminders(ctx, clanTag)
 	if err != nil {
 		return err
 	}
 	now := time.Now().UTC()
-	for _, reminder := range reminderTimes {
-		hours, err := parseReminderHours(reminder)
-		if err != nil {
-			continue
-		}
-		runAt := war.EndTime.Time.UTC().Add(-time.Duration(hours * float64(time.Hour)))
+	for _, reminder := range reminders {
+		runAt := war.EndTime.Time.UTC().Add(-time.Duration(reminder.MinutesRemaining) * time.Minute)
 		if !runAt.After(now) {
 			continue
 		}
-		jobID := "war_end:" + kind + ":" + clanTag + ":" + reminder + ":" + war.EndTime.RawTime
+		jobID := "war_end:" + kind + ":" + clanTag + ":" + reminder.TriggerTime + ":" + war.EndTime.RawTime
 		if !d.scheduleOnce(jobID) {
 			continue
 		}
-		reminder := reminder
+		reminderTime := reminder.TriggerTime
 		raw := append([]byte(nil), raw...)
-		app.Scheduler.Schedule(platform.Job{
-			ID:   jobID,
-			When: runAt,
-			Run: func(ctx context.Context) {
-				_ = app.PublishEvent(ctx, platform.Event{
-					Topic:   "reminder",
-					ClanTag: clanTag,
-					Value: map[string]any{
-						"type":     "war",
-						"war_type": kind,
-						"time":     reminder,
-						"data":     string(raw),
-					},
-				})
-			},
+		d.scheduleReminderDelivery(app, jobID, runAt, func(ctx context.Context) error {
+			return app.PublishEvent(ctx, platform.Event{
+				Topic:   "reminder",
+				ClanTag: clanTag,
+				Value: map[string]any{
+					"type":     "war",
+					"war_type": kind,
+					"time":     reminderTime,
+					"data":     string(raw),
+				},
+			})
 		})
 	}
 	return nil
 }
 
 func (d *botClansDomain) scheduleRaidReminders(ctx context.Context, app *platform.App, clanTag string, raid clashy.RaidLogEntry) error {
-	if raid.EndTime == nil || raid.EndTime.Time.IsZero() || app.Scheduler == nil || app.Store == nil {
+	if raid.EndTime == nil || raid.EndTime.Time.IsZero() || app.Scheduler == nil || d.store == nil {
 		return nil
 	}
-	reminders, err := app.Store.Static().Collection("reminders").FindAll(ctx, bson.M{"clan": clanTag, "type": "Clan Capital"}, platform.FindOptions{})
+	reminders, err := d.loadRaidReminders(ctx, clanTag)
 	if err != nil {
 		return err
 	}
 	now := time.Now().UTC()
 	for _, reminder := range reminders {
-		if reminder["clan"] != nil && reminder["clan"] != clanTag {
-			continue
-		}
-		if reminder["type"] != nil && reminder["type"] != "Clan Capital" {
-			continue
-		}
-		timeValue, _ := reminder["time"].(string)
-		hours, err := parseReminderHours(timeValue)
-		if err != nil {
-			continue
-		}
-		runAt := raid.EndTime.Time.UTC().Add(-time.Duration(hours * float64(time.Hour)))
+		runAt := raid.EndTime.Time.UTC().Add(-time.Duration(reminder.MinutesRemaining) * time.Minute)
 		if !runAt.After(now) {
 			continue
 		}
-		jobID := "raid_end:" + clanTag + ":" + timeValue + ":" + raid.EndTime.RawTime
+		jobID := "raid_end:" + clanTag + ":" + reminder.ID + ":" + raid.EndTime.RawTime
 		if !d.scheduleOnce(jobID) {
 			continue
 		}
-		reminder := cloneReminder(reminder)
-		app.Scheduler.Schedule(platform.Job{
-			ID:   jobID,
-			When: runAt,
-			Run: func(ctx context.Context) {
-				_ = d.publishRaidReminder(ctx, app, clanTag, reminder)
-			},
+		reminder := reminder
+		d.scheduleReminderDelivery(app, jobID, runAt, func(ctx context.Context) error {
+			return d.publishRaidReminder(ctx, app, clanTag, reminder)
 		})
 	}
 	return nil
@@ -666,16 +1075,88 @@ func (d *botClansDomain) scheduleOnce(jobID string) bool {
 	return true
 }
 
-func (d *botClansDomain) publishRaidReminder(ctx context.Context, app *platform.App, clanTag string, reminder bson.M) error {
+func (d *botClansDomain) forgetScheduled(jobID string) {
+	d.mu.Lock()
+	delete(d.scheduled, jobID)
+	d.mu.Unlock()
+}
+
+func (d *botClansDomain) scheduleReminderDelivery(
+	app *platform.App,
+	jobID string,
+	when time.Time,
+	publish func(context.Context) error,
+) {
+	app.Scheduler.Schedule(platform.Job{
+		ID:   jobID,
+		When: when,
+		Run: func(ctx context.Context) {
+			if err := publish(ctx); err != nil {
+				if ctx.Err() != nil {
+					return
+				}
+				app.Logger.Error("bot clan reminder delivery failed", "job_id", jobID, "err", err)
+				app.Stats.SetReady(botClansDomainName, false, err.Error())
+				d.scheduleReminderDelivery(app, jobID, time.Now().UTC().Add(botClanReminderRetryDelay), publish)
+				return
+			}
+			d.forgetScheduled(jobID)
+		},
+	})
+}
+
+func (d *botClansDomain) loadWarReminders(ctx context.Context, clanTag string) ([]warReminder, error) {
+	now := time.Now()
+	d.reminderMu.Lock()
+	if cached, ok := d.warReminders[clanTag]; ok && now.Sub(cached.loadedAt) < botClanReminderTTL {
+		values := append([]warReminder(nil), cached.values...)
+		d.reminderMu.Unlock()
+		return values, nil
+	}
+	d.reminderMu.Unlock()
+	values, err := d.store.ListWarReminders(ctx, clanTag)
+	if err != nil {
+		return nil, err
+	}
+	d.reminderMu.Lock()
+	d.warReminders[clanTag] = cachedWarReminders{loadedAt: now, values: append([]warReminder(nil), values...)}
+	d.reminderMu.Unlock()
+	return values, nil
+}
+
+func (d *botClansDomain) loadRaidReminders(ctx context.Context, clanTag string) ([]raidReminder, error) {
+	now := time.Now()
+	d.reminderMu.Lock()
+	if cached, ok := d.raidReminders[clanTag]; ok && now.Sub(cached.loadedAt) < botClanReminderTTL {
+		values := append([]raidReminder(nil), cached.values...)
+		d.reminderMu.Unlock()
+		return values, nil
+	}
+	d.reminderMu.Unlock()
+	values, err := d.store.ListRaidReminders(ctx, clanTag)
+	if err != nil {
+		return nil, err
+	}
+	d.reminderMu.Lock()
+	d.raidReminders[clanTag] = cachedRaidReminders{loadedAt: now, values: append([]raidReminder(nil), values...)}
+	d.reminderMu.Unlock()
+	return values, nil
+}
+
+func (d *botClansDomain) publishRaidReminder(ctx context.Context, app *platform.App, clanTag string, reminder raidReminder) error {
 	clan, _, ok, err := loadBotClanSnapshot[clashy.Clan](ctx, d.snapshots, d.snapshotPrefix, "clan", clanTag)
 	if err != nil || !ok {
 		return err
 	}
-	raid, _, ok, err := loadBotClanSnapshot[clashy.RaidLogEntry](ctx, d.snapshots, d.snapshotPrefix, "raid", clanTag)
+	raw, ok, err := d.capitalRaids.LoadRaw(ctx, clanTag)
 	if err != nil || !ok {
 		return err
 	}
-	missing := raidMissingMembers(*clan, *raid, reminder)
+	var raid clashy.RaidLogEntry
+	if err := json.Unmarshal(raw, &raid); err != nil {
+		return err
+	}
+	missing := raidMissingMembers(*clan, raid, reminder)
 	if len(missing) == 0 {
 		return nil
 	}
@@ -685,8 +1166,8 @@ func (d *botClansDomain) publishRaidReminder(ctx context.Context, app *platform.
 		Value: map[string]any{
 			"type":          "raid",
 			"clan_data":     clan,
-			"raid_data":     raid,
-			"reminder_data": reminder,
+			"raid_data":     &raid,
+			"reminder_data": reminder.eventData(),
 			"missing":       missing,
 		},
 	})
@@ -726,10 +1207,10 @@ func changedRaidMemberAttacks(previous, current clashy.RaidLogEntry) []string {
 	return out
 }
 
-func raidMissingMembers(clan clashy.Clan, raid clashy.RaidLogEntry, reminder bson.M) []map[string]any {
-	threshold := intFromAny(reminder["attack_threshold"])
-	roles := stringList(reminder["roles"])
-	townHalls := intList(reminder["townhalls"])
+func raidMissingMembers(clan clashy.Clan, raid clashy.RaidLogEntry, reminder raidReminder) []map[string]any {
+	threshold := reminder.AttackThreshold
+	roles := reminder.Roles
+	townHalls := reminder.TownHalls
 	raidMembers := make(map[string]clashy.RaidMember)
 	for _, member := range raid.Members {
 		raidMembers[member.Tag] = member
@@ -781,7 +1262,7 @@ type botCWLState struct {
 	NoSpin           bool   `json:"no_spin,omitempty"`
 }
 
-func (d *botClansDomain) runCWLLoop(ctx context.Context, app *platform.App, limiter *clashtracker.Limiter) error {
+func (d *botClansDomain) runCWLLoop(ctx context.Context, app *platform.App, limiter *clashy.Limiter) error {
 	interval := time.Duration(app.Config.WarCWLSyncSeconds) * time.Second
 	if interval <= 0 {
 		interval = 3 * time.Minute
@@ -799,11 +1280,8 @@ func (d *botClansDomain) runCWLLoop(ctx context.Context, app *platform.App, limi
 	}
 }
 
-func (d *botClansDomain) runCWLCycle(ctx context.Context, app *platform.App, limiter *clashtracker.Limiter) error {
-	tags, err := collectTagStoreTags(ctx, d.targets)
-	if err != nil {
-		return err
-	}
+func (d *botClansDomain) runCWLCycle(ctx context.Context, app *platform.App, limiter *clashy.Limiter) error {
+	tags := d.targetTags()
 	now := time.Now().UTC()
 	for _, tag := range tags {
 		if err := d.processCWLTarget(ctx, app, limiter, tag, now); err != nil {
@@ -813,7 +1291,7 @@ func (d *botClansDomain) runCWLCycle(ctx context.Context, app *platform.App, lim
 	return nil
 }
 
-func (d *botClansDomain) processCWLTarget(ctx context.Context, app *platform.App, limiter *clashtracker.Limiter, tag string, now time.Time) error {
+func (d *botClansDomain) processCWLTarget(ctx context.Context, app *platform.App, limiter *clashy.Limiter, tag string, now time.Time) error {
 	state, _, ok, err := loadBotClanSnapshot[botCWLState](ctx, d.snapshots, d.snapshotPrefix, d.cwlStateSnapshot, tag)
 	if err != nil {
 		return err
@@ -876,43 +1354,44 @@ func (d *botClansDomain) processCWLTarget(ctx context.Context, app *platform.App
 	return storeBotClanValue(ctx, d.snapshots, d.snapshotPrefix, d.cwlStateSnapshot, tag, currentState)
 }
 
-func (d *botClansDomain) fetchCWLGroup(ctx context.Context, app *platform.App, limiter *clashtracker.Limiter, tag string) (*clashy.ClanWarLeagueGroup, []byte, error) {
-	group, err := platform.RetryClashFetch(ctx, func(fetchCtx context.Context) (*clashy.ClanWarLeagueGroup, error) {
-		release, err := limiter.Acquire(fetchCtx)
-		if err != nil {
-			return nil, err
-		}
-		defer release()
+func (d *botClansDomain) fetchCWLGroup(ctx context.Context, app *platform.App, limiter *clashy.Limiter, tag string) (*clashy.ClanWarLeagueGroup, []byte, error) {
+	group, err := retryLimitedClashFetch(ctx, limiter, func(fetchCtx context.Context) (*clashy.ClanWarLeagueGroup, error) {
 		start := time.Now()
 		group, err := app.Clash.GetLeagueGroup(fetchCtx, tag)
 		app.Stats.RecordRequest(botClansDomainName, time.Since(start), err)
 		return group, err
 	})
 	if err != nil {
-		return nil, nil, nil
+		var notFound *clashy.NotFound
+		if errors.As(err, &notFound) {
+			return nil, nil, nil
+		}
+		return nil, nil, err
 	}
 	return group, jsonBytes(group), nil
 }
 
-func (d *botClansDomain) fetchCWLWar(ctx context.Context, app *platform.App, limiter *clashtracker.Limiter, warTag string) (*clashy.ClanWar, []byte, error) {
-	wars, err := platform.RetryClashFetch(ctx, func(fetchCtx context.Context) ([]clashy.ClanWar, error) {
-		release, err := limiter.Acquire(fetchCtx)
-		if err != nil {
-			return nil, err
-		}
-		defer release()
+func (d *botClansDomain) fetchCWLWar(ctx context.Context, app *platform.App, limiter *clashy.Limiter, warTag string) (*clashy.ClanWar, []byte, error) {
+	wars, err := retryLimitedClashFetch(ctx, limiter, func(fetchCtx context.Context) ([]clashy.ClanWar, error) {
 		start := time.Now()
 		wars, err := app.Clash.GetLeagueWars(fetchCtx, []string{warTag})
 		app.Stats.RecordRequest(botClansDomainName, time.Since(start), err)
 		return wars, err
 	})
-	if err != nil || len(wars) == 0 {
+	if err != nil {
+		var notFound *clashy.NotFound
+		if errors.As(err, &notFound) {
+			return nil, nil, nil
+		}
+		return nil, nil, err
+	}
+	if len(wars) == 0 {
 		return nil, nil, nil
 	}
 	return &wars[0], jsonBytes(wars[0]), nil
 }
 
-func (d *botClansDomain) findClanCWLWar(ctx context.Context, app *platform.App, limiter *clashtracker.Limiter, clanTag string, warTags []string) (string, *clashy.ClanWar, []byte, error) {
+func (d *botClansDomain) findClanCWLWar(ctx context.Context, app *platform.App, limiter *clashy.Limiter, clanTag string, warTags []string) (string, *clashy.ClanWar, []byte, error) {
 	for _, warTag := range warTags {
 		war, raw, err := d.fetchCWLWar(ctx, app, limiter, warTag)
 		if err != nil {
@@ -950,40 +1429,43 @@ func (d *botClansDomain) handleCWLWarChange(ctx context.Context, app *platform.A
 	if err := d.scheduleWarReminders(ctx, app, clanTag, war, raw, "cwl"); err != nil {
 		return err
 	}
-	previous, raw, hasPrevious, changed, err := botClanSnapshotChanged(ctx, d.snapshots, d.snapshotPrefix, "cwlwar", clanTag, war, raw)
-	if err != nil || !hasPrevious || !changed {
+	previous, raw, hasPrevious, changed, err := loadBotClanSnapshotChange(ctx, d.snapshots, d.snapshotPrefix, "cwlwar", clanTag, war, raw)
+	if err != nil || !changed {
 		return err
 	}
-	app.Stats.SetReady(botClansDomainName, true, "")
-	if err := app.PublishEvent(ctx, platform.Event{
-		Topic:   "cwl",
-		ClanTag: clanTag,
-		Value:   map[string]any{"type": "cwl_war_update", "clan_tag": clanTag, "war": string(raw), "league_group": rawCWLGroup(group)},
-	}); err != nil {
-		return err
-	}
-	if previous == nil {
-		return nil
-	}
-	if lineup := cwlLineupChanges(*previous, war); cwlLineupChanged(lineup) {
-		lineup["clan_tag"] = clanTag
-		lineup["league_group"] = rawCWLGroup(group)
+	if hasPrevious {
+		app.Stats.SetReady(botClansDomainName, true, "")
 		if err := app.PublishEvent(ctx, platform.Event{
 			Topic:   "cwl",
 			ClanTag: clanTag,
-			Value:   lineup,
+			Value:   map[string]any{"type": "cwl_war_update", "clan_tag": clanTag, "war": string(raw), "league_group": rawCWLGroup(group)},
 		}); err != nil {
 			return err
 		}
+		if previous != nil {
+			if lineup := cwlLineupChanges(*previous, war); cwlLineupChanged(lineup) {
+				lineup["clan_tag"] = clanTag
+				lineup["league_group"] = rawCWLGroup(group)
+				if err := app.PublishEvent(ctx, platform.Event{
+					Topic:   "cwl",
+					ClanTag: clanTag,
+					Value:   lineup,
+				}); err != nil {
+					return err
+				}
+			}
+			if attacks := newWarAttacks(*previous, war); len(attacks) > 0 {
+				if err := app.PublishEvent(ctx, platform.Event{
+					Topic:   "cwl",
+					ClanTag: clanTag,
+					Value:   map[string]any{"type": "cwl_new_attacks", "clan_tag": clanTag, "war": string(raw), "attacks": attacks, "league_group": rawCWLGroup(group)},
+				}); err != nil {
+					return err
+				}
+			}
+		}
 	}
-	if attacks := newWarAttacks(*previous, war); len(attacks) > 0 {
-		return app.PublishEvent(ctx, platform.Event{
-			Topic:   "cwl",
-			ClanTag: clanTag,
-			Value:   map[string]any{"type": "cwl_new_attacks", "clan_tag": clanTag, "war": string(raw), "attacks": attacks, "league_group": rawCWLGroup(group)},
-		})
-	}
-	return nil
+	return d.snapshots.StoreRaw(ctx, botClanSnapshotKey(d.snapshotPrefix, "cwlwar", clanTag), raw)
 }
 
 func storeBotClanValue(ctx context.Context, store botClanSnapshotStore, prefix, kind, tag string, value any) error {
@@ -1130,79 +1612,6 @@ func hashBytes(raw []byte) uint64 {
 	return hash
 }
 
-func cloneReminder(in bson.M) bson.M {
-	out := make(bson.M, len(in))
-	for key, value := range in {
-		out[key] = value
-	}
-	return out
-}
-
-func stringList(value any) []string {
-	switch typed := value.(type) {
-	case []string:
-		return typed
-	case []any:
-		out := make([]string, 0, len(typed))
-		for _, item := range typed {
-			if text, ok := item.(string); ok {
-				out = append(out, text)
-			}
-		}
-		return out
-	case bson.A:
-		out := make([]string, 0, len(typed))
-		for _, item := range typed {
-			if text, ok := item.(string); ok {
-				out = append(out, text)
-			}
-		}
-		return out
-	default:
-		return nil
-	}
-}
-
-func intList(value any) []int {
-	switch typed := value.(type) {
-	case []int:
-		return typed
-	case []any:
-		out := make([]int, 0, len(typed))
-		for _, item := range typed {
-			if value := intFromAny(item); value != 0 {
-				out = append(out, value)
-			}
-		}
-		return out
-	case bson.A:
-		out := make([]int, 0, len(typed))
-		for _, item := range typed {
-			if value := intFromAny(item); value != 0 {
-				out = append(out, value)
-			}
-		}
-		return out
-	default:
-		return nil
-	}
-}
-
-func intFromAny(value any) int {
-	switch typed := value.(type) {
-	case int:
-		return typed
-	case int32:
-		return int(typed)
-	case int64:
-		return int(typed)
-	case float64:
-		return int(typed)
-	default:
-		return 0
-	}
-}
-
 func stringContains(values []string, target string) bool {
 	for _, value := range values {
 		if value == target {
@@ -1221,23 +1630,6 @@ func intContains(values []int, target int) bool {
 	return false
 }
 
-func collectTagStoreTags(ctx context.Context, targets clashtracker.TagStore) ([]string, error) {
-	if targets == nil {
-		return nil, nil
-	}
-	list, err := targets.List(ctx)
-	if err != nil {
-		return nil, err
-	}
-	tags := make([]string, 0, len(list))
-	for _, target := range list {
-		if target.Key != "" {
-			tags = append(tags, target.Key)
-		}
-	}
-	return tags, nil
-}
-
 func rawPayload(raw []byte, fallback any) string {
 	if len(raw) > 0 {
 		return string(raw)
@@ -1248,9 +1640,4 @@ func rawPayload(raw []byte, fallback any) string {
 func jsonBytes(value any) []byte {
 	raw, _ := json.Marshal(value)
 	return raw
-}
-
-func parseReminderHours(raw string) (float64, error) {
-	value := strings.TrimSpace(strings.TrimSuffix(raw, "hr"))
-	return strconv.ParseFloat(value, 64)
 }
