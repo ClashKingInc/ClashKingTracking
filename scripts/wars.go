@@ -2,6 +2,8 @@ package scripts
 
 import (
 	"context"
+	"crypto/sha256"
+	"encoding/base64"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -15,7 +17,6 @@ import (
 	"clashking_tracking/models"
 
 	clashy "github.com/clashkinginc/clashy.go"
-	clashtracker "github.com/clashkinginc/clashy.go/tracker"
 	"github.com/google/uuid"
 	"github.com/jackc/pgx/v5/pgxpool"
 )
@@ -44,6 +45,7 @@ const warTargetsSQL = `
 type warsDomain struct {
 	store   warStore
 	targets warTargetSource
+	limiter *clashy.Limiter
 
 	mu        sync.Mutex
 	scheduled map[string]time.Time
@@ -92,6 +94,8 @@ func (q *warQueue) Enqueue(req warFetchRequest) error {
 type warStore interface {
 	LoadPendingSchedules(context.Context) ([]models.WarScheduleRow, error)
 	LoadCWLLeague(context.Context, string) (int, error)
+	LoadActiveCurrentWarTimer(context.Context, string) (models.CurrentWarTimerRow, bool, error)
+	DeleteExpiredCurrentWarTimers(context.Context) (int, error)
 	Store(context.Context, models.WarIngest) error
 	ShiftMaintenance(context.Context, time.Duration) error
 	Close() error
@@ -127,22 +131,39 @@ func (d *warsDomain) Run(ctx context.Context, app *platform.App) error {
 	}
 	d.targets = targets
 	defer targets.Close()
-
-	if err := d.reloadSchedules(ctx, app); err != nil {
-		return err
-	}
-	// Schedules live in Postgres, but the process-local scheduler owns the actual timers.
-	// Reloading first keeps restarts from requiring a full clan scan to rediscover war ends.
-	go d.runMaintenanceLoop(ctx, app)
-	go d.runCWLLoop(ctx, app)
-
 	limiter, err := newWarLimiter(app)
 	if err != nil {
 		return err
 	}
+	d.limiter = limiter
+	runCtx, stopBackground := context.WithCancel(ctx)
+	var background sync.WaitGroup
+	defer func() {
+		stopBackground()
+		background.Wait()
+	}()
+
+	if err := d.reloadSchedules(runCtx, app); err != nil {
+		return err
+	}
+	// Schedules live in Postgres, but the process-local scheduler owns the actual timers.
+	// Reloading first keeps restarts from requiring a full clan scan to rediscover war ends.
+	background.Add(3)
+	go func() {
+		defer background.Done()
+		d.runMaintenanceLoop(runCtx, app)
+	}()
+	go func() {
+		defer background.Done()
+		d.runCurrentWarTimerCleanupLoop(runCtx, app)
+	}()
+	go func() {
+		defer background.Done()
+		d.runCWLLoop(runCtx, app, limiter)
+	}()
 	for {
 		start := time.Now()
-		err := d.runCycle(ctx, app, limiter)
+		err := d.runCycle(runCtx, app, limiter)
 		if err != nil {
 			app.Stats.SetReady(warsDomainName, false, err.Error())
 			return err
@@ -307,11 +328,11 @@ func memoryWarTargetBatch(targets []models.BasicClanRow, cursor int, limit int) 
 	return out, cursor
 }
 
-func newWarLimiter(app *platform.App) (*clashtracker.Limiter, error) {
-	return clashtracker.NewLimiter(app.Config.WarRequestsPerSecond, app.Config.WarMaxInFlight)
+func newWarLimiter(app *platform.App) (*clashy.Limiter, error) {
+	return clashy.NewLimiter(app.Config.WarRequestsPerSecond, app.Config.WarMaxInFlight)
 }
 
-func (d *warsDomain) runCycle(ctx context.Context, app *platform.App, limiter *clashtracker.Limiter) error {
+func (d *warsDomain) runCycle(ctx context.Context, app *platform.App, limiter *clashy.Limiter) error {
 	targetPageSize := app.Config.WarRequestsPerSecond * app.Config.TargetPageMultiplier
 	targets, err := d.targets.NextTargetBatch(ctx, targetPageSize)
 	if err != nil {
@@ -326,10 +347,14 @@ func (d *warsDomain) runCycle(ctx context.Context, app *platform.App, limiter *c
 	return d.processQueue(ctx, app, limiter, queue.items)
 }
 
-func (d *warsDomain) processQueue(ctx context.Context, app *platform.App, limiter *clashtracker.Limiter, requests []warFetchRequest) error {
-	// Max in-flight and request starts/sec are intentionally tied for this script.
-	// The limiter controls starts; the slots channel caps concurrently running requests.
-	slots := make(chan struct{}, app.Config.WarMaxInFlight)
+func (d *warsDomain) processQueue(ctx context.Context, app *platform.App, limiter *clashy.Limiter, requests []warFetchRequest) error {
+	// The limiter caps request starts while the larger in-flight pool prevents
+	// normal proxy latency from lowering the configured starts-per-second rate.
+	maxInFlight := app.Config.WarMaxInFlight
+	if maxInFlight <= 0 {
+		maxInFlight = app.Config.WarRequestsPerSecond
+	}
+	slots := make(chan struct{}, maxInFlight)
 	errCh := make(chan error, len(requests))
 	var wg sync.WaitGroup
 	for _, req := range requests {
@@ -348,6 +373,11 @@ func (d *warsDomain) processQueue(ctx context.Context, app *platform.App, limite
 			if err == nil {
 				err = d.storeIngest(ctx, app, ingest)
 			}
+			if err == nil && req.StoreOnly {
+				d.mu.Lock()
+				delete(d.scheduled, req.ScheduleKey)
+				d.mu.Unlock()
+			}
 			if err != nil {
 				app.Logger.Error("war processing failed", "err", err)
 				errCh <- err
@@ -364,38 +394,50 @@ func (d *warsDomain) processQueue(ctx context.Context, app *platform.App, limite
 	return nil
 }
 
-func (d *warsDomain) do(ctx context.Context, app *platform.App, limiter *clashtracker.Limiter, req warFetchRequest) (models.WarIngest, error) {
-	war, err := platform.RetryClashFetch(ctx, func(fetchCtx context.Context) (*clashy.ClanWar, error) {
-		release, err := limiter.Acquire(fetchCtx)
-		if err != nil {
-			return nil, err
-		}
-		defer release()
+func (d *warsDomain) do(ctx context.Context, app *platform.App, limiter *clashy.Limiter, req warFetchRequest) (models.WarIngest, error) {
+	war, err := retryLimitedClashFetch(ctx, limiter, func(fetchCtx context.Context) (*clashy.ClanWar, error) {
 		start := time.Now()
 		var war *clashy.ClanWar
+		var fetchErr error
 		// CWL wars are fetched by war tag; regular wars are fetched from the clan public war log.
 		if req.WarTag != "" {
-			wars, fetchErr := app.Clash.GetLeagueWars(fetchCtx, []string{req.WarTag})
-			err = fetchErr
+			wars, err := app.Clash.GetLeagueWars(fetchCtx, []string{req.WarTag})
+			fetchErr = err
 			if len(wars) > 0 {
 				war = &wars[0]
 			}
 		} else {
-			war, err = app.Clash.GetClanWar(fetchCtx, req.ClanTag)
+			war, fetchErr = app.Clash.GetClanWar(fetchCtx, req.ClanTag)
 		}
-		app.Stats.RecordRequest(warsDomainName, time.Since(start), err)
-		return war, err
+		app.Stats.RecordRequest(warsDomainName, time.Since(start), fetchErr)
+		return war, fetchErr
 	})
 	if err != nil {
 		if isSkippableWarFetchError(err) {
+			if req.StoreOnly {
+				return models.WarIngest{}, fmt.Errorf("scheduled war %s is not available yet: %w", req.WarID, err)
+			}
 			return models.WarIngest{}, nil
 		}
 		return models.WarIngest{}, err
 	}
 	if war == nil {
+		if req.StoreOnly {
+			return models.WarIngest{}, fmt.Errorf("scheduled war %s returned no war", req.WarID)
+		}
 		return models.WarIngest{}, nil
 	}
-	return buildWarIngest(*war, req.ClanTag, req.StoreOnly, req.WarTag, req.ScheduleKey, req.WarID)
+	if req.StoreOnly && war.State != clashy.WarStateEnded {
+		return models.WarIngest{}, fmt.Errorf("scheduled war %s is still in state %s", req.WarID, war.State)
+	}
+	ingest, err := buildWarIngest(*war, req.ClanTag, req.StoreOnly, req.WarTag, req.ScheduleKey, req.WarID)
+	if err != nil {
+		return models.WarIngest{}, err
+	}
+	if req.StoreOnly && len(ingest.IndexRows) == 0 {
+		return models.WarIngest{}, fmt.Errorf("scheduled war %s produced no finished ingest", req.WarID)
+	}
+	return ingest, nil
 }
 
 func isSkippableWarFetchError(err error) bool {
@@ -406,7 +448,7 @@ func isSkippableWarFetchError(err error) bool {
 }
 
 func (d *warsDomain) storeIngest(ctx context.Context, app *platform.App, ingest models.WarIngest) error {
-	if len(ingest.IndexRows) == 0 && len(ingest.AttackRows) == 0 && len(ingest.Schedules) == 0 && len(ingest.CWLGroups) == 0 {
+	if len(ingest.IndexRows) == 0 && len(ingest.AttackRows) == 0 && len(ingest.Schedules) == 0 && len(ingest.CurrentWarTimers) == 0 && len(ingest.CWLGroups) == 0 {
 		return nil
 	}
 	if err := d.store.Store(ctx, ingest); err != nil {
@@ -416,7 +458,7 @@ func (d *warsDomain) storeIngest(ctx context.Context, app *platform.App, ingest 
 	for _, schedule := range ingest.Schedules {
 		d.scheduleStore(app, schedule)
 	}
-	app.Stats.RecordWrite(warsDomainName, len(ingest.AttackRows)+len(ingest.IndexRows)+len(ingest.Players)+len(ingest.Schedules)+len(ingest.CWLGroups))
+	app.Stats.RecordWrite(warsDomainName, len(ingest.AttackRows)+len(ingest.IndexRows)+len(ingest.Players)+len(ingest.Schedules)+len(ingest.CurrentWarTimers)+len(ingest.CWLGroups))
 	app.Stats.SetQueueDepth(warsDomainName, len(ingest.Schedules))
 	return nil
 }
@@ -462,12 +504,12 @@ func buildWarIngest(war clashy.ClanWar, sourceClanTag string, finished bool, war
 				NextRunAt:     endAt,
 				WarTag:        warTag,
 			}},
+			CurrentWarTimers: currentWarTimerRows(warID, war.Clan, war.Opponent, endAt),
 		}, nil
 	}
+	clan, opponent := canonicalWarSides(war.Clan, war.Opponent)
 	indexRows := []models.WarLogIndexRow{
-		// Store both perspectives so either clan can load the war log without reversing joins.
-		warIndexRow(warID, war.Clan, war.Opponent, prepAt, startAt, endAt, war, warType, warTag),
-		warIndexRow(warID, war.Opponent, war.Clan, prepAt, startAt, endAt, war, warType, warTag),
+		warIndexRow(warID, clan, opponent, prepAt, startAt, endAt, war, warType, warTag),
 	}
 	ingest := models.WarIngest{
 		IndexRows:  indexRows,
@@ -485,19 +527,66 @@ func buildWarIngest(war clashy.ClanWar, sourceClanTag string, finished bool, war
 	return ingest, nil
 }
 
+func currentWarTimerRows(warID string, clan, opponent *clashy.WarClan, endAt time.Time) []models.CurrentWarTimerRow {
+	if warID == "" || clan == nil || opponent == nil || clan.Tag == "" || opponent.Tag == "" || endAt.IsZero() {
+		return nil
+	}
+	rows := make([]models.CurrentWarTimerRow, 0, len(clan.Members)+len(opponent.Members))
+	seen := make(map[string]struct{}, len(clan.Members)+len(opponent.Members))
+	appendSide := func(members []clashy.ClanWarMember, clanTag, opponentTag string) {
+		for _, member := range members {
+			if member.Tag == "" {
+				continue
+			}
+			if _, exists := seen[member.Tag]; exists {
+				continue
+			}
+			seen[member.Tag] = struct{}{}
+			rows = append(rows, models.CurrentWarTimerRow{PlayerTag: member.Tag, WarID: warID, ClanTag: clanTag, OpponentTag: opponentTag, EndTime: endAt})
+		}
+	}
+	appendSide(clan.Members, clan.Tag, opponent.Tag)
+	appendSide(opponent.Members, opponent.Tag, clan.Tag)
+	return rows
+}
+
+func canonicalWarSides(clan, opponent *clashy.WarClan) (*clashy.WarClan, *clashy.WarClan) {
+	if clan != nil && opponent != nil && clan.Tag > opponent.Tag {
+		return opponent, clan
+	}
+	return clan, opponent
+}
+
 func warIndexRow(warID string, clan, opponent *clashy.WarClan, prepAt time.Time, startAt *time.Time, endAt time.Time, war clashy.ClanWar, warType, warTag string) models.WarLogIndexRow {
+	attacksPerMember := 1
+	if warType == "random" {
+		attacksPerMember = 2
+	}
 	return models.WarLogIndexRow{
-		WarID:          warID,
-		ClanTag:        clan.Tag,
-		OpponentTag:    opponent.Tag,
-		PrepTime:       prepAt,
-		StartTime:      startAt,
-		EndTime:        endAt,
-		Size:           war.TeamSize,
-		WarType:        warType,
-		State:          string(war.State),
-		BattleModifier: string(war.BattleModifier),
-		WarTag:         warTag,
+		WarID:                         warID,
+		ClanTag:                       clan.Tag,
+		OpponentTag:                   opponent.Tag,
+		PrepTime:                      prepAt,
+		StartTime:                     startAt,
+		EndTime:                       endAt,
+		Size:                          war.TeamSize,
+		AttacksPerMember:              attacksPerMember,
+		WarType:                       warType,
+		State:                         string(war.State),
+		BattleModifier:                string(war.BattleModifier),
+		WarTag:                        warTag,
+		ClanName:                      clan.Name,
+		OpponentName:                  opponent.Name,
+		ClanBadgeToken:                badgeToken(clan.Badge),
+		OpponentBadgeToken:            badgeToken(opponent.Badge),
+		ClanLevel:                     clan.Level,
+		OpponentClanLevel:             opponent.Level,
+		ClanAttacks:                   clan.Attacks,
+		OpponentAttacks:               opponent.Attacks,
+		ClanStars:                     clan.Stars,
+		OpponentStars:                 opponent.Stars,
+		ClanDestructionPercentage:     clan.Destruction,
+		OpponentDestructionPercentage: opponent.Destruction,
 	}
 }
 
@@ -660,12 +749,11 @@ func (d *warsDomain) scheduleStore(app *platform.App, schedule models.WarSchedul
 				app.Logger.Error("invalid scheduled war store request", "err", err)
 				return
 			}
-			limiter, err := newWarLimiter(app)
-			if err != nil {
-				app.Logger.Error("scheduled war limiter failed", "err", err)
+			if d.limiter == nil {
+				app.Logger.Error("scheduled war limiter is not initialized")
 				return
 			}
-			if err := d.processQueue(ctx, app, limiter, queue.items); err != nil {
+			if err := d.processQueue(ctx, app, d.limiter, queue.items); err != nil {
 				app.Logger.Error("scheduled war store failed", "err", err)
 				retry := schedule
 				retry.NextRunAt = time.Now().UTC().Add(time.Minute)
@@ -675,7 +763,7 @@ func (d *warsDomain) scheduleStore(app *platform.App, schedule models.WarSchedul
 	})
 }
 
-func (d *warsDomain) runCWLLoop(ctx context.Context, app *platform.App) {
+func (d *warsDomain) runCWLLoop(ctx context.Context, app *platform.App, limiter *clashy.Limiter) {
 	timer := time.NewTimer(0)
 	defer timer.Stop()
 	for {
@@ -685,7 +773,7 @@ func (d *warsDomain) runCWLLoop(ctx context.Context, app *platform.App) {
 		case <-timer.C:
 		}
 		if utils.IsCWL(time.Now()) {
-			if err := d.syncCWLGroups(ctx, app); err != nil {
+			if err := d.syncCWLGroups(ctx, app, limiter); err != nil {
 				app.Logger.Error("cwl sync failed", "err", err)
 			}
 		}
@@ -693,24 +781,19 @@ func (d *warsDomain) runCWLLoop(ctx context.Context, app *platform.App) {
 	}
 }
 
-func (d *warsDomain) syncCWLGroups(ctx context.Context, app *platform.App) error {
+func (d *warsDomain) syncCWLGroups(ctx context.Context, app *platform.App, limiter *clashy.Limiter) error {
 	targets, err := d.targets.NextCWLTargetBatch(ctx, app.Config.WarRequestsPerSecond*app.Config.TargetPageMultiplier)
 	if err != nil {
 		return err
 	}
 	season := utils.CurrentSeason(time.Now())
-	seen := make(map[string]struct{})
-	limiter, err := newWarLimiter(app)
-	if err != nil {
-		return err
-	}
+	seenGroups := make(map[string]struct{})
+	coveredClans := make(map[string]struct{})
 	for _, target := range targets {
-		group, err := platform.RetryClashFetch(ctx, func(fetchCtx context.Context) (*clashy.ClanWarLeagueGroup, error) {
-			release, err := limiter.Acquire(fetchCtx)
-			if err != nil {
-				return nil, err
-			}
-			defer release()
+		if _, covered := coveredClans[target.Tag]; covered {
+			continue
+		}
+		group, err := retryLimitedClashFetch(ctx, limiter, func(fetchCtx context.Context) (*clashy.ClanWarLeagueGroup, error) {
 			start := time.Now()
 			group, err := app.Clash.GetLeagueGroup(fetchCtx, target.Tag)
 			app.Stats.RecordRequest(warsDomainName, time.Since(start), err)
@@ -723,10 +806,13 @@ func (d *warsDomain) syncCWLGroups(ctx context.Context, app *platform.App) error
 		if cwlID == "" {
 			continue
 		}
-		if _, ok := seen[cwlID]; ok {
+		for _, clanTag := range clanTags {
+			coveredClans[clanTag] = struct{}{}
+		}
+		if _, ok := seenGroups[cwlID]; ok {
 			continue
 		}
-		seen[cwlID] = struct{}{}
+		seenGroups[cwlID] = struct{}{}
 		// CWL league comes from the tracked source clan row, not extra clan discovery calls.
 		leagueID := target.CWLLeagueID
 		if leagueID == 0 {
@@ -735,34 +821,58 @@ func (d *warsDomain) syncCWLGroups(ctx context.Context, app *platform.App) error
 				return err
 			}
 		}
-		ingest := models.WarIngest{
-			CWLGroups: []models.CWLGroupRow{{
-				CWLID:       cwlID,
-				Season:      group.Season,
-				CWLLeagueID: leagueID,
-				ClanTags:    clanTags,
-				Rounds:      cwlRounds(group),
-				Data:        group,
-			}},
-		}
-		if err := d.storeIngest(ctx, app, ingest); err != nil {
+		groupRow := cwlGroupRow(cwlID, group, leagueID)
+		warSize, err := d.scheduleCWLWars(ctx, app, limiter, group)
+		if err != nil {
 			return err
 		}
-		if err := d.scheduleCWLWars(ctx, app, limiter, group); err != nil {
+		if warSize > 0 {
+			groupRow.WarSize = intPtr(warSize)
+		}
+		if err := d.storeIngest(ctx, app, models.WarIngest{CWLGroups: []models.CWLGroupRow{groupRow}}); err != nil {
 			return err
 		}
 	}
 	return nil
 }
 
-func (d *warsDomain) scheduleCWLWars(ctx context.Context, app *platform.App, limiter *clashtracker.Limiter, group *clashy.ClanWarLeagueGroup) error {
+func cwlGroupRow(cwlID string, group *clashy.ClanWarLeagueGroup, leagueID int) models.CWLGroupRow {
+	row := models.CWLGroupRow{
+		CWLID:  cwlID,
+		Season: group.Season,
+		State:  group.State,
+		Rounds: cwlRounds(group),
+		Clans:  cwlGroupClanRows(group),
+	}
+	if leagueID != 0 {
+		row.CWLLeagueID = intPtr(leagueID)
+	}
+	return row
+}
+
+func cwlGroupClanRows(group *clashy.ClanWarLeagueGroup) []models.CWLGroupClanRow {
+	if group == nil {
+		return nil
+	}
+	rows := make([]models.CWLGroupClanRow, 0, len(group.Clans))
+	seen := make(map[string]struct{}, len(group.Clans))
+	for _, clan := range group.Clans {
+		if clan.Tag == "" {
+			continue
+		}
+		if _, exists := seen[clan.Tag]; exists {
+			continue
+		}
+		seen[clan.Tag] = struct{}{}
+		rows = append(rows, models.CWLGroupClanRow{ClanTag: clan.Tag, Name: clan.Name, ClanLevel: clan.Level, BadgeToken: badgeToken(clan.Badge)})
+	}
+	return rows
+}
+
+func (d *warsDomain) scheduleCWLWars(ctx context.Context, app *platform.App, limiter *clashy.Limiter, group *clashy.ClanWarLeagueGroup) (int, error) {
+	warSize := 0
 	for _, warTag := range warTags(group) {
-		wars, err := platform.RetryClashFetch(ctx, func(fetchCtx context.Context) ([]clashy.ClanWar, error) {
-			release, err := limiter.Acquire(fetchCtx)
-			if err != nil {
-				return nil, err
-			}
-			defer release()
+		wars, err := retryLimitedClashFetch(ctx, limiter, func(fetchCtx context.Context) ([]clashy.ClanWar, error) {
 			start := time.Now()
 			wars, err := app.Clash.GetLeagueWars(fetchCtx, []string{warTag})
 			app.Stats.RecordRequest(warsDomainName, time.Since(start), err)
@@ -777,13 +887,16 @@ func (d *warsDomain) scheduleCWLWars(ctx context.Context, app *platform.App, lim
 		}
 		ingest, err := buildWarIngest(wars[0], source, false, warTag, "", "")
 		if err != nil {
-			return err
+			return 0, err
+		}
+		if wars[0].TeamSize > 0 {
+			warSize = wars[0].TeamSize
 		}
 		if err := d.storeIngest(ctx, app, ingest); err != nil {
-			return err
+			return 0, err
 		}
 	}
-	return nil
+	return warSize, nil
 }
 
 func cwlGroupID(group *clashy.ClanWarLeagueGroup) (string, []string) {
@@ -804,7 +917,13 @@ func cwlGroupID(group *clashy.ClanWarLeagueGroup) (string, []string) {
 	for _, tag := range tags {
 		keys = append(keys, strings.TrimPrefix(tag, "#"))
 	}
-	return group.Season + "-" + strings.Join(keys, "-"), tags
+	legacyIdentity := group.Season + "-" + strings.Join(keys, "-")
+	return stableCWLID(legacyIdentity), tags
+}
+
+func stableCWLID(legacyIdentity string) string {
+	sum := sha256.Sum256([]byte(legacyIdentity))
+	return base64.RawURLEncoding.EncodeToString(sum[:9])
 }
 
 func cwlRounds(group *clashy.ClanWarLeagueGroup) [][]string {
@@ -826,8 +945,15 @@ func cwlRounds(group *clashy.ClanWarLeagueGroup) [][]string {
 
 func warTags(group *clashy.ClanWarLeagueGroup) []string {
 	var out []string
+	seen := make(map[string]struct{})
 	for _, round := range cwlRounds(group) {
-		out = append(out, round...)
+		for _, warTag := range round {
+			if _, ok := seen[warTag]; ok {
+				continue
+			}
+			seen[warTag] = struct{}{}
+			out = append(out, warTag)
+		}
 	}
 	return out
 }
@@ -845,8 +971,30 @@ func (d *warsDomain) runMaintenanceLoop(ctx context.Context, app *platform.App) 
 	}
 }
 
+const currentWarTimerCleanupInterval = 5 * time.Minute
+
+func (d *warsDomain) runCurrentWarTimerCleanupLoop(ctx context.Context, app *platform.App) {
+	ticker := time.NewTicker(currentWarTimerCleanupInterval)
+	defer ticker.Stop()
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-ticker.C:
+			deleted, err := d.store.DeleteExpiredCurrentWarTimers(ctx)
+			if err != nil {
+				app.Logger.Error("current war timer cleanup failed", "err", err)
+				continue
+			}
+			if deleted > 0 {
+				app.Stats.RecordWrite(warsDomainName, deleted)
+			}
+		}
+	}
+}
+
 func (d *warsDomain) checkMaintenance(ctx context.Context, app *platform.App) error {
-	start := time.Now().UTC()
+	var start time.Time
 	inMaintenance := false
 	for {
 		// Gold pass season is a cheap global endpoint; failures here are used as the
@@ -855,8 +1003,12 @@ func (d *warsDomain) checkMaintenance(ctx context.Context, app *platform.App) er
 		if err == nil {
 			break
 		}
+		if !isOfficialMaintenance500(err) {
+			return err
+		}
 		if !inMaintenance {
 			inMaintenance = true
+			start = time.Now().UTC()
 			_ = app.PublishEvent(ctx, platform.Event{Topic: "maintenance", Value: map[string]any{"status": "start"}})
 		}
 		timer := time.NewTimer(15 * time.Second)
@@ -870,8 +1022,8 @@ func (d *warsDomain) checkMaintenance(ctx context.Context, app *platform.App) er
 	if !inMaintenance {
 		return nil
 	}
-	duration := time.Since(start)
-	if duration <= 0 {
+	duration, ok := maintenanceShiftDuration(start, time.Now().UTC())
+	if !ok {
 		return nil
 	}
 	if err := d.store.ShiftMaintenance(ctx, duration); err != nil {
@@ -882,6 +1034,18 @@ func (d *warsDomain) checkMaintenance(ctx context.Context, app *platform.App) er
 	}
 	_ = app.PublishEvent(ctx, platform.Event{Topic: "maintenance", Value: map[string]any{"status": "end", "duration_seconds": int(duration.Seconds())}})
 	return nil
+}
+
+func isOfficialMaintenance500(err error) bool {
+	var gateway *clashy.GatewayError
+	return errors.As(err, &gateway) && gateway.HTTPException != nil && gateway.Status == 500
+}
+
+func maintenanceShiftDuration(start, recovered time.Time) (time.Duration, bool) {
+	if start.IsZero() || !recovered.After(start) {
+		return 0, false
+	}
+	return recovered.Sub(start), true
 }
 
 func warStoreError(operation string, err error) error {
