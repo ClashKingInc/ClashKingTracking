@@ -4,15 +4,30 @@ package scripts
 
 import (
 	"context"
+	"io"
+	"log/slog"
 	"reflect"
 	"strings"
 	"testing"
 	"time"
 
+	"clashking_tracking/internal/platform"
 	"clashking_tracking/models"
 
 	clashy "github.com/clashkinginc/clashy.go"
 )
+
+type countingGlobalClanStore struct {
+	*memoryGlobalClanStore
+	loadCalls int
+	loaded    []string
+}
+
+func (s *countingGlobalClanStore) Load(ctx context.Context, tags []string) (map[string]models.BasicClanRow, error) {
+	s.loadCalls++
+	s.loaded = append([]string(nil), tags...)
+	return s.memoryGlobalClanStore.Load(ctx, tags)
+}
 
 func globalClanIngestForTest(current clashy.Clan, previous *models.BasicClanRow, now time.Time) models.GlobalClanIngest {
 	row := basicClanRow(current)
@@ -107,10 +122,59 @@ func TestMemoryGlobalClanTargetListsSeedActiveAndInactiveBuckets(t *testing.T) {
 	}
 }
 
+func TestGlobalClanWriterBulkLoadsPreviousRows(t *testing.T) {
+	store := &countingGlobalClanStore{memoryGlobalClanStore: newMemoryGlobalClanStore()}
+	store.rows["#A"] = models.BasicClanRow{Tag: "#A", Name: "Before A", MemberCount: 1}
+	store.rows["#B"] = models.BasicClanRow{Tag: "#B", Name: "Before B", MemberCount: 1}
+	app := &platform.App{
+		Config: platform.Config{MockDB: true},
+		Logger: slog.New(slog.NewTextHandler(io.Discard, nil)),
+		Stats:  platform.NewTracker(),
+	}
+	writer := newGlobalClanAsyncWriter(app, store)
+	now := time.Now().UTC()
+	err := writer.writeBatch(t.Context(), []globalClanWriteJob{{
+		Group: "priority",
+		Snapshots: []globalClanSnapshot{
+			{Clan: clashy.Clan{Tag: "#A", Name: "After A", MemberCount: 1}, Row: models.BasicClanRow{Tag: "#A", Name: "After A", MemberCount: 1}, FetchedAt: now},
+			{Clan: clashy.Clan{Tag: "#B", Name: "After B", MemberCount: 1}, Row: models.BasicClanRow{Tag: "#B", Name: "After B", MemberCount: 1}, FetchedAt: now},
+		},
+	}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if store.loadCalls != 1 {
+		t.Fatalf("previous row loads = %d, want one bulk load", store.loadCalls)
+	}
+	if want := []string{"#A", "#B"}; !reflect.DeepEqual(store.loaded, want) {
+		t.Fatalf("loaded tags = %#v, want %#v", store.loaded, want)
+	}
+}
+
 func TestBasicClanRowUsesUnrankedWarLeagueWhenMissing(t *testing.T) {
-	got := basicClanRow(clashy.Clan{Tag: "#CLAN", MemberCount: 1})
+	got := basicClanRow(clashy.Clan{
+		Tag:               "#CLAN",
+		MemberCount:       1,
+		Points:            50000,
+		BuilderBasePoints: 42000,
+		CapitalPoints:     3100,
+	})
 	if got.LocationID != nil || got.CWLLeagueID != unrankedWarLeagueID || got.CapitalLeagueID != nil {
 		t.Fatalf("optional ids/war league mismatch when missing: %#v", got)
+	}
+	if got.ClanPoints != 50000 || got.BuilderBasePoints != 42000 || got.CapitalPoints != 3100 {
+		t.Fatalf("typed clan points were not preserved: %#v", got)
+	}
+}
+
+func TestBasicClanUpsertStoresAllTypedPointFields(t *testing.T) {
+	for _, field := range []string{"clan_points", "builder_base_points", "capital_points"} {
+		if !strings.Contains(upsertBasicClanSQL, field+" = EXCLUDED."+field) {
+			t.Fatalf("basic clan upsert does not update %s: %s", field, upsertBasicClanSQL)
+		}
+		if !strings.Contains(upsertBasicClanSQL, "basic_clan."+field+" IS DISTINCT FROM EXCLUDED."+field) {
+			t.Fatalf("basic clan upsert does not compare %s: %s", field, upsertBasicClanSQL)
+		}
 	}
 }
 

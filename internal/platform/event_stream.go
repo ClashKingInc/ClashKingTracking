@@ -3,6 +3,7 @@ package platform
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"strconv"
 	"time"
 
@@ -15,7 +16,10 @@ func (a *App) PublishEvent(ctx context.Context, event Event) error {
 		event.Timestamp = time.Now().UTC()
 	}
 	if a.Valkey == nil || a.Config.EventStreamName == "" {
-		return nil
+		if a.Config.DryRun || a.Config.MockDB {
+			return nil
+		}
+		return errors.New("Valkey and events.stream are required to publish events")
 	}
 	return AppendEvent(ctx, a.Valkey, a.Config, event)
 }

@@ -14,6 +14,8 @@ type BasicClanRow struct {
 	WarWins              int
 	WarWinStreak         int
 	ClanPoints           int
+	BuilderBasePoints    int
+	CapitalPoints        int
 	MemberCount          int
 	BadgeURL             string
 	TroopsDonated        int
@@ -27,8 +29,9 @@ type BasicClanRow struct {
 }
 
 type BasicClanMember struct {
-	Tag  string `json:"tag"`
-	Name string `json:"name"`
+	Tag      string `json:"tag"`
+	Name     string `json:"name"`
+	TownHall int    `json:"town_hall"`
 }
 
 type ClanChangeRow struct {

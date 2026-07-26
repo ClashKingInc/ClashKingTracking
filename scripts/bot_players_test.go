@@ -44,32 +44,43 @@ func TestPlayerChangesBuildsSQLRows(t *testing.T) {
 	}
 }
 
-func TestMemoryBotPlayerStoreCursorWraps(t *testing.T) {
+func TestMemoryBotPlayerStorePagesByLocalCursor(t *testing.T) {
 	store := newMemoryBotPlayerStore()
 	store.targets = []models.BotPlayerTarget{{Tag: "#A"}, {Tag: "#B"}, {Tag: "#C"}}
 
-	first, err := store.NextTargetBatch(t.Context(), 2)
+	first, err := store.NextTargetPage(t.Context(), "", 2)
 	if err != nil {
 		t.Fatal(err)
 	}
 	if want := []models.BotPlayerTarget{{Tag: "#A"}, {Tag: "#B"}}; !reflect.DeepEqual(first.Targets, want) {
 		t.Fatalf("first targets = %#v, want %#v", first.Targets, want)
 	}
-	if first.Cursor != "#B" {
-		t.Fatalf("first cursor = %q, want #B", first.Cursor)
-	}
-	if err := store.CommitTargetBatch(t.Context(), first); err != nil {
-		t.Fatal(err)
+	if first.NextCursor != "#B" {
+		t.Fatalf("first cursor = %q, want #B", first.NextCursor)
 	}
 
-	second, err := store.NextTargetBatch(t.Context(), 2)
+	second, err := store.NextTargetPage(t.Context(), first.NextCursor, 2)
 	if err != nil {
 		t.Fatal(err)
 	}
 	if want := []models.BotPlayerTarget{{Tag: "#C"}}; !reflect.DeepEqual(second.Targets, want) {
 		t.Fatalf("second targets = %#v, want %#v", second.Targets, want)
 	}
-	if second.Cursor != "" {
-		t.Fatalf("second cursor = %q, want wrap cursor", second.Cursor)
+	if second.NextCursor != "" {
+		t.Fatalf("second cursor = %q, want wrap cursor", second.NextCursor)
+	}
+}
+
+func TestMemoryBotPlayerSnapshotsPersistRawBytes(t *testing.T) {
+	store := newBotPlayerSnapshotStore(nil)
+	if err := store.Store(t.Context(), "ps:#A", []byte("snapshot")); err != nil {
+		t.Fatal(err)
+	}
+	raw, ok, err := store.Load(t.Context(), "ps:#A")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !ok || string(raw) != "snapshot" {
+		t.Fatalf("snapshot = %q, ok = %t", raw, ok)
 	}
 }

@@ -16,7 +16,6 @@ import (
 	"clashking_tracking/models"
 
 	clashy "github.com/clashkinginc/clashy.go"
-	clashtracker "github.com/clashkinginc/clashy.go/tracker"
 	"github.com/jackc/pgx/v5/pgconn"
 	"github.com/jackc/pgx/v5/pgxpool"
 	valkey "github.com/valkey-io/valkey-go"
@@ -31,6 +30,13 @@ const (
 	leaderboardUpdateRetries                  = 3
 	leaderboardMaterializedViewRefreshSeconds = 3600
 )
+
+var leaderboardCacheScript = valkey.NewLuaScript(`
+	for i = 1, #KEYS do
+		redis.call('SET', KEYS[i], ARGV[i])
+	end
+	return #KEYS
+`)
 
 const leaderboardCandidateSQL = `
 	WITH league_ids AS (
@@ -216,6 +222,10 @@ func (d *leaderboardsDomain) openStore(ctx context.Context, app *platform.App) (
 }
 
 func (d *leaderboardsDomain) runCycle(ctx context.Context, app *platform.App) error {
+	limiter, err := newTrackingLimiter(app.Config.LeaderboardRequestsPerSecond)
+	if err != nil {
+		return err
+	}
 	candidates, err := d.store.LoadCandidates(ctx, d.limit)
 	if err != nil {
 		return err
@@ -225,11 +235,11 @@ func (d *leaderboardsDomain) runCycle(ctx context.Context, app *platform.App) er
 		cache := buildLeaderboardCache(candidates, nil, nil, time.Now().UTC(), d.limit, d.nullAssetURL)
 		return d.store.CacheBoards(ctx, cache)
 	}
-	leagues, err := d.fetchLeagues(ctx, app)
+	leagues, err := d.fetchLeagues(ctx, app, limiter)
 	if err != nil {
 		return err
 	}
-	players, deletedTags, err := d.fetchPlayers(ctx, app, tags, leagues)
+	players, deletedTags, err := d.fetchPlayers(ctx, app, limiter, tags, leagues)
 	if err != nil {
 		return err
 	}
@@ -268,10 +278,10 @@ func (d *leaderboardsDomain) refreshMaterializedViewsIfDue(ctx context.Context, 
 	return nil
 }
 
-func (d *leaderboardsDomain) fetchLeagues(ctx context.Context, app *platform.App) (map[int]leaderboardLeaguePayload, error) {
-	leagues, err := platform.RetryClashFetch(ctx, func(fetchCtx context.Context) ([]clashy.League, error) {
+func (d *leaderboardsDomain) fetchLeagues(ctx context.Context, app *platform.App, limiter *clashy.Limiter) (map[int]leaderboardLeaguePayload, error) {
+	leagues, err := retryLimitedClashFetch(ctx, limiter, func(fetchCtx context.Context) ([]clashy.League, error) {
 		start := time.Now()
-		leagues, err := app.Clash.SearchLeagues(fetchCtx, 100, "", "")
+		leagues, err := app.Clash.SearchLeagues(fetchCtx, clashy.PageOptions{Limit: 100})
 		app.Stats.RecordRequest(leaderboardsDomainName, time.Since(start), err)
 		return leagues, err
 	})
@@ -285,54 +295,42 @@ func (d *leaderboardsDomain) fetchLeagues(ctx context.Context, app *platform.App
 	return out, nil
 }
 
-func (d *leaderboardsDomain) fetchPlayers(ctx context.Context, app *platform.App, tags []string, leagues map[int]leaderboardLeaguePayload) ([]leaderboardPlayerRow, []string, error) {
-	limiter, err := clashtracker.NewLimiter(app.Config.LeaderboardRequestsPerSecond, app.Config.LeaderboardRequestsPerSecond)
-	if err != nil {
-		return nil, nil, err
-	}
+func (d *leaderboardsDomain) fetchPlayers(ctx context.Context, app *platform.App, limiter *clashy.Limiter, tags []string, leagues map[int]leaderboardLeaguePayload) ([]leaderboardPlayerRow, []string, error) {
 	var mu sync.Mutex
 	players := make([]leaderboardPlayerRow, 0, len(tags))
 	deleteTags := make([]string, 0)
 	skipped := 0
 	notFound := 0
-	var wg sync.WaitGroup
-	for _, tag := range tags {
-		release, err := limiter.Acquire(ctx)
+	err := runBounded(ctx, platform.RequestConcurrency(app.Config.LeaderboardRequestsPerSecond), tags, func(workerCtx context.Context, tag string) error {
+		player, err := retryLimitedClashFetch(workerCtx, limiter, func(fetchCtx context.Context) (*clashy.Player, error) {
+			start := time.Now()
+			player, err := app.Clash.GetPlayer(fetchCtx, tag)
+			app.Stats.RecordRequest(leaderboardsDomainName, time.Since(start), err)
+			return player, err
+		})
 		if err != nil {
-			return nil, nil, err
-		}
-		tag := tag
-		wg.Add(1)
-		go func() {
-			defer wg.Done()
-			defer release()
-			player, err := platform.RetryClashFetch(ctx, func(fetchCtx context.Context) (*clashy.Player, error) {
-				start := time.Now()
-				player, err := app.Clash.GetPlayer(fetchCtx, tag)
-				app.Stats.RecordRequest(leaderboardsDomainName, time.Since(start), err)
-				return player, err
-			})
-			if err != nil {
-				var missing *clashy.NotFound
-				mu.Lock()
-				skipped++
-				if errors.As(err, &missing) {
-					notFound++
-					deleteTags = append(deleteTags, tag)
-				}
-				mu.Unlock()
-				return
-			}
-			row, ok := basicPlayerRowFromPlayer(player, leagues)
-			if !ok {
-				return
-			}
+			var missing *clashy.NotFound
 			mu.Lock()
-			players = append(players, row)
+			skipped++
+			if errors.As(err, &missing) {
+				notFound++
+				deleteTags = append(deleteTags, tag)
+			}
 			mu.Unlock()
-		}()
+			return nil
+		}
+		row, ok := basicPlayerRowFromPlayer(player, leagues)
+		if !ok {
+			return nil
+		}
+		mu.Lock()
+		players = append(players, row)
+		mu.Unlock()
+		return nil
+	})
+	if err != nil {
+		return nil, nil, err
 	}
-	wg.Wait()
 	if len(players) == 0 && len(tags) > 0 {
 		return nil, nil, fmt.Errorf("leaderboards player refresh returned no usable players from %d candidates", len(tags))
 	}
@@ -643,29 +641,35 @@ func (s *timescaleLeaderboardStore) CacheBoards(ctx context.Context, cache leade
 	if err != nil {
 		return err
 	}
-	if err := s.valkey.Do(ctx, s.valkey.B().Set().Key(leaderboardIndexKey).Value(string(rawIndex)).Build()).Error(); err != nil {
-		return err
-	}
+	keys := make([]string, 0, len(cache.Boards)+1)
+	values := make([]string, 0, len(cache.Boards)+1)
 	for _, board := range cache.Boards {
 		raw, err := json.Marshal(board)
 		if err != nil {
 			return err
 		}
-		if err := s.valkey.Do(ctx, s.valkey.B().Set().Key(leaderboardCacheKey(board.Kind, board.Key)).Value(string(raw)).Build()).Error(); err != nil {
-			return err
-		}
+		keys = append(keys, leaderboardCacheKey(board.Kind, board.Key))
+		values = append(values, string(raw))
 	}
-	return nil
+	keys = append(keys, leaderboardIndexKey)
+	values = append(values, string(rawIndex))
+	return leaderboardCacheScript.Exec(ctx, s.valkey, keys, values).Error()
 }
 
 func (s *timescaleLeaderboardStore) RefreshMaterializedViews(ctx context.Context) error {
-	for _, query := range []string{
-		`REFRESH MATERIALIZED VIEW clan_leaderboards`,
-		`REFRESH MATERIALIZED VIEW war_league_counts`,
-	} {
-		if _, err := s.pool.Exec(ctx, query); err != nil {
+	if _, err := s.pool.Exec(ctx, `REFRESH MATERIALIZED VIEW CONCURRENTLY clan_leaderboards`); err != nil {
+		var pgErr *pgconn.PgError
+		if !errors.As(err, &pgErr) || pgErr.Code != "55000" {
 			return err
 		}
+		// A new database starts this view WITH NO DATA, which PostgreSQL requires
+		// us to populate once before concurrent refreshes are allowed.
+		if _, err := s.pool.Exec(ctx, `REFRESH MATERIALIZED VIEW clan_leaderboards`); err != nil {
+			return err
+		}
+	}
+	if _, err := s.pool.Exec(ctx, `REFRESH MATERIALIZED VIEW war_league_counts`); err != nil {
+		return err
 	}
 	return nil
 }

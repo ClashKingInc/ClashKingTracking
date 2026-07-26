@@ -10,7 +10,6 @@ import (
 	"clashking_tracking/models"
 
 	clashy "github.com/clashkinginc/clashy.go"
-	clashtracker "github.com/clashkinginc/clashy.go/tracker"
 	"github.com/jackc/pgx/v5/pgxpool"
 )
 
@@ -42,10 +41,15 @@ type basicPlayersDomain struct {
 }
 
 type basicPlayerStore interface {
-	NextTargetPage(context.Context, string, int) (clashtracker.TargetPage, error)
+	NextTargetPage(context.Context, string, int) (basicPlayerTargetPage, error)
 	CountTargets(context.Context) (int, error)
 	Store(context.Context, []basicPlayerIngest) (requestedRows int, affectedRows int, err error)
 	Close() error
+}
+
+type basicPlayerTargetPage struct {
+	Tags       []string
+	NextCursor string
 }
 
 type basicPlayerIngest struct {
@@ -55,10 +59,6 @@ type basicPlayerIngest struct {
 
 type timescaleBasicPlayerStore struct {
 	pool *pgxpool.Pool
-}
-
-type basicPlayerTargetPager struct {
-	store basicPlayerStore
 }
 
 func NewBasicPlayersDomain() platform.Domain {
@@ -114,39 +114,54 @@ func (d *basicPlayersDomain) Run(ctx context.Context, app *platform.App) error {
 			},
 		},
 	)
-	go writer.Run(ctx)
+	writerCtx, stopWriter := context.WithCancel(ctx)
+	writerDone := make(chan struct{})
+	go func() {
+		defer close(writerDone)
+		writer.Run(writerCtx)
+	}()
+	defer func() {
+		stopWriter()
+		<-writerDone
+	}()
 
-	runner, err := clashtracker.NewRunner[basicPlayerIngest](clashtracker.Config[basicPlayerIngest]{
-		TargetPager:       basicPlayerTargetPager{store: d.store},
-		TargetPageSize:    app.Config.BasicPlayerRequestsPerSecond * app.Config.TargetPageMultiplier,
-		ResultBatchSize:   basicPlayerAsyncWriteBatchSize,
-		RequestsPerSecond: app.Config.BasicPlayerRequestsPerSecond,
-		MaxInFlight:       app.Config.BasicPlayerRequestsPerSecond,
-		EmitInitial:       true,
-		Fetch: func(fetchCtx context.Context, target clashtracker.Target) (clashtracker.FetchResult[basicPlayerIngest], error) {
-			ingest, err := d.do(fetchCtx, app, target.Key)
-			return clashtracker.FetchResult[basicPlayerIngest]{Value: ingest}, err
-		},
-		Handle: func(handleCtx context.Context, _ clashtracker.Target, _ *basicPlayerIngest, ingest basicPlayerIngest) error {
-			if err := writer.Enqueue(handleCtx, ingest); err != nil {
+	limiter, err := newTrackingLimiter(app.Config.BasicPlayerRequestsPerSecond)
+	if err != nil {
+		return err
+	}
+	pageSize := app.Config.BasicPlayerRequestsPerSecond * app.Config.TargetPageMultiplier
+	cursor := ""
+	for {
+		page, err := d.store.NextTargetPage(ctx, cursor, pageSize)
+		if err != nil {
+			return err
+		}
+		if len(page.Tags) == 0 {
+			cursor = ""
+			if err := sleepOrDone(ctx, time.Second); err != nil {
+				return err
+			}
+			continue
+		}
+		if err := runBounded(ctx, platform.RequestConcurrency(app.Config.BasicPlayerRequestsPerSecond), page.Tags, func(workerCtx context.Context, tag string) error {
+			ingest, err := retryLimitedClashFetch(workerCtx, limiter, func(fetchCtx context.Context) (basicPlayerIngest, error) {
+				return d.do(fetchCtx, app, tag)
+			})
+			if err != nil {
+				app.Logger.Error("basic player processing failed", "tag", tag, "err", err)
+				app.Stats.SetReady(basicPlayersDomainName, false, err.Error())
+				return err
+			}
+			if err := writer.Enqueue(workerCtx, ingest); err != nil {
 				return err
 			}
 			app.Stats.RecordTrackedTarget(basicPlayersDomainName)
 			return nil
-		},
-		OnFetchError: func(_ context.Context, target clashtracker.Target, err error) (clashtracker.FetchErrorDecision, error) {
-			app.Logger.Error("basic player processing failed", "tag", target.Key, "err", err)
-			app.Stats.SetReady(basicPlayersDomainName, false, err.Error())
-			if decision, ok := platform.ClashFetchErrorDecision(err); ok {
-				return decision, nil
-			}
-			return clashtracker.FetchErrorDecision{Action: clashtracker.FetchErrorStop}, nil
-		},
-	})
-	if err != nil {
-		return err
+		}); err != nil {
+			return err
+		}
+		cursor = page.NextCursor
 	}
-	return runner.Run(ctx)
 }
 
 func (d *basicPlayersDomain) do(ctx context.Context, app *platform.App, tag string) (basicPlayerIngest, error) {
@@ -159,16 +174,11 @@ func (d *basicPlayersDomain) do(ctx context.Context, app *platform.App, tag stri
 	if err != nil {
 		return basicPlayerIngest{}, err
 	}
+	if player == nil {
+		return basicPlayerIngest{}, errors.New("player fetch returned no player")
+	}
 	profile := utils.PlayerProfileFromClashy(*player)
 	return basicPlayerIngest{Profile: &profile}, nil
-}
-
-func (p basicPlayerTargetPager) NextPage(ctx context.Context, cursor string, limit int) (clashtracker.TargetPage, error) {
-	return p.store.NextTargetPage(ctx, cursor, limit)
-}
-
-func (p basicPlayerTargetPager) Count(ctx context.Context) (int, error) {
-	return p.store.CountTargets(ctx)
 }
 
 func newTimescaleBasicPlayerStore(ctx context.Context, dsn string) (*timescaleBasicPlayerStore, error) {
@@ -187,38 +197,38 @@ func (s *timescaleBasicPlayerStore) Close() error {
 	return nil
 }
 
-func (s *timescaleBasicPlayerStore) NextTargetPage(ctx context.Context, cursor string, limit int) (clashtracker.TargetPage, error) {
+func (s *timescaleBasicPlayerStore) NextTargetPage(ctx context.Context, cursor string, limit int) (basicPlayerTargetPage, error) {
 	if limit <= 0 {
 		limit = 1000
 	}
 	rows, err := s.pool.Query(ctx, basicPlayerTargetSQL, cursor, limit+1)
 	if err != nil {
-		return clashtracker.TargetPage{}, err
+		return basicPlayerTargetPage{}, err
 	}
 	defer rows.Close()
-	targets := make([]clashtracker.Target, 0, limit)
+	tags := make([]string, 0, limit)
 	nextCursor := ""
 	for rows.Next() {
 		var tag string
 		if err := rows.Scan(&tag); err != nil {
-			return clashtracker.TargetPage{}, err
+			return basicPlayerTargetPage{}, err
 		}
 		if tag != "" {
-			if len(targets) == limit {
+			if len(tags) == limit {
 				nextCursor = tag
 				break
 			}
-			targets = append(targets, clashtracker.Target{Key: tag, Value: tag})
+			tags = append(tags, tag)
 		}
 	}
 	err = rows.Err()
 	if err != nil {
-		return clashtracker.TargetPage{}, err
+		return basicPlayerTargetPage{}, err
 	}
-	if nextCursor != "" && len(targets) > 0 {
-		nextCursor = targets[len(targets)-1].Key
+	if nextCursor != "" && len(tags) > 0 {
+		nextCursor = tags[len(tags)-1]
 	}
-	return clashtracker.TargetPage{Targets: targets, NextCursor: nextCursor}, nil
+	return basicPlayerTargetPage{Tags: tags, NextCursor: nextCursor}, nil
 }
 
 func (s *timescaleBasicPlayerStore) CountTargets(ctx context.Context) (int, error) {

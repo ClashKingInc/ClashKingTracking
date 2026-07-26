@@ -15,7 +15,6 @@ import (
 	"clashking_tracking/models"
 
 	clashy "github.com/clashkinginc/clashy.go"
-	clashtracker "github.com/clashkinginc/clashy.go/tracker"
 )
 
 func TestParseArmyColumnsAndNormalizeIgnoresOrder(t *testing.T) {
@@ -219,8 +218,8 @@ type fakeBattlelogStore struct {
 	calls  int
 }
 
-func (s *fakeBattlelogStore) NextTargetPage(context.Context, string, string, int) (clashtracker.TargetPage, error) {
-	return clashtracker.TargetPage{}, nil
+func (s *fakeBattlelogStore) NextTargetPage(context.Context, string, string, int) (battlelogTargetPage, error) {
+	return battlelogTargetPage{}, nil
 }
 
 func (s *fakeBattlelogStore) CountTargets(context.Context, string) (int, error) {

@@ -5,6 +5,7 @@ package scripts
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"os"
 	"reflect"
 	"testing"
@@ -105,6 +106,30 @@ func TestRedditPostHandlerPublishesInsertedSearchPost(t *testing.T) {
 	}
 }
 
+func TestRedditPostHandlerRetriesAfterPublishFailure(t *testing.T) {
+	app := &platform.App{Stats: platform.NewTracker()}
+	handler := newRedditPostHandler(t.Context(), app)
+	attempts := 0
+	handler.publish = func(_ context.Context, _ platform.Event) error {
+		attempts++
+		if attempts == 1 {
+			return errors.New("event stream unavailable")
+		}
+		return nil
+	}
+	post := &reddit.Post{ID: "retry", Title: "Need clan", LinkFlairText: "Searching"}
+
+	if err := handler.Post(post); err == nil {
+		t.Fatal("first publish should fail")
+	}
+	if err := handler.Post(post); err != nil {
+		t.Fatal(err)
+	}
+	if attempts != 2 {
+		t.Fatalf("publish attempts = %d, want 2", attempts)
+	}
+}
+
 func TestRedditPostHandlerPublishesToValkeyWhenConfigured(t *testing.T) {
 	addr := os.Getenv("VALKEY_ADDR")
 	if addr == "" {
@@ -122,6 +147,7 @@ func TestRedditPostHandlerPublishesToValkeyWhenConfigured(t *testing.T) {
 	defer client.Close()
 
 	stream := "reddit:test:" + time.Now().UTC().Format("20060102150405.000000000")
+	postID := "valkey" + time.Now().UTC().Format("20060102150405.000000000")
 	app := &platform.App{
 		Config: platform.Config{EventStreamName: stream},
 		Valkey: client,
@@ -129,7 +155,7 @@ func TestRedditPostHandlerPublishesToValkeyWhenConfigured(t *testing.T) {
 	}
 	handler := newRedditPostHandler(ctx, app)
 	if err := handler.Post(&reddit.Post{
-		ID:            "valkeyabc",
+		ID:            postID,
 		Title:         "Need clan #PYLQGR",
 		Score:         7,
 		URL:           "https://example.test/post",
@@ -152,4 +178,5 @@ func TestRedditPostHandlerPublishesToValkeyWhenConfigured(t *testing.T) {
 		t.Fatal("stream value was empty")
 	}
 	_ = client.Do(ctx, client.B().Del().Key(stream).Build()).Error()
+	_ = client.Do(ctx, client.B().Del().Key("reddit:seen:"+postID).Build()).Error()
 }

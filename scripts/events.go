@@ -36,7 +36,16 @@ func (d *eventsDomain) Run(ctx context.Context, app *platform.App) error {
 	register(server, app.Valkey, app.Config)
 	go func() {
 		<-ctx.Done()
-		server.GracefulStop()
+		stopped := make(chan struct{})
+		go func() {
+			server.GracefulStop()
+			close(stopped)
+		}()
+		select {
+		case <-stopped:
+		case <-time.After(5 * time.Second):
+			server.Stop()
+		}
 	}()
 	err = server.Serve(lis)
 	if errors.Is(err, grpc.ErrServerStopped) {

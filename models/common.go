@@ -2,14 +2,13 @@ package models
 
 import "time"
 
-// These lightweight transport models are shared across the in-process bus,
-// health endpoints, and queue reporting surfaces.
+// These lightweight transport models are shared by event and health surfaces.
 type Event struct {
-	Topic     string         `json:"topic" bson:"topic"`
-	Key       string         `json:"key,omitempty" bson:"key,omitempty"`
-	Type      string         `json:"type,omitempty" bson:"type,omitempty"`
-	Value     map[string]any `json:"value" bson:"value"`
-	CreatedAt time.Time      `json:"created_at" bson:"created_at"`
+	Topic     string         `json:"topic"`
+	Key       string         `json:"key,omitempty"`
+	Type      string         `json:"type,omitempty"`
+	Value     map[string]any `json:"value"`
+	CreatedAt time.Time      `json:"created_at"`
 }
 
 type HealthStatus struct {

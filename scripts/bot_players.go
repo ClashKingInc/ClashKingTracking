@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"errors"
 	"sort"
+	"sync"
 	"time"
 
 	"clashking_tracking/internal/platform"
@@ -13,7 +14,6 @@ import (
 	"clashking_tracking/models"
 
 	clashy "github.com/clashkinginc/clashy.go"
-	clashtracker "github.com/clashkinginc/clashy.go/tracker"
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgxpool"
 	valkey "github.com/valkey-io/valkey-go"
@@ -21,11 +21,6 @@ import (
 
 const (
 	botPlayersDomainName = "botplayers"
-	botPlayerCursorKey   = "botplayers:cursor:targets"
-
-	botPlayerAsyncWriteBatchSize     = 4000
-	botPlayerAsyncWriteQueueSize     = 8000
-	botPlayerAsyncWriteFlushInterval = 500 * time.Millisecond
 )
 
 func playerSnapshotKey(tag string) string {
@@ -45,27 +40,19 @@ func equalBytes(a, b []byte) bool {
 }
 
 type botPlayersDomain struct {
-	valkey valkey.Client
-	store  botPlayerStore
+	snapshots botPlayerSnapshotStore
+	store     botPlayerStore
 }
 
 type botPlayerStore interface {
 	Close()
-	NextTargetBatch(context.Context, int) (botPlayerTargetBatch, error)
-	CommitTargetBatch(context.Context, botPlayerTargetBatch) error
+	NextTargetPage(context.Context, string, int) (botPlayerTargetPage, error)
 	StoreIngest(context.Context, models.BotPlayerIngest) error
 }
 
-type botPlayerTargetBatch struct {
-	Targets []models.BotPlayerTarget
-	Cursor  string
-}
-
-type botPlayerTrackerTargetStore struct {
-	store    botPlayerStore
-	pageSize int
-	batch    botPlayerTargetBatch
-	progress cursorTargetBatchProgress
+type botPlayerTargetPage struct {
+	Targets    []models.BotPlayerTarget
+	NextCursor string
 }
 
 func NewBotPlayersDomain() platform.Domain { return &botPlayersDomain{} }
@@ -81,89 +68,53 @@ func (d *botPlayersDomain) Run(ctx context.Context, app *platform.App) error {
 		return err
 	}
 	defer store.Close()
-	d.valkey = app.Valkey
+	d.snapshots = newBotPlayerSnapshotStore(app.Valkey)
 	d.store = store
 
-	targetPageSize := app.Config.BotPlayerRequestsPerSecond * app.Config.TargetPageMultiplier
-	targets := &botPlayerTrackerTargetStore{store: d.store, pageSize: targetPageSize}
-	targetSet, err := newScriptMemoryTargetSet(ctx, app, botPlayersDomainName, "targets", 0, targets.List)
+	limiter, err := newTrackingLimiter(app.Config.BotPlayerRequestsPerSecond)
 	if err != nil {
 		return err
 	}
-	if err := targetSet.RegisterProgress(ctx, targetSet.ProgressName()); err != nil {
-		return err
-	}
-	writer := platform.NewAsyncBatchWriter[models.BotPlayerIngest](
-		app,
-		platform.AsyncBatchWriterConfig[models.BotPlayerIngest]{
-			Domain:        botPlayersDomainName,
-			BatchSize:     botPlayerAsyncWriteBatchSize,
-			QueueSize:     botPlayerAsyncWriteQueueSize,
-			FlushInterval: botPlayerAsyncWriteFlushInterval,
-			WriteBatch: func(writeCtx context.Context, values []models.BotPlayerIngest) error {
-				start := time.Now()
-				for _, ingest := range values {
-					if err := d.storePlayerIngest(writeCtx, app, ingest); err != nil {
-						return err
-					}
-					if err := targets.MarkStored(writeCtx, targetSet); err != nil {
-						return err
-					}
-				}
-				app.Stats.RecordProcess(botPlayersDomainName, time.Since(start))
-				return nil
-			},
-		},
-	)
-	go writer.Run(ctx)
-	tags := targetSet.Tags()
-	pager := targetSet.TargetPager()
-	runner, err := clashtracker.NewRunner[models.BotPlayerIngest](clashtracker.Config[models.BotPlayerIngest]{
-		Tags:              tags,
-		TargetPager:       pager,
-		RequestsPerSecond: app.Config.BotPlayerRequestsPerSecond,
-		MaxInFlight:       app.Config.BotPlayerRequestsPerSecond,
-		EmitInitial:       true,
-		Fetch: func(fetchCtx context.Context, target clashtracker.Target) (clashtracker.FetchResult[models.BotPlayerIngest], error) {
-			botTarget, err := decodeBotPlayerTarget(target)
+	pageSize := app.Config.BotPlayerRequestsPerSecond * app.Config.TargetPageMultiplier
+	cursor := ""
+	for {
+		page, err := d.store.NextTargetPage(ctx, cursor, pageSize)
+		if err != nil {
+			return err
+		}
+		if len(page.Targets) == 0 {
+			cursor = ""
+			if err := sleepOrDone(ctx, time.Second); err != nil {
+				return err
+			}
+			continue
+		}
+		start := time.Now()
+		if err := runBounded(ctx, platform.RequestConcurrency(app.Config.BotPlayerRequestsPerSecond), page.Targets, func(workerCtx context.Context, target models.BotPlayerTarget) error {
+			ingest, err := retryLimitedClashFetch(workerCtx, limiter, func(fetchCtx context.Context) (models.BotPlayerIngest, error) {
+				return d.fetchAndPreparePlayer(fetchCtx, app, target)
+			})
 			if err != nil {
-				return clashtracker.FetchResult[models.BotPlayerIngest]{}, err
-			}
-			ingest, err := d.fetchAndPreparePlayer(fetchCtx, app, botTarget)
-			return clashtracker.FetchResult[models.BotPlayerIngest]{Value: ingest}, err
-		},
-		Handle: func(handleCtx context.Context, _ clashtracker.Target, _ *models.BotPlayerIngest, ingest models.BotPlayerIngest) error {
-			if err := writer.Enqueue(handleCtx, ingest); err != nil {
+				app.Logger.Error("bot player processing failed", "tag", target.Tag, "err", err)
+				app.Stats.SetReady(botPlayersDomainName, false, err.Error())
 				return err
 			}
-			targetSet.RecordTracked()
-			if err := targets.MarkHandled(handleCtx, targetSet); err != nil {
+			if err := d.storePlayerIngest(workerCtx, app, ingest); err != nil {
 				return err
 			}
+			app.Stats.RecordTrackedTarget(botPlayersDomainName)
 			return nil
-		},
-		OnFetchError: func(_ context.Context, target clashtracker.Target, err error) (clashtracker.FetchErrorDecision, error) {
-			app.Logger.Error("bot player processing failed", "tag", target.Key, "err", err)
-			app.Stats.SetReady(botPlayersDomainName, false, err.Error())
-			if decision, ok := platform.ClashFetchErrorDecision(err); ok {
-				return decision, nil
-			}
-			return clashtracker.FetchErrorDecision{Action: clashtracker.FetchErrorStop}, nil
-		},
-	})
-	if err != nil {
-		return err
+		}); err != nil {
+			return err
+		}
+		app.Stats.RecordProcess(botPlayersDomainName, time.Since(start))
+		cursor = page.NextCursor
 	}
-	targetSet.SetRunner(runner)
-	return runner.Run(ctx)
 }
 
 func validateBotPlayersConfig(cfg platform.Config) error {
 	if cfg.BotPlayerRequestsPerSecond <= 0 {
 		return errors.New("botplayers.requests_per_second must be greater than zero")
-	}
-	if cfg.BotPlayerTargetRefreshSeconds <= 0 {
-		return errors.New("botplayers.target_refresh_seconds must be greater than zero")
 	}
 	if cfg.TargetPageMultiplier <= 0 {
 		return errors.New("target_page_multiplier must be greater than zero")
@@ -172,7 +123,7 @@ func validateBotPlayersConfig(cfg platform.Config) error {
 		return errors.New("TIMESCALE_URL is required for botplayers")
 	}
 	if !cfg.DryRun && !cfg.MockDB && cfg.ValkeyAddr == "" {
-		return errors.New("valkey_addr is required for botplayers snapshots and cursors")
+		return errors.New("valkey_addr is required for botplayers snapshots")
 	}
 	return nil
 }
@@ -181,7 +132,7 @@ func newBotPlayerStore(ctx context.Context, app *platform.App) (botPlayerStore, 
 	if app.Config.MockDB || app.Config.DryRun || app.Config.TimescaleURL == "" {
 		return newMemoryBotPlayerStore(), nil
 	}
-	return newTimescaleBotPlayerStore(ctx, app.Config.TimescaleURL, app.Valkey)
+	return newTimescaleBotPlayerStore(ctx, app.Config.TimescaleURL)
 }
 
 func (d *botPlayersDomain) fetchAndPreparePlayer(
@@ -196,7 +147,7 @@ func (d *botPlayersDomain) fetchAndPreparePlayer(
 	player, err := app.Clash.GetPlayer(ctx, target.Tag)
 	app.Stats.RecordRequest(botPlayersDomainName, time.Since(start), err)
 	if err != nil {
-		if _, ok := platform.ClashFetchErrorDecision(err); ok {
+		if _, ok := platform.ClashFetchRetryPolicy(err); ok {
 			return models.BotPlayerIngest{}, err
 		}
 		return models.BotPlayerIngest{}, nil
@@ -208,7 +159,7 @@ func (d *botPlayersDomain) fetchAndPreparePlayer(
 }
 
 func (d *botPlayersDomain) storePlayerIngest(ctx context.Context, app *platform.App, ingest models.BotPlayerIngest) error {
-	if len(ingest.ProfileChanges) == 0 && len(ingest.SeasonStats) == 0 {
+	if len(ingest.Players) == 0 && len(ingest.ProfileChanges) == 0 && len(ingest.SeasonStats) == 0 {
 		return d.savePlayerSnapshot(ctx, ingest.SnapshotTag, ingest.SnapshotRaw)
 	}
 	if err := d.store.StoreIngest(ctx, ingest); err != nil {
@@ -218,92 +169,16 @@ func (d *botPlayersDomain) storePlayerIngest(ctx context.Context, app *platform.
 		len(ingest.Players)+len(ingest.ProfileChanges)+len(ingest.SeasonStats),
 	)
 	app.Stats.SetReady(botPlayersDomainName, true, "")
-	if err := app.PublishEvent(ctx, platform.Event{
-		Topic:   ingest.Event.Topic,
-		ClanTag: ingest.Event.Key,
-		Value:   ingest.Event.Value,
-	}); err != nil {
-		return err
+	if ingest.Event.Topic != "" {
+		if err := app.PublishEvent(ctx, platform.Event{
+			Topic:   ingest.Event.Topic,
+			ClanTag: ingest.Event.Key,
+			Value:   ingest.Event.Value,
+		}); err != nil {
+			return err
+		}
 	}
 	return d.savePlayerSnapshot(ctx, ingest.SnapshotTag, ingest.SnapshotRaw)
-}
-
-func (s *botPlayerTrackerTargetStore) List(ctx context.Context) ([]clashtracker.Target, error) {
-	batch, err := s.store.NextTargetBatch(ctx, s.pageSize)
-	if err != nil {
-		return nil, err
-	}
-	s.batch = batch
-	if len(batch.Targets) == 0 {
-		if err := s.store.CommitTargetBatch(ctx, batch); err != nil {
-			return nil, err
-		}
-		return nil, nil
-	}
-	s.progress.reset(len(batch.Targets))
-	targets := make([]clashtracker.Target, 0, len(batch.Targets))
-	for _, target := range batch.Targets {
-		targets = append(targets, encodeBotPlayerTarget(target))
-	}
-	return targets, nil
-}
-
-func (s *botPlayerTrackerTargetStore) Add(context.Context, ...clashtracker.Target) error {
-	return nil
-}
-
-func (s *botPlayerTrackerTargetStore) Remove(context.Context, ...string) error {
-	return nil
-}
-
-func (s *botPlayerTrackerTargetStore) Commit(ctx context.Context) error {
-	err := s.store.CommitTargetBatch(ctx, s.batch)
-	s.batch = botPlayerTargetBatch{}
-	return err
-}
-
-func (s *botPlayerTrackerTargetStore) MarkHandled(ctx context.Context, targetSet *scriptMemoryTargetSet) error {
-	if s.progress.completedWithStore() {
-		return s.CommitAndRefresh(ctx, targetSet)
-	}
-	return nil
-}
-
-func (s *botPlayerTrackerTargetStore) MarkSkipped(ctx context.Context, targetSet *scriptMemoryTargetSet) error {
-	if s.progress.completedWithoutStore() {
-		return s.CommitAndRefresh(ctx, targetSet)
-	}
-	return nil
-}
-
-func (s *botPlayerTrackerTargetStore) MarkStored(ctx context.Context, targetSet *scriptMemoryTargetSet) error {
-	if s.progress.storedOne() {
-		return s.CommitAndRefresh(ctx, targetSet)
-	}
-	return nil
-}
-
-func (s *botPlayerTrackerTargetStore) CommitAndRefresh(ctx context.Context, targetSet *scriptMemoryTargetSet) error {
-	if err := s.Commit(ctx); err != nil {
-		return err
-	}
-	return targetSet.Refresh(ctx)
-}
-
-func encodeBotPlayerTarget(target models.BotPlayerTarget) clashtracker.Target {
-	raw, _ := json.Marshal(target)
-	return clashtracker.Target{Key: target.Tag, Value: string(raw)}
-}
-
-func decodeBotPlayerTarget(target clashtracker.Target) (models.BotPlayerTarget, error) {
-	var out models.BotPlayerTarget
-	if err := json.Unmarshal([]byte(target.Value), &out); err != nil {
-		return models.BotPlayerTarget{}, err
-	}
-	if out.Tag == "" {
-		out.Tag = target.Key
-	}
-	return out, nil
 }
 
 func (d *botPlayersDomain) doPlayer(
@@ -320,7 +195,14 @@ func (d *botPlayersDomain) doPlayer(
 	if err != nil {
 		return models.BotPlayerIngest{}, err
 	}
-	if len(previousRaw) == 0 || equalBytes(previousRaw, raw) {
+	if len(previousRaw) == 0 {
+		return models.BotPlayerIngest{
+			Players:     []models.BasicPlayerRow{botPlayerRow(player)},
+			SnapshotTag: tag,
+			SnapshotRaw: raw,
+		}, nil
+	}
+	if equalBytes(previousRaw, raw) {
 		return models.BotPlayerIngest{SnapshotTag: tag, SnapshotRaw: raw}, nil
 	}
 	var previousPlayer clashy.Player
@@ -342,15 +224,7 @@ func (d *botPlayersDomain) doPlayer(
 		}
 	}
 	return models.BotPlayerIngest{
-		Players: []models.BasicPlayerRow{{
-			Tag:          player.Tag,
-			Name:         player.Name,
-			LeagueID:     player.LeagueTier.ID,
-			ClanTag:      clan,
-			ClanTagKnown: true,
-			TownHall:     player.TownHall,
-			Trophies:     player.Trophies,
-		}},
+		Players:        []models.BasicPlayerRow{botPlayerRow(player)},
 		ProfileChanges: changes,
 		SeasonStats:    stats,
 		LastOnlineAt:   lastOnline,
@@ -371,29 +245,90 @@ func (d *botPlayersDomain) doPlayer(
 	}, nil
 }
 
-func (d *botPlayersDomain) loadPlayerSnapshot(ctx context.Context, tag string) ([]byte, error) {
-	if d.valkey == nil {
-		return nil, nil
+func botPlayerRow(player clashy.Player) models.BasicPlayerRow {
+	clan := ""
+	if player.Clan != nil {
+		clan = player.Clan.Tag
 	}
-	value, err := d.valkey.Do(ctx, d.valkey.B().Get().Key(playerSnapshotKey(tag)).Build()).ToString()
-	if err != nil {
-		if valkey.IsValkeyNil(err) {
-			return nil, nil
-		}
-		return nil, err
+	return models.BasicPlayerRow{
+		Tag:          player.Tag,
+		Name:         player.Name,
+		LeagueID:     player.LeagueTier.ID,
+		ClanTag:      clan,
+		ClanTagKnown: true,
+		TownHall:     player.TownHall,
+		Trophies:     player.Trophies,
 	}
-	return utils.Decompress([]byte(value))
 }
 
-func (d *botPlayersDomain) savePlayerSnapshot(ctx context.Context, tag string, raw []byte) error {
-	if d.valkey == nil || tag == "" || len(raw) == 0 {
-		return nil
+type botPlayerSnapshotStore interface {
+	Load(context.Context, string) ([]byte, bool, error)
+	Store(context.Context, string, []byte) error
+}
+
+type valkeyBotPlayerSnapshotStore struct {
+	client valkey.Client
+}
+
+type memoryBotPlayerSnapshotStore struct {
+	mu     sync.Mutex
+	values map[string][]byte
+}
+
+func newBotPlayerSnapshotStore(client valkey.Client) botPlayerSnapshotStore {
+	if client != nil {
+		return valkeyBotPlayerSnapshotStore{client: client}
 	}
-	return d.valkey.Do(ctx, d.valkey.B().Set().
-		Key(playerSnapshotKey(tag)).
+	return &memoryBotPlayerSnapshotStore{values: make(map[string][]byte)}
+}
+
+func (s valkeyBotPlayerSnapshotStore) Load(ctx context.Context, key string) ([]byte, bool, error) {
+	value, err := s.client.Do(ctx, s.client.B().Get().Key(key).Build()).ToString()
+	if err != nil {
+		if valkey.IsValkeyNil(err) {
+			return nil, false, nil
+		}
+		return nil, false, err
+	}
+	raw, err := utils.Decompress([]byte(value))
+	return raw, err == nil, err
+}
+
+func (s valkeyBotPlayerSnapshotStore) Store(ctx context.Context, key string, raw []byte) error {
+	return s.client.Do(ctx, s.client.B().Set().
+		Key(key).
 		Value(valkey.BinaryString(utils.Compress(raw))).
 		Build(),
 	).Error()
+}
+
+func (s *memoryBotPlayerSnapshotStore) Load(_ context.Context, key string) ([]byte, bool, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	raw, ok := s.values[key]
+	return append([]byte(nil), raw...), ok, nil
+}
+
+func (s *memoryBotPlayerSnapshotStore) Store(_ context.Context, key string, raw []byte) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.values[key] = append([]byte(nil), raw...)
+	return nil
+}
+
+func (d *botPlayersDomain) loadPlayerSnapshot(ctx context.Context, tag string) ([]byte, error) {
+	if d.snapshots == nil {
+		return nil, nil
+	}
+	raw, _, err := d.snapshots.Load(ctx, playerSnapshotKey(tag))
+	return raw, err
+}
+
+func (d *botPlayersDomain) savePlayerSnapshot(ctx context.Context, tag string, raw []byte) error {
+	if d.snapshots == nil || tag == "" || len(raw) == 0 {
+		return nil
+	}
+	return d.snapshots.Store(ctx, playerSnapshotKey(tag), raw)
 }
 
 func playerMap(player clashy.Player) map[string]any {
@@ -555,21 +490,18 @@ func clanTag(player map[string]any) string {
 }
 
 type timescaleBotPlayerStore struct {
-	pool   *pgxpool.Pool
-	valkey valkey.Client
-	cursor string
+	pool *pgxpool.Pool
 }
 
 func newTimescaleBotPlayerStore(
 	ctx context.Context,
 	dsn string,
-	client valkey.Client,
 ) (*timescaleBotPlayerStore, error) {
 	pool, err := pgxpool.New(ctx, dsn)
 	if err != nil {
 		return nil, err
 	}
-	return &timescaleBotPlayerStore{pool: pool, valkey: client}, nil
+	return &timescaleBotPlayerStore{pool: pool}, nil
 }
 
 func (s *timescaleBotPlayerStore) Close() {
@@ -578,51 +510,36 @@ func (s *timescaleBotPlayerStore) Close() {
 	}
 }
 
-func (s *timescaleBotPlayerStore) NextTargetBatch(
+func (s *timescaleBotPlayerStore) NextTargetPage(
 	ctx context.Context,
+	cursor string,
 	limit int,
-) (botPlayerTargetBatch, error) {
+) (botPlayerTargetPage, error) {
 	if limit <= 0 {
-		return botPlayerTargetBatch{}, nil
-	}
-	cursor, err := s.getCursor(ctx)
-	if err != nil {
-		return botPlayerTargetBatch{}, err
+		return botPlayerTargetPage{}, nil
 	}
 	rows, err := s.pool.Query(ctx, botPlayerTargetsSQL, cursor, limit+1)
 	if err != nil {
-		return botPlayerTargetBatch{}, err
+		return botPlayerTargetPage{}, err
 	}
 	defer rows.Close()
 	var targets []models.BotPlayerTarget
 	for rows.Next() {
 		var target models.BotPlayerTarget
 		if err := rows.Scan(&target.Tag); err != nil {
-			return botPlayerTargetBatch{}, err
+			return botPlayerTargetPage{}, err
 		}
 		targets = append(targets, target)
 	}
 	if err := rows.Err(); err != nil {
-		return botPlayerTargetBatch{}, err
+		return botPlayerTargetPage{}, err
 	}
 	nextCursor := ""
 	if len(targets) > limit {
 		nextCursor = targets[limit-1].Tag
 		targets = targets[:limit]
 	}
-	return botPlayerTargetBatch{Targets: targets, Cursor: nextCursor}, nil
-}
-
-func (s *timescaleBotPlayerStore) CommitTargetBatch(
-	ctx context.Context,
-	batch botPlayerTargetBatch,
-) error {
-	s.cursor = batch.Cursor
-	if s.valkey == nil {
-		return nil
-	}
-	cmd := cursorCommand(s.valkey, botPlayerCursorKey, batch.Cursor)
-	return s.valkey.Do(ctx, cmd).Error()
+	return botPlayerTargetPage{Targets: targets, NextCursor: nextCursor}, nil
 }
 
 func (s *timescaleBotPlayerStore) StoreIngest(
@@ -651,26 +568,13 @@ func (s *timescaleBotPlayerStore) StoreIngest(
 	return tx.Commit(ctx)
 }
 
-func (s *timescaleBotPlayerStore) getCursor(ctx context.Context) (string, error) {
-	if s.valkey == nil {
-		return s.cursor, nil
-	}
-	value, err := s.valkey.Do(ctx, s.valkey.B().Get().Key(botPlayerCursorKey).Build()).ToString()
-	if err != nil {
-		if valkey.IsValkeyNil(err) {
-			return "", nil
-		}
-		return "", err
-	}
-	return value, nil
-}
-
 const botPlayerTargetsSQL = `
 	SELECT tag
 	FROM (
-		SELECT unnest(member_tags) AS tag
+		SELECT member->>'tag' AS tag
 		FROM basic_clan
-		WHERE cardinality(member_tags) > 0
+		CROSS JOIN LATERAL jsonb_array_elements(COALESCE(members, '[]'::jsonb)) AS member
+		WHERE member->>'tag' <> ''
 		UNION
 		SELECT tag
 		FROM tracked_player_targets
@@ -755,7 +659,6 @@ func upsertPlayerSeasonStats(
 
 type memoryBotPlayerStore struct {
 	targets []models.BotPlayerTarget
-	cursor  int
 }
 
 func newMemoryBotPlayerStore() *memoryBotPlayerStore {
@@ -764,43 +667,30 @@ func newMemoryBotPlayerStore() *memoryBotPlayerStore {
 
 func (s *memoryBotPlayerStore) Close() {}
 
-func (s *memoryBotPlayerStore) NextTargetBatch(
+func (s *memoryBotPlayerStore) NextTargetPage(
 	_ context.Context,
+	cursor string,
 	limit int,
-) (botPlayerTargetBatch, error) {
+) (botPlayerTargetPage, error) {
 	if limit <= 0 || len(s.targets) == 0 {
-		return botPlayerTargetBatch{}, nil
+		return botPlayerTargetPage{}, nil
 	}
-	if s.cursor >= len(s.targets) {
-		s.cursor = 0
+	targets := append([]models.BotPlayerTarget(nil), s.targets...)
+	sort.Slice(targets, func(i, j int) bool { return targets[i].Tag < targets[j].Tag })
+	start := sort.Search(len(targets), func(i int) bool { return targets[i].Tag > cursor })
+	if start >= len(targets) {
+		return botPlayerTargetPage{}, nil
 	}
-	end := s.cursor + limit
-	if end > len(s.targets) {
-		end = len(s.targets)
+	end := start + limit
+	if end > len(targets) {
+		end = len(targets)
 	}
-	targets := append([]models.BotPlayerTarget(nil), s.targets[s.cursor:end]...)
-	cursor := ""
-	if end < len(s.targets) {
-		cursor = targets[len(targets)-1].Tag
+	pageTargets := append([]models.BotPlayerTarget(nil), targets[start:end]...)
+	nextCursor := ""
+	if end < len(targets) {
+		nextCursor = pageTargets[len(pageTargets)-1].Tag
 	}
-	return botPlayerTargetBatch{Targets: targets, Cursor: cursor}, nil
-}
-
-func (s *memoryBotPlayerStore) CommitTargetBatch(
-	_ context.Context,
-	batch botPlayerTargetBatch,
-) error {
-	if batch.Cursor == "" {
-		s.cursor = 0
-		return nil
-	}
-	for i, target := range s.targets {
-		if target.Tag == batch.Cursor {
-			s.cursor = i + 1
-			return nil
-		}
-	}
-	return nil
+	return botPlayerTargetPage{Targets: pageTargets, NextCursor: nextCursor}, nil
 }
 
 func (s *memoryBotPlayerStore) StoreIngest(context.Context, models.BotPlayerIngest) error {

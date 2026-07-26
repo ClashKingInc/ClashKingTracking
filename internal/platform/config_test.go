@@ -31,13 +31,11 @@ func TestLoadWithArgsReadsConfigJSON(t *testing.T) {
 		},
 		"globalclans": {
 			"priority_requests_per_second": 123,
-			"non_priority_requests_per_second": 45,
-			"target_refresh_seconds": 3600
+			"non_priority_requests_per_second": 45
 		},
 		"battlelogs": {
 			"requests_per_second": 11,
 			"priority_requests_per_second": 3,
-			"target_refresh_seconds": 3700,
 			"checkpoint_ttl_days": 34,
 			"first_seen_lookback_days": 56
 		},
@@ -52,12 +50,10 @@ func TestLoadWithArgsReadsConfigJSON(t *testing.T) {
 			"cwl_state_snapshot": "test-cwlstate"
 		},
 		"botplayers": {
-			"requests_per_second": 88,
-			"target_refresh_seconds": 3900
+			"requests_per_second": 88
 		},
 		"basicplayers": {
-			"requests_per_second": 30,
-			"target_refresh_seconds": 43200
+			"requests_per_second": 30
 		},
 		"leaderboards": {
 			"requests_per_second": 66,
@@ -72,8 +68,7 @@ func TestLoadWithArgsReadsConfigJSON(t *testing.T) {
 			"scan_seconds": 60
 		},
 		"reddit": {
-			"poll_seconds": 120,
-			"limit": 10
+			"poll_seconds": 120
 		}
 	}`)
 
@@ -95,13 +90,11 @@ func TestLoadWithArgsReadsConfigJSON(t *testing.T) {
 		t.Fatalf("runtime stats/r2 config was not applied: %+v", cfg)
 	}
 	if cfg.GlobalClanPriorityRequestsPerSecond != 123 || cfg.GlobalClanNonPriorityRequestsPerSecond != 45 ||
-		cfg.GlobalClanMaxInFlight != 123 || cfg.GlobalClanTargetRefreshSeconds != 3600 ||
 		cfg.TargetPageMultiplier != 9 {
 		t.Fatalf("globalclans config was not applied: %+v", cfg)
 	}
 	if cfg.BattlelogRequestsPerSecond != 11 || cfg.BattlelogPriorityRequestsPerSecond != 3 ||
-		cfg.BattlelogCheckpointTTLDays != 34 || cfg.BattlelogFirstSeenLookbackDays != 56 ||
-		cfg.BattlelogTargetRefreshSeconds != 3700 {
+		cfg.BattlelogCheckpointTTLDays != 34 || cfg.BattlelogFirstSeenLookbackDays != 56 {
 		t.Fatalf("battlelogs config was not applied: %+v", cfg)
 	}
 	if cfg.WarCWLSyncSeconds != 22 {
@@ -116,12 +109,11 @@ func TestLoadWithArgsReadsConfigJSON(t *testing.T) {
 		cfg.EventStreamRetentionSeconds != 300 || cfg.EventStreamReclaimIdleSeconds != 30 {
 		t.Fatalf("events config was not applied: %+v", cfg)
 	}
-	if cfg.BotPlayerRequestsPerSecond != 88 || cfg.BotPlayerTargetRefreshSeconds != 3900 ||
-		cfg.BasicPlayerRequestsPerSecond != 30 || cfg.BasicPlayerTargetRefreshSeconds != 43200 ||
+	if cfg.BotPlayerRequestsPerSecond != 88 || cfg.BasicPlayerRequestsPerSecond != 30 ||
 		cfg.LeaderboardRequestsPerSecond != 66 ||
 		cfg.LeaderboardIntervalSeconds != 600 || cfg.ScheduledIntervalSeconds != 900 ||
 		cfg.LeaderboardLimit != 500 || cfg.LeaderboardNullAssetURL != "https://assets/null" ||
-		cfg.GiveawayScanSeconds != 60 || cfg.RedditPollSeconds != 120 || cfg.RedditLimit != 10 {
+		cfg.GiveawayScanSeconds != 60 || cfg.RedditPollSeconds != 120 {
 		t.Fatalf("script config was not applied: %+v", cfg)
 	}
 }
@@ -162,15 +154,8 @@ func TestLoadWithArgsOnlyScriptComesFromCLI(t *testing.T) {
 		cfg.ProxyURL != "http://proxy-json" || !cfg.DryRun {
 		t.Fatalf("env should not override config knobs: %+v", cfg)
 	}
-	if cfg.GlobalClanMaxInFlight != cfg.GlobalClanPriorityRequestsPerSecond {
-		t.Fatalf("globalclans max in-flight = %d, want request/sec %d",
-			cfg.GlobalClanMaxInFlight, cfg.GlobalClanPriorityRequestsPerSecond)
-	}
-	if cfg.WarMaxInFlight != cfg.WarRequestsPerSecond {
-		t.Fatalf("war max in-flight = %d, want requests/sec %d", cfg.WarMaxInFlight, cfg.WarRequestsPerSecond)
-	}
-	if cfg.BattlelogTargetRefreshSeconds != 4*60*60 {
-		t.Fatalf("battlelogs target refresh default = %d, want 14400", cfg.BattlelogTargetRefreshSeconds)
+	if cfg.WarMaxInFlight != RequestConcurrency(cfg.WarRequestsPerSecond) {
+		t.Fatalf("war max in-flight = %d, want concurrency %d", cfg.WarMaxInFlight, RequestConcurrency(cfg.WarRequestsPerSecond))
 	}
 }
 
@@ -243,8 +228,6 @@ func clearConfigEnv(t *testing.T) {
 		"EVENT_BUFFER_SIZE",
 		"RECENT_EVENT_BUFFER",
 		"PROXY_URL",
-		"STATS_MONGODB_URI",
-		"STATIC_MONGODB_URI",
 		"TIMESCALE_URL",
 		"VALKEY_ADDR",
 		"VALKEY_PASSWORD",

@@ -16,7 +16,6 @@ import (
 	"clashking_tracking/models"
 
 	"github.com/clashkinginc/clashy.go"
-	clashtracker "github.com/clashkinginc/clashy.go/tracker"
 	"github.com/google/uuid"
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgxpool"
@@ -44,19 +43,19 @@ type battlelogsDomain struct {
 }
 
 type battlelogStore interface {
-	NextTargetPage(context.Context, string, string, int) (clashtracker.TargetPage, error)
+	NextTargetPage(context.Context, string, string, int) (battlelogTargetPage, error)
 	CountTargets(context.Context, string) (int, error)
 	Store(context.Context, models.BattlelogIngest) (int, error)
 	Close() error
 }
 
-type timescaleBattlelogStore struct {
-	pool *pgxpool.Pool
+type battlelogTargetPage struct {
+	Tags       []string
+	NextCursor string
 }
 
-type battlelogTargetPager struct {
-	store battlelogStore
-	group string
+type timescaleBattlelogStore struct {
+	pool *pgxpool.Pool
 }
 
 func NewBattlelogsDomain() platform.Domain {
@@ -69,8 +68,8 @@ func (d *battlelogsDomain) Run(ctx context.Context, app *platform.App) error {
 	if app.Config.BattlelogRequestsPerSecond <= 0 {
 		return errors.New("battlelogs.requests_per_second must be greater than zero when battlelogs is enabled")
 	}
-	if app.Config.BattlelogTargetRefreshSeconds <= 0 {
-		return errors.New("battlelogs.target_refresh_seconds must be greater than zero when battlelogs is enabled")
+	if app.Config.BattlelogPriorityRequestsPerSecond < 0 || app.Config.BattlelogPriorityRequestsPerSecond > app.Config.BattlelogRequestsPerSecond {
+		return errors.New("battlelogs.priority_requests_per_second must be between zero and battlelogs.requests_per_second")
 	}
 	if app.Config.BattlelogCheckpointTTLDays <= 0 {
 		return errors.New("battlelogs.checkpoint_ttl_days must be greater than zero when battlelogs is enabled")
@@ -122,33 +121,46 @@ func (d *battlelogsDomain) Run(ctx context.Context, app *platform.App) error {
 			},
 		},
 	)
-	go writer.Run(ctx)
+	writerCtx, stopWriter := context.WithCancel(ctx)
+	writerDone := make(chan struct{})
+	go func() {
+		defer close(writerDone)
+		writer.Run(writerCtx)
+	}()
+	defer func() {
+		stopWriter()
+		<-writerDone
+	}()
 
 	legendRPS := app.Config.BattlelogPriorityRequestsPerSecond
 	standardRPS := app.Config.BattlelogRequestsPerSecond - legendRPS
+	trackerCtx, stopTrackers := context.WithCancel(ctx)
+	defer stopTrackers()
 	errCh := make(chan error, 2)
 	runners := 0
 	if legendRPS > 0 {
 		runners++
 		go func() {
-			errCh <- d.runTracker(ctx, app, writer, "legend", legendRPS)
+			errCh <- d.runTracker(trackerCtx, app, writer, "legend", legendRPS)
 		}()
 	}
 	if standardRPS > 0 {
 		runners++
 		go func() {
-			errCh <- d.runTracker(ctx, app, writer, "standard", standardRPS)
+			errCh <- d.runTracker(trackerCtx, app, writer, "standard", standardRPS)
 		}()
 	}
 	if runners == 0 {
 		return errors.New("battlelogs has no positive request budget after priority split")
 	}
-	for i := 0; i < runners; i++ {
-		if err := <-errCh; err != nil {
-			return err
+	var firstErr error
+	for range runners {
+		if err := <-errCh; err != nil && firstErr == nil {
+			firstErr = err
+			stopTrackers()
 		}
 	}
-	return nil
+	return firstErr
 }
 
 func (d *battlelogsDomain) runTracker(
@@ -164,47 +176,48 @@ func (d *battlelogsDomain) runTracker(
 	} else {
 		app.Logger.Error("battlelog target count failed", "group", group, "err", err)
 	}
-	runner, err := clashtracker.NewRunner[models.BattlelogIngest](clashtracker.Config[models.BattlelogIngest]{
-		TargetPager:       battlelogTargetPager{store: d.sink, group: group},
-		TargetPageSize:    battlelogTargetPageSize,
-		ResultBatchSize:   battlelogAsyncWriteBatchSize,
-		RequestsPerSecond: requestsPerSecond,
-		MaxInFlight:       requestsPerSecond,
-		EmitInitial:       true,
-		Fetch: func(fetchCtx context.Context, target clashtracker.Target) (clashtracker.FetchResult[models.BattlelogIngest], error) {
-			ingest, err := d.do(fetchCtx, app, statsName, target.Key)
-			return clashtracker.FetchResult[models.BattlelogIngest]{Value: ingest}, err
-		},
-		Handle: func(handleCtx context.Context, _ clashtracker.Target, _ *models.BattlelogIngest, ingest models.BattlelogIngest) error {
+	limiter, err := newTrackingLimiter(requestsPerSecond)
+	if err != nil {
+		return err
+	}
+	cursor := ""
+	for {
+		page, err := d.sink.NextTargetPage(ctx, group, cursor, battlelogTargetPageSize)
+		if err != nil {
+			return err
+		}
+		if len(page.Tags) == 0 {
+			cursor = ""
+			if err := sleepOrDone(ctx, time.Second); err != nil {
+				return err
+			}
+			continue
+		}
+		checkpoints, err := d.checkpoint.GetMany(ctx, page.Tags)
+		if err != nil {
+			return err
+		}
+		if err := runBounded(ctx, platform.RequestConcurrency(requestsPerSecond), page.Tags, func(workerCtx context.Context, tag string) error {
+			ingest, err := retryLimitedClashFetch(workerCtx, limiter, func(fetchCtx context.Context) (models.BattlelogIngest, error) {
+				return d.do(fetchCtx, app, statsName, tag, checkpoints[tag])
+			})
+			if err != nil {
+				app.Logger.Error("battlelog processing failed", "tag", tag, "err", err)
+				app.Stats.SetReady(statsName, false, err.Error())
+				return err
+			}
 			if len(ingest.Rows) > 0 || len(ingest.Checkpoints) > 0 {
-				if err := writer.Enqueue(handleCtx, ingest); err != nil {
+				if err := writer.Enqueue(workerCtx, ingest); err != nil {
 					return err
 				}
 			}
 			app.Stats.RecordTrackedTarget(statsName)
 			return nil
-		},
-		OnFetchError: func(_ context.Context, target clashtracker.Target, err error) (clashtracker.FetchErrorDecision, error) {
-			app.Logger.Error("battlelog processing failed", "tag", target.Key, "err", err)
-			app.Stats.SetReady(statsName, false, err.Error())
-			if decision, ok := platform.ClashFetchErrorDecision(err); ok {
-				return decision, nil
-			}
-			return clashtracker.FetchErrorDecision{Action: clashtracker.FetchErrorStop}, nil
-		},
-	})
-	if err != nil {
-		return err
+		}); err != nil {
+			return err
+		}
+		cursor = page.NextCursor
 	}
-	return runner.Run(ctx)
-}
-
-func (p battlelogTargetPager) NextPage(ctx context.Context, cursor string, limit int) (clashtracker.TargetPage, error) {
-	return p.store.NextTargetPage(ctx, p.group, cursor, limit)
-}
-
-func (p battlelogTargetPager) Count(ctx context.Context) (int, error) {
-	return p.store.CountTargets(ctx, p.group)
 }
 
 func mergeBattlelogIngests(values []models.BattlelogIngest) models.BattlelogIngest {
@@ -244,17 +257,19 @@ func mergeBattlelogIngests(values []models.BattlelogIngest) models.BattlelogInge
 	return out
 }
 
-func (d *battlelogsDomain) do(ctx context.Context, app *platform.App, statsName string, playerTag string) (models.BattlelogIngest, error) {
+func (d *battlelogsDomain) do(
+	ctx context.Context,
+	app *platform.App,
+	statsName string,
+	playerTag string,
+	checkpoint models.BattlelogCheckpoint,
+) (models.BattlelogIngest, error) {
 	entries, err := d.fetchBattleLog(ctx, app, statsName, playerTag)
 	if err != nil {
 		return models.BattlelogIngest{}, err
 	}
 
 	now := time.Now().UTC()
-	checkpoint, err := d.loadBattlelogCheckpoint(ctx, playerTag)
-	if err != nil {
-		return models.BattlelogIngest{}, err
-	}
 	if len(entries) == 0 {
 		return models.BattlelogIngest{}, nil
 	}
@@ -334,10 +349,6 @@ func (d *battlelogsDomain) fetchBattleLog(ctx context.Context, app *platform.App
 	return entries, err
 }
 
-func (d *battlelogsDomain) loadBattlelogCheckpoint(ctx context.Context, tag string) (models.BattlelogCheckpoint, error) {
-	return d.checkpoint.Get(ctx, tag)
-}
-
 func newTimescaleBattlelogStore(ctx context.Context, dsn string) (*timescaleBattlelogStore, error) {
 	pool, err := pgxpool.New(ctx, dsn)
 	if err != nil {
@@ -359,17 +370,17 @@ func (s *timescaleBattlelogStore) NextTargetPage(
 	group string,
 	cursor string,
 	limit int,
-) (clashtracker.TargetPage, error) {
+) (battlelogTargetPage, error) {
 	if limit <= 0 {
 		limit = battlelogTargetPageSize
 	}
 	decoded, err := decodeBattlelogTargetCursor(cursor)
 	if err != nil {
-		return clashtracker.TargetPage{}, err
+		return battlelogTargetPage{}, err
 	}
 	page, err := s.scanActivePlayerPage(ctx, group, decoded, limit)
 	if err != nil {
-		return clashtracker.TargetPage{}, err
+		return battlelogTargetPage{}, err
 	}
 	return page, nil
 }
@@ -401,7 +412,7 @@ func (s *timescaleBattlelogStore) scanActivePlayerPage(
 	group string,
 	cursor battlelogTargetCursor,
 	limit int,
-) (clashtracker.TargetPage, error) {
+) (battlelogTargetPage, error) {
 	leaguePredicate := "league_id IS DISTINCT FROM 105000036"
 	if group == "legend" {
 		leaguePredicate = "league_id = 105000036"
@@ -429,30 +440,30 @@ func (s *timescaleBattlelogStore) scanActivePlayerPage(
 	`, leaguePredicate, cursorPredicate, limitPlaceholder)
 	rows, err := s.pool.Query(ctx, query, args...)
 	if err != nil {
-		return clashtracker.TargetPage{}, err
+		return battlelogTargetPage{}, err
 	}
 	defer rows.Close()
 
-	page := clashtracker.TargetPage{Targets: make([]clashtracker.Target, 0, limit)}
+	page := battlelogTargetPage{Tags: make([]string, 0, limit)}
 	var lastTTL time.Time
 	var lastTag string
 	for rows.Next() {
 		var tag string
 		var ttl time.Time
 		if err := rows.Scan(&tag, &ttl); err != nil {
-			return clashtracker.TargetPage{}, err
+			return battlelogTargetPage{}, err
 		}
 		if tag == "" {
 			continue
 		}
-		page.Targets = append(page.Targets, clashtracker.Target{Key: tag})
+		page.Tags = append(page.Tags, tag)
 		lastTTL = ttl
 		lastTag = tag
 	}
 	if err := rows.Err(); err != nil {
-		return clashtracker.TargetPage{}, err
+		return battlelogTargetPage{}, err
 	}
-	if len(page.Targets) == limit {
+	if len(page.Tags) == limit {
 		page.NextCursor = encodeBattlelogTargetCursor(lastTTL, lastTag)
 	}
 	return page, nil
@@ -645,6 +656,39 @@ func sortedArmyColumnKeys(columns map[string]uint16) []string {
 type battlelogTimestampCache struct {
 	client valkey.Client
 	ttl    time.Duration
+}
+
+func (c battlelogTimestampCache) GetMany(ctx context.Context, tags []string) (map[string]models.BattlelogCheckpoint, error) {
+	out := make(map[string]models.BattlelogCheckpoint, len(tags))
+	if c.client == nil || len(tags) == 0 {
+		return out, nil
+	}
+	keys := make([]string, 0, len(tags))
+	for _, tag := range tags {
+		keys = append(keys, battlelogCheckpointKey(tag))
+	}
+	values, err := c.client.Do(ctx, c.client.B().Mget().Key(keys...).Build()).ToArray()
+	if err != nil {
+		return nil, err
+	}
+	for i, value := range values {
+		if i >= len(tags) {
+			break
+		}
+		raw, err := value.ToString()
+		if valkey.IsValkeyNil(err) {
+			continue
+		}
+		if err != nil {
+			return nil, err
+		}
+		timestamp, err := time.Parse(time.RFC3339Nano, raw)
+		if err != nil {
+			return nil, err
+		}
+		out[tags[i]] = models.BattlelogCheckpoint{Tag: tags[i], Timestamp: timestamp.UTC()}
+	}
+	return out, nil
 }
 
 func (c battlelogTimestampCache) Get(ctx context.Context, tag string) (models.BattlelogCheckpoint, error) {

@@ -6,7 +6,6 @@ import (
 	"time"
 
 	clashy "github.com/clashkinginc/clashy.go"
-	clashtracker "github.com/clashkinginc/clashy.go/tracker"
 )
 
 const (
@@ -15,18 +14,21 @@ const (
 	ClashUnavailableRetryDelay    = 60 * time.Second
 )
 
-func ClashFetchErrorDecision(err error) (clashtracker.FetchErrorDecision, bool) {
+type ClashFetchRetry struct {
+	RetryAfter time.Duration
+	MaxRetries int
+}
+
+func ClashFetchRetryPolicy(err error) (ClashFetchRetry, bool) {
 	var gateway *clashy.GatewayError
 	if errors.As(err, &gateway) {
 		switch gateway.Status {
 		case 0:
-			return clashtracker.FetchErrorDecision{
-				Action:     clashtracker.FetchErrorRetry,
+			return ClashFetchRetry{
 				RetryAfter: ClashUnavailableRetryDelay,
 			}, true
 		case 504:
-			return clashtracker.FetchErrorDecision{
-				Action:     clashtracker.FetchErrorRetry,
+			return ClashFetchRetry{
 				RetryAfter: ClashGatewayTimeoutRetryDelay,
 				MaxRetries: ClashGatewayTimeoutMaxRetries,
 			}, true
@@ -35,13 +37,12 @@ func ClashFetchErrorDecision(err error) (clashtracker.FetchErrorDecision, bool) 
 
 	var maintenance *clashy.Maintenance
 	if errors.As(err, &maintenance) {
-		return clashtracker.FetchErrorDecision{
-			Action:     clashtracker.FetchErrorRetry,
+		return ClashFetchRetry{
 			RetryAfter: ClashUnavailableRetryDelay,
 		}, true
 	}
 
-	return clashtracker.FetchErrorDecision{}, false
+	return ClashFetchRetry{}, false
 }
 
 func RetryClashFetch[T any](ctx context.Context, fetch func(context.Context) (T, error)) (T, error) {
@@ -52,8 +53,8 @@ func RetryClashFetch[T any](ctx context.Context, fetch func(context.Context) (T,
 		if err == nil {
 			return value, nil
 		}
-		decision, ok := ClashFetchErrorDecision(err)
-		if !ok || decision.Action != clashtracker.FetchErrorRetry {
+		decision, ok := ClashFetchRetryPolicy(err)
+		if !ok {
 			return zero, err
 		}
 		if decision.MaxRetries > 0 {

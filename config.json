@@ -22,13 +22,11 @@
   },
   "globalclans": {
     "priority_requests_per_second": 50,
-    "non_priority_requests_per_second": 1000,
-    "target_refresh_seconds": 3600
+    "non_priority_requests_per_second": 1000
   },
   "battlelogs": {
     "requests_per_second": 1000,
     "priority_requests_per_second": 100,
-    "target_refresh_seconds": 14400,
     "checkpoint_ttl_days": 15,
     "first_seen_lookback_days": 1
   },
@@ -43,12 +41,10 @@
     "cwl_state_snapshot": "cwlstate"
   },
   "botplayers": {
-    "requests_per_second": 950,
-    "target_refresh_seconds": 3600
+    "requests_per_second": 950
   },
   "basicplayers": {
-    "requests_per_second": 30,
-    "target_refresh_seconds": 43200
+    "requests_per_second": 30
   },
   "leaderboards": {
     "requests_per_second": 300,
@@ -57,14 +53,13 @@
     "null_asset_url": "https://api-assets.clashofclans.com/null"
   },
   "scheduled": {
-    "interval_seconds": 900
+    "interval_seconds": 86400
   },
   "giveaways": {
     "scan_seconds": 60
   },
   "reddit": {
-    "poll_seconds": 120,
-    "limit": 10
+    "poll_seconds": 120
   },
   "mobile_push": {
     "scan_seconds": 15

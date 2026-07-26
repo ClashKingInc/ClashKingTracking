@@ -4,8 +4,41 @@ package platform
 
 import (
 	"context"
+	"errors"
 	"testing"
 )
+
+type runTestDomain struct {
+	name string
+	run  func(context.Context) error
+}
+
+func (d runTestDomain) Name() string { return d.name }
+
+func (d runTestDomain) Run(ctx context.Context, _ *App) error { return d.run(ctx) }
+
+func TestRunCancelsSiblingDomainsAfterFailure(t *testing.T) {
+	stopped := make(chan struct{})
+	app := &App{Scheduler: NewScheduler()}
+	err := Run(t.Context(), app, []Domain{
+		runTestDomain{name: "failed", run: func(context.Context) error {
+			return errors.New("failed")
+		}},
+		runTestDomain{name: "blocking", run: func(ctx context.Context) error {
+			<-ctx.Done()
+			close(stopped)
+			return ctx.Err()
+		}},
+	})
+	if err == nil {
+		t.Fatal("Run should return the domain failure")
+	}
+	select {
+	case <-stopped:
+	default:
+		t.Fatal("sibling domain was not stopped before Run returned")
+	}
+}
 
 func TestNewRequiresProxyForClashDomains(t *testing.T) {
 	_, err := New(context.Background(), Config{

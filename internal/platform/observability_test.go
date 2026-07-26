@@ -1,9 +1,21 @@
 package platform
 
 import (
+	"errors"
 	"testing"
 	"time"
 )
+
+func TestTrackerSuccessfulReadinessClearsLastError(t *testing.T) {
+	stats := NewTracker()
+	stats.RecordRequest("wars", time.Millisecond, errors.New("proxy unavailable"))
+	stats.SetReady("wars", true, "")
+
+	got := stats.Domain("wars")
+	if !got.Healthy || got.LastError != "" {
+		t.Fatalf("readiness after recovery = healthy %t last error %q", got.Healthy, got.LastError)
+	}
+}
 
 func TestTrackerRecordStore(t *testing.T) {
 	stats := NewTracker()

@@ -21,7 +21,6 @@ type Domain interface {
 type App struct {
 	Config      Config
 	Logger      *slog.Logger
-	Store       Store
 	Valkey      valkey.Client
 	Clash       *clashy.Client
 	R2          ObjectStore
@@ -32,14 +31,11 @@ type App struct {
 
 func New(ctx context.Context, cfg Config) (*App, error) {
 	logger := slog.New(slog.NewJSONHandler(os.Stdout, &slog.HandlerOptions{Level: slog.LevelInfo}))
-	store, err := newStore(ctx, cfg)
-	if err != nil {
-		return nil, err
-	}
 	if needsClashClient(cfg) && cfg.ProxyURL == "" {
 		return nil, errors.New("proxy_url is required when Clash-backed domains are enabled")
 	}
 	var valkeyClient valkey.Client
+	var err error
 	if cfg.ValkeyAddr != "" {
 		valkeyClient, err = valkey.NewClient(valkey.ClientOption{
 			InitAddress:  []string{cfg.ValkeyAddr},
@@ -47,7 +43,6 @@ func New(ctx context.Context, cfg Config) (*App, error) {
 			DisableCache: true,
 		})
 		if err != nil {
-			_ = store.Close(ctx)
 			return nil, err
 		}
 	}
@@ -59,7 +54,6 @@ func New(ctx context.Context, cfg Config) (*App, error) {
 			if valkeyClient != nil {
 				valkeyClient.Close()
 			}
-			_ = store.Close(ctx)
 			return nil, err
 		}
 	}
@@ -80,7 +74,6 @@ func New(ctx context.Context, cfg Config) (*App, error) {
 			if statsWriter != nil {
 				statsWriter.Close()
 			}
-			_ = store.Close(ctx)
 			return nil, err
 		}
 	}
@@ -98,7 +91,6 @@ func New(ctx context.Context, cfg Config) (*App, error) {
 			if statsWriter != nil {
 				statsWriter.Close()
 			}
-			_ = store.Close(ctx)
 			return nil, err
 		}
 	} else if cfg.R2MockUpload {
@@ -107,7 +99,6 @@ func New(ctx context.Context, cfg Config) (*App, error) {
 	app := &App{
 		Config:      cfg,
 		Logger:      logger,
-		Store:       store,
 		Valkey:      valkeyClient,
 		Clash:       clashClient,
 		R2:          objectStore,
@@ -128,21 +119,18 @@ func (a *App) Close(ctx context.Context) error {
 	if a.StatsWriter != nil {
 		a.StatsWriter.Close()
 	}
-	if err := a.Store.Close(ctx); err != nil {
-		return err
-	}
 	return nil
 }
 
 func Run(ctx context.Context, app *App, domains []Domain) error {
+	runCtx, cancel := context.WithCancel(ctx)
+	defer cancel()
 	if app.StatsWriter != nil {
-		go app.StatsWriter.Run(ctx, app.Logger)
+		go app.StatsWriter.Run(runCtx, app.Logger)
 	}
-	schedulerCtx, cancelScheduler := context.WithCancel(ctx)
-	defer cancelScheduler()
 	go func() {
 		// Keep delayed jobs alive in the same process as the domains that schedule them.
-		_ = app.Scheduler.Run(schedulerCtx)
+		_ = app.Scheduler.Run(runCtx)
 	}()
 
 	var wg sync.WaitGroup
@@ -152,7 +140,7 @@ func Run(ctx context.Context, app *App, domains []Domain) error {
 		wg.Add(1)
 		go func() {
 			defer wg.Done()
-			if err := domain.Run(ctx, app); err != nil && !errors.Is(err, context.Canceled) {
+			if err := domain.Run(runCtx, app); err != nil && !errors.Is(err, context.Canceled) {
 				errCh <- fmt.Errorf("%s: %w", domain.Name(), err)
 			}
 		}()
@@ -163,24 +151,18 @@ func Run(ctx context.Context, app *App, domains []Domain) error {
 		close(errCh)
 	}()
 
+	var firstErr error
 	for err := range errCh {
-		if err != nil {
-			return err
+		if err != nil && firstErr == nil {
+			firstErr = err
+			cancel()
 		}
 	}
-	return nil
+	return firstErr
 }
 
 func shouldPersistStats(cfg Config) bool {
 	return !cfg.MockDB && !cfg.DryRun && cfg.TimescaleURL != "" && cfg.StatsTimescaleFlushSeconds > 0
-}
-
-func newStore(ctx context.Context, cfg Config) (Store, error) {
-	// Dry-run and mock-db both use the in-memory store so writes can be exercised safely.
-	if cfg.MockDB || cfg.DryRun || cfg.StatsMongoURI == "" || cfg.StaticMongoURI == "" {
-		return NewMockStore(), nil
-	}
-	return NewMongoStore(ctx, cfg.StatsMongoURI, cfg.StaticMongoURI)
 }
 
 func proxyConnectionLimit(cfg Config) int {

@@ -13,12 +13,14 @@ import (
 
 	"github.com/turnage/graw"
 	grawreddit "github.com/turnage/graw/reddit"
+	valkey "github.com/valkey-io/valkey-go"
 )
 
 const (
 	redditDomainName = "reddit"
 	redditSubreddit  = "ClashOfClansRecruit"
 	redditUserAgent  = "Reply Recruit"
+	redditSeenTTL    = 30 * 24 * time.Hour
 )
 
 // Match plausible clan tags in recruit posts without trying to fully validate them.
@@ -51,6 +53,9 @@ func validateRedditConfig(cfg platform.Config) error {
 	}
 	if cfg.RedditClientID == "" || cfg.RedditSecret == "" || cfg.RedditUsername == "" || cfg.RedditPassword == "" {
 		return errors.New("REDDIT_CLIENT_ID, REDDIT_CLIENT_SECRET, REDDIT_USERNAME, and REDDIT_PASSWORD are required for reddit")
+	}
+	if cfg.ValkeyAddr == "" || cfg.EventStreamName == "" {
+		return errors.New("valkey_addr and events.stream are required for reddit dedupe and publishing")
 	}
 	return nil
 }
@@ -97,6 +102,7 @@ func (d *redditDomain) runStream(ctx context.Context, app *platform.App) error {
 type redditPostHandler struct {
 	ctx     context.Context
 	app     *platform.App
+	valkey  valkey.Client
 	mu      sync.Mutex
 	seen    map[string]struct{}
 	publish func(context.Context, platform.Event) error
@@ -106,6 +112,7 @@ func newRedditPostHandler(ctx context.Context, app *platform.App) *redditPostHan
 	return &redditPostHandler{
 		ctx:     ctx,
 		app:     app,
+		valkey:  app.Valkey,
 		seen:    make(map[string]struct{}),
 		publish: app.PublishEvent,
 	}
@@ -116,24 +123,55 @@ func (h *redditPostHandler) Post(post *grawreddit.Post) error {
 	if !ok {
 		return nil
 	}
-	if !h.markSeen(event.ID) {
+	fresh, err := h.markSeen(event.ID)
+	if err != nil {
+		return err
+	}
+	if !fresh {
 		return nil
 	}
-	h.app.Stats.RecordWrite(redditDomainName, 1)
-	return h.publish(h.ctx, platform.Event{
+	err = h.publish(h.ctx, platform.Event{
 		Topic: "reddit",
 		Value: map[string]any{"type": "reddit", "data": event.CompactData},
 	})
+	if err != nil {
+		return errors.Join(err, h.unmarkSeen(event.ID))
+	}
+	h.app.Stats.RecordWrite(redditDomainName, 1)
+	return nil
 }
 
-func (h *redditPostHandler) markSeen(id string) bool {
-	h.mu.Lock()
-	defer h.mu.Unlock()
-	if _, ok := h.seen[id]; ok {
-		return false
+func (h *redditPostHandler) markSeen(id string) (bool, error) {
+	if h.valkey == nil {
+		h.mu.Lock()
+		defer h.mu.Unlock()
+		if _, exists := h.seen[id]; exists {
+			return false, nil
+		}
+		h.seen[id] = struct{}{}
+		return true, nil
 	}
-	h.seen[id] = struct{}{}
-	return true
+	err := h.valkey.Do(h.ctx, h.valkey.B().Set().
+		Key("reddit:seen:"+id).
+		Value("1").
+		Nx().
+		Ex(redditSeenTTL).
+		Build(),
+	).Error()
+	if valkey.IsValkeyNil(err) {
+		return false, nil
+	}
+	return err == nil, err
+}
+
+func (h *redditPostHandler) unmarkSeen(id string) error {
+	if h.valkey == nil {
+		h.mu.Lock()
+		delete(h.seen, id)
+		h.mu.Unlock()
+		return nil
+	}
+	return h.valkey.Do(h.ctx, h.valkey.B().Del().Key("reddit:seen:"+id).Build()).Error()
 }
 
 type redditPostEvent struct {

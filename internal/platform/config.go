@@ -16,19 +16,14 @@ type Config struct {
 	HTTPAddr                               string
 	GRPCAddr                               string
 	ProxyURL                               string
-	StatsMongoURI                          string
-	StaticMongoURI                         string
 	TimescaleURL                           string
 	ValkeyAddr                             string
 	ValkeyPassword                         string
 	TargetPageMultiplier                   int
 	GlobalClanPriorityRequestsPerSecond    int
 	GlobalClanNonPriorityRequestsPerSecond int
-	GlobalClanTargetRefreshSeconds         int
-	GlobalClanMaxInFlight                  int
 	BattlelogRequestsPerSecond             int
 	BattlelogPriorityRequestsPerSecond     int
-	BattlelogTargetRefreshSeconds          int
 	BattlelogCheckpointTTLDays             int
 	BattlelogFirstSeenLookbackDays         int
 	WarRequestsPerSecond                   int
@@ -54,9 +49,7 @@ type Config struct {
 	EventStreamBatchSize                   int
 	EventStreamReclaimIdleSeconds          int
 	BotPlayerRequestsPerSecond             int
-	BotPlayerTargetRefreshSeconds          int
 	BasicPlayerRequestsPerSecond           int
-	BasicPlayerTargetRefreshSeconds        int
 	LeaderboardRequestsPerSecond           int
 	LeaderboardIntervalSeconds             int
 	LeaderboardLimit                       int
@@ -64,7 +57,6 @@ type Config struct {
 	ScheduledIntervalSeconds               int
 	GiveawayScanSeconds                    int
 	RedditPollSeconds                      int
-	RedditLimit                            int
 	RedditClientID                         string
 	RedditSecret                           string
 	RedditUsername                         string
@@ -164,13 +156,11 @@ type jsonEventsConfig struct {
 type jsonGlobalClansConfig struct {
 	PriorityRequestsPerSecond    int `json:"priority_requests_per_second"`
 	NonPriorityRequestsPerSecond int `json:"non_priority_requests_per_second"`
-	TargetRefreshSeconds         int `json:"target_refresh_seconds"`
 }
 
 type jsonBattlelogsConfig struct {
 	RequestsPerSecond         int `json:"requests_per_second"`
 	PriorityRequestsPerSecond int `json:"priority_requests_per_second"`
-	TargetRefreshSeconds      int `json:"target_refresh_seconds"`
 	CheckpointTTLDays         int `json:"checkpoint_ttl_days"`
 	FirstSeenLookbackDays     int `json:"first_seen_lookback_days"`
 }
@@ -188,13 +178,11 @@ type jsonBotClansConfig struct {
 }
 
 type jsonBotPlayersConfig struct {
-	RequestsPerSecond    int `json:"requests_per_second"`
-	TargetRefreshSeconds int `json:"target_refresh_seconds"`
+	RequestsPerSecond int `json:"requests_per_second"`
 }
 
 type jsonBasicPlayersConfig struct {
-	RequestsPerSecond    int `json:"requests_per_second"`
-	TargetRefreshSeconds int `json:"target_refresh_seconds"`
+	RequestsPerSecond int `json:"requests_per_second"`
 }
 
 type jsonLeaderboardsConfig struct {
@@ -214,7 +202,6 @@ type jsonGiveawaysConfig struct {
 
 type jsonRedditConfig struct {
 	PollSeconds int `json:"poll_seconds"`
-	Limit       int `json:"limit"`
 }
 
 type jsonMobilePushConfig struct {
@@ -256,10 +243,8 @@ func loadConfigFile(path string) (Config, error) {
 		EventStreamReclaimIdleSeconds:          file.Events.ReclaimIdleSeconds,
 		GlobalClanPriorityRequestsPerSecond:    file.GlobalClans.PriorityRequestsPerSecond,
 		GlobalClanNonPriorityRequestsPerSecond: file.GlobalClans.NonPriorityRequestsPerSecond,
-		GlobalClanTargetRefreshSeconds:         file.GlobalClans.TargetRefreshSeconds,
 		BattlelogRequestsPerSecond:             file.Battlelogs.RequestsPerSecond,
 		BattlelogPriorityRequestsPerSecond:     file.Battlelogs.PriorityRequestsPerSecond,
-		BattlelogTargetRefreshSeconds:          file.Battlelogs.TargetRefreshSeconds,
 		BattlelogCheckpointTTLDays:             file.Battlelogs.CheckpointTTLDays,
 		BattlelogFirstSeenLookbackDays:         file.Battlelogs.FirstSeenLookbackDays,
 		WarRequestsPerSecond:                   file.Wars.RequestsPerSecond,
@@ -269,9 +254,7 @@ func loadConfigFile(path string) (Config, error) {
 		BotClanSnapshotPrefix:                  file.BotClans.SnapshotPrefix,
 		BotClanCWLStateSnapshot:                file.BotClans.CWLStateSnapshot,
 		BotPlayerRequestsPerSecond:             file.BotPlayers.RequestsPerSecond,
-		BotPlayerTargetRefreshSeconds:          file.BotPlayers.TargetRefreshSeconds,
 		BasicPlayerRequestsPerSecond:           file.BasicPlayers.RequestsPerSecond,
-		BasicPlayerTargetRefreshSeconds:        file.BasicPlayers.TargetRefreshSeconds,
 		LeaderboardRequestsPerSecond:           file.Leaderboards.RequestsPerSecond,
 		LeaderboardIntervalSeconds:             file.Leaderboards.IntervalSeconds,
 		LeaderboardLimit:                       file.Leaderboards.Limit,
@@ -279,14 +262,11 @@ func loadConfigFile(path string) (Config, error) {
 		ScheduledIntervalSeconds:               file.Scheduled.IntervalSeconds,
 		GiveawayScanSeconds:                    file.Giveaways.ScanSeconds,
 		RedditPollSeconds:                      file.Reddit.PollSeconds,
-		RedditLimit:                            file.Reddit.Limit,
 		MobilePushScanSeconds:                  file.MobilePush.ScanSeconds,
 	}, nil
 }
 
 func applySecretEnv(cfg *Config) {
-	overrideString(&cfg.StatsMongoURI, "STATS_MONGODB_URI")
-	overrideString(&cfg.StaticMongoURI, "STATIC_MONGODB_URI")
 	overrideString(&cfg.TimescaleURL, "TIMESCALE_URL")
 	overrideString(&cfg.ValkeyPassword, "VALKEY_PASSWORD")
 	overrideString(&cfg.R2Endpoint, "R2_ENDPOINT")
@@ -311,14 +291,7 @@ func applySecretEnv(cfg *Config) {
 }
 
 func deriveConfig(cfg *Config) {
-	cfg.GlobalClanMaxInFlight = cfg.GlobalClanPriorityRequestsPerSecond
-	cfg.WarMaxInFlight = cfg.WarRequestsPerSecond
-	if cfg.GlobalClanTargetRefreshSeconds == 0 {
-		cfg.GlobalClanTargetRefreshSeconds = 3600
-	}
-	if cfg.BattlelogTargetRefreshSeconds == 0 {
-		cfg.BattlelogTargetRefreshSeconds = 4 * 60 * 60
-	}
+	cfg.WarMaxInFlight = RequestConcurrency(cfg.WarRequestsPerSecond)
 	if cfg.BattlelogPriorityRequestsPerSecond == 0 {
 		cfg.BattlelogPriorityRequestsPerSecond = 100
 	}
@@ -334,14 +307,8 @@ func deriveConfig(cfg *Config) {
 	if cfg.BotClanCWLStateSnapshot == "" {
 		cfg.BotClanCWLStateSnapshot = "cwlstate"
 	}
-	if cfg.BotPlayerTargetRefreshSeconds == 0 {
-		cfg.BotPlayerTargetRefreshSeconds = 3600
-	}
 	if cfg.BasicPlayerRequestsPerSecond == 0 {
 		cfg.BasicPlayerRequestsPerSecond = 30
-	}
-	if cfg.BasicPlayerTargetRefreshSeconds == 0 {
-		cfg.BasicPlayerTargetRefreshSeconds = 12 * 60 * 60
 	}
 	if cfg.LeaderboardRequestsPerSecond == 0 {
 		cfg.LeaderboardRequestsPerSecond = 100

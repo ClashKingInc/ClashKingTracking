@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"log"
+	"os"
 	"os/signal"
 	"strings"
 	"syscall"
@@ -14,6 +15,13 @@ import (
 )
 
 func main() {
+	if err := run(); err != nil {
+		log.Print(err)
+		os.Exit(1)
+	}
+}
+
+func run() error {
 	// Trap SIGINT/SIGTERM so all domains and background jobs can stop cleanly.
 	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
 	defer stop()
@@ -38,11 +46,11 @@ func main() {
 
 	selected, err := selectedDomain(cfg.Script, domains)
 	if err != nil {
-		log.Fatal(err)
+		return err
 	}
 	app, err := platform.New(ctx, cfg)
 	if err != nil {
-		log.Fatal(err)
+		return err
 	}
 	defer func() {
 		// Give the HTTP server, scheduler, and stores a bounded window to shut down.
@@ -50,9 +58,7 @@ func main() {
 		defer cancel()
 		_ = app.Close(shutdownCtx)
 	}()
-	if err := platform.Run(ctx, app, []platform.Domain{selected}); err != nil {
-		log.Fatal(err)
-	}
+	return platform.Run(ctx, app, []platform.Domain{selected})
 }
 
 func selectedDomain(script string, domains []platform.Domain) (platform.Domain, error) {

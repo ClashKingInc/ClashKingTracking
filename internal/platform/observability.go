@@ -138,7 +138,9 @@ func (t *Tracker) SetReady(name string, healthy bool, detail string) {
 		stats.LastReadyChange = time.Now().UTC()
 	}
 	stats.Healthy = healthy
-	if detail != "" {
+	if healthy {
+		stats.LastError = ""
+	} else if detail != "" {
 		stats.LastError = detail
 	}
 }
