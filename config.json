@@ -65,5 +65,8 @@
   "reddit": {
     "poll_seconds": 120,
     "limit": 10
+  },
+  "mobile_push": {
+    "scan_seconds": 15
   }
 }

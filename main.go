@@ -32,6 +32,7 @@ func main() {
 		scriptdomains.NewRedditDomain(),
 		scriptdomains.NewGiveawaysDomain(),
 		scriptdomains.NewEventsDomain(),
+		scriptdomains.NewMobileEventsDomain(),
 		scriptdomains.NewMobilePushDomain(),
 	}
 

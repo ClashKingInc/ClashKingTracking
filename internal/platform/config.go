@@ -13,6 +13,7 @@ import (
 
 type Config struct {
 	Script                                 string
+	HTTPAddr                               string
 	GRPCAddr                               string
 	ProxyURL                               string
 	StatsMongoURI                          string
@@ -41,6 +42,8 @@ type Config struct {
 	R2AccessKeyID                          string
 	R2SecretAccessKey                      string
 	R2Bucket                               string
+	R2Prefix                               string
+	R2PublicBaseURL                        string
 	R2RequestsPerSecond                    int
 	R2MockUpload                           bool
 	StatsTimescaleFlushSeconds             int
@@ -69,10 +72,16 @@ type Config struct {
 	MobilePushAPNSBearerToken              string
 	MobilePushAPNSBundleID                 string
 	MobilePushFCMBearerToken               string
+	MobilePushFCMServiceAccountJSON        string
 	MobilePushFCMProjectID                 string
 	MobilePushTokenKey                     string
+	MobilePushScanSeconds                  int
+	RunOnce                                bool
 	DryRun                                 bool
 	MockDB                                 bool
+	OTELEnabled                            bool
+	OTELServiceName                        string
+	OTELExporterOTLPEndpoint               string
 }
 
 func Load() Config {
@@ -103,12 +112,15 @@ func (c Config) Enabled(name string) bool {
 }
 
 type jsonConfig struct {
+	HTTPAddr             string                 `json:"http_addr"`
 	GRPCAddr             string                 `json:"grpc_addr"`
 	ProxyURL             string                 `json:"proxy_url"`
 	ValkeyAddr           string                 `json:"valkey_addr"`
+	RunOnce              bool                   `json:"run_once"`
 	DryRun               bool                   `json:"dry_run"`
 	MockDB               bool                   `json:"mock_db"`
 	TargetPageMultiplier int                    `json:"target_page_multiplier"`
+	OTEL                 jsonOTELConfig         `json:"otel"`
 	R2                   jsonR2Config           `json:"r2"`
 	Stats                jsonStatsConfig        `json:"stats"`
 	Events               jsonEventsConfig       `json:"events"`
@@ -122,6 +134,13 @@ type jsonConfig struct {
 	Scheduled            jsonScheduledConfig    `json:"scheduled"`
 	Giveaways            jsonGiveawaysConfig    `json:"giveaways"`
 	Reddit               jsonRedditConfig       `json:"reddit"`
+	MobilePush           jsonMobilePushConfig   `json:"mobile_push"`
+}
+
+type jsonOTELConfig struct {
+	Enabled              bool   `json:"enabled"`
+	ServiceName          string `json:"service_name"`
+	ExporterOTLPEndpoint string `json:"exporter_otlp_endpoint"`
 }
 
 type jsonR2Config struct {
@@ -198,6 +217,10 @@ type jsonRedditConfig struct {
 	Limit       int `json:"limit"`
 }
 
+type jsonMobilePushConfig struct {
+	ScanSeconds int `json:"scan_seconds"`
+}
+
 func loadConfigFile(path string) (Config, error) {
 	if strings.TrimSpace(path) == "" {
 		return Config{}, errors.New("config path is required")
@@ -211,12 +234,17 @@ func loadConfigFile(path string) (Config, error) {
 		return Config{}, fmt.Errorf("parse config %s: %w", path, err)
 	}
 	return Config{
+		HTTPAddr:                               file.HTTPAddr,
 		GRPCAddr:                               file.GRPCAddr,
 		ProxyURL:                               file.ProxyURL,
 		ValkeyAddr:                             file.ValkeyAddr,
+		RunOnce:                                file.RunOnce,
 		DryRun:                                 file.DryRun,
 		MockDB:                                 file.MockDB,
 		TargetPageMultiplier:                   file.TargetPageMultiplier,
+		OTELEnabled:                            file.OTEL.Enabled,
+		OTELServiceName:                        file.OTEL.ServiceName,
+		OTELExporterOTLPEndpoint:               file.OTEL.ExporterOTLPEndpoint,
 		R2MockUpload:                           file.R2.MockUpload,
 		R2RequestsPerSecond:                    file.R2.RequestsPerSecond,
 		StatsTimescaleFlushSeconds:             file.Stats.TimescaleFlushSeconds,
@@ -252,6 +280,7 @@ func loadConfigFile(path string) (Config, error) {
 		GiveawayScanSeconds:                    file.Giveaways.ScanSeconds,
 		RedditPollSeconds:                      file.Reddit.PollSeconds,
 		RedditLimit:                            file.Reddit.Limit,
+		MobilePushScanSeconds:                  file.MobilePush.ScanSeconds,
 	}, nil
 }
 
@@ -264,6 +293,8 @@ func applySecretEnv(cfg *Config) {
 	overrideString(&cfg.R2AccessKeyID, "R2_ACCESS_KEY_ID")
 	overrideString(&cfg.R2SecretAccessKey, "R2_SECRET_ACCESS_KEY")
 	overrideString(&cfg.R2Bucket, "R2_BUCKET")
+	overrideString(&cfg.R2Prefix, "R2_PREFIX")
+	overrideString(&cfg.R2PublicBaseURL, "R2_PUBLIC_BASE_URL")
 	overrideString(&cfg.RedditClientID, "REDDIT_CLIENT_ID")
 	overrideString(&cfg.RedditSecret, "REDDIT_CLIENT_SECRET")
 	overrideString(&cfg.RedditUsername, "REDDIT_USERNAME")
@@ -271,6 +302,7 @@ func applySecretEnv(cfg *Config) {
 	overrideString(&cfg.MobilePushAPNSBearerToken, "MOBILE_PUSH_APNS_BEARER_TOKEN")
 	overrideString(&cfg.MobilePushAPNSBundleID, "MOBILE_PUSH_APNS_BUNDLE_ID")
 	overrideString(&cfg.MobilePushFCMBearerToken, "MOBILE_PUSH_FCM_BEARER_TOKEN")
+	overrideString(&cfg.MobilePushFCMServiceAccountJSON, "MOBILE_PUSH_FCM_SERVICE_ACCOUNT_JSON")
 	overrideString(&cfg.MobilePushFCMProjectID, "MOBILE_PUSH_FCM_PROJECT_ID")
 	overrideString(&cfg.MobilePushTokenKey, "MOBILE_PUSH_TOKEN_KEY")
 	if cfg.MobilePushTokenKey == "" {
