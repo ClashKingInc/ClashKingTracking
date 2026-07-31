@@ -30,21 +30,13 @@ func NewMobileEventsDomain() platform.Domain { return &mobileEventsDomain{} }
 func (d *mobileEventsDomain) Name() string { return mobileEventsDomainName }
 
 type mobileSubscription struct {
-	Provider            string
-	Environment         string
-	TokenCiphertext     string
-	WarStartEnabled     bool
-	ScoreChangeEnabled  bool
-	WarEndEnabled       bool
-	CWLRankEnabled      bool
-	LiveActivityEnabled bool
-}
-
-type mobileLiveActivity struct {
-	ID              string
-	Environment     string
-	TokenCiphertext string
-	LastPayloadHash string
+	Provider           string
+	Environment        string
+	TokenCiphertext    string
+	WarStartEnabled    bool
+	ScoreChangeEnabled bool
+	WarEndEnabled      bool
+	CWLRankEnabled     bool
 }
 
 type mobileWarEvent struct {
@@ -269,22 +261,24 @@ func (w *mobileEventsWorker) processEvent(ctx context.Context, event mobileWarEv
 			}
 		}
 	}
-	return w.updateLiveActivities(ctx, event)
+	return nil
 }
 
+const mobileSubscriptionsSQL = `
+	SELECT d.provider, d.environment, d.token_ciphertext,
+	       s.war_start_enabled, s.score_change_enabled, s.war_end_enabled,
+	       s.cwl_rank_enabled
+	FROM mobile_war_subscriptions s
+	JOIN mobile_push_devices d
+	  ON d.user_id = s.user_id
+	 AND d.device_id = s.device_id
+	 AND d.enabled = true
+	WHERE s.clan_tag = $1
+	  AND s.enabled = true
+`
+
 func (w *mobileEventsWorker) subscriptions(ctx context.Context, clanTag string) ([]mobileSubscription, error) {
-	rows, err := w.pool.Query(ctx, `
-		SELECT d.provider, d.environment, d.token_ciphertext,
-		       s.war_start_enabled, s.score_change_enabled, s.war_end_enabled,
-		       s.cwl_rank_enabled, s.live_activity_enabled
-		FROM mobile_war_subscriptions s
-		JOIN mobile_push_devices d
-		  ON d.user_id = s.user_id
-		 AND d.device_id = s.device_id
-		 AND d.enabled = true
-		WHERE s.clan_tag = $1
-		  AND s.enabled = true
-	`, clanTag)
+	rows, err := w.pool.Query(ctx, mobileSubscriptionsSQL, clanTag)
 	if err != nil {
 		return nil, err
 	}
@@ -292,52 +286,12 @@ func (w *mobileEventsWorker) subscriptions(ctx context.Context, clanTag string) 
 	var out []mobileSubscription
 	for rows.Next() {
 		var sub mobileSubscription
-		if err := rows.Scan(&sub.Provider, &sub.Environment, &sub.TokenCiphertext, &sub.WarStartEnabled, &sub.ScoreChangeEnabled, &sub.WarEndEnabled, &sub.CWLRankEnabled, &sub.LiveActivityEnabled); err != nil {
+		if err := rows.Scan(&sub.Provider, &sub.Environment, &sub.TokenCiphertext, &sub.WarStartEnabled, &sub.ScoreChangeEnabled, &sub.WarEndEnabled, &sub.CWLRankEnabled); err != nil {
 			return nil, err
 		}
 		out = append(out, sub)
 	}
 	return out, rows.Err()
-}
-
-func (w *mobileEventsWorker) updateLiveActivities(ctx context.Context, event mobileWarEvent) error {
-	payload := mobileLiveActivityPayload(event)
-	payloadHash := mobilePayloadHash(payload)
-	rows, err := w.pool.Query(ctx, `
-		SELECT id::text, environment, push_token_ciphertext, COALESCE(last_payload_hash, '')
-		FROM mobile_live_activities
-		WHERE clan_tag = $1
-		  AND status = 'active'
-	`, event.ClanTag)
-	if err != nil {
-		return err
-	}
-	defer rows.Close()
-	for rows.Next() {
-		var activity mobileLiveActivity
-		if err := rows.Scan(&activity.ID, &activity.Environment, &activity.TokenCiphertext, &activity.LastPayloadHash); err != nil {
-			return err
-		}
-		if activity.LastPayloadHash == payloadHash {
-			continue
-		}
-		token := decodeMobileToken(activity.TokenCiphertext, w.cfg.MobilePushTokenKey)
-		if token == "" {
-			continue
-		}
-		if err := w.sendAPNSLiveActivity(ctx, activity.Environment, token, payload); err != nil {
-			w.logDeliveryError("mobile live activity delivery failed", "activity_id", activity.ID, "clan_tag", event.ClanTag, "err", err)
-			continue
-		}
-		if _, err := w.pool.Exec(ctx, `
-			UPDATE mobile_live_activities
-			SET last_payload_hash = $1, updated_at = now()
-			WHERE id = $2::uuid
-		`, payloadHash, activity.ID); err != nil {
-			return err
-		}
-	}
-	return rows.Err()
 }
 
 func (w *mobileEventsWorker) logDeliveryError(message string, args ...any) {
@@ -402,29 +356,6 @@ func mobileNotificationText(event mobileWarEvent) (string, string) {
 	}
 }
 
-func mobileLiveActivityPayload(event mobileWarEvent) map[string]any {
-	title, body := mobileNotificationText(event)
-	return map[string]any{
-		"aps": map[string]any{
-			"timestamp": time.Now().Unix(),
-			"event":     "update",
-			"alert": map[string]any{
-				"title": title,
-				"body":  body,
-			},
-			"content-state": map[string]any{
-				"state":         mobileStringValue(event.Value["new_state"], "inWar"),
-				"mode":          event.Topic,
-				"clanName":      event.ClanTag,
-				"opponentName":  "Opponent",
-				"clanStars":     0,
-				"opponentStars": 0,
-				"timeState":     title,
-			},
-		},
-	}
-}
-
 func (w *mobileEventsWorker) sendAPNSNotification(ctx context.Context, environment, token, title, body string) error {
 	if w.cfg.MobilePushAPNSBearerToken == "" || w.cfg.MobilePushAPNSBundleID == "" {
 		return nil
@@ -432,13 +363,6 @@ func (w *mobileEventsWorker) sendAPNSNotification(ctx context.Context, environme
 	topic := w.cfg.MobilePushAPNSBundleID
 	payload := map[string]any{"aps": map[string]any{"alert": map[string]string{"title": title, "body": body}, "sound": "default"}}
 	return w.postAPNS(ctx, environment, token, topic, "alert", payload)
-}
-
-func (w *mobileEventsWorker) sendAPNSLiveActivity(ctx context.Context, environment, token string, payload map[string]any) error {
-	if w.cfg.MobilePushAPNSBearerToken == "" || w.cfg.MobilePushAPNSBundleID == "" {
-		return nil
-	}
-	return w.postAPNS(ctx, environment, token, w.cfg.MobilePushAPNSBundleID+".push-type.liveactivity", "liveactivity", payload)
 }
 
 func (w *mobileEventsWorker) postAPNS(ctx context.Context, environment, token, topic, pushType string, payload map[string]any) error {
@@ -533,17 +457,4 @@ func decryptMobileToken(ciphertext, keySource string) string {
 		return ""
 	}
 	return string(out)
-}
-
-func mobilePayloadHash(payload map[string]any) string {
-	raw, _ := json.Marshal(payload)
-	sum := sha256.Sum256(raw)
-	return fmt.Sprintf("%x", sum[:])
-}
-
-func mobileStringValue(value any, fallback string) string {
-	if text, ok := value.(string); ok && text != "" {
-		return text
-	}
-	return fallback
 }
