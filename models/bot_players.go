@@ -16,21 +16,20 @@ type PlayerProfileChangeRow struct {
 	CurrentValue  any
 }
 
-type PlayerSeasonStatRow struct {
-	PlayerTag        string
-	Season           string
-	ClanTag          string
-	Donated          int
-	Received         int
-	CapitalGoldDonos int
-	ActivityScore    int
-	LastOnlineAt     *time.Time
+type PlayerStatChangeRow struct {
+	EventTime     time.Time
+	PlayerTag     string
+	ClanTag       *string
+	StatType      string
+	PreviousValue int64
+	CurrentValue  int64
+	Delta         int64
 }
 
 type BotPlayerIngest struct {
 	Players        []BasicPlayerRow
 	ProfileChanges []PlayerProfileChangeRow
-	SeasonStats    []PlayerSeasonStatRow
+	StatChanges    []PlayerStatChangeRow
 	LastOnlineAt   *time.Time
 	Event          Event
 	SnapshotTag    string

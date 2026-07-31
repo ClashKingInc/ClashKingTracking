@@ -3,9 +3,12 @@ package scripts
 import (
 	"bytes"
 	"context"
+	"crypto/sha256"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"sort"
+	"strconv"
 	"sync"
 	"time"
 
@@ -21,11 +24,40 @@ import (
 
 const (
 	botPlayersDomainName = "botplayers"
+
+	playerStatDonated            = "donated"
+	playerStatReceived           = "received"
+	playerStatClanGames          = "clan_games"
+	playerStatCapitalGoldDonated = "capital_gold_donated"
+	playerClanGamesAchievement   = "Games Champion"
 )
 
 func playerSnapshotKey(tag string) string {
 	return "ps:" + tag
 }
+
+func playerStatPendingKey(tag string) string {
+	return "ps:stat-pending:" + tag
+}
+
+var reservePlayerStatEventTimeScript = valkey.NewLuaScript(`
+	local existing = redis.call('GET', KEYS[1])
+	if existing then
+		local separator = string.find(existing, '|', 1, true)
+		if separator and string.sub(existing, 1, separator - 1) == ARGV[1] then
+			return string.sub(existing, separator + 1)
+		end
+	end
+	local value = ARGV[1] .. '|' .. ARGV[2]
+	redis.call('SET', KEYS[1], value)
+	return ARGV[2]
+`)
+
+var storePlayerSnapshotScript = valkey.NewLuaScript(`
+	redis.call('SET', KEYS[1], ARGV[1])
+	redis.call('DEL', KEYS[2])
+	return 1
+`)
 
 func equalBytes(a, b []byte) bool {
 	if len(a) != len(b) {
@@ -159,14 +191,14 @@ func (d *botPlayersDomain) fetchAndPreparePlayer(
 }
 
 func (d *botPlayersDomain) storePlayerIngest(ctx context.Context, app *platform.App, ingest models.BotPlayerIngest) error {
-	if len(ingest.Players) == 0 && len(ingest.ProfileChanges) == 0 && len(ingest.SeasonStats) == 0 {
+	if len(ingest.Players) == 0 && len(ingest.ProfileChanges) == 0 && len(ingest.StatChanges) == 0 {
 		return d.savePlayerSnapshot(ctx, ingest.SnapshotTag, ingest.SnapshotRaw)
 	}
 	if err := d.store.StoreIngest(ctx, ingest); err != nil {
 		return err
 	}
 	app.Stats.RecordWrite(botPlayersDomainName,
-		len(ingest.Players)+len(ingest.ProfileChanges)+len(ingest.SeasonStats),
+		len(ingest.Players)+len(ingest.ProfileChanges)+len(ingest.StatChanges),
 	)
 	app.Stats.SetReady(botPlayersDomainName, true, "")
 	if ingest.Event.Topic != "" {
@@ -213,20 +245,27 @@ func (d *botPlayersDomain) doPlayer(
 	if equalJSON(previous, current) {
 		return models.BotPlayerIngest{SnapshotTag: tag, SnapshotRaw: raw}, nil
 	}
-	changes, activityScore, stats := playerChanges(tag, previous, current)
-	clan := clanTag(current)
 	now := time.Now().UTC()
+	changes, activityScore := playerChanges(tag, previous, current, now)
+	statChanges := playerStatChanges(tag, previousPlayer, player, now)
+	if len(statChanges) > 0 {
+		statEventTime, err := d.reservePlayerStatEventTime(ctx, tag, previousRaw, now)
+		if err != nil {
+			return models.BotPlayerIngest{}, err
+		}
+		for index := range statChanges {
+			statChanges[index].EventTime = statEventTime
+		}
+	}
+	clan := clanTag(current)
 	var lastOnline *time.Time
 	if activityScore > 0 {
 		lastOnline = &now
-		for i := range stats {
-			stats[i].LastOnlineAt = lastOnline
-		}
 	}
 	return models.BotPlayerIngest{
 		Players:        []models.BasicPlayerRow{botPlayerRow(player)},
 		ProfileChanges: changes,
-		SeasonStats:    stats,
+		StatChanges:    statChanges,
 		LastOnlineAt:   lastOnline,
 		Event: models.Event{
 			Topic: "player",
@@ -263,7 +302,8 @@ func botPlayerRow(player clashy.Player) models.BasicPlayerRow {
 
 type botPlayerSnapshotStore interface {
 	Load(context.Context, string) ([]byte, bool, error)
-	Store(context.Context, string, []byte) error
+	ReserveStatEventTime(context.Context, string, string, time.Time) (time.Time, error)
+	StoreAndClear(context.Context, string, string, []byte) error
 }
 
 type valkeyBotPlayerSnapshotStore struct {
@@ -271,15 +311,24 @@ type valkeyBotPlayerSnapshotStore struct {
 }
 
 type memoryBotPlayerSnapshotStore struct {
-	mu     sync.Mutex
-	values map[string][]byte
+	mu             sync.Mutex
+	values         map[string][]byte
+	statEventTimes map[string]memoryPlayerStatEventTime
+}
+
+type memoryPlayerStatEventTime struct {
+	SnapshotHash string
+	EventTime    time.Time
 }
 
 func newBotPlayerSnapshotStore(client valkey.Client) botPlayerSnapshotStore {
 	if client != nil {
 		return valkeyBotPlayerSnapshotStore{client: client}
 	}
-	return &memoryBotPlayerSnapshotStore{values: make(map[string][]byte)}
+	return &memoryBotPlayerSnapshotStore{
+		values:         make(map[string][]byte),
+		statEventTimes: make(map[string]memoryPlayerStatEventTime),
+	}
 }
 
 func (s valkeyBotPlayerSnapshotStore) Load(ctx context.Context, key string) ([]byte, bool, error) {
@@ -294,11 +343,39 @@ func (s valkeyBotPlayerSnapshotStore) Load(ctx context.Context, key string) ([]b
 	return raw, err == nil, err
 }
 
-func (s valkeyBotPlayerSnapshotStore) Store(ctx context.Context, key string, raw []byte) error {
-	return s.client.Do(ctx, s.client.B().Set().
-		Key(key).
-		Value(valkey.BinaryString(utils.Compress(raw))).
-		Build(),
+func (s valkeyBotPlayerSnapshotStore) ReserveStatEventTime(
+	ctx context.Context,
+	key string,
+	snapshotHash string,
+	proposed time.Time,
+) (time.Time, error) {
+	value, err := reservePlayerStatEventTimeScript.Exec(
+		ctx,
+		s.client,
+		[]string{key},
+		[]string{snapshotHash, strconv.FormatInt(proposed.UTC().UnixNano(), 10)},
+	).ToString()
+	if err != nil {
+		return time.Time{}, err
+	}
+	nanoseconds, err := strconv.ParseInt(value, 10, 64)
+	if err != nil {
+		return time.Time{}, err
+	}
+	return time.Unix(0, nanoseconds).UTC(), nil
+}
+
+func (s valkeyBotPlayerSnapshotStore) StoreAndClear(
+	ctx context.Context,
+	key string,
+	pendingKey string,
+	raw []byte,
+) error {
+	return storePlayerSnapshotScript.Exec(
+		ctx,
+		s.client,
+		[]string{key, pendingKey},
+		[]string{valkey.BinaryString(utils.Compress(raw))},
 	).Error()
 }
 
@@ -309,10 +386,35 @@ func (s *memoryBotPlayerSnapshotStore) Load(_ context.Context, key string) ([]by
 	return append([]byte(nil), raw...), ok, nil
 }
 
-func (s *memoryBotPlayerSnapshotStore) Store(_ context.Context, key string, raw []byte) error {
+func (s *memoryBotPlayerSnapshotStore) ReserveStatEventTime(
+	_ context.Context,
+	key string,
+	snapshotHash string,
+	proposed time.Time,
+) (time.Time, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if existing, ok := s.statEventTimes[key]; ok && existing.SnapshotHash == snapshotHash {
+		return existing.EventTime, nil
+	}
+	proposed = proposed.UTC()
+	s.statEventTimes[key] = memoryPlayerStatEventTime{
+		SnapshotHash: snapshotHash,
+		EventTime:    proposed,
+	}
+	return proposed, nil
+}
+
+func (s *memoryBotPlayerSnapshotStore) StoreAndClear(
+	_ context.Context,
+	key string,
+	pendingKey string,
+	raw []byte,
+) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	s.values[key] = append([]byte(nil), raw...)
+	delete(s.statEventTimes, pendingKey)
 	return nil
 }
 
@@ -328,7 +430,31 @@ func (d *botPlayersDomain) savePlayerSnapshot(ctx context.Context, tag string, r
 	if d.snapshots == nil || tag == "" || len(raw) == 0 {
 		return nil
 	}
-	return d.snapshots.Store(ctx, playerSnapshotKey(tag), raw)
+	return d.snapshots.StoreAndClear(
+		ctx,
+		playerSnapshotKey(tag),
+		playerStatPendingKey(tag),
+		raw,
+	)
+}
+
+func (d *botPlayersDomain) reservePlayerStatEventTime(
+	ctx context.Context,
+	tag string,
+	previousRaw []byte,
+	proposed time.Time,
+) (time.Time, error) {
+	proposed = proposed.UTC().Truncate(time.Microsecond)
+	if d.snapshots == nil {
+		return proposed, nil
+	}
+	hash := sha256.Sum256(previousRaw)
+	return d.snapshots.ReserveStatEventTime(
+		ctx,
+		playerStatPendingKey(tag),
+		fmt.Sprintf("%x", hash[:]),
+		proposed,
+	)
 }
 
 func playerMap(player clashy.Player) map[string]any {
@@ -342,13 +468,11 @@ func playerChanges(
 	tag string,
 	previous map[string]any,
 	current map[string]any,
-) ([]models.PlayerProfileChangeRow, int, []models.PlayerSeasonStatRow) {
+	eventTime time.Time,
+) ([]models.PlayerProfileChangeRow, int) {
 	var profileChanges []models.PlayerProfileChangeRow
-	statsByKey := map[string]models.PlayerSeasonStatRow{}
 	activityScore := 0
-	season := utils.CurrentSeason(time.Now())
 	clan := clanTag(current)
-	now := time.Now().UTC()
 	townhall, _ := asInt(current["townHallLevel"])
 
 	for key, currentValue := range current {
@@ -358,7 +482,7 @@ func playerChanges(
 		}
 		if isHistoricalField(key) {
 			profileChanges = append(profileChanges, models.PlayerProfileChangeRow{
-				EventTime:     now,
+				EventTime:     eventTime,
 				PlayerTag:     tag,
 				ClanTag:       clan,
 				TownHallLevel: townhall,
@@ -370,44 +494,71 @@ func playerChanges(
 		if isOnlineField(key) {
 			activityScore++
 		}
-		if incKey, ok := seasonalIncField(key); ok {
-			change := numericChange(previousValue, currentValue)
-			if change > 0 && clan != "" {
-				row := statsByKey[clan]
-				row.PlayerTag = tag
-				row.Season = season
-				row.ClanTag = clan
-				switch incKey {
-				case "donated":
-					row.Donated += change
-				case "received":
-					row.Received += change
-				case "capital_gold_dono":
-					row.CapitalGoldDonos += change
-				}
-				statsByKey[clan] = row
-			}
+	}
+	return profileChanges, activityScore
+}
+
+func playerStatChanges(
+	tag string,
+	previous clashy.Player,
+	current clashy.Player,
+	eventTime time.Time,
+) []models.PlayerStatChangeRow {
+	var clanTag *string
+	if current.Clan != nil && current.Clan.Tag != "" {
+		value := current.Clan.Tag
+		clanTag = &value
+	}
+	counters := [...]struct {
+		statType string
+		previous int64
+		current  int64
+	}{
+		{
+			statType: playerStatDonated,
+			previous: int64(previous.Donations),
+			current:  int64(current.Donations),
+		},
+		{
+			statType: playerStatReceived,
+			previous: int64(previous.Received),
+			current:  int64(current.Received),
+		},
+		{
+			statType: playerStatClanGames,
+			previous: playerClanGamesValue(previous),
+			current:  playerClanGamesValue(current),
+		},
+		{
+			statType: playerStatCapitalGoldDonated,
+			previous: int64(previous.ClanCapitalContributions),
+			current:  int64(current.ClanCapitalContributions),
+		},
+	}
+	rows := make([]models.PlayerStatChangeRow, 0, len(counters))
+	for _, counter := range counters {
+		if counter.previous < 0 || counter.current <= counter.previous {
+			continue
 		}
+		rows = append(rows, models.PlayerStatChangeRow{
+			EventTime:     eventTime,
+			PlayerTag:     tag,
+			ClanTag:       clanTag,
+			StatType:      counter.statType,
+			PreviousValue: counter.previous,
+			CurrentValue:  counter.current,
+			Delta:         counter.current - counter.previous,
+		})
 	}
-	if activityScore > 0 && clan != "" {
-		row := statsByKey[clan]
-		row.PlayerTag = tag
-		row.Season = season
-		row.ClanTag = clan
-		row.ActivityScore++
-		statsByKey[clan] = row
+	return rows
+}
+
+func playerClanGamesValue(player clashy.Player) int64 {
+	achievement := player.GetAchievement(playerClanGamesAchievement)
+	if achievement == nil {
+		return 0
 	}
-	out := make([]models.PlayerSeasonStatRow, 0, len(statsByKey))
-	for _, row := range statsByKey {
-		out = append(out, row)
-	}
-	sort.Slice(out, func(i, j int) bool {
-		if out[i].ClanTag == out[j].ClanTag {
-			return out[i].PlayerTag < out[j].PlayerTag
-		}
-		return out[i].ClanTag < out[j].ClanTag
-	})
-	return profileChanges, activityScore, out
+	return int64(achievement.Value)
 }
 
 func isHistoricalField(key string) bool {
@@ -429,28 +580,6 @@ func isOnlineField(key string) bool {
 	default:
 		return false
 	}
-}
-
-func seasonalIncField(key string) (string, bool) {
-	switch key {
-	case "donations":
-		return "donated", true
-	case "donationsReceived":
-		return "received", true
-	case "clanCapitalContributions":
-		return "capital_gold_dono", true
-	default:
-		return "", false
-	}
-}
-
-func numericChange(previous, current any) int {
-	prev, ok1 := asInt(previous)
-	curr, ok2 := asInt(current)
-	if !ok1 || !ok2 {
-		return 0
-	}
-	return curr - prev
 }
 
 func asInt(value any) (int, bool) {
@@ -551,13 +680,18 @@ func (s *timescaleBotPlayerStore) StoreIngest(
 		return err
 	}
 	defer tx.Rollback(ctx)
+	if len(ingest.StatChanges) > 0 {
+		if _, err := tx.Exec(ctx, lockPlayerStatChangesSQL, ingest.SnapshotTag); err != nil {
+			return err
+		}
+	}
 	if err := utils.UpsertBasicPlayers(ctx, tx, ingest.Players, botPlayersDomainName); err != nil {
 		return err
 	}
 	if err := insertPlayerProfileChanges(ctx, tx, ingest.ProfileChanges); err != nil {
 		return err
 	}
-	if err := upsertPlayerSeasonStats(ctx, tx, ingest.SeasonStats); err != nil {
+	if err := insertPlayerStatChanges(ctx, tx, ingest.StatChanges); err != nil {
 		return err
 	}
 	if ingest.LastOnlineAt != nil && ingest.SnapshotTag != "" {
@@ -607,54 +741,104 @@ func insertPlayerProfileChanges(
 		}
 		previous, _ := json.Marshal(row.PreviousValue)
 		current, _ := json.Marshal(row.CurrentValue)
-		batch.Queue(`
-			INSERT INTO player_profile_changes (
-				event_time, player_tag, clan_tag, townhall_level, change_type,
-				previous_value, current_value
-			)
-			VALUES ($1, $2, $3, $4, $5, $6::jsonb, $7::jsonb)
-			ON CONFLICT DO NOTHING
-		`, row.EventTime, row.PlayerTag, row.ClanTag, row.TownHallLevel, row.ChangeType,
+		batch.Queue(insertPlayerProfileChangeSQL,
+			row.EventTime, row.PlayerTag, row.ClanTag, row.TownHallLevel, row.ChangeType,
 			string(previous), string(current))
 	}
 	return utils.SendBatch(ctx, tx, batch)
 }
 
-func upsertPlayerSeasonStats(
+const insertPlayerProfileChangeSQL = `
+	INSERT INTO player_change_history (
+		event_time, player_tag, clan_tag, townhall_level, change_type,
+		previous_value, current_value
+	)
+	VALUES ($1, $2, $3, $4, $5, $6::jsonb, $7::jsonb)
+	ON CONFLICT DO NOTHING
+`
+
+const insertPlayerStatChangesSQL = `
+	WITH existing AS MATERIALIZED (
+		SELECT 1
+		FROM player_stat_changes
+		WHERE event_time = $1
+		  AND player_tag = $2
+		  AND stat_type = $4
+		LIMIT 1
+	),
+	updated AS (
+		UPDATE player_stat_changes
+		SET clan_tag = $3,
+			current_value = $6,
+			delta = $7
+		WHERE event_time = $1
+		  AND player_tag = $2
+		  AND stat_type = $4
+		  AND current_value < $6
+		RETURNING 1
+	)
+	INSERT INTO player_stat_changes (
+		event_time, player_tag, clan_tag, stat_type,
+		previous_value, current_value, delta
+	)
+	SELECT $1, $2, $3, $4, $5, $6, $7
+	WHERE NOT EXISTS (SELECT 1 FROM existing)
+	  AND NOT EXISTS (SELECT 1 FROM updated)
+`
+
+const lockPlayerStatChangesSQL = `
+	SELECT pg_advisory_xact_lock(hashtextextended($1, 0))
+`
+
+func insertPlayerStatChanges(
 	ctx context.Context,
 	tx pgx.Tx,
-	rows []models.PlayerSeasonStatRow,
+	rows []models.PlayerStatChangeRow,
 ) error {
 	if len(rows) == 0 {
 		return nil
 	}
 	batch := &pgx.Batch{}
 	for _, row := range rows {
-		if row.PlayerTag == "" || row.Season == "" {
-			continue
+		if err := validatePlayerStatChange(row); err != nil {
+			return err
 		}
-		batch.Queue(`
-			INSERT INTO player_season_stats (
-				player_tag, season, clan_tag, donated, received, capital_gold_donos,
-				activity_score, last_online_at
-			)
-			VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
-			ON CONFLICT (player_tag, season, clan_tag) DO UPDATE SET
-				donated = player_season_stats.donated + EXCLUDED.donated,
-				received = player_season_stats.received + EXCLUDED.received,
-				capital_gold_donos =
-					player_season_stats.capital_gold_donos + EXCLUDED.capital_gold_donos,
-				activity_score =
-					player_season_stats.activity_score + EXCLUDED.activity_score,
-				last_online_at = GREATEST(
-					player_season_stats.last_online_at,
-					EXCLUDED.last_online_at
-				),
-				updated_at = now()
-		`, row.PlayerTag, row.Season, row.ClanTag, row.Donated, row.Received,
-			row.CapitalGoldDonos, row.ActivityScore, row.LastOnlineAt)
+		batch.Queue(
+			insertPlayerStatChangesSQL,
+			row.EventTime,
+			row.PlayerTag,
+			row.ClanTag,
+			row.StatType,
+			row.PreviousValue,
+			row.CurrentValue,
+			row.Delta,
+		)
 	}
 	return utils.SendBatch(ctx, tx, batch)
+}
+
+func validatePlayerStatChange(row models.PlayerStatChangeRow) error {
+	if row.EventTime.IsZero() ||
+		row.PlayerTag == "" ||
+		!validPlayerStatType(row.StatType) ||
+		row.PreviousValue < 0 ||
+		row.CurrentValue <= row.PreviousValue ||
+		row.Delta != row.CurrentValue-row.PreviousValue {
+		return fmt.Errorf("invalid %s player stat change for %s", row.StatType, row.PlayerTag)
+	}
+	return nil
+}
+
+func validPlayerStatType(statType string) bool {
+	switch statType {
+	case playerStatDonated,
+		playerStatReceived,
+		playerStatClanGames,
+		playerStatCapitalGoldDonated:
+		return true
+	default:
+		return false
+	}
 }
 
 type memoryBotPlayerStore struct {

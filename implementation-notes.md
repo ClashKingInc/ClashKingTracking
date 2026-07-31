@@ -26,6 +26,9 @@
   from the beginning because their writes are idempotent.
 - Bot-player snapshots stay compressed in Valkey, fall back to memory for
   mock/dry-run execution, and update only after SQL and event writes succeed.
+- Bot-player stat retries reserve one Valkey event time per prior `ps:<tag>`
+  snapshot and use guarded SQL update-or-insert semantics, so a committed stat
+  write followed by a failed event append cannot duplicate the same deltas.
 - Giveaway status changes set `event_pending` before publishing to Valkey
   Streams.
 - Giveaway pending markers are cleared only after the event append succeeds.
@@ -65,20 +68,22 @@
   avoid adding polling load to Timescale.
 - Stream replay survives script or bot downtime, but Valkey restart durability
   depends on the deployed Valkey AOF/RDB persistence settings.
-- The bot-player SQL schema keeps profile changes append-only and season stats
-  aggregated to keep reads simple.
+- The bot-player SQL schema keeps profile changes and typed positive stat
+  deltas append-only. Stat deltas use the compressed Valkey player snapshot as
+  their before-state and do not maintain a second SQL baseline.
 
 ## Schema Changes
 
 - Added `tracked_player_targets`.
-- Added `player_profile_changes`.
-- Added `player_season_stats`.
+- Added `player_change_history`.
+- Added `player_stat_changes`.
 - Expanded `giveaways` to match the current API giveaway document shape.
 
 ## Client Changes
 
 - Added `Player.ClanCapitalContributions` in local `clashy.go`.
-- This supports bot-player capital donation stat increments from the Clash API.
+- This supports typed bot-player `capital_gold_donated` delta events from the
+  Clash API.
 
 ## Open Questions
 
