@@ -1,11 +1,16 @@
 package scripts
 
 import (
+	"context"
 	"encoding/json"
+	"errors"
+	"io"
+	"log/slog"
 	"strings"
 	"testing"
 	"time"
 
+	"clashking_tracking/internal/platform"
 	"clashking_tracking/models"
 
 	clashy "github.com/clashkinginc/clashy.go"
@@ -112,6 +117,81 @@ func TestLeaguePayloadForPlayerUsesLeagueTierMetadata(t *testing.T) {
 
 	if payload != playerLeague {
 		t.Fatalf("expected leaguetiers payload: %#v", payload)
+	}
+}
+
+func TestLeaderboardMaterializedViewRefreshSet(t *testing.T) {
+	got := strings.Join(leaderboardMaterializedViewRefreshQueries[:], "\n")
+	want := strings.Join([]string{
+		`REFRESH MATERIALIZED VIEW CONCURRENTLY clan_leaderboards`,
+		`REFRESH MATERIALIZED VIEW war_league_counts`,
+		`REFRESH MATERIALIZED VIEW CONCURRENTLY townhall_counts`,
+	}, "\n")
+
+	if got != want {
+		t.Fatalf("materialized view refresh queries:\n%s\nwant:\n%s", got, want)
+	}
+	if leaderboardMaterializedViewCount != len(leaderboardMaterializedViewRefreshQueries) {
+		t.Fatalf(
+			"materialized view metric count = %d, queries = %d",
+			leaderboardMaterializedViewCount,
+			len(leaderboardMaterializedViewRefreshQueries),
+		)
+	}
+}
+
+func TestLeaderboardMaterializedViewRefreshFailureKeepsDeadlineDue(t *testing.T) {
+	now := time.Date(2026, 7, 26, 12, 0, 0, 0, time.UTC)
+	refreshErr := errors.New("townhall refresh failed")
+	attempts := 0
+	fail := true
+	domain := &leaderboardsDomain{
+		refreshMaterializedViews: func(context.Context) error {
+			attempts++
+			if fail {
+				return refreshErr
+			}
+			return nil
+		},
+	}
+	app := &platform.App{
+		Logger: slog.New(slog.NewTextHandler(io.Discard, nil)),
+		Stats:  platform.NewTracker(),
+	}
+
+	err := domain.refreshMaterializedViewsIfDue(context.Background(), app, now)
+	if !errors.Is(err, refreshErr) {
+		t.Fatalf("first refresh error = %v, want %v", err, refreshErr)
+	}
+	if !domain.nextMaterializedViewRefresh.IsZero() {
+		t.Fatalf("failed refresh advanced deadline to %s", domain.nextMaterializedViewRefresh)
+	}
+
+	fail = false
+	retryAt := now.Add(600 * time.Second)
+	if err := domain.refreshMaterializedViewsIfDue(context.Background(), app, retryAt); err != nil {
+		t.Fatalf("retry refresh: %v", err)
+	}
+	if attempts != 2 {
+		t.Fatalf("refresh attempts = %d, want 2", attempts)
+	}
+	wantDeadline := retryAt.Add(leaderboardMaterializedViewRefreshSeconds * time.Second)
+	if !domain.nextMaterializedViewRefresh.Equal(wantDeadline) {
+		t.Fatalf("successful refresh deadline = %s, want %s", domain.nextMaterializedViewRefresh, wantDeadline)
+	}
+
+	stats := app.Stats.Domain(leaderboardsDomainName)
+	if stats.StoreBatches != 1 ||
+		stats.StoreRowsRequested != leaderboardMaterializedViewCount ||
+		stats.StoreRowsAffected != leaderboardMaterializedViewCount {
+		t.Fatalf("refresh store metrics = %#v", stats)
+	}
+
+	if err := domain.refreshMaterializedViewsIfDue(context.Background(), app, retryAt.Add(600*time.Second)); err != nil {
+		t.Fatalf("refresh before hourly deadline: %v", err)
+	}
+	if attempts != 2 {
+		t.Fatalf("refresh ran before hourly deadline: attempts = %d", attempts)
 	}
 }
 

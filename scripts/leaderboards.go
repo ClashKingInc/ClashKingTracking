@@ -29,6 +29,7 @@ const (
 	leaderboardTHKeyPrefix                    = "leaderboards:townhall:"
 	leaderboardUpdateRetries                  = 3
 	leaderboardMaterializedViewRefreshSeconds = 3600
+	leaderboardMaterializedViewCount          = 3
 )
 
 var leaderboardCacheScript = valkey.NewLuaScript(`
@@ -37,6 +38,12 @@ var leaderboardCacheScript = valkey.NewLuaScript(`
 	end
 	return #KEYS
 `)
+
+var leaderboardMaterializedViewRefreshQueries = [...]string{
+	`REFRESH MATERIALIZED VIEW CONCURRENTLY clan_leaderboards`,
+	`REFRESH MATERIALIZED VIEW war_league_counts`,
+	`REFRESH MATERIALIZED VIEW CONCURRENTLY townhall_counts`,
+}
 
 const leaderboardCandidateSQL = `
 	WITH league_ids AS (
@@ -93,6 +100,7 @@ type leaderboardsDomain struct {
 	limit                       int
 	nullAssetURL                string
 	nextMaterializedViewRefresh time.Time
+	refreshMaterializedViews    func(context.Context) error
 }
 
 type leaderboardCandidate struct {
@@ -167,6 +175,7 @@ func (d *leaderboardsDomain) Run(ctx context.Context, app *platform.App) error {
 		return err
 	}
 	d.store = store
+	d.refreshMaterializedViews = store.RefreshMaterializedViews
 	defer store.Close()
 
 	interval := time.Duration(app.Config.LeaderboardIntervalSeconds) * time.Second
@@ -268,13 +277,18 @@ func (d *leaderboardsDomain) refreshMaterializedViewsIfDue(ctx context.Context, 
 		return nil
 	}
 	start := time.Now()
-	if err := d.store.RefreshMaterializedViews(ctx); err != nil {
+	if err := d.refreshMaterializedViews(ctx); err != nil {
 		return fmt.Errorf("refresh leaderboard materialized views: %w", err)
 	}
 	duration := time.Since(start)
 	d.nextMaterializedViewRefresh = now.Add(time.Duration(leaderboardMaterializedViewRefreshSeconds) * time.Second)
 	app.Logger.Info("leaderboards materialized views refreshed", "duration", duration)
-	app.Stats.RecordStore(leaderboardsDomainName, duration, 2, 2)
+	app.Stats.RecordStore(
+		leaderboardsDomainName,
+		duration,
+		leaderboardMaterializedViewCount,
+		leaderboardMaterializedViewCount,
+	)
 	return nil
 }
 
@@ -657,7 +671,7 @@ func (s *timescaleLeaderboardStore) CacheBoards(ctx context.Context, cache leade
 }
 
 func (s *timescaleLeaderboardStore) RefreshMaterializedViews(ctx context.Context) error {
-	if _, err := s.pool.Exec(ctx, `REFRESH MATERIALIZED VIEW CONCURRENTLY clan_leaderboards`); err != nil {
+	if _, err := s.pool.Exec(ctx, leaderboardMaterializedViewRefreshQueries[0]); err != nil {
 		var pgErr *pgconn.PgError
 		if !errors.As(err, &pgErr) || pgErr.Code != "55000" {
 			return err
@@ -668,8 +682,10 @@ func (s *timescaleLeaderboardStore) RefreshMaterializedViews(ctx context.Context
 			return err
 		}
 	}
-	if _, err := s.pool.Exec(ctx, `REFRESH MATERIALIZED VIEW war_league_counts`); err != nil {
-		return err
+	for _, query := range leaderboardMaterializedViewRefreshQueries[1:] {
+		if _, err := s.pool.Exec(ctx, query); err != nil {
+			return err
+		}
 	}
 	return nil
 }
