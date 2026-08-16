@@ -58,17 +58,17 @@ type WarScheduleRow struct {
 	PrepTime      time.Time
 	EndTime       time.Time
 	NextRunAt     time.Time
+	WarType       string
 	WarTag        string
 }
 
-// CurrentWarTimerRow is the active player-to-war lookup. It deliberately has no
-// payload: the durable war record is written only after the scheduled final fetch.
-type CurrentWarTimerRow struct {
-	PlayerTag   string
-	WarID       string
-	ClanTag     string
-	OpponentTag string
-	EndTime     time.Time
+// PlayerTimerRow records that a player is participating in a time-bounded event.
+// EventKey points at war_schedule.schedule_key for wars and is the clan tag for raids.
+type PlayerTimerRow struct {
+	PlayerTag string
+	EventType string
+	EventKey  string
+	ExpiresAt time.Time
 }
 
 type CWLGroupRow struct {
@@ -86,16 +86,15 @@ type CWLGroupClanRow struct {
 	Name       string
 	ClanLevel  int
 	BadgeToken string
+	Members    []BasicClanMember
 }
 
 type WarIngest struct {
 	IndexRows           []WarLogIndexRow
 	AttackRows          []WarAttackRow
-	Players             []BasicPlayerRow
 	Schedules           []WarScheduleRow
-	CurrentWarTimers    []CurrentWarTimerRow
+	PlayerTimers        []PlayerTimerRow
 	CWLGroups           []CWLGroupRow
 	FinishedScheduleKey string
 	FinishedWarID       string
-	RawWarJSON          []byte
 }

@@ -3,10 +3,13 @@ package scripts
 import (
 	"context"
 	"errors"
+	"strings"
 	"time"
 
 	"clashking_tracking/internal/platform"
 	"clashking_tracking/models"
+
+	clashy "github.com/clashkinginc/clashy.go"
 )
 
 const mobilePushDomainName = "mobile_push"
@@ -57,7 +60,7 @@ func validateMobilePushConfig(cfg platform.Config) error {
 		return errors.New("mobile_push.scan_seconds must be greater than zero")
 	}
 	if !cfg.DryRun && !cfg.MockDB && cfg.TimescaleURL == "" {
-		return errors.New("TIMESCALE_URL is required for mobile_push")
+		return errors.New("TIMESCALE_* connection variables are required for mobile_push")
 	}
 	return nil
 }
@@ -86,13 +89,16 @@ func (d *mobilePushDomain) runCycle(ctx context.Context, app *platform.App) erro
 			app.Logger.Warn("mobile_push: automatic retry failed", "post_id", post.ID, "err", err)
 		}
 	}
+	if err := d.store.EnsureGameEventCampaigns(ctx, now); err != nil {
+		return err
+	}
 
 	campaigns, err := d.store.ClaimDueCampaigns(ctx, now)
 	if err != nil {
 		return err
 	}
 	for _, campaign := range campaigns {
-		devices, loadErr := d.store.DevicesForPlatforms(ctx, campaign.Platforms, campaign.TargetLocales)
+		devices, loadErr := d.store.DevicesForPlatforms(ctx, campaign.Platforms, campaign.TargetLocales, campaignNotificationPreference(campaign))
 		if loadErr != nil {
 			app.Logger.Warn("mobile_push: campaign audience failed", "campaign_id", campaign.ID, "err", loadErr)
 			continue
@@ -166,7 +172,7 @@ func publishAndNotify(ctx context.Context, app *platform.App, store mobilePushSt
 }
 
 func deliverPostPush(ctx context.Context, app *platform.App, store mobilePushStore, post models.AdminPost, trigger string) (int, int, error) {
-	devices, err := store.DevicesForPlatforms(ctx, post.Platforms, nil)
+	devices, err := store.DevicesForPlatforms(ctx, post.Platforms, nil, "announcements")
 	if err != nil {
 		_, _ = store.RecordDeliveryAttempt(ctx, models.AdminPostDeliveryAttempt{PostID: post.ID, Trigger: trigger, Status: "failed", ErrorSummary: err.Error()})
 		return 0, 0, err
@@ -202,6 +208,64 @@ func deliverPostPush(ctx context.Context, app *platform.App, store mobilePushSto
 		_ = store.MarkPushSent(ctx, post.ID)
 	}
 	return sent, skipped, recordErr
+}
+
+func campaignNotificationPreference(campaign models.NotificationCampaign) string {
+	if campaign.Key == "monthly-support" {
+		return "monthly_support"
+	}
+	if strings.HasPrefix(campaign.Key, "game-event-") ||
+		strings.HasPrefix(campaign.Key, "clan-games-") ||
+		strings.HasPrefix(campaign.Key, "cwl-") ||
+		strings.HasPrefix(campaign.Key, "raid-weekend-") ||
+		strings.HasPrefix(campaign.Key, "season-start-") {
+		return "events"
+	}
+	return "announcements"
+}
+
+func gameEventCampaigns(now time.Time) []models.NotificationCampaign {
+	now = now.UTC()
+	events := []struct {
+		slug  string
+		title string
+		body  string
+		start time.Time
+	}{
+		{slug: "cwl", title: "Clan War League has started", body: "Clan War League is now live in game.", start: nextMonthlyEventStart(now, 1, 8)},
+		{slug: "clan-games", title: "Clan Games have started", body: "Clan Games are now live in game.", start: nextMonthlyEventStart(now, 22, 8)},
+		{slug: "raid-weekend", title: "Raid Weekend has started", body: "Raid Weekend is now live in game.", start: nextRaidWeekendStart(now)},
+		{slug: "season-start", title: "A new season has started", body: "The new Clash of Clans season is now live.", start: clashy.GetSeasonEnd(now).UTC()},
+	}
+	campaigns := make([]models.NotificationCampaign, 0, len(events))
+	for _, event := range events {
+		start := event.start
+		campaigns = append(campaigns, models.NotificationCampaign{
+			Key:       "game-event-" + event.slug + "-" + start.Format("20060102T1504"),
+			Title:     event.title,
+			Body:      event.body,
+			Platforms: []string{"ios", "android"},
+			SendAt:    &start,
+		})
+	}
+	return campaigns
+}
+
+func nextMonthlyEventStart(now time.Time, day, hour int) time.Time {
+	start := time.Date(now.Year(), now.Month(), day, hour, 0, 0, 0, time.UTC)
+	if !start.After(now) {
+		start = time.Date(now.Year(), now.Month()+1, day, hour, 0, 0, 0, time.UTC)
+	}
+	return start
+}
+
+func nextRaidWeekendStart(now time.Time) time.Time {
+	daysUntilFriday := (int(time.Friday) - int(now.Weekday()) + 7) % 7
+	start := time.Date(now.Year(), now.Month(), now.Day(), 7, 0, 0, 0, time.UTC).AddDate(0, 0, daysUntilFriday)
+	if !start.After(now) {
+		start = start.AddDate(0, 0, 7)
+	}
+	return start
 }
 
 func sendLocalizedPush(ctx context.Context, app *platform.App, devices []models.PushDevice, messageForLocale func(string) pushMessage) (int, int) {

@@ -16,22 +16,22 @@ import (
 	clashy "github.com/clashkinginc/clashy.go"
 )
 
-func TestBotClanSnapshotDiffDoesNotAdvanceUntilStored(t *testing.T) {
-	store := &memoryBotClanSnapshotStore{values: make(map[string][]byte)}
+func TestTrackedClanSnapshotDiffDoesNotAdvanceUntilStored(t *testing.T) {
+	store := &memoryTrackedClanSnapshotStore{values: make(map[string][]byte)}
 	clan := clashy.Clan{Tag: "#CLAN", Name: "Before"}
-	prefix := "botclans:test:"
+	prefix := "trackedclans:test:"
 
-	_, raw, hasPrevious, changed, err := loadBotClanSnapshotChange(t.Context(), store, prefix, "clan", clan.Tag, clan, nil)
+	_, raw, hasPrevious, changed, err := loadTrackedClanSnapshotChange(t.Context(), store, prefix, "clan", clan.Tag, clan, nil)
 	if err != nil {
 		t.Fatal(err)
 	}
 	if hasPrevious || !changed {
 		t.Fatalf("first snapshot = hasPrevious %v changed %v, want false/true", hasPrevious, changed)
 	}
-	if err := store.StoreRaw(t.Context(), botClanSnapshotKey(prefix, "clan", clan.Tag), raw); err != nil {
+	if err := store.StoreRaw(t.Context(), trackedClanSnapshotKey(prefix, "clan", clan.Tag), raw); err != nil {
 		t.Fatal(err)
 	}
-	_, _, hasPrevious, changed, err = loadBotClanSnapshotChange(t.Context(), store, prefix, "clan", clan.Tag, clan, nil)
+	_, _, hasPrevious, changed, err = loadTrackedClanSnapshotChange(t.Context(), store, prefix, "clan", clan.Tag, clan, nil)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -39,14 +39,14 @@ func TestBotClanSnapshotDiffDoesNotAdvanceUntilStored(t *testing.T) {
 		t.Fatalf("same snapshot = hasPrevious %v changed %v, want true/false", hasPrevious, changed)
 	}
 	clan.Name = "After"
-	previous, _, hasPrevious, changed, err := loadBotClanSnapshotChange(t.Context(), store, prefix, "clan", clan.Tag, clan, nil)
+	previous, _, hasPrevious, changed, err := loadTrackedClanSnapshotChange(t.Context(), store, prefix, "clan", clan.Tag, clan, nil)
 	if err != nil {
 		t.Fatal(err)
 	}
 	if !hasPrevious || !changed || previous == nil || previous.Name != "Before" {
 		t.Fatalf("changed snapshot = previous %#v hasPrevious %v changed %v", previous, hasPrevious, changed)
 	}
-	stored, _, ok, err := loadBotClanSnapshot[clashy.Clan](t.Context(), store, prefix, "clan", clan.Tag)
+	stored, _, ok, err := loadTrackedClanSnapshot[clashy.Clan](t.Context(), store, prefix, "clan", clan.Tag)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -132,14 +132,14 @@ func TestRaidMissingMembersUsesClanSnapshot(t *testing.T) {
 }
 
 func TestCapitalRaidCacheKeys(t *testing.T) {
-	const prefix = "botclans:snapshot:"
-	if got, want := capitalRaidPayloadKey(prefix, "#CLAN"), "botclans:snapshot:raid:#CLAN"; got != want {
+	const prefix = "trackedclans:snapshot:"
+	if got, want := capitalRaidPayloadKey(prefix, "#CLAN"), "trackedclans:snapshot:raid:#CLAN"; got != want {
 		t.Fatalf("payload key = %q, want %q", got, want)
 	}
-	if got, want := capitalRaidParticipantSetKey(prefix, "#CLAN"), "botclans:snapshot:raid-members:#CLAN"; got != want {
+	if got, want := capitalRaidParticipantSetKey(prefix, "#CLAN"), "trackedclans:snapshot:raid-members:#CLAN"; got != want {
 		t.Fatalf("participant set key = %q, want %q", got, want)
 	}
-	if got, want := capitalRaidMemberKey(prefix, "#PLAYER"), "botclans:snapshot:raid-member:#PLAYER"; got != want {
+	if got, want := capitalRaidMemberKey(prefix, "#PLAYER"), "trackedclans:snapshot:raid-member:#PLAYER"; got != want {
 		t.Fatalf("member key = %q, want %q", got, want)
 	}
 }
@@ -171,7 +171,7 @@ func TestCapitalRaidCacheExpiryIsWeekendEndPlusTenMinutes(t *testing.T) {
 
 func TestCapitalRaidCacheSnappyRoundTripAndPreviousResponse(t *testing.T) {
 	now := time.Date(2026, 7, 24, 12, 0, 0, 0, time.UTC)
-	cache := newMemoryCapitalRaidCache("botclans:snapshot:", func() time.Time { return now })
+	cache := newMemoryCapitalRaidCache("trackedclans:snapshot:", func() time.Time { return now })
 	previous := clashy.RaidLogEntry{
 		State:   "ongoing",
 		EndTime: &clashy.Timestamp{Time: now.Add(time.Hour)},
@@ -219,7 +219,7 @@ func TestCapitalRaidCacheSnappyRoundTripAndPreviousResponse(t *testing.T) {
 
 func TestCapitalRaidCacheAlignsExpiryAndCleansReplacementMappings(t *testing.T) {
 	now := time.Date(2026, 7, 24, 12, 0, 0, 0, time.UTC)
-	cache := newMemoryCapitalRaidCache("botclans:snapshot:", func() time.Time { return now })
+	cache := newMemoryCapitalRaidCache("trackedclans:snapshot:", func() time.Time { return now })
 	expiresAt := now.Add(2*time.Hour + 10*time.Minute)
 	if err := cache.Replace(t.Context(), "#CLAN", []string{"#A", "#B"}, []byte(`{"state":"ongoing"}`), expiresAt); err != nil {
 		t.Fatal(err)
@@ -281,12 +281,12 @@ func TestCapitalRaidCacheAlignsExpiryAndCleansReplacementMappings(t *testing.T) 
 
 func TestCapitalRaidInvalidEndCleansExistingCache(t *testing.T) {
 	now := time.Date(2026, 7, 24, 12, 0, 0, 0, time.UTC)
-	cache := newMemoryCapitalRaidCache("botclans:snapshot:", func() time.Time { return now })
+	cache := newMemoryCapitalRaidCache("trackedclans:snapshot:", func() time.Time { return now })
 	if err := cache.Replace(t.Context(), "#CLAN", []string{"#A"}, []byte(`{"state":"ongoing"}`), now.Add(time.Hour)); err != nil {
 		t.Fatal(err)
 	}
-	domain := &botClansDomain{capitalRaids: cache}
-	if err := domain.handleRaidChange(t.Context(), botClansTestApp(), TrackedItem[clashy.RaidLogEntry]{
+	domain := &trackedClansDomain{capitalRaids: cache}
+	if err := domain.handleRaidChange(t.Context(), trackedClansTestApp(), TrackedItem[clashy.RaidLogEntry]{
 		Tag:     "#CLAN",
 		Current: &clashy.RaidLogEntry{},
 	}); err != nil {
@@ -306,14 +306,14 @@ func TestCapitalRaidUnchangedResponseRefreshesExpiryAndMappings(t *testing.T) {
 		Members: []clashy.RaidMember{{Tag: "#A"}},
 	}
 	raw := jsonBytes(raid)
-	cache := newMemoryCapitalRaidCache("botclans:snapshot:", func() time.Time { return now })
+	cache := newMemoryCapitalRaidCache("trackedclans:snapshot:", func() time.Time { return now })
 	cache.entries["#CLAN"] = memoryCapitalRaidCacheEntry{
 		compressed: utils.Compress(raw),
 		expiresAt:  now.Add(24 * time.Hour),
 		members:    make(map[string]struct{}),
 	}
-	domain := &botClansDomain{capitalRaids: cache}
-	if err := domain.handleRaidChange(t.Context(), botClansTestApp(), TrackedItem[clashy.RaidLogEntry]{
+	domain := &trackedClansDomain{capitalRaids: cache}
+	if err := domain.handleRaidChange(t.Context(), trackedClansTestApp(), TrackedItem[clashy.RaidLogEntry]{
 		Tag:     "#CLAN",
 		Current: &raid,
 		Raw:     raw,
@@ -341,24 +341,35 @@ func TestCapitalRaidParticipantTagsAreUnique(t *testing.T) {
 	}
 }
 
-func TestBotClansHasNoCapitalRaidSQLQueries(t *testing.T) {
-	source, err := os.ReadFile("bot_clans.go")
+func TestTrackedClansHasNoCapitalRaidSQLQueries(t *testing.T) {
+	source, err := os.ReadFile("tracked_clans.go")
 	if err != nil {
 		t.Fatal(err)
 	}
 	for _, table := range []string{"capital_raid_cache", "capital_raid_members"} {
 		if strings.Contains(string(source), table) {
-			t.Fatalf("bot_clans.go still references removed SQL table %s", table)
+			t.Fatalf("tracked_clans.go still references removed SQL table %s", table)
 		}
 	}
 }
 
-func botClansTestApp() *platform.App {
+func TestMergeWarRemindersDeduplicatesDiscordAndMobileTimings(t *testing.T) {
+	got := mergeWarReminders(
+		[]warReminder{{TriggerTime: "5hr", MinutesRemaining: 300}},
+		[]warReminder{{TriggerTime: "300min", MinutesRemaining: 300}, {TriggerTime: "60min", MinutesRemaining: 60}},
+	)
+	want := []warReminder{{TriggerTime: "5hr", MinutesRemaining: 300}, {TriggerTime: "60min", MinutesRemaining: 60}}
+	if !reflect.DeepEqual(got, want) {
+		t.Fatalf("merged reminders = %#v, want %#v", got, want)
+	}
+}
+
+func trackedClansTestApp() *platform.App {
 	return &platform.App{
 		Config: platform.Config{
-			BotClanRequestsPerSecond: 950,
-			BotClanSnapshotPrefix:    "botclans:test:",
-			BotClanCWLStateSnapshot:  "cwlstate",
+			TrackedClanRequestsPerSecond: 950,
+			TrackedClanSnapshotPrefix:    "trackedclans:test:",
+			TrackedClanCWLStateSnapshot:  "cwlstate",
 		},
 		Stats: platform.NewTracker(),
 	}

@@ -2,8 +2,9 @@ package models
 
 import "time"
 
-type BotPlayerTarget struct {
-	Tag string
+type TrackedPlayerTarget struct {
+	Tag      string
+	Verified bool
 }
 
 type PlayerProfileChangeRow struct {
@@ -26,12 +27,14 @@ type PlayerStatChangeRow struct {
 	Delta         int64
 }
 
-type BotPlayerIngest struct {
-	Players        []BasicPlayerRow
-	ProfileChanges []PlayerProfileChangeRow
-	StatChanges    []PlayerStatChangeRow
-	LastOnlineAt   *time.Time
-	Event          Event
-	SnapshotTag    string
-	SnapshotRaw    []byte
+type TrackedPlayerIngest struct {
+	Players          []BasicPlayerRow
+	ProfileChanges   []PlayerProfileChangeRow
+	StatChanges      []PlayerStatChangeRow
+	LastOnlineAt     *time.Time
+	Event            Event
+	SnapshotTag      string
+	SnapshotRaw      []byte
+	VerifiedTracking bool
+	CurrentClan      string
 }

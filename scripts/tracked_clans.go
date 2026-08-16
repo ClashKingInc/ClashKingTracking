@@ -18,7 +18,7 @@ import (
 	valkey "github.com/valkey-io/valkey-go"
 )
 
-type botClanFetchFunc[T any] func(context.Context, string) (*T, error)
+type trackedClanFetchFunc[T any] func(context.Context, string) (*T, error)
 
 type TrackedItem[T any] struct {
 	Group   string
@@ -29,10 +29,10 @@ type TrackedItem[T any] struct {
 }
 
 const (
-	botClansDomainName        = "botclans"
-	botClanReminderTTL        = time.Minute
-	botClanReminderRetryDelay = time.Minute
-	capitalRaidCacheGrace     = 10 * time.Minute
+	trackedClansDomainName        = "trackedclans"
+	trackedClanReminderTTL        = time.Minute
+	trackedClanReminderRetryDelay = time.Minute
+	capitalRaidCacheGrace         = 10 * time.Minute
 )
 
 var replaceCapitalRaidCacheScript = valkey.NewLuaScript(`
@@ -89,40 +89,47 @@ type cachedRaidReminders struct {
 	values   []raidReminder
 }
 
-type botClansDomain struct {
+type trackedClansDomain struct {
 	mu               sync.Mutex
 	scheduled        map[string]struct{}
 	targetsMu        sync.RWMutex
-	targets          []string
-	snapshots        botClanSnapshotStore
+	targets          []trackedClanTarget
+	snapshots        trackedClanSnapshotStore
 	snapshotPrefix   string
 	cwlStateSnapshot string
-	store            botClanStore
+	store            trackedClanStore
 	capitalRaids     capitalRaidCache
 	reminderMu       sync.Mutex
 	warReminders     map[string]cachedWarReminders
 	raidReminders    map[string]cachedRaidReminders
 }
 
-func NewBotClansDomain() platform.Domain {
-	return &botClansDomain{
+type trackedClanTarget struct {
+	Tag              string
+	ClanEvents       bool
+	WarEvents        bool
+	PublishWarEvents bool
+}
+
+func NewTrackedClansDomain() platform.Domain {
+	return &trackedClansDomain{
 		scheduled: make(map[string]struct{}),
-		snapshots: &memoryBotClanSnapshotStore{
+		snapshots: &memoryTrackedClanSnapshotStore{
 			values: make(map[string][]byte),
 		},
-		capitalRaids:  newMemoryCapitalRaidCache("botclans:snapshot:", time.Now),
+		capitalRaids:  newMemoryCapitalRaidCache("trackedclans:snapshot:", time.Now),
 		warReminders:  make(map[string]cachedWarReminders),
 		raidReminders: make(map[string]cachedRaidReminders),
 	}
 }
 
-func (d *botClansDomain) Name() string { return botClansDomainName }
+func (d *trackedClansDomain) Name() string { return trackedClansDomainName }
 
-func (d *botClansDomain) Run(ctx context.Context, app *platform.App) error {
-	if err := validateBotClansConfig(app.Config); err != nil {
+func (d *trackedClansDomain) Run(ctx context.Context, app *platform.App) error {
+	if err := validateTrackedClansConfig(app.Config); err != nil {
 		return err
 	}
-	store, err := newBotClanStore(ctx, app)
+	store, err := newTrackedClanStore(ctx, app)
 	if err != nil {
 		return err
 	}
@@ -133,61 +140,55 @@ func (d *botClansDomain) Run(ctx context.Context, app *platform.App) error {
 		return err
 	}
 	d.replaceTargets(app, targets)
-	d.snapshots = newBotClanSnapshotStore(app)
-	d.snapshotPrefix = app.Config.BotClanSnapshotPrefix
-	d.cwlStateSnapshot = app.Config.BotClanCWLStateSnapshot
+	d.snapshots = newTrackedClanSnapshotStore(app)
+	d.snapshotPrefix = app.Config.TrackedClanSnapshotPrefix
+	d.cwlStateSnapshot = app.Config.TrackedClanCWLStateSnapshot
 	d.capitalRaids = newCapitalRaidCache(app, d.snapshotPrefix)
 
-	rateLimit := app.Config.BotClanRequestsPerSecond
+	rateLimit := app.Config.TrackedClanRequestsPerSecond
 	limiter, err := newTrackingLimiter(rateLimit)
 	if err != nil {
 		return err
 	}
 	trackerCtx, stopTrackers := context.WithCancel(ctx)
 	defer stopTrackers()
-	errCh := make(chan error, 4)
+	errCh := make(chan error, 2)
 	go func() {
-		errCh <- runBotClanTracker(trackerCtx, app, d, "clans", "clan", fetchClan(app), d.handleClanChange, limiter, rateLimit)
+		errCh <- runTrackedClanTracker(trackerCtx, app, d, "clans", "clan", fetchClan(app), d.handleClanChange, limiter, rateLimit)
 	}()
 	go func() {
-		errCh <- runBotClanTracker(trackerCtx, app, d, "wars", "war", fetchWar(app), d.handleWarChange, limiter, rateLimit)
-	}()
-	go func() {
-		errCh <- runBotClanTracker(trackerCtx, app, d, "raids", "raid", fetchRaid(app), d.handleRaidChange, limiter, rateLimit)
+		errCh <- runTrackedClanTracker(trackerCtx, app, d, "wars", "war", fetchWar(app), d.handleWarChange, limiter, rateLimit)
 	}()
 	go d.runTargetRefreshLoop(trackerCtx, app, store)
-	go func() {
-		errCh <- d.runCWLLoop(trackerCtx, app, limiter)
-	}()
 	firstErr := <-errCh
 	stopTrackers()
-	for range 3 {
+	for range 1 {
 		<-errCh
 	}
 	return firstErr
 }
 
-func validateBotClansConfig(cfg platform.Config) error {
-	if cfg.BotClanRequestsPerSecond <= 0 {
-		return errors.New("botclans.requests_per_second must be greater than zero")
+func validateTrackedClansConfig(cfg platform.Config) error {
+	if cfg.TrackedClanRequestsPerSecond <= 0 {
+		return errors.New("trackedclans.requests_per_second must be greater than zero")
 	}
-	if cfg.BotClanTargetRefreshSeconds <= 0 {
-		return errors.New("botclans.target_refresh_seconds must be greater than zero")
+	if cfg.TrackedClanTargetRefreshSeconds <= 0 {
+		return errors.New("trackedclans.target_refresh_seconds must be greater than zero")
 	}
-	if cfg.BotClanSnapshotPrefix == "" {
-		return errors.New("botclans.snapshot_prefix is required")
+	if cfg.TrackedClanSnapshotPrefix == "" {
+		return errors.New("trackedclans.snapshot_prefix is required")
 	}
-	if cfg.BotClanCWLStateSnapshot == "" {
-		return errors.New("botclans.cwl_state_snapshot is required")
+	if cfg.TrackedClanCWLStateSnapshot == "" {
+		return errors.New("trackedclans.cwl_state_snapshot is required")
 	}
 	if !cfg.DryRun && !cfg.MockDB && cfg.TimescaleURL == "" {
-		return errors.New("TIMESCALE_URL is required for botclans server_clans targets")
+		return errors.New("TIMESCALE_* connection variables are required for trackedclans server_clans targets")
 	}
 	if !cfg.DryRun && !cfg.MockDB && cfg.ValkeyAddr == "" {
-		return errors.New("valkey_addr is required for botclans snapshots")
+		return errors.New("valkey_addr is required for trackedclans snapshots")
 	}
 	if !cfg.DryRun && !cfg.MockDB && cfg.EventStreamName == "" {
-		return errors.New("events.stream is required for botclans event publishing")
+		return errors.New("events.stream is required for trackedclans event publishing")
 	}
 	return nil
 }
@@ -227,57 +228,132 @@ func (r raidReminder) eventData() map[string]any {
 	}
 }
 
-type botClanStore interface {
-	ListTargets(context.Context) ([]string, error)
+type trackedClanStore interface {
+	ListTargets(context.Context) ([]trackedClanTarget, error)
+	UpsertCurrentWar(context.Context, string, clashy.ClanWar) (string, error)
 	ListWarReminders(context.Context, string) ([]warReminder, error)
+	ListMobileWarReminderTimings(context.Context, []string) ([]warReminder, error)
 	ListRaidReminders(context.Context, string) ([]raidReminder, error)
 	Close()
 }
 
-type timescaleBotClanStore struct {
+type timescaleTrackedClanStore struct {
 	pool *pgxpool.Pool
 }
 
-func newBotClanStore(ctx context.Context, app *platform.App) (botClanStore, error) {
+func newTrackedClanStore(ctx context.Context, app *platform.App) (trackedClanStore, error) {
 	if app.Config.MockDB || app.Config.DryRun || app.Config.TimescaleURL == "" {
-		return memoryBotClanStore{}, nil
+		return memoryTrackedClanStore{}, nil
 	}
 	pool, err := pgxpool.New(ctx, app.Config.TimescaleURL)
 	if err != nil {
 		return nil, err
 	}
-	return &timescaleBotClanStore{pool: pool}, nil
+	return &timescaleTrackedClanStore{pool: pool}, nil
 }
 
-func (s *timescaleBotClanStore) Close() {
+func (s *timescaleTrackedClanStore) Close() {
 	if s != nil && s.pool != nil {
 		s.pool.Close()
 	}
 }
 
-func (s *timescaleBotClanStore) ListTargets(ctx context.Context) ([]string, error) {
+func (s *timescaleTrackedClanStore) UpsertCurrentWar(ctx context.Context, sourceTag string, war clashy.ClanWar) (string, error) {
+	ingest, err := buildWarIngest(war, sourceTag, false, "", "", "")
+	if err != nil || len(ingest.Schedules) == 0 {
+		return "", err
+	}
+	tx, err := s.pool.Begin(ctx)
+	if err != nil {
+		return "", err
+	}
+	defer tx.Rollback(ctx)
+	if err := upsertWarSchedules(ctx, tx, ingest.Schedules); err != nil {
+		return "", err
+	}
+	if err := upsertPlayerTimers(ctx, tx, ingest.PlayerTimers); err != nil {
+		return "", err
+	}
+	if err := tx.Commit(ctx); err != nil {
+		return "", err
+	}
+	return ingest.Schedules[0].ScheduleKey, nil
+}
+
+func (s *timescaleTrackedClanStore) ListTargets(ctx context.Context) ([]trackedClanTarget, error) {
 	rows, err := s.pool.Query(ctx, `
-		SELECT DISTINCT tag
-		FROM server_clans
-		WHERE tag <> ''
-		ORDER BY tag
-	`)
+			SELECT tag,
+			       bool_or(kind = 'clan') AS clan_events,
+			       bool_or(kind IN ('war_event', 'war_reminder')) AS war_events,
+			       bool_or(kind = 'war_event') AS publish_war_events
+			FROM (
+				SELECT log.clan_tag AS tag,
+				       CASE WHEN log.type IN ('join_log', 'leave_log') THEN 'clan' ELSE 'war_event' END AS kind
+				FROM server_logs log
+				JOIN servers server ON server.id = log.server_id
+				WHERE server.last_command_at >= now() - interval '90 days'
+				  AND log.disabled = false
+				  AND log.clan_tag <> ''
+				  AND log.type IN ('join_log', 'leave_log', 'war_log', 'war_panel')
+				UNION
+				SELECT reminder.clan_tag AS tag, 'war_reminder' AS kind
+				FROM reminders reminder
+				JOIN servers server ON server.id = reminder.server_id
+				WHERE server.last_command_at >= now() - interval '90 days'
+				  AND reminder.type_name = 'War'
+				  AND reminder.clan_tag <> ''
+			) targets
+			GROUP BY tag
+			ORDER BY tag
+		`)
 	if err != nil {
 		return nil, err
 	}
 	defer rows.Close()
-	var out []string
+	var out []trackedClanTarget
 	for rows.Next() {
-		var tag string
-		if err := rows.Scan(&tag); err != nil {
+		var target trackedClanTarget
+		if err := rows.Scan(&target.Tag, &target.ClanEvents, &target.WarEvents, &target.PublishWarEvents); err != nil {
 			return nil, err
 		}
-		out = append(out, tag)
+		out = append(out, target)
 	}
 	return out, rows.Err()
 }
 
-func (s *timescaleBotClanStore) ListWarReminders(ctx context.Context, clanTag string) ([]warReminder, error) {
+func (s *timescaleTrackedClanStore) ListMobileWarReminderTimings(ctx context.Context, playerTags []string) ([]warReminder, error) {
+	if len(playerTags) == 0 {
+		return nil, nil
+	}
+	rows, err := s.pool.Query(ctx, `
+		SELECT DISTINCT timing, timing::text || 'min'
+		FROM mobile_notification_accounts account
+		JOIN mobile_push_devices device
+		  ON device.user_id = account.user_id
+		 AND device.enabled = true
+		 AND device.provider = 'fcm'
+		 AND device.war_reminders_enabled = true
+		CROSS JOIN LATERAL unnest(device.reminder_timings) timing
+		WHERE account.active = true
+		  AND account.player_tag = ANY($1)
+		ORDER BY timing DESC
+	`, playerTags)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var out []warReminder
+	for rows.Next() {
+		var reminder warReminder
+		if err := rows.Scan(&reminder.MinutesRemaining, &reminder.TriggerTime); err != nil {
+			return nil, err
+		}
+		out = append(out, reminder)
+	}
+	return out, rows.Err()
+}
+
+func (s *timescaleTrackedClanStore) ListWarReminders(ctx context.Context, clanTag string) ([]warReminder, error) {
 	rows, err := s.pool.Query(ctx, `
 		SELECT DISTINCT COALESCE(trigger_time, ''), minutes_remaining
 		FROM reminders
@@ -302,7 +378,7 @@ func (s *timescaleBotClanStore) ListWarReminders(ctx context.Context, clanTag st
 	return out, rows.Err()
 }
 
-func (s *timescaleBotClanStore) ListRaidReminders(ctx context.Context, clanTag string) ([]raidReminder, error) {
+func (s *timescaleTrackedClanStore) ListRaidReminders(ctx context.Context, clanTag string) ([]raidReminder, error) {
 	rows, err := s.pool.Query(ctx, `
 		SELECT id::text, server_id, clan_tag, COALESCE(channel_id, ''),
 			COALESCE(trigger_time, ''), minutes_remaining, custom_text,
@@ -342,41 +418,73 @@ func (s *timescaleBotClanStore) ListRaidReminders(ctx context.Context, clanTag s
 	return out, rows.Err()
 }
 
-type memoryBotClanStore struct {
+type memoryTrackedClanStore struct {
 	tags []string
 }
 
-func (s memoryBotClanStore) Close() {}
+func (s memoryTrackedClanStore) Close() {}
 
-func (s memoryBotClanStore) ListTargets(context.Context) ([]string, error) {
-	return append([]string(nil), s.tags...), nil
+func (s memoryTrackedClanStore) ListTargets(context.Context) ([]trackedClanTarget, error) {
+	out := make([]trackedClanTarget, 0, len(s.tags))
+	for _, tag := range s.tags {
+		out = append(out, trackedClanTarget{Tag: tag, ClanEvents: true, WarEvents: true, PublishWarEvents: true})
+	}
+	return out, nil
 }
 
-func (memoryBotClanStore) ListWarReminders(context.Context, string) ([]warReminder, error) {
+func (memoryTrackedClanStore) UpsertCurrentWar(_ context.Context, sourceTag string, war clashy.ClanWar) (string, error) {
+	ingest, err := buildWarIngest(war, sourceTag, false, "", "", "")
+	if err != nil || len(ingest.Schedules) == 0 {
+		return "", err
+	}
+	return ingest.Schedules[0].ScheduleKey, nil
+}
+
+func (memoryTrackedClanStore) ListWarReminders(context.Context, string) ([]warReminder, error) {
 	return nil, nil
 }
 
-func (memoryBotClanStore) ListRaidReminders(context.Context, string) ([]raidReminder, error) {
+func (memoryTrackedClanStore) ListMobileWarReminderTimings(context.Context, []string) ([]warReminder, error) {
 	return nil, nil
 }
 
-func (d *botClansDomain) targetTags() []string {
+func (memoryTrackedClanStore) ListRaidReminders(context.Context, string) ([]raidReminder, error) {
+	return nil, nil
+}
+
+func (d *trackedClansDomain) targetTags(group string) []string {
 	d.targetsMu.RLock()
 	defer d.targetsMu.RUnlock()
-	return append([]string(nil), d.targets...)
+	var out []string
+	for _, target := range d.targets {
+		if (group == "clans" && target.ClanEvents) || (group == "wars" && target.WarEvents) {
+			out = append(out, target.Tag)
+		}
+	}
+	return out
 }
 
-func (d *botClansDomain) replaceTargets(app *platform.App, targets []string) {
+func (d *trackedClansDomain) replaceTargets(app *platform.App, targets []trackedClanTarget) {
 	d.targetsMu.Lock()
 	d.targets = append(d.targets[:0], targets...)
 	d.targetsMu.Unlock()
-	for _, group := range []string{"clans", "wars", "raids"} {
-		app.Stats.SetTrackingTargets(trackingProgressName(botClansDomainName, group), len(targets))
-	}
+	app.Stats.SetTrackingTargets(trackingProgressName(trackedClansDomainName, "clans"), len(d.targetTags("clans")))
+	app.Stats.SetTrackingTargets(trackingProgressName(trackedClansDomainName, "wars"), len(d.targetTags("wars")))
 }
 
-func (d *botClansDomain) runTargetRefreshLoop(ctx context.Context, app *platform.App, source botClanStore) {
-	interval := time.Duration(app.Config.BotClanTargetRefreshSeconds) * time.Second
+func (d *trackedClansDomain) publishesWarEvents(tag string) bool {
+	d.targetsMu.RLock()
+	defer d.targetsMu.RUnlock()
+	for _, target := range d.targets {
+		if target.Tag == tag {
+			return target.PublishWarEvents
+		}
+	}
+	return false
+}
+
+func (d *trackedClansDomain) runTargetRefreshLoop(ctx context.Context, app *platform.App, source trackedClanStore) {
+	interval := time.Duration(app.Config.TrackedClanTargetRefreshSeconds) * time.Second
 	ticker := time.NewTicker(interval)
 	defer ticker.Stop()
 	for {
@@ -387,29 +495,29 @@ func (d *botClansDomain) runTargetRefreshLoop(ctx context.Context, app *platform
 		}
 		targets, err := source.ListTargets(ctx)
 		if err != nil {
-			app.Logger.Error("bot clan target refresh failed", "err", err)
-			app.Stats.SetReady(botClansDomainName, false, err.Error())
+			app.Logger.Error("tracked clan target refresh failed", "err", err)
+			app.Stats.SetReady(trackedClansDomainName, false, err.Error())
 			continue
 		}
 		d.replaceTargets(app, targets)
-		app.Logger.Info("refreshed bot clan targets", "count", len(targets))
+		app.Logger.Info("refreshed tracked clan targets", "count", len(targets))
 	}
 }
 
-func runBotClanTracker[T any](
+func runTrackedClanTracker[T any](
 	ctx context.Context,
 	app *platform.App,
-	domain *botClansDomain,
+	domain *trackedClansDomain,
 	group string,
 	kind string,
-	fetch botClanFetchFunc[T],
+	fetch trackedClanFetchFunc[T],
 	handle func(context.Context, *platform.App, TrackedItem[T]) error,
 	limiter *clashy.Limiter,
 	rateLimit int,
 ) error {
-	progressName := trackingProgressName(botClansDomainName, group)
+	progressName := trackingProgressName(trackedClansDomainName, group)
 	for {
-		tags := domain.targetTags()
+		tags := domain.targetTags(group)
 		if len(tags) == 0 {
 			if err := sleepOrDone(ctx, time.Second); err != nil {
 				return err
@@ -417,16 +525,16 @@ func runBotClanTracker[T any](
 			continue
 		}
 		if err := runBounded(ctx, platform.RequestConcurrency(rateLimit), tags, func(workerCtx context.Context, tag string) error {
-			current, err := retryLimitedClashFetch(workerCtx, limiter, func(fetchCtx context.Context) (*T, error) {
+			current, err := retryLimitedClashFetch(workerCtx, app, limiter, func(fetchCtx context.Context) (*T, error) {
 				start := time.Now()
 				current, err := fetch(fetchCtx, tag)
-				app.Stats.RecordRequest(botClansDomainName, time.Since(start), err)
+				app.Stats.RecordRequest(trackedClansDomainName, time.Since(start), err)
 				return current, err
 			})
 			app.Stats.RecordTrackedTarget(progressName)
 			if err != nil {
-				app.Logger.Error("bot clan fetch failed", "group", group, "tag", tag, "err", err)
-				app.Stats.SetReady(botClansDomainName, false, err.Error())
+				app.Logger.Error("tracked clan fetch failed", "group", group, "tag", tag, "err", err)
+				app.Stats.SetReady(trackedClansDomainName, false, err.Error())
 				if _, ok := platform.ClashFetchRetryPolicy(err); ok || workerCtx.Err() != nil {
 					return err
 				}
@@ -449,19 +557,19 @@ func runBotClanTracker[T any](
 	}
 }
 
-func fetchClan(app *platform.App) botClanFetchFunc[clashy.Clan] {
+func fetchClan(app *platform.App) trackedClanFetchFunc[clashy.Clan] {
 	return func(ctx context.Context, tag string) (*clashy.Clan, error) {
 		return app.Clash.GetClan(ctx, tag)
 	}
 }
 
-func fetchWar(app *platform.App) botClanFetchFunc[clashy.ClanWar] {
+func fetchWar(app *platform.App) trackedClanFetchFunc[clashy.ClanWar] {
 	return func(ctx context.Context, tag string) (*clashy.ClanWar, error) {
 		return app.Clash.GetClanWar(ctx, tag)
 	}
 }
 
-func fetchRaid(app *platform.App) botClanFetchFunc[clashy.RaidLogEntry] {
+func fetchRaid(app *platform.App) trackedClanFetchFunc[clashy.RaidLogEntry] {
 	return func(ctx context.Context, tag string) (*clashy.RaidLogEntry, error) {
 		raids, err := app.Clash.GetRaidLog(ctx, tag, clashy.PageOptions{Limit: 1})
 		if err != nil {
@@ -475,50 +583,86 @@ func fetchRaid(app *platform.App) botClanFetchFunc[clashy.RaidLogEntry] {
 	}
 }
 
-func (d *botClansDomain) handleClanChange(ctx context.Context, app *platform.App, item TrackedItem[clashy.Clan]) error {
+func (d *trackedClansDomain) handleClanChange(ctx context.Context, app *platform.App, item TrackedItem[clashy.Clan]) error {
 	if item.Current == nil {
 		return nil
 	}
-	_, raw, hasPrevious, changed, err := loadBotClanSnapshotChange(ctx, d.snapshots, d.snapshotPrefix, "clan", item.Tag, *item.Current, item.Raw)
+	previous, raw, hasPrevious, changed, err := loadTrackedClanSnapshotChange(ctx, d.snapshots, d.snapshotPrefix, "clan", item.Tag, *item.Current, item.Raw)
 	if err != nil {
 		return err
 	}
 	if !changed {
 		return nil
 	}
-	if hasPrevious {
-		app.Stats.SetReady(botClansDomainName, true, "")
-		if err := app.PublishEvent(ctx, platform.Event{
-			Topic:   "clan",
-			ClanTag: item.Tag,
-			Value:   map[string]any{"type": "clan_update", "raw": string(raw)},
-		}); err != nil {
-			return err
+	if hasPrevious && previous != nil {
+		app.Stats.SetReady(trackedClansDomainName, true, "")
+		joined, left := trackedClanMemberChanges(*previous, *item.Current)
+		for _, member := range joined {
+			if err := app.PublishEvent(ctx, platform.Event{Topic: "clan", ClanTag: item.Tag, Value: map[string]any{
+				"type": "member_join", "member": member, "raw": string(raw),
+			}}); err != nil {
+				return err
+			}
+		}
+		for _, member := range left {
+			if err := app.PublishEvent(ctx, platform.Event{Topic: "clan", ClanTag: item.Tag, Value: map[string]any{
+				"type": "member_leave", "member": member, "raw": string(raw),
+			}}); err != nil {
+				return err
+			}
 		}
 	}
-	return d.snapshots.StoreRaw(ctx, botClanSnapshotKey(d.snapshotPrefix, "clan", item.Tag), raw)
+	return d.snapshots.StoreRaw(ctx, trackedClanSnapshotKey(d.snapshotPrefix, "clan", item.Tag), raw)
 }
 
-func (d *botClansDomain) handleWarChange(ctx context.Context, app *platform.App, item TrackedItem[clashy.ClanWar]) error {
+func trackedClanMemberChanges(previous, current clashy.Clan) (joined, left []clashy.ClanMember) {
+	previousByTag := make(map[string]clashy.ClanMember, len(previous.Members))
+	currentByTag := make(map[string]clashy.ClanMember, len(current.Members))
+	for _, member := range previous.Members {
+		previousByTag[member.Tag] = member
+	}
+	for _, member := range current.Members {
+		currentByTag[member.Tag] = member
+		if _, exists := previousByTag[member.Tag]; !exists {
+			joined = append(joined, member)
+		}
+	}
+	for _, member := range previous.Members {
+		if _, exists := currentByTag[member.Tag]; !exists {
+			left = append(left, member)
+		}
+	}
+	return joined, left
+}
+
+func (d *trackedClansDomain) handleWarChange(ctx context.Context, app *platform.App, item TrackedItem[clashy.ClanWar]) error {
 	if item.Current == nil {
 		return nil
 	}
 	current := *item.Current
 	if current.Type() == "cwl" {
-		return d.handleCWLWarChange(ctx, app, item.Tag, current, item.Raw, nil)
+		return nil
 	}
-	if err := d.scheduleWarReminders(ctx, app, item.Tag, current, item.Raw, "war"); err != nil {
-		return err
-	}
-	previous, raw, hasPrevious, changed, err := loadBotClanSnapshotChange(ctx, d.snapshots, d.snapshotPrefix, "war", item.Tag, current, item.Raw)
+	previous, raw, hasPrevious, changed, err := loadTrackedClanSnapshotChange(ctx, d.snapshots, d.snapshotPrefix, "war", item.Tag, current, item.Raw)
 	if err != nil {
 		return err
 	}
 	if !changed {
 		return nil
 	}
-	if hasPrevious {
-		app.Stats.SetReady(botClansDomainName, true, "")
+	scheduleKey, err := d.store.UpsertCurrentWar(ctx, item.Tag, current)
+	if err != nil {
+		return err
+	}
+	if scheduleKey != "" {
+		if err := app.PublishEvent(ctx, platform.Event{Topic: "war_schedule", ClanTag: item.Tag, Value: map[string]any{
+			"type": "war_available", "schedule_key": scheduleKey,
+		}}); err != nil {
+			return err
+		}
+	}
+	if hasPrevious && d.publishesWarEvents(item.Tag) {
+		app.Stats.SetReady(trackedClansDomainName, true, "")
 		if err := app.PublishEvent(ctx, platform.Event{
 			Topic:   "war",
 			ClanTag: item.Tag,
@@ -557,10 +701,10 @@ func (d *botClansDomain) handleWarChange(ctx context.Context, app *platform.App,
 			}
 		}
 	}
-	return d.snapshots.StoreRaw(ctx, botClanSnapshotKey(d.snapshotPrefix, "war", item.Tag), raw)
+	return d.snapshots.StoreRaw(ctx, trackedClanSnapshotKey(d.snapshotPrefix, "war", item.Tag), raw)
 }
 
-func (d *botClansDomain) handleRaidChange(ctx context.Context, app *platform.App, item TrackedItem[clashy.RaidLogEntry]) error {
+func (d *trackedClansDomain) handleRaidChange(ctx context.Context, app *platform.App, item TrackedItem[clashy.RaidLogEntry]) error {
 	if item.Current == nil {
 		return nil
 	}
@@ -579,8 +723,8 @@ func (d *botClansDomain) handleRaidChange(ctx context.Context, app *platform.App
 		return d.capitalRaids.Replace(ctx, item.Tag, capitalRaidParticipantTags(*item.Current), raw, expiresAt)
 	}
 	if hasPrevious {
-		app.Stats.RecordWrite(botClansDomainName, 1)
-		app.Stats.SetReady(botClansDomainName, true, "")
+		app.Stats.RecordWrite(trackedClansDomainName, 1)
+		app.Stats.SetReady(trackedClansDomainName, true, "")
 		if err := app.PublishEvent(ctx, platform.Event{
 			Topic:   "capital",
 			ClanTag: item.Tag,
@@ -788,7 +932,7 @@ func (s *memoryCapitalRaidCache) removeExpiredLocked(now time.Time) {
 }
 
 func capitalRaidPayloadKey(prefix, clanTag string) string {
-	return botClanSnapshotKey(prefix, "raid", clanTag)
+	return trackedClanSnapshotKey(prefix, "raid", clanTag)
 }
 
 func capitalRaidParticipantSetKey(prefix, clanTag string) string {
@@ -857,28 +1001,28 @@ func loadCapitalRaidCacheChange(
 	return previous, raw, hasPrevious, true, nil
 }
 
-type botClanSnapshotStore interface {
+type trackedClanSnapshotStore interface {
 	LoadRaw(context.Context, string) ([]byte, bool, error)
 	StoreRaw(context.Context, string, []byte) error
 }
 
-type valkeyBotClanSnapshotStore struct {
+type valkeyTrackedClanSnapshotStore struct {
 	client valkey.Client
 }
 
-type memoryBotClanSnapshotStore struct {
+type memoryTrackedClanSnapshotStore struct {
 	mu     sync.Mutex
 	values map[string][]byte
 }
 
-func newBotClanSnapshotStore(app *platform.App) botClanSnapshotStore {
+func newTrackedClanSnapshotStore(app *platform.App) trackedClanSnapshotStore {
 	if app.Valkey != nil {
-		return valkeyBotClanSnapshotStore{client: app.Valkey}
+		return valkeyTrackedClanSnapshotStore{client: app.Valkey}
 	}
-	return &memoryBotClanSnapshotStore{values: make(map[string][]byte)}
+	return &memoryTrackedClanSnapshotStore{values: make(map[string][]byte)}
 }
 
-func (s valkeyBotClanSnapshotStore) LoadRaw(ctx context.Context, key string) ([]byte, bool, error) {
+func (s valkeyTrackedClanSnapshotStore) LoadRaw(ctx context.Context, key string) ([]byte, bool, error) {
 	value, err := s.client.Do(ctx, s.client.B().Get().Key(key).Build()).ToString()
 	if err != nil {
 		if valkey.IsValkeyNil(err) {
@@ -893,7 +1037,7 @@ func (s valkeyBotClanSnapshotStore) LoadRaw(ctx context.Context, key string) ([]
 	return raw, true, nil
 }
 
-func (s valkeyBotClanSnapshotStore) StoreRaw(ctx context.Context, key string, raw []byte) error {
+func (s valkeyTrackedClanSnapshotStore) StoreRaw(ctx context.Context, key string, raw []byte) error {
 	return s.client.Do(ctx, s.client.B().Set().
 		Key(key).
 		Value(valkey.BinaryString(utils.Compress(raw))).
@@ -901,7 +1045,7 @@ func (s valkeyBotClanSnapshotStore) StoreRaw(ctx context.Context, key string, ra
 	).Error()
 }
 
-func (s *memoryBotClanSnapshotStore) LoadRaw(_ context.Context, key string) ([]byte, bool, error) {
+func (s *memoryTrackedClanSnapshotStore) LoadRaw(_ context.Context, key string) ([]byte, bool, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	raw, ok := s.values[key]
@@ -911,20 +1055,20 @@ func (s *memoryBotClanSnapshotStore) LoadRaw(_ context.Context, key string) ([]b
 	return append([]byte(nil), raw...), true, nil
 }
 
-func (s *memoryBotClanSnapshotStore) StoreRaw(_ context.Context, key string, raw []byte) error {
+func (s *memoryTrackedClanSnapshotStore) StoreRaw(_ context.Context, key string, raw []byte) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	s.values[key] = append([]byte(nil), raw...)
 	return nil
 }
 
-func botClanSnapshotKey(prefix, kind, tag string) string {
+func trackedClanSnapshotKey(prefix, kind, tag string) string {
 	return prefix + kind + ":" + tag
 }
 
-func loadBotClanSnapshotChange[T any](
+func loadTrackedClanSnapshotChange[T any](
 	ctx context.Context,
-	store botClanSnapshotStore,
+	store trackedClanSnapshotStore,
 	prefix string,
 	kind string,
 	tag string,
@@ -934,7 +1078,7 @@ func loadBotClanSnapshotChange[T any](
 	if len(raw) == 0 {
 		raw = jsonBytes(current)
 	}
-	key := botClanSnapshotKey(prefix, kind, tag)
+	key := trackedClanSnapshotKey(prefix, kind, tag)
 	previousRaw, hasPrevious, err := store.LoadRaw(ctx, key)
 	if err != nil {
 		return nil, raw, false, false, err
@@ -952,8 +1096,8 @@ func loadBotClanSnapshotChange[T any](
 	return previous, raw, hasPrevious, true, nil
 }
 
-func loadBotClanSnapshot[T any](ctx context.Context, store botClanSnapshotStore, prefix, kind, tag string) (*T, []byte, bool, error) {
-	raw, ok, err := store.LoadRaw(ctx, botClanSnapshotKey(prefix, kind, tag))
+func loadTrackedClanSnapshot[T any](ctx context.Context, store trackedClanSnapshotStore, prefix, kind, tag string) (*T, []byte, bool, error) {
+	raw, ok, err := store.LoadRaw(ctx, trackedClanSnapshotKey(prefix, kind, tag))
 	if err != nil || !ok {
 		return nil, raw, ok, err
 	}
@@ -1000,7 +1144,7 @@ func warAttackKey(attack clashy.WarAttack) string {
 	return attack.AttackerTag + ":" + attack.DefenderTag + ":" + strconv.Itoa(attack.Order)
 }
 
-func (d *botClansDomain) scheduleWarReminders(ctx context.Context, app *platform.App, clanTag string, war clashy.ClanWar, raw []byte, kind string) error {
+func (d *trackedClansDomain) scheduleWarReminders(ctx context.Context, app *platform.App, clanTag string, war clashy.ClanWar, raw []byte, kind string) error {
 	if war.EndTime == nil || war.EndTime.Time.IsZero() || app.Scheduler == nil || d.store == nil {
 		return nil
 	}
@@ -1011,6 +1155,12 @@ func (d *botClansDomain) scheduleWarReminders(ctx context.Context, app *platform
 	if err != nil {
 		return err
 	}
+	playerTags := warPlayerTags(war)
+	mobileReminders, err := d.store.ListMobileWarReminderTimings(ctx, playerTags)
+	if err != nil {
+		return err
+	}
+	reminders = mergeWarReminders(reminders, mobileReminders)
 	now := time.Now().UTC()
 	for _, reminder := range reminders {
 		runAt := war.EndTime.Time.UTC().Add(-time.Duration(reminder.MinutesRemaining) * time.Minute)
@@ -1028,10 +1178,11 @@ func (d *botClansDomain) scheduleWarReminders(ctx context.Context, app *platform
 				Topic:   "reminder",
 				ClanTag: clanTag,
 				Value: map[string]any{
-					"type":     "war",
-					"war_type": kind,
-					"time":     reminderTime,
-					"data":     string(raw),
+					"type":              "war",
+					"war_type":          kind,
+					"time":              reminderTime,
+					"minutes_remaining": reminder.MinutesRemaining,
+					"data":              string(raw),
 				},
 			})
 		})
@@ -1039,7 +1190,46 @@ func (d *botClansDomain) scheduleWarReminders(ctx context.Context, app *platform
 	return nil
 }
 
-func (d *botClansDomain) scheduleRaidReminders(ctx context.Context, app *platform.App, clanTag string, raid clashy.RaidLogEntry) error {
+func warPlayerTags(war clashy.ClanWar) []string {
+	seen := map[string]struct{}{}
+	var tags []string
+	for _, side := range []*clashy.WarClan{war.Clan, war.Opponent} {
+		if side == nil {
+			continue
+		}
+		for _, member := range side.Members {
+			if member.Tag == "" {
+				continue
+			}
+			if _, ok := seen[member.Tag]; ok {
+				continue
+			}
+			seen[member.Tag] = struct{}{}
+			tags = append(tags, member.Tag)
+		}
+	}
+	return tags
+}
+
+func mergeWarReminders(groups ...[]warReminder) []warReminder {
+	seen := map[int]struct{}{}
+	var out []warReminder
+	for _, group := range groups {
+		for _, reminder := range group {
+			if reminder.MinutesRemaining <= 0 {
+				continue
+			}
+			if _, ok := seen[reminder.MinutesRemaining]; ok {
+				continue
+			}
+			seen[reminder.MinutesRemaining] = struct{}{}
+			out = append(out, reminder)
+		}
+	}
+	return out
+}
+
+func (d *trackedClansDomain) scheduleRaidReminders(ctx context.Context, app *platform.App, clanTag string, raid clashy.RaidLogEntry) error {
 	if raid.EndTime == nil || raid.EndTime.Time.IsZero() || app.Scheduler == nil || d.store == nil {
 		return nil
 	}
@@ -1065,7 +1255,7 @@ func (d *botClansDomain) scheduleRaidReminders(ctx context.Context, app *platfor
 	return nil
 }
 
-func (d *botClansDomain) scheduleOnce(jobID string) bool {
+func (d *trackedClansDomain) scheduleOnce(jobID string) bool {
 	d.mu.Lock()
 	defer d.mu.Unlock()
 	if _, exists := d.scheduled[jobID]; exists {
@@ -1075,13 +1265,13 @@ func (d *botClansDomain) scheduleOnce(jobID string) bool {
 	return true
 }
 
-func (d *botClansDomain) forgetScheduled(jobID string) {
+func (d *trackedClansDomain) forgetScheduled(jobID string) {
 	d.mu.Lock()
 	delete(d.scheduled, jobID)
 	d.mu.Unlock()
 }
 
-func (d *botClansDomain) scheduleReminderDelivery(
+func (d *trackedClansDomain) scheduleReminderDelivery(
 	app *platform.App,
 	jobID string,
 	when time.Time,
@@ -1095,9 +1285,9 @@ func (d *botClansDomain) scheduleReminderDelivery(
 				if ctx.Err() != nil {
 					return
 				}
-				app.Logger.Error("bot clan reminder delivery failed", "job_id", jobID, "err", err)
-				app.Stats.SetReady(botClansDomainName, false, err.Error())
-				d.scheduleReminderDelivery(app, jobID, time.Now().UTC().Add(botClanReminderRetryDelay), publish)
+				app.Logger.Error("tracked clan reminder delivery failed", "job_id", jobID, "err", err)
+				app.Stats.SetReady(trackedClansDomainName, false, err.Error())
+				d.scheduleReminderDelivery(app, jobID, time.Now().UTC().Add(trackedClanReminderRetryDelay), publish)
 				return
 			}
 			d.forgetScheduled(jobID)
@@ -1105,10 +1295,10 @@ func (d *botClansDomain) scheduleReminderDelivery(
 	})
 }
 
-func (d *botClansDomain) loadWarReminders(ctx context.Context, clanTag string) ([]warReminder, error) {
+func (d *trackedClansDomain) loadWarReminders(ctx context.Context, clanTag string) ([]warReminder, error) {
 	now := time.Now()
 	d.reminderMu.Lock()
-	if cached, ok := d.warReminders[clanTag]; ok && now.Sub(cached.loadedAt) < botClanReminderTTL {
+	if cached, ok := d.warReminders[clanTag]; ok && now.Sub(cached.loadedAt) < trackedClanReminderTTL {
 		values := append([]warReminder(nil), cached.values...)
 		d.reminderMu.Unlock()
 		return values, nil
@@ -1124,10 +1314,10 @@ func (d *botClansDomain) loadWarReminders(ctx context.Context, clanTag string) (
 	return values, nil
 }
 
-func (d *botClansDomain) loadRaidReminders(ctx context.Context, clanTag string) ([]raidReminder, error) {
+func (d *trackedClansDomain) loadRaidReminders(ctx context.Context, clanTag string) ([]raidReminder, error) {
 	now := time.Now()
 	d.reminderMu.Lock()
-	if cached, ok := d.raidReminders[clanTag]; ok && now.Sub(cached.loadedAt) < botClanReminderTTL {
+	if cached, ok := d.raidReminders[clanTag]; ok && now.Sub(cached.loadedAt) < trackedClanReminderTTL {
 		values := append([]raidReminder(nil), cached.values...)
 		d.reminderMu.Unlock()
 		return values, nil
@@ -1143,8 +1333,26 @@ func (d *botClansDomain) loadRaidReminders(ctx context.Context, clanTag string) 
 	return values, nil
 }
 
-func (d *botClansDomain) publishRaidReminder(ctx context.Context, app *platform.App, clanTag string, reminder raidReminder) error {
-	clan, _, ok, err := loadBotClanSnapshot[clashy.Clan](ctx, d.snapshots, d.snapshotPrefix, "clan", clanTag)
+func (d *trackedClansDomain) publishRaidReminder(ctx context.Context, app *platform.App, clanTag string, reminder raidReminder) error {
+	// The timer may have been installed before the reminder was edited or
+	// deleted. Re-read the durable row at delivery time so a stale closure can
+	// neither send deleted configuration nor ignore updated filters/text.
+	currentReminders, err := d.store.ListRaidReminders(ctx, clanTag)
+	if err != nil {
+		return err
+	}
+	found := false
+	for _, current := range currentReminders {
+		if current.ID == reminder.ID {
+			reminder = current
+			found = true
+			break
+		}
+	}
+	if !found {
+		return nil
+	}
+	clan, _, ok, err := loadTrackedClanSnapshot[clashy.Clan](ctx, d.snapshots, d.snapshotPrefix, "clan", clanTag)
 	if err != nil || !ok {
 		return err
 	}
@@ -1173,7 +1381,7 @@ func (d *botClansDomain) publishRaidReminder(ctx context.Context, app *platform.
 	})
 }
 
-func (d *botClansDomain) publishRaidDiffEvents(ctx context.Context, app *platform.App, clanTag string, previous, current clashy.RaidLogEntry, raw []byte) error {
+func (d *trackedClansDomain) publishRaidDiffEvents(ctx context.Context, app *platform.App, clanTag string, previous, current clashy.RaidLogEntry, raw []byte) error {
 	if previous.State != current.State {
 		if err := app.PublishEvent(ctx, platform.Event{
 			Topic:   "capital",
@@ -1262,7 +1470,7 @@ type botCWLState struct {
 	NoSpin           bool   `json:"no_spin,omitempty"`
 }
 
-func (d *botClansDomain) runCWLLoop(ctx context.Context, app *platform.App, limiter *clashy.Limiter) error {
+func (d *trackedClansDomain) runCWLLoop(ctx context.Context, app *platform.App, limiter *clashy.Limiter) error {
 	interval := time.Duration(app.Config.WarCWLSyncSeconds) * time.Second
 	if interval <= 0 {
 		interval = 3 * time.Minute
@@ -1270,7 +1478,7 @@ func (d *botClansDomain) runCWLLoop(ctx context.Context, app *platform.App, limi
 	for {
 		start := time.Now()
 		err := d.runCWLCycle(ctx, app, limiter)
-		app.Stats.RecordProcess(botClansDomainName, time.Since(start))
+		app.Stats.RecordProcess(trackedClansDomainName, time.Since(start))
 		if err != nil {
 			return err
 		}
@@ -1280,8 +1488,8 @@ func (d *botClansDomain) runCWLLoop(ctx context.Context, app *platform.App, limi
 	}
 }
 
-func (d *botClansDomain) runCWLCycle(ctx context.Context, app *platform.App, limiter *clashy.Limiter) error {
-	tags := d.targetTags()
+func (d *trackedClansDomain) runCWLCycle(ctx context.Context, app *platform.App, limiter *clashy.Limiter) error {
+	tags := d.targetTags("wars")
 	now := time.Now().UTC()
 	for _, tag := range tags {
 		if err := d.processCWLTarget(ctx, app, limiter, tag, now); err != nil {
@@ -1291,8 +1499,8 @@ func (d *botClansDomain) runCWLCycle(ctx context.Context, app *platform.App, lim
 	return nil
 }
 
-func (d *botClansDomain) processCWLTarget(ctx context.Context, app *platform.App, limiter *clashy.Limiter, tag string, now time.Time) error {
-	state, _, ok, err := loadBotClanSnapshot[botCWLState](ctx, d.snapshots, d.snapshotPrefix, d.cwlStateSnapshot, tag)
+func (d *trackedClansDomain) processCWLTarget(ctx context.Context, app *platform.App, limiter *clashy.Limiter, tag string, now time.Time) error {
+	state, _, ok, err := loadTrackedClanSnapshot[botCWLState](ctx, d.snapshots, d.snapshotPrefix, d.cwlStateSnapshot, tag)
 	if err != nil {
 		return err
 	}
@@ -1310,7 +1518,7 @@ func (d *botClansDomain) processCWLTarget(ctx context.Context, app *platform.App
 	if groupNotInThisSeason(group, now) {
 		if now.Day() >= 3 {
 			currentState.NoSpin = true
-			return storeBotClanValue(ctx, d.snapshots, d.snapshotPrefix, d.cwlStateSnapshot, tag, currentState)
+			return storeTrackedClanValue(ctx, d.snapshots, d.snapshotPrefix, d.cwlStateSnapshot, tag, currentState)
 		}
 		return nil
 	}
@@ -1318,7 +1526,7 @@ func (d *botClansDomain) processCWLTarget(ctx context.Context, app *platform.App
 		return err
 	}
 	if currentState.Ended {
-		return storeBotClanValue(ctx, d.snapshots, d.snapshotPrefix, d.cwlStateSnapshot, tag, currentState)
+		return storeTrackedClanValue(ctx, d.snapshots, d.snapshotPrefix, d.cwlStateSnapshot, tag, currentState)
 	}
 	roundTags, roundHash := latestCWLWarTags(group)
 	if roundHash != "" && (!ok || state.CurrentRoundHash != roundHash) {
@@ -1351,14 +1559,14 @@ func (d *botClansDomain) processCWLTarget(ctx context.Context, app *platform.App
 			}
 		}
 	}
-	return storeBotClanValue(ctx, d.snapshots, d.snapshotPrefix, d.cwlStateSnapshot, tag, currentState)
+	return storeTrackedClanValue(ctx, d.snapshots, d.snapshotPrefix, d.cwlStateSnapshot, tag, currentState)
 }
 
-func (d *botClansDomain) fetchCWLGroup(ctx context.Context, app *platform.App, limiter *clashy.Limiter, tag string) (*clashy.ClanWarLeagueGroup, []byte, error) {
-	group, err := retryLimitedClashFetch(ctx, limiter, func(fetchCtx context.Context) (*clashy.ClanWarLeagueGroup, error) {
+func (d *trackedClansDomain) fetchCWLGroup(ctx context.Context, app *platform.App, limiter *clashy.Limiter, tag string) (*clashy.ClanWarLeagueGroup, []byte, error) {
+	group, err := retryLimitedClashFetch(ctx, app, limiter, func(fetchCtx context.Context) (*clashy.ClanWarLeagueGroup, error) {
 		start := time.Now()
 		group, err := app.Clash.GetLeagueGroup(fetchCtx, tag)
-		app.Stats.RecordRequest(botClansDomainName, time.Since(start), err)
+		app.Stats.RecordRequest(trackedClansDomainName, time.Since(start), err)
 		return group, err
 	})
 	if err != nil {
@@ -1371,11 +1579,11 @@ func (d *botClansDomain) fetchCWLGroup(ctx context.Context, app *platform.App, l
 	return group, jsonBytes(group), nil
 }
 
-func (d *botClansDomain) fetchCWLWar(ctx context.Context, app *platform.App, limiter *clashy.Limiter, warTag string) (*clashy.ClanWar, []byte, error) {
-	wars, err := retryLimitedClashFetch(ctx, limiter, func(fetchCtx context.Context) ([]clashy.ClanWar, error) {
+func (d *trackedClansDomain) fetchCWLWar(ctx context.Context, app *platform.App, limiter *clashy.Limiter, warTag string) (*clashy.ClanWar, []byte, error) {
+	wars, err := retryLimitedClashFetch(ctx, app, limiter, func(fetchCtx context.Context) ([]clashy.ClanWar, error) {
 		start := time.Now()
 		wars, err := app.Clash.GetLeagueWars(fetchCtx, []string{warTag})
-		app.Stats.RecordRequest(botClansDomainName, time.Since(start), err)
+		app.Stats.RecordRequest(trackedClansDomainName, time.Since(start), err)
 		return wars, err
 	})
 	if err != nil {
@@ -1391,7 +1599,7 @@ func (d *botClansDomain) fetchCWLWar(ctx context.Context, app *platform.App, lim
 	return &wars[0], jsonBytes(wars[0]), nil
 }
 
-func (d *botClansDomain) findClanCWLWar(ctx context.Context, app *platform.App, limiter *clashy.Limiter, clanTag string, warTags []string) (string, *clashy.ClanWar, []byte, error) {
+func (d *trackedClansDomain) findClanCWLWar(ctx context.Context, app *platform.App, limiter *clashy.Limiter, clanTag string, warTags []string) (string, *clashy.ClanWar, []byte, error) {
 	for _, warTag := range warTags {
 		war, raw, err := d.fetchCWLWar(ctx, app, limiter, warTag)
 		if err != nil {
@@ -1407,11 +1615,11 @@ func (d *botClansDomain) findClanCWLWar(ctx context.Context, app *platform.App, 
 	return "", nil, nil, nil
 }
 
-func (d *botClansDomain) handleCWLGroupChange(ctx context.Context, app *platform.App, clanTag string, group *clashy.ClanWarLeagueGroup, raw []byte, previous *botCWLState, current botCWLState) error {
+func (d *trackedClansDomain) handleCWLGroupChange(ctx context.Context, app *platform.App, clanTag string, group *clashy.ClanWarLeagueGroup, raw []byte, previous *botCWLState, current botCWLState) error {
 	if previous == nil || previous.GroupHash == current.GroupHash {
 		return nil
 	}
-	app.Stats.SetReady(botClansDomainName, true, "")
+	app.Stats.SetReady(trackedClansDomainName, true, "")
 	return app.PublishEvent(ctx, platform.Event{
 		Topic:   "cwl",
 		ClanTag: clanTag,
@@ -1425,16 +1633,16 @@ func (d *botClansDomain) handleCWLGroupChange(ctx context.Context, app *platform
 	})
 }
 
-func (d *botClansDomain) handleCWLWarChange(ctx context.Context, app *platform.App, clanTag string, war clashy.ClanWar, raw []byte, group *clashy.ClanWarLeagueGroup) error {
+func (d *trackedClansDomain) handleCWLWarChange(ctx context.Context, app *platform.App, clanTag string, war clashy.ClanWar, raw []byte, group *clashy.ClanWarLeagueGroup) error {
 	if err := d.scheduleWarReminders(ctx, app, clanTag, war, raw, "cwl"); err != nil {
 		return err
 	}
-	previous, raw, hasPrevious, changed, err := loadBotClanSnapshotChange(ctx, d.snapshots, d.snapshotPrefix, "cwlwar", clanTag, war, raw)
+	previous, raw, hasPrevious, changed, err := loadTrackedClanSnapshotChange(ctx, d.snapshots, d.snapshotPrefix, "cwlwar", clanTag, war, raw)
 	if err != nil || !changed {
 		return err
 	}
 	if hasPrevious {
-		app.Stats.SetReady(botClansDomainName, true, "")
+		app.Stats.SetReady(trackedClansDomainName, true, "")
 		if err := app.PublishEvent(ctx, platform.Event{
 			Topic:   "cwl",
 			ClanTag: clanTag,
@@ -1465,11 +1673,11 @@ func (d *botClansDomain) handleCWLWarChange(ctx context.Context, app *platform.A
 			}
 		}
 	}
-	return d.snapshots.StoreRaw(ctx, botClanSnapshotKey(d.snapshotPrefix, "cwlwar", clanTag), raw)
+	return d.snapshots.StoreRaw(ctx, trackedClanSnapshotKey(d.snapshotPrefix, "cwlwar", clanTag), raw)
 }
 
-func storeBotClanValue(ctx context.Context, store botClanSnapshotStore, prefix, kind, tag string, value any) error {
-	return store.StoreRaw(ctx, botClanSnapshotKey(prefix, kind, tag), jsonBytes(value))
+func storeTrackedClanValue(ctx context.Context, store trackedClanSnapshotStore, prefix, kind, tag string, value any) error {
+	return store.StoreRaw(ctx, trackedClanSnapshotKey(prefix, kind, tag), jsonBytes(value))
 }
 
 func shouldPollCWL(now time.Time, state botCWLState) bool {

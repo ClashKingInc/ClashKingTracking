@@ -9,6 +9,42 @@ import (
 	"clashking_tracking/models"
 )
 
+func TestCampaignNotificationPreference(t *testing.T) {
+	if got := campaignNotificationPreference(models.NotificationCampaign{Key: "monthly-support"}); got != "monthly_support" {
+		t.Fatalf("monthly support preference = %q", got)
+	}
+	if got := campaignNotificationPreference(models.NotificationCampaign{Key: "game-event-clan-games-2026-08"}); got != "events" {
+		t.Fatalf("game event campaign preference = %q, want events", got)
+	}
+	if got := campaignNotificationPreference(models.NotificationCampaign{Key: "product-news"}); got != "announcements" {
+		t.Fatalf("ordinary campaign preference = %q", got)
+	}
+}
+
+func TestGameEventCampaignsUseClashCalendarStartTimes(t *testing.T) {
+	now := time.Date(2026, time.August, 4, 12, 0, 0, 0, time.UTC)
+	campaigns := gameEventCampaigns(now)
+	if len(campaigns) != 4 {
+		t.Fatalf("campaign count = %d, want 4", len(campaigns))
+	}
+	starts := map[string]time.Time{}
+	for _, campaign := range campaigns {
+		if campaign.SendAt == nil || !campaign.SendAt.After(now) {
+			t.Fatalf("campaign %q has invalid start: %#v", campaign.Key, campaign.SendAt)
+		}
+		starts[campaign.Title] = campaign.SendAt.UTC()
+	}
+	if got := starts["Clan Games have started"]; !got.Equal(time.Date(2026, time.August, 22, 8, 0, 0, 0, time.UTC)) {
+		t.Fatalf("Clan Games start = %s", got)
+	}
+	if got := starts["Clan War League has started"]; !got.Equal(time.Date(2026, time.September, 1, 8, 0, 0, 0, time.UTC)) {
+		t.Fatalf("CWL start = %s", got)
+	}
+	if got := starts["Raid Weekend has started"]; !got.Equal(time.Date(2026, time.August, 7, 7, 0, 0, 0, time.UTC)) {
+		t.Fatalf("Raid Weekend start = %s", got)
+	}
+}
+
 func TestStoryReplacementCreatesRestorableRevision(t *testing.T) {
 	store := newMemoryMobilePushStore()
 	first := "https://example.com/story-v1.html"
@@ -230,20 +266,6 @@ func TestUnconfiguredPushProvidersReturnErrors(t *testing.T) {
 	message := pushMessage{Title: "Title", Body: "Body"}
 	if err := sendFCM(t.Context(), app, "token", message); err == nil {
 		t.Fatal("unconfigured FCM must not be reported as sent")
-	}
-	if err := sendAPNS(t.Context(), app, "token", "production", message); err == nil {
-		t.Fatal("unconfigured APNs must not be reported as sent")
-	}
-}
-
-func TestFCMAccessTokenAllowsExplicitOverride(t *testing.T) {
-	app := &platform.App{Config: platform.Config{MobilePushFCMBearerToken: "test-token"}}
-	token, err := fcmAccessToken(app)
-	if err != nil {
-		t.Fatalf("explicit FCM token rejected: %v", err)
-	}
-	if token != "test-token" {
-		t.Fatalf("FCM token = %q, want explicit override", token)
 	}
 }
 

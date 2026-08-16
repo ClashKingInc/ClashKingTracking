@@ -160,8 +160,6 @@ type leaderboardPlayerRow struct {
 	League leaderboardLeaguePayload
 }
 
-func NewLeaderboardsDomain() platform.Domain { return &leaderboardsDomain{} }
-
 func (d *leaderboardsDomain) Name() string { return leaderboardsDomainName }
 
 func (d *leaderboardsDomain) Run(ctx context.Context, app *platform.App) error {
@@ -214,7 +212,7 @@ func validateLeaderboardsConfig(cfg platform.Config) error {
 		return errors.New("leaderboards.null_asset_url is required")
 	}
 	if cfg.TimescaleURL == "" {
-		return errors.New("TIMESCALE_URL is required for leaderboards")
+		return errors.New("TIMESCALE_* connection variables are required for leaderboards")
 	}
 	if cfg.ValkeyAddr == "" {
 		return errors.New("valkey_addr is required for leaderboards")
@@ -293,7 +291,7 @@ func (d *leaderboardsDomain) refreshMaterializedViewsIfDue(ctx context.Context, 
 }
 
 func (d *leaderboardsDomain) fetchLeagues(ctx context.Context, app *platform.App, limiter *clashy.Limiter) (map[int]leaderboardLeaguePayload, error) {
-	leagues, err := retryLimitedClashFetch(ctx, limiter, func(fetchCtx context.Context) ([]clashy.League, error) {
+	leagues, err := retryLimitedClashFetch(ctx, app, limiter, func(fetchCtx context.Context) ([]clashy.League, error) {
 		start := time.Now()
 		leagues, err := app.Clash.SearchLeagues(fetchCtx, clashy.PageOptions{Limit: 100})
 		app.Stats.RecordRequest(leaderboardsDomainName, time.Since(start), err)
@@ -316,7 +314,7 @@ func (d *leaderboardsDomain) fetchPlayers(ctx context.Context, app *platform.App
 	skipped := 0
 	notFound := 0
 	err := runBounded(ctx, platform.RequestConcurrency(app.Config.LeaderboardRequestsPerSecond), tags, func(workerCtx context.Context, tag string) error {
-		player, err := retryLimitedClashFetch(workerCtx, limiter, func(fetchCtx context.Context) (*clashy.Player, error) {
+		player, err := retryLimitedClashFetch(workerCtx, app, limiter, func(fetchCtx context.Context) (*clashy.Player, error) {
 			start := time.Now()
 			player, err := app.Clash.GetPlayer(fetchCtx, tag)
 			app.Stats.RecordRequest(leaderboardsDomainName, time.Since(start), err)

@@ -19,14 +19,14 @@ type Domain interface {
 }
 
 type App struct {
-	Config      Config
-	Logger      *slog.Logger
-	Valkey      valkey.Client
-	Clash       *clashy.Client
-	R2          ObjectStore
-	Stats       *Tracker
-	StatsWriter *TimescaleStatsWriter
-	Scheduler   *Scheduler
+	Config       Config
+	Logger       *slog.Logger
+	Valkey       valkey.Client
+	Clash        *clashy.Client
+	Stats        *Tracker
+	StatsWriter  *TimescaleStatsWriter
+	Scheduler    *Scheduler
+	Availability *AvailabilityGate
 }
 
 func New(ctx context.Context, cfg Config) (*App, error) {
@@ -77,34 +77,15 @@ func New(ctx context.Context, cfg Config) (*App, error) {
 			return nil, err
 		}
 	}
-	var objectStore ObjectStore
-	hasR2Config := cfg.R2Endpoint != "" || cfg.R2Bucket != "" || cfg.R2AccessKeyID != "" || cfg.R2SecretAccessKey != ""
-	if hasR2Config {
-		objectStore, err = NewR2ObjectStore(cfg)
-		if err != nil {
-			if clashClient != nil {
-				_ = clashClient.Close()
-			}
-			if valkeyClient != nil {
-				valkeyClient.Close()
-			}
-			if statsWriter != nil {
-				statsWriter.Close()
-			}
-			return nil, err
-		}
-	} else if cfg.R2MockUpload {
-		objectStore = MockObjectStore{}
-	}
 	app := &App{
-		Config:      cfg,
-		Logger:      logger,
-		Valkey:      valkeyClient,
-		Clash:       clashClient,
-		R2:          objectStore,
-		Stats:       stats,
-		StatsWriter: statsWriter,
-		Scheduler:   NewScheduler(),
+		Config:       cfg,
+		Logger:       logger,
+		Valkey:       valkeyClient,
+		Clash:        clashClient,
+		Stats:        stats,
+		StatsWriter:  statsWriter,
+		Scheduler:    NewScheduler(),
+		Availability: NewAvailabilityGate(valkeyClient),
 	}
 	return app, nil
 }
@@ -128,10 +109,11 @@ func Run(ctx context.Context, app *App, domains []Domain) error {
 	if app.StatsWriter != nil {
 		go app.StatsWriter.Run(runCtx, app.Logger)
 	}
-	go func() {
-		// Keep delayed jobs alive in the same process as the domains that schedule them.
-		_ = app.Scheduler.Run(runCtx)
-	}()
+	if app.Availability != nil {
+		go app.Availability.Run(runCtx)
+	}
+	// Legacy in-process timers remain available to old helper code, but all active
+	// war and reminder scheduling reads durable SQL rows instead.
 
 	var wg sync.WaitGroup
 	errCh := make(chan error, len(domains))
@@ -170,9 +152,9 @@ func proxyConnectionLimit(cfg Config) int {
 		cfg.GlobalClanPriorityRequestsPerSecond+cfg.GlobalClanNonPriorityRequestsPerSecond,
 		cfg.BattlelogRequestsPerSecond,
 		cfg.BattlelogPriorityRequestsPerSecond,
-		cfg.WarRequestsPerSecond,
-		cfg.BotClanRequestsPerSecond,
-		cfg.BotPlayerRequestsPerSecond,
+		cfg.WarRequestsPerSecond+cfg.WarDormantRequestsPerSecond,
+		cfg.TrackedClanRequestsPerSecond,
+		cfg.TrackedPlayerRequestsPerSecond,
 		cfg.BasicPlayerRequestsPerSecond,
 		cfg.LeaderboardRequestsPerSecond,
 	)
@@ -184,7 +166,7 @@ func proxyConnectionLimit(cfg Config) int {
 
 func needsClashClient(cfg Config) bool {
 	switch cfg.Script {
-	case "globalclans", "botplayers", "basicplayers", "botclans", "wars", "scheduled", "battlelogs", "leaderboards":
+	case "globalclans", "trackedplayers", "basicplayers", "trackedclans", "war-discovery", "cwl", "capital", "reminders", "availability", "scheduled", "battlelogs", "leaderboards", "notifications":
 		return true
 	default:
 		return false

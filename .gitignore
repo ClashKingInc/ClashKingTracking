@@ -6,3 +6,5 @@
 *__pycache__*
 .DS_Store
 .gocache/
+.t3/
+t3.json

@@ -217,7 +217,7 @@ type scheduledStore interface {
 	ReplaceLegendSeason(context.Context, string, []models.LegendHistoryRow) (int, error)
 	ReplaceCurrentClanRankingGroup(context.Context, currentClanRankingGroup) (int, error)
 	ListRankedGroupTargets(context.Context) ([]string, error)
-	StorePlayerProfiles(context.Context, []models.PlayerProfileIngest, *time.Time) (int, error)
+	StorePlayerProfiles(context.Context, []models.PlayerProfileIngest) (int, error)
 	DeletePlayers(context.Context, []string) error
 	StoreRankedLeagueGroupMembers(context.Context, []models.RankedLeagueGroupMemberRow) (int, error)
 	MissingRankedGroupPlayers(context.Context, int64) ([]string, error)
@@ -238,6 +238,18 @@ func (d *scheduledDomain) Run(ctx context.Context, app *platform.App) error {
 	defer store.Close()
 	d.store = store
 
+	// Current player leaderboards are another scheduled data refresh, so they
+	// share this process while retaining their own cadence and readiness stats.
+	leaderboardCtx, stopLeaderboards := context.WithCancel(ctx)
+	leaderboardDone := make(chan error, 1)
+	go func() {
+		leaderboardDone <- (&leaderboardsDomain{}).Run(leaderboardCtx, app)
+	}()
+	defer func() {
+		stopLeaderboards()
+		<-leaderboardDone
+	}()
+
 	interval := time.Duration(app.Config.ScheduledIntervalSeconds) * time.Second
 	for {
 		start := time.Now()
@@ -246,8 +258,21 @@ func (d *scheduledDomain) Run(ctx context.Context, app *platform.App) error {
 		if err != nil {
 			app.Stats.SetReady(scheduledDomainName, false, err.Error())
 		}
-		if err := sleepOrDone(ctx, interval); err != nil {
-			return err
+		timer := time.NewTimer(interval)
+		select {
+		case err := <-leaderboardDone:
+			if !timer.Stop() {
+				<-timer.C
+			}
+			stopLeaderboards()
+			leaderboardDone <- err
+			return fmt.Errorf("scheduled leaderboard refresh stopped: %w", err)
+		case <-ctx.Done():
+			if !timer.Stop() {
+				<-timer.C
+			}
+			return ctx.Err()
+		case <-timer.C:
 		}
 	}
 }
@@ -257,7 +282,7 @@ func validateScheduledConfig(cfg platform.Config) error {
 		return errors.New("scheduled.interval_seconds must be greater than zero")
 	}
 	if !cfg.DryRun && !cfg.MockDB && cfg.TimescaleURL == "" {
-		return errors.New("TIMESCALE_URL is required for scheduled")
+		return errors.New("TIMESCALE_* connection variables are required for scheduled")
 	}
 	return nil
 }
@@ -335,7 +360,7 @@ func (d *scheduledDomain) doRankedGroupDiscovery(ctx context.Context, app *platf
 		if !ok {
 			continue
 		}
-		affected, err := d.store.StorePlayerProfiles(ctx, []models.PlayerProfileIngest{utils.PlayerProfileFromClashy(*player)}, nil)
+		affected, err := d.store.StorePlayerProfiles(ctx, []models.PlayerProfileIngest{utils.PlayerProfileFromClashy(*player)})
 		if err != nil {
 			return writes, err
 		}
@@ -374,7 +399,7 @@ func (d *scheduledDomain) doRankedGroupDiscovery(ctx context.Context, app *platf
 }
 
 func (d *scheduledDomain) fetchRankedSeedPlayer(ctx context.Context, app *platform.App, tag string) (*clashy.Player, bool, error) {
-	player, err := platform.RetryClashFetch(ctx, func(fetchCtx context.Context) (*clashy.Player, error) {
+	player, err := platform.RetryClashFetch(ctx, app.Availability, func(fetchCtx context.Context) (*clashy.Player, error) {
 		start := time.Now()
 		player, err := app.Clash.GetPlayer(fetchCtx, tag)
 		app.Stats.RecordRequest(scheduledDomainName, time.Since(start), err)
@@ -393,7 +418,7 @@ func (d *scheduledDomain) fetchRankedSeedPlayer(ctx context.Context, app *platfo
 }
 
 func (d *scheduledDomain) previousLeagueTierID(ctx context.Context, app *platform.App, tag string, seasonID int64) (int, bool, error) {
-	entries, err := platform.RetryClashFetch(ctx, func(fetchCtx context.Context) ([]clashy.LeagueHistoryEntry, error) {
+	entries, err := platform.RetryClashFetch(ctx, app.Availability, func(fetchCtx context.Context) ([]clashy.LeagueHistoryEntry, error) {
 		start := time.Now()
 		entries, err := app.Clash.GetPlayerLeagueHistory(fetchCtx, tag)
 		app.Stats.RecordRequest(scheduledDomainName, time.Since(start), err)
@@ -411,7 +436,7 @@ func (d *scheduledDomain) previousLeagueTierID(ctx context.Context, app *platfor
 }
 
 func (d *scheduledDomain) fetchRankedGroupMembers(ctx context.Context, app *platform.App, seedTag, groupTag string, seasonID int64, leagueTierID int) ([]models.RankedLeagueGroupMemberRow, error) {
-	group, err := platform.RetryClashFetch(ctx, func(fetchCtx context.Context) (*clashy.LeagueTierGroup, error) {
+	group, err := platform.RetryClashFetch(ctx, app.Availability, func(fetchCtx context.Context) (*clashy.LeagueTierGroup, error) {
 		start := time.Now()
 		group, err := app.Clash.GetPlayerLeagueGroup(fetchCtx, seedTag, groupTag, strconv.FormatInt(seasonID, 10))
 		app.Stats.RecordRequest(scheduledDomainName, time.Since(start), err)
@@ -451,7 +476,7 @@ func rankedGroupMemberRows(groupTag string, seasonID int64, leagueTierID int, gr
 	return rows
 }
 
-func (d *scheduledDomain) fetchAndStoreMissingRankedPlayers(ctx context.Context, app *platform.App, seasonID int64, activityAt time.Time) (int, error) {
+func (d *scheduledDomain) fetchAndStoreMissingRankedPlayers(ctx context.Context, app *platform.App, seasonID int64, _ time.Time) (int, error) {
 	tags, err := d.store.MissingRankedGroupPlayers(ctx, seasonID)
 	if err != nil {
 		return 0, err
@@ -462,7 +487,7 @@ func (d *scheduledDomain) fetchAndStoreMissingRankedPlayers(ctx context.Context,
 		if len(profiles) == 0 {
 			return nil
 		}
-		affected, err := d.store.StorePlayerProfiles(ctx, profiles, &activityAt)
+		affected, err := d.store.StorePlayerProfiles(ctx, profiles)
 		if err != nil {
 			return err
 		}
@@ -502,7 +527,7 @@ func (d *scheduledDomain) loadLeaderboardLocationIDs(
 	ctx context.Context,
 	app *platform.App,
 ) ([]string, error) {
-	locations, err := platform.RetryClashFetch(ctx, func(fetchCtx context.Context) ([]clashy.Location, error) {
+	locations, err := platform.RetryClashFetch(ctx, app.Availability, func(fetchCtx context.Context) ([]clashy.Location, error) {
 		start := time.Now()
 		locations, err := app.Clash.SearchLocations(fetchCtx, clashy.PageOptions{})
 		app.Stats.RecordRequest(scheduledDomainName, time.Since(start), err)
@@ -528,7 +553,7 @@ func (d *scheduledDomain) doLeaderboardHistory(
 			if !shouldStoreLeaderboardHistoryKind(path.Kind, now) {
 				continue
 			}
-			payload, err := platform.RetryClashFetch(ctx, func(fetchCtx context.Context) (any, error) {
+			payload, err := platform.RetryClashFetch(ctx, app.Availability, func(fetchCtx context.Context) (any, error) {
 				start := time.Now()
 				payload, err := path.Load(fetchCtx, app.Clash, locationID)
 				app.Stats.RecordRequest(scheduledDomainName, time.Since(start), err)
@@ -608,7 +633,7 @@ func (d *scheduledDomain) doLegendHistory(
 }
 
 func loadOfficialLegendSeasons(ctx context.Context, app *platform.App) ([]string, error) {
-	return platform.RetryClashFetch(ctx, func(fetchCtx context.Context) ([]string, error) {
+	return platform.RetryClashFetch(ctx, app.Availability, func(fetchCtx context.Context) ([]string, error) {
 		start := time.Now()
 		seasons, err := app.Clash.GetSeasons(fetchCtx, legendLeagueID)
 		app.Stats.RecordRequest(scheduledDomainName, time.Since(start), err)
@@ -621,7 +646,7 @@ func loadOfficialLegendSeasonRankings(
 	app *platform.App,
 	season string,
 ) ([]legendRankingItem, error) {
-	return platform.RetryClashFetch(ctx, func(fetchCtx context.Context) ([]legendRankingItem, error) {
+	return platform.RetryClashFetch(ctx, app.Availability, func(fetchCtx context.Context) ([]legendRankingItem, error) {
 		return fetchAllLegendSeasonRankingPages(fetchCtx, app, season)
 	})
 }
@@ -866,7 +891,7 @@ func (d *scheduledDomain) doCurrentClanRankings(
 	var groupErrors []error
 	for _, locationID := range locationIDs {
 		for _, path := range currentClanRankingPaths {
-			rankings, err := platform.RetryClashFetch(ctx, func(fetchCtx context.Context) ([]clashy.RankedClan, error) {
+			rankings, err := platform.RetryClashFetch(ctx, app.Availability, func(fetchCtx context.Context) ([]clashy.RankedClan, error) {
 				start := time.Now()
 				rankings, err := path.Load(fetchCtx, app.Clash, locationID, clashy.PageOptions{Limit: currentClanRankingLimit})
 				app.Stats.RecordRequest(scheduledDomainName, time.Since(start), err)
@@ -2176,7 +2201,7 @@ func (s *timescaleScheduledStore) ListRankedGroupTargets(ctx context.Context) ([
 	return tags, rows.Err()
 }
 
-func (s *timescaleScheduledStore) StorePlayerProfiles(ctx context.Context, profiles []models.PlayerProfileIngest, activityAt *time.Time) (int, error) {
+func (s *timescaleScheduledStore) StorePlayerProfiles(ctx context.Context, profiles []models.PlayerProfileIngest) (int, error) {
 	if len(profiles) == 0 {
 		return 0, nil
 	}
@@ -2185,7 +2210,7 @@ func (s *timescaleScheduledStore) StorePlayerProfiles(ctx context.Context, profi
 		return 0, err
 	}
 	defer tx.Rollback(ctx)
-	affected, err := utils.UpsertPlayerProfiles(ctx, tx, profiles, scheduledDomainName, activityAt)
+	affected, err := utils.UpsertPlayerProfiles(ctx, tx, profiles, scheduledDomainName)
 	if err != nil {
 		return affected, err
 	}
@@ -2431,7 +2456,7 @@ func (*memoryScheduledStore) ListRankedGroupTargets(context.Context) ([]string, 
 	return nil, nil
 }
 
-func (*memoryScheduledStore) StorePlayerProfiles(context.Context, []models.PlayerProfileIngest, *time.Time) (int, error) {
+func (*memoryScheduledStore) StorePlayerProfiles(context.Context, []models.PlayerProfileIngest) (int, error) {
 	return 0, nil
 }
 

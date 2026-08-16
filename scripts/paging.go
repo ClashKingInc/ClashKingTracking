@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"sync"
+	"time"
 
 	"clashking_tracking/internal/platform"
 
@@ -15,6 +16,17 @@ func trackingProgressName(domain, group string) string {
 		return domain
 	}
 	return domain + "." + group
+}
+
+func sleepOrDone(ctx context.Context, delay time.Duration) error {
+	timer := time.NewTimer(delay)
+	defer timer.Stop()
+	select {
+	case <-ctx.Done():
+		return ctx.Err()
+	case <-timer.C:
+		return nil
+	}
 }
 
 func newTrackingLimiter(requestsPerSecond int) (*clashy.Limiter, error) {
@@ -74,10 +86,11 @@ sendLoop:
 
 func retryLimitedClashFetch[T any](
 	ctx context.Context,
+	app *platform.App,
 	limiter *clashy.Limiter,
 	fetch func(context.Context) (T, error),
 ) (T, error) {
-	return platform.RetryClashFetch(ctx, func(fetchCtx context.Context) (T, error) {
+	return platform.RetryClashFetch(ctx, app.Availability, func(fetchCtx context.Context) (T, error) {
 		release, err := limiter.Acquire(fetchCtx)
 		if err != nil {
 			var zero T

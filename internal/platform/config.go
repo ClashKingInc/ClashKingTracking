@@ -5,6 +5,8 @@ import (
 	"errors"
 	"flag"
 	"fmt"
+	"net"
+	"net/url"
 	"os"
 	"strings"
 
@@ -27,20 +29,16 @@ type Config struct {
 	BattlelogCheckpointTTLDays             int
 	BattlelogFirstSeenLookbackDays         int
 	WarRequestsPerSecond                   int
+	WarDormantRequestsPerSecond            int
 	WarMaxInFlight                         int
 	WarCWLSyncSeconds                      int
-	BotClanRequestsPerSecond               int
-	BotClanTargetRefreshSeconds            int
-	BotClanSnapshotPrefix                  string
-	BotClanCWLStateSnapshot                string
-	R2Endpoint                             string
-	R2AccessKeyID                          string
-	R2SecretAccessKey                      string
-	R2Bucket                               string
-	R2Prefix                               string
-	R2PublicBaseURL                        string
-	R2RequestsPerSecond                    int
-	R2MockUpload                           bool
+	TrackedClanRequestsPerSecond           int
+	TrackedClanTargetRefreshSeconds        int
+	TrackedClanSnapshotPrefix              string
+	TrackedClanCWLStateSnapshot            string
+	CapitalRequestsPerSecond               int
+	CapitalTargetRefreshSeconds            int
+	CapitalSnapshotPrefix                  string
 	StatsTimescaleFlushSeconds             int
 	EventStreamName                        string
 	EventStreamGroup                       string
@@ -48,7 +46,7 @@ type Config struct {
 	EventStreamRetentionSeconds            int
 	EventStreamBatchSize                   int
 	EventStreamReclaimIdleSeconds          int
-	BotPlayerRequestsPerSecond             int
+	TrackedPlayerRequestsPerSecond         int
 	BasicPlayerRequestsPerSecond           int
 	LeaderboardRequestsPerSecond           int
 	LeaderboardIntervalSeconds             int
@@ -61,13 +59,12 @@ type Config struct {
 	RedditSecret                           string
 	RedditUsername                         string
 	RedditPassword                         string
-	MobilePushAPNSBearerToken              string
-	MobilePushAPNSBundleID                 string
-	MobilePushFCMBearerToken               string
 	MobilePushFCMServiceAccountJSON        string
 	MobilePushFCMProjectID                 string
 	MobilePushTokenKey                     string
 	MobilePushScanSeconds                  int
+	RosterAutomationScanSeconds            int
+	RosterAutomationBatchSize              int
 	RunOnce                                bool
 	DryRun                                 bool
 	MockDB                                 bool
@@ -88,7 +85,7 @@ func LoadWithArgs(args []string) Config {
 	if err != nil {
 		panic(err)
 	}
-	applySecretEnv(&cfg)
+	applyEnvironment(&cfg)
 	deriveConfig(&cfg)
 
 	fs := flag.NewFlagSet(os.Args[0], flag.ExitOnError)
@@ -104,40 +101,34 @@ func (c Config) Enabled(name string) bool {
 }
 
 type jsonConfig struct {
-	HTTPAddr             string                 `json:"http_addr"`
-	GRPCAddr             string                 `json:"grpc_addr"`
-	ProxyURL             string                 `json:"proxy_url"`
-	ValkeyAddr           string                 `json:"valkey_addr"`
-	RunOnce              bool                   `json:"run_once"`
-	DryRun               bool                   `json:"dry_run"`
-	MockDB               bool                   `json:"mock_db"`
-	TargetPageMultiplier int                    `json:"target_page_multiplier"`
-	OTEL                 jsonOTELConfig         `json:"otel"`
-	R2                   jsonR2Config           `json:"r2"`
-	Stats                jsonStatsConfig        `json:"stats"`
-	Events               jsonEventsConfig       `json:"events"`
-	GlobalClans          jsonGlobalClansConfig  `json:"globalclans"`
-	Battlelogs           jsonBattlelogsConfig   `json:"battlelogs"`
-	Wars                 jsonWarsConfig         `json:"wars"`
-	BotClans             jsonBotClansConfig     `json:"botclans"`
-	BotPlayers           jsonBotPlayersConfig   `json:"botplayers"`
-	BasicPlayers         jsonBasicPlayersConfig `json:"basicplayers"`
-	Leaderboards         jsonLeaderboardsConfig `json:"leaderboards"`
-	Scheduled            jsonScheduledConfig    `json:"scheduled"`
-	Giveaways            jsonGiveawaysConfig    `json:"giveaways"`
-	Reddit               jsonRedditConfig       `json:"reddit"`
-	MobilePush           jsonMobilePushConfig   `json:"mobile_push"`
+	HTTPAddr             string                     `json:"http_addr"`
+	GRPCAddr             string                     `json:"grpc_addr"`
+	RunOnce              bool                       `json:"run_once"`
+	DryRun               bool                       `json:"dry_run"`
+	MockDB               bool                       `json:"mock_db"`
+	TargetPageMultiplier int                        `json:"target_page_multiplier"`
+	OTEL                 jsonOTELConfig             `json:"otel"`
+	Stats                jsonStatsConfig            `json:"stats"`
+	Events               jsonEventsConfig           `json:"events"`
+	GlobalClans          jsonGlobalClansConfig      `json:"globalclans"`
+	Battlelogs           jsonBattlelogsConfig       `json:"battlelogs"`
+	Wars                 jsonWarsConfig             `json:"wars"`
+	TrackedClans         jsonTrackedClansConfig     `json:"trackedclans"`
+	Capital              jsonCapitalConfig          `json:"capital"`
+	TrackedPlayers       jsonTrackedPlayersConfig   `json:"trackedplayers"`
+	BasicPlayers         jsonBasicPlayersConfig     `json:"basicplayers"`
+	Leaderboards         jsonLeaderboardsConfig     `json:"leaderboards"`
+	Scheduled            jsonScheduledConfig        `json:"scheduled"`
+	Giveaways            jsonGiveawaysConfig        `json:"giveaways"`
+	Reddit               jsonRedditConfig           `json:"reddit"`
+	MobilePush           jsonMobilePushConfig       `json:"mobile_push"`
+	RosterAutomations    jsonRosterAutomationConfig `json:"roster_automations"`
 }
 
 type jsonOTELConfig struct {
 	Enabled              bool   `json:"enabled"`
 	ServiceName          string `json:"service_name"`
 	ExporterOTLPEndpoint string `json:"exporter_otlp_endpoint"`
-}
-
-type jsonR2Config struct {
-	MockUpload        bool `json:"mock_upload"`
-	RequestsPerSecond int  `json:"requests_per_second"`
 }
 
 type jsonStatsConfig struct {
@@ -166,19 +157,26 @@ type jsonBattlelogsConfig struct {
 }
 
 type jsonWarsConfig struct {
-	RequestsPerSecond int `json:"requests_per_second"`
-	CWLSyncSeconds    int `json:"cwl_sync_seconds"`
+	RequestsPerSecond        int `json:"requests_per_second"`
+	DormantRequestsPerSecond int `json:"dormant_requests_per_second"`
+	CWLSyncSeconds           int `json:"cwl_sync_seconds"`
 }
 
-type jsonBotClansConfig struct {
+type jsonTrackedClansConfig struct {
 	RequestsPerSecond    int    `json:"requests_per_second"`
 	TargetRefreshSeconds int    `json:"target_refresh_seconds"`
 	SnapshotPrefix       string `json:"snapshot_prefix"`
 	CWLStateSnapshot     string `json:"cwl_state_snapshot"`
 }
 
-type jsonBotPlayersConfig struct {
+type jsonTrackedPlayersConfig struct {
 	RequestsPerSecond int `json:"requests_per_second"`
+}
+
+type jsonCapitalConfig struct {
+	RequestsPerSecond    int    `json:"requests_per_second"`
+	TargetRefreshSeconds int    `json:"target_refresh_seconds"`
+	SnapshotPrefix       string `json:"snapshot_prefix"`
 }
 
 type jsonBasicPlayersConfig struct {
@@ -208,6 +206,11 @@ type jsonMobilePushConfig struct {
 	ScanSeconds int `json:"scan_seconds"`
 }
 
+type jsonRosterAutomationConfig struct {
+	ScanSeconds int `json:"scan_seconds"`
+	BatchSize   int `json:"batch_size"`
+}
+
 func loadConfigFile(path string) (Config, error) {
 	if strings.TrimSpace(path) == "" {
 		return Config{}, errors.New("config path is required")
@@ -223,8 +226,6 @@ func loadConfigFile(path string) (Config, error) {
 	return Config{
 		HTTPAddr:                               file.HTTPAddr,
 		GRPCAddr:                               file.GRPCAddr,
-		ProxyURL:                               file.ProxyURL,
-		ValkeyAddr:                             file.ValkeyAddr,
 		RunOnce:                                file.RunOnce,
 		DryRun:                                 file.DryRun,
 		MockDB:                                 file.MockDB,
@@ -232,8 +233,6 @@ func loadConfigFile(path string) (Config, error) {
 		OTELEnabled:                            file.OTEL.Enabled,
 		OTELServiceName:                        file.OTEL.ServiceName,
 		OTELExporterOTLPEndpoint:               file.OTEL.ExporterOTLPEndpoint,
-		R2MockUpload:                           file.R2.MockUpload,
-		R2RequestsPerSecond:                    file.R2.RequestsPerSecond,
 		StatsTimescaleFlushSeconds:             file.Stats.TimescaleFlushSeconds,
 		EventStreamName:                        file.Events.Stream,
 		EventStreamGroup:                       file.Events.Group,
@@ -248,12 +247,16 @@ func loadConfigFile(path string) (Config, error) {
 		BattlelogCheckpointTTLDays:             file.Battlelogs.CheckpointTTLDays,
 		BattlelogFirstSeenLookbackDays:         file.Battlelogs.FirstSeenLookbackDays,
 		WarRequestsPerSecond:                   file.Wars.RequestsPerSecond,
+		WarDormantRequestsPerSecond:            file.Wars.DormantRequestsPerSecond,
 		WarCWLSyncSeconds:                      file.Wars.CWLSyncSeconds,
-		BotClanRequestsPerSecond:               file.BotClans.RequestsPerSecond,
-		BotClanTargetRefreshSeconds:            file.BotClans.TargetRefreshSeconds,
-		BotClanSnapshotPrefix:                  file.BotClans.SnapshotPrefix,
-		BotClanCWLStateSnapshot:                file.BotClans.CWLStateSnapshot,
-		BotPlayerRequestsPerSecond:             file.BotPlayers.RequestsPerSecond,
+		TrackedClanRequestsPerSecond:           file.TrackedClans.RequestsPerSecond,
+		TrackedClanTargetRefreshSeconds:        file.TrackedClans.TargetRefreshSeconds,
+		TrackedClanSnapshotPrefix:              file.TrackedClans.SnapshotPrefix,
+		TrackedClanCWLStateSnapshot:            file.TrackedClans.CWLStateSnapshot,
+		CapitalRequestsPerSecond:               file.Capital.RequestsPerSecond,
+		CapitalTargetRefreshSeconds:            file.Capital.TargetRefreshSeconds,
+		CapitalSnapshotPrefix:                  file.Capital.SnapshotPrefix,
+		TrackedPlayerRequestsPerSecond:         file.TrackedPlayers.RequestsPerSecond,
 		BasicPlayerRequestsPerSecond:           file.BasicPlayers.RequestsPerSecond,
 		LeaderboardRequestsPerSecond:           file.Leaderboards.RequestsPerSecond,
 		LeaderboardIntervalSeconds:             file.Leaderboards.IntervalSeconds,
@@ -263,49 +266,53 @@ func loadConfigFile(path string) (Config, error) {
 		GiveawayScanSeconds:                    file.Giveaways.ScanSeconds,
 		RedditPollSeconds:                      file.Reddit.PollSeconds,
 		MobilePushScanSeconds:                  file.MobilePush.ScanSeconds,
+		RosterAutomationScanSeconds:            file.RosterAutomations.ScanSeconds,
+		RosterAutomationBatchSize:              file.RosterAutomations.BatchSize,
 	}, nil
 }
 
-func applySecretEnv(cfg *Config) {
-	overrideString(&cfg.TimescaleURL, "TIMESCALE_URL")
-	overrideString(&cfg.ValkeyPassword, "VALKEY_PASSWORD")
-	overrideString(&cfg.R2Endpoint, "R2_ENDPOINT")
-	overrideString(&cfg.R2AccessKeyID, "R2_ACCESS_KEY_ID")
-	overrideString(&cfg.R2SecretAccessKey, "R2_SECRET_ACCESS_KEY")
-	overrideString(&cfg.R2Bucket, "R2_BUCKET")
-	overrideString(&cfg.R2Prefix, "R2_PREFIX")
-	overrideString(&cfg.R2PublicBaseURL, "R2_PUBLIC_BASE_URL")
-	overrideString(&cfg.RedditClientID, "REDDIT_CLIENT_ID")
-	overrideString(&cfg.RedditSecret, "REDDIT_CLIENT_SECRET")
-	overrideString(&cfg.RedditUsername, "REDDIT_USERNAME")
-	overrideString(&cfg.RedditPassword, "REDDIT_PASSWORD")
-	overrideString(&cfg.MobilePushAPNSBearerToken, "MOBILE_PUSH_APNS_BEARER_TOKEN")
-	overrideString(&cfg.MobilePushAPNSBundleID, "MOBILE_PUSH_APNS_BUNDLE_ID")
-	overrideString(&cfg.MobilePushFCMBearerToken, "MOBILE_PUSH_FCM_BEARER_TOKEN")
-	overrideString(&cfg.MobilePushFCMServiceAccountJSON, "MOBILE_PUSH_FCM_SERVICE_ACCOUNT_JSON")
-	overrideString(&cfg.MobilePushFCMProjectID, "MOBILE_PUSH_FCM_PROJECT_ID")
-	overrideString(&cfg.MobilePushTokenKey, "MOBILE_PUSH_TOKEN_KEY")
-	if cfg.MobilePushTokenKey == "" {
-		overrideString(&cfg.MobilePushTokenKey, "ENCRYPTION_KEY")
-	}
+func applyEnvironment(cfg *Config) {
+	cfg.ProxyURL = appendOriginPath(os.Getenv("CLASHKING_PROXY_INTERNAL_ORIGIN"), "/v1")
+	cfg.TimescaleURL = buildTimescaleURL(os.Getenv)
+	cfg.ValkeyAddr = buildValkeyAddress(os.Getenv)
+	cfg.ValkeyPassword = os.Getenv("VALKEY_PASSWORD")
+	cfg.RedditClientID = strings.TrimSpace(os.Getenv("REDDIT_CLIENT_ID"))
+	cfg.RedditSecret = os.Getenv("REDDIT_CLIENT_SECRET")
+	cfg.RedditUsername = strings.TrimSpace(os.Getenv("REDDIT_USERNAME"))
+	cfg.RedditPassword = os.Getenv("REDDIT_PASSWORD")
+	cfg.MobilePushFCMServiceAccountJSON = os.Getenv("MOBILE_PUSH_FCM_SERVICE_ACCOUNT_JSON")
+	cfg.MobilePushFCMProjectID = strings.TrimSpace(os.Getenv("MOBILE_PUSH_FCM_PROJECT_ID"))
+	cfg.MobilePushTokenKey = os.Getenv("DATA_ENCRYPTION_KEY")
 }
 
 func deriveConfig(cfg *Config) {
 	cfg.WarMaxInFlight = RequestConcurrency(cfg.WarRequestsPerSecond)
+	if cfg.WarDormantRequestsPerSecond == 0 {
+		cfg.WarDormantRequestsPerSecond = 50
+	}
 	if cfg.BattlelogPriorityRequestsPerSecond == 0 {
 		cfg.BattlelogPriorityRequestsPerSecond = 100
 	}
-	if cfg.BotClanRequestsPerSecond == 0 {
-		cfg.BotClanRequestsPerSecond = 950
+	if cfg.TrackedClanRequestsPerSecond == 0 {
+		cfg.TrackedClanRequestsPerSecond = 950
 	}
-	if cfg.BotClanTargetRefreshSeconds == 0 {
-		cfg.BotClanTargetRefreshSeconds = 3600
+	if cfg.TrackedClanTargetRefreshSeconds == 0 {
+		cfg.TrackedClanTargetRefreshSeconds = 3600
 	}
-	if cfg.BotClanSnapshotPrefix == "" {
-		cfg.BotClanSnapshotPrefix = "botclans:snapshot:"
+	if cfg.TrackedClanSnapshotPrefix == "" {
+		cfg.TrackedClanSnapshotPrefix = "trackedclans:snapshot:"
 	}
-	if cfg.BotClanCWLStateSnapshot == "" {
-		cfg.BotClanCWLStateSnapshot = "cwlstate"
+	if cfg.TrackedClanCWLStateSnapshot == "" {
+		cfg.TrackedClanCWLStateSnapshot = "cwlstate"
+	}
+	if cfg.CapitalRequestsPerSecond == 0 {
+		cfg.CapitalRequestsPerSecond = 250
+	}
+	if cfg.CapitalTargetRefreshSeconds == 0 {
+		cfg.CapitalTargetRefreshSeconds = 300
+	}
+	if cfg.CapitalSnapshotPrefix == "" {
+		cfg.CapitalSnapshotPrefix = "capital:raid:"
 	}
 	if cfg.BasicPlayerRequestsPerSecond == 0 {
 		cfg.BasicPlayerRequestsPerSecond = 30
@@ -322,16 +329,62 @@ func deriveConfig(cfg *Config) {
 	if cfg.LeaderboardNullAssetURL == "" {
 		cfg.LeaderboardNullAssetURL = "https://api-assets.clashofclans.com/null"
 	}
-	if cfg.R2RequestsPerSecond == 0 {
-		cfg.R2RequestsPerSecond = 100
-	}
 	if cfg.StatsTimescaleFlushSeconds == 0 {
 		cfg.StatsTimescaleFlushSeconds = 60
 	}
+	if cfg.RosterAutomationScanSeconds == 0 {
+		cfg.RosterAutomationScanSeconds = 15
+	}
+	if cfg.RosterAutomationBatchSize == 0 {
+		cfg.RosterAutomationBatchSize = 100
+	}
 }
 
-func overrideString(target *string, key string) {
-	if value := os.Getenv(key); value != "" {
-		*target = value
+func buildTimescaleURL(getenv func(string) string) string {
+	host := strings.TrimSpace(getenv("TIMESCALE_HOST"))
+	username := strings.TrimSpace(getenv("TIMESCALE_USERNAME"))
+	password := getenv("TIMESCALE_PASSWORD")
+	database := strings.TrimSpace(getenv("TIMESCALE_DATABASE"))
+	if host == "" || username == "" || password == "" || database == "" {
+		return ""
 	}
+	connection := &url.URL{
+		Scheme: "postgres",
+		User:   url.UserPassword(username, password),
+		Host:   net.JoinHostPort(host, firstNonEmpty(getenv("TIMESCALE_PORT"), "5432")),
+		Path:   database,
+	}
+	query := connection.Query()
+	query.Set("sslmode", firstNonEmpty(getenv("TIMESCALE_SSLMODE"), "disable"))
+	connection.RawQuery = query.Encode()
+	return connection.String()
+}
+
+func buildValkeyAddress(getenv func(string) string) string {
+	host := strings.TrimSpace(getenv("VALKEY_HOST"))
+	if host == "" {
+		return ""
+	}
+	return net.JoinHostPort(host, firstNonEmpty(getenv("VALKEY_PORT"), "6379"))
+}
+
+func normalizeOrigin(value string) string {
+	return strings.TrimRight(strings.TrimSpace(value), "/")
+}
+
+func appendOriginPath(origin, path string) string {
+	origin = normalizeOrigin(origin)
+	if origin == "" {
+		return ""
+	}
+	return origin + path
+}
+
+func firstNonEmpty(values ...string) string {
+	for _, value := range values {
+		if strings.TrimSpace(value) != "" {
+			return value
+		}
+	}
+	return ""
 }

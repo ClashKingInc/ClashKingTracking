@@ -22,13 +22,14 @@ type mobilePushStore interface {
 	RecordDeliveryAttempt(ctx context.Context, attempt models.AdminPostDeliveryAttempt) (models.AdminPostDeliveryAttempt, error)
 	ClaimDuePushRetries(ctx context.Context, now time.Time) ([]models.AdminPost, error)
 	ClaimDueCampaigns(ctx context.Context, now time.Time) ([]models.NotificationCampaign, error)
+	EnsureGameEventCampaigns(ctx context.Context, now time.Time) error
 	RecordCampaignDelivery(ctx context.Context, campaign models.NotificationCampaign, now time.Time, eligible, sent, skipped int, status string) error
 	DuePosts(ctx context.Context, now time.Time) ([]models.AdminPost, error)
 	MarkPublished(ctx context.Context, id string) (models.AdminPost, error)
 	DueExpirations(ctx context.Context, now time.Time) ([]models.AdminPost, error)
 	MarkExpired(ctx context.Context, id string) error
 	MarkPushSent(ctx context.Context, id string) error
-	DevicesForPlatforms(ctx context.Context, platforms []string, locales []string) ([]models.PushDevice, error)
+	DevicesForPlatforms(ctx context.Context, platforms []string, locales []string, preference string) ([]models.PushDevice, error)
 }
 
 const featureFlagColumns = `flag_key, name, description, enabled, rollout_percentage, min_app_version,
@@ -169,14 +170,7 @@ func (s *timescaleMobilePushStore) AdminDashboard(ctx context.Context, days int,
 		count(*) FILTER (WHERE enabled AND platform = 'android'),
 		count(*) FILTER (WHERE enabled AND platform = 'ios'),
 		count(*) FILTER (WHERE enabled AND authorization_status IN ('authorized', 'provisional')),
-		count(*) FILTER (WHERE enabled AND EXISTS (
-			SELECT 1 FROM mobile_notification_preferences p
-			WHERE p.user_id = mobile_push_devices.user_id
-			  AND p.device_id = mobile_push_devices.device_id
-			  AND p.environment = mobile_push_devices.environment
-			  AND p.enabled
-			  AND 'announcements' = ANY(p.enabled_types)
-		)),
+		count(*) FILTER (WHERE enabled AND announcements_enabled),
 		count(*) FILTER (WHERE enabled AND last_seen_at >= $1::timestamptz - interval '24 hours'),
 		count(*) FILTER (WHERE enabled AND last_seen_at >= $1::timestamptz - interval '7 days')
 		FROM mobile_push_devices`, now).Scan(
@@ -984,6 +978,22 @@ func (s *timescaleMobilePushStore) ClaimDueCampaigns(ctx context.Context, now ti
 	return claimed, nil
 }
 
+func (s *timescaleMobilePushStore) EnsureGameEventCampaigns(ctx context.Context, now time.Time) error {
+	for _, campaign := range gameEventCampaigns(now) {
+		_, err := s.pool.Exec(ctx, `
+			INSERT INTO admin_notification_campaigns (
+				campaign_key, title, body, platforms, status, trigger_type,
+				send_at, send_time, created_by
+			) VALUES ($1, $2, $3, $4, 'scheduled', 'manual', $5, NULL, 'tracking-calendar')
+			ON CONFLICT (campaign_key) DO NOTHING
+		`, campaign.Key, campaign.Title, campaign.Body, campaign.Platforms, campaign.SendAt)
+		if err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
 func (s *timescaleMobilePushStore) RecordCampaignDelivery(ctx context.Context, campaign models.NotificationCampaign, now time.Time, eligible, sent, skipped int, status string) error {
 	_, err := s.pool.Exec(ctx, `INSERT INTO admin_campaign_delivery_attempts
 		(campaign_id, scheduled_for, eligible_count, sent_count, skipped_count, status, attempted_at)
@@ -1094,27 +1104,26 @@ func (s *timescaleMobilePushStore) PublicPosts(ctx context.Context, now time.Tim
 	return out, rows.Err()
 }
 
-func (s *timescaleMobilePushStore) DevicesForPlatforms(ctx context.Context, platforms []string, locales []string) ([]models.PushDevice, error) {
+func (s *timescaleMobilePushStore) DevicesForPlatforms(ctx context.Context, platforms []string, locales []string, preference string) ([]models.PushDevice, error) {
 	locales = normalizeCampaignLocales(locales)
 	rows, err := s.pool.Query(ctx, `
 		SELECT d.user_id, d.device_id, d.platform, d.provider, d.environment, d.token_ciphertext,
-			lower(split_part(replace(coalesce(nullif(p.locale, ''), nullif(d.locale, ''), 'en'), '_', '-'), '-', 1))
+			lower(split_part(replace(coalesce(nullif(d.locale, ''), 'en'), '_', '-'), '-', 1))
 		FROM mobile_push_devices d
-		JOIN mobile_notification_preferences p
-		  ON p.user_id = d.user_id
-		 AND p.device_id = d.device_id
-		 AND p.environment = d.environment
 		WHERE d.enabled = true
 		  AND d.environment = 'production'
 		  AND d.authorization_status IN ('authorized', 'provisional')
 		  AND d.platform = ANY($1)
-		  AND p.enabled = true
-		  AND 'announcements' = ANY(p.enabled_types)
+		  AND CASE $3
+			WHEN 'monthly_support' THEN d.monthly_support_enabled
+			WHEN 'events' THEN d.events_enabled
+			ELSE d.announcements_enabled
+		  END
 		  AND (
 			cardinality($2::text[]) = 0
-			OR lower(split_part(replace(coalesce(nullif(p.locale, ''), nullif(d.locale, ''), ''), '_', '-'), '-', 1)) = ANY($2)
+			OR lower(split_part(replace(coalesce(nullif(d.locale, ''), ''), '_', '-'), '-', 1)) = ANY($2)
 		  )
-	`, platforms, locales)
+	`, platforms, locales, preference)
 	if err != nil {
 		return nil, err
 	}
@@ -1139,18 +1148,13 @@ func (s *timescaleMobilePushStore) AudienceCount(ctx context.Context, platforms 
 	err := s.pool.QueryRow(ctx, `
 		SELECT count(*)
 		FROM mobile_push_devices d
-		JOIN mobile_notification_preferences p
-		  ON p.user_id = d.user_id
-		 AND p.device_id = d.device_id
-		 AND p.environment = d.environment
 		WHERE d.enabled = true
 		  AND d.authorization_status IN ('authorized', 'provisional')
 		  AND d.platform = ANY($1)
-		  AND p.enabled = true
-		  AND 'announcements' = ANY(p.enabled_types)
+		  AND d.announcements_enabled = true
 		  AND (
 			cardinality($2::text[]) = 0
-			OR lower(split_part(replace(coalesce(nullif(p.locale, ''), nullif(d.locale, ''), ''), '_', '-'), '-', 1)) = ANY($2)
+			OR lower(split_part(replace(coalesce(nullif(d.locale, ''), ''), '_', '-'), '-', 1)) = ANY($2)
 		  )
 	`, platforms, locales).Scan(&count)
 	return count, err
@@ -1560,8 +1564,12 @@ func (s *memoryMobilePushStore) PublicPosts(_ context.Context, now time.Time) ([
 	return out, nil
 }
 
-func (s *memoryMobilePushStore) DevicesForPlatforms(context.Context, []string, []string) ([]models.PushDevice, error) {
+func (s *memoryMobilePushStore) DevicesForPlatforms(context.Context, []string, []string, string) ([]models.PushDevice, error) {
 	return nil, nil
+}
+
+func (s *memoryMobilePushStore) EnsureGameEventCampaigns(context.Context, time.Time) error {
+	return nil
 }
 
 func (s *memoryMobilePushStore) AudienceCount(context.Context, []string, []string) (int, error) {

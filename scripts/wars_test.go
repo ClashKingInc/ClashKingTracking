@@ -37,21 +37,17 @@ func TestWarQueueRejectsIncompleteStoreWork(t *testing.T) {
 	}
 }
 
-func TestWarR2Key(t *testing.T) {
-	if got, want := warR2Key("018f4ad0-26c7-7b0d-9a4c-5b6c7d8e9f01"), "018f4ad0-26c7-7b0d-9a4c-5b6c7d8e9f01"; got != want {
-		t.Fatalf("warR2Key = %q, want %q", got, want)
-	}
-}
-
 func TestWarTargetsSQLOnlyUsesPublicWarLogs(t *testing.T) {
-	if !strings.Contains(warTargetsSQL, "public_war_log = true") {
-		t.Fatalf("war target query should require public war logs: %s", warTargetsSQL)
-	}
-	if strings.Contains(warTargetsSQL, "last_active") {
-		t.Fatalf("war target query should not include activity fallback: %s", warTargetsSQL)
-	}
-	if !strings.Contains(warTargetsSQL, "NOT EXISTS") || !strings.Contains(warTargetsSQL, "war_schedule") {
-		t.Fatalf("war target query should skip scheduled in-war clans: %s", warTargetsSQL)
+	for name, query := range map[string]string{"active": activeWarTargetsSQL, "dormant": dormantWarTargetsSQL} {
+		if !strings.Contains(query, "public_war_log = true") {
+			t.Fatalf("%s war target query should require public war logs: %s", name, query)
+		}
+		if strings.Contains(query, "last_active") {
+			t.Fatalf("%s war target query should not include activity fallback: %s", name, query)
+		}
+		if !strings.Contains(query, "30 days") || !strings.Contains(query, "NOT EXISTS") || !strings.Contains(query, "war_schedule") {
+			t.Fatalf("%s war target query should tier by recent war and skip scheduled clans: %s", name, query)
+		}
 	}
 }
 
@@ -66,69 +62,69 @@ func TestBuildWarIngestSchedulesActiveWar(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if len(ingest.IndexRows) != 0 || len(ingest.AttackRows) != 0 || len(ingest.Players) != 0 {
+	if len(ingest.IndexRows) != 0 || len(ingest.AttackRows) != 0 {
 		t.Fatalf("active war should only schedule final store: %#v", ingest)
 	}
 	if len(ingest.Schedules) != 1 || ingest.Schedules[0].ScheduleKey == "" || ingest.Schedules[0].WarID == "" || !ingest.Schedules[0].NextRunAt.Equal(end) {
 		t.Fatalf("unexpected schedule: %#v", ingest.Schedules)
 	}
-	if got := ingest.CurrentWarTimers; len(got) != 2 || got[0].PlayerTag != "#P1" || got[0].ClanTag != "#AAA" || got[0].OpponentTag != "#BBB" || got[1].PlayerTag != "#P2" || got[1].ClanTag != "#BBB" || got[1].OpponentTag != "#AAA" || got[0].WarID != ingest.Schedules[0].WarID || !got[0].EndTime.Equal(end) {
-		t.Fatalf("unexpected current war timers: %#v", got)
+	if got := ingest.PlayerTimers; len(got) != 2 || got[0].PlayerTag != "#P1" || got[1].PlayerTag != "#P2" || got[0].EventType != "war" || got[0].EventKey != ingest.Schedules[0].ScheduleKey || !got[0].ExpiresAt.Equal(end) {
+		t.Fatalf("unexpected player timers: %#v", got)
 	}
 }
 
-func TestMemoryWarStoreCurrentWarTimerConflictReplacesPriorWar(t *testing.T) {
+func TestMemoryWarStoreRetainsMultipleWarsForPlayer(t *testing.T) {
 	store := newMemoryWarStore()
 	now := time.Now().UTC()
-	for _, row := range []models.CurrentWarTimerRow{
-		{PlayerTag: "#P1", WarID: "war-one", ClanTag: "#AAA", OpponentTag: "#BBB", EndTime: now.Add(time.Hour)},
-		{PlayerTag: "#P1", WarID: "war-two", ClanTag: "#CCC", OpponentTag: "#DDD", EndTime: now.Add(2 * time.Hour)},
+	for _, row := range []models.PlayerTimerRow{
+		{PlayerTag: "#P1", EventType: "war", EventKey: "war-one", ExpiresAt: now.Add(time.Hour)},
+		{PlayerTag: "#P1", EventType: "war", EventKey: "war-two", ExpiresAt: now.Add(2 * time.Hour)},
 	} {
-		if err := store.Store(context.Background(), models.WarIngest{CurrentWarTimers: []models.CurrentWarTimerRow{row}}); err != nil {
+		if err := store.Store(context.Background(), models.WarIngest{PlayerTimers: []models.PlayerTimerRow{row}}); err != nil {
 			t.Fatal(err)
 		}
 	}
-	got, ok, err := store.LoadActiveCurrentWarTimer(context.Background(), "#P1")
-	if err != nil || !ok || got.WarID != "war-two" || got.ClanTag != "#CCC" || got.OpponentTag != "#DDD" {
-		t.Fatalf("replacement = %#v, %v, %v", got, ok, err)
+	got, err := store.LoadActivePlayerTimers(context.Background(), "#P1")
+	if err != nil || len(got) != 2 {
+		t.Fatalf("timers = %#v, %v", got, err)
 	}
 }
 
-func TestCurrentWarTimerCleanupAndActiveReads(t *testing.T) {
-	if currentWarTimerCleanupInterval != 5*time.Minute {
-		t.Fatalf("cleanup interval = %s", currentWarTimerCleanupInterval)
+func TestPlayerTimerCleanupAndActiveReads(t *testing.T) {
+	if playerTimerCleanupInterval != 5*time.Minute {
+		t.Fatalf("cleanup interval = %s", playerTimerCleanupInterval)
 	}
-	if !strings.Contains(deleteExpiredCurrentWarTimersSQL, "end_time <= now()") || !strings.Contains(loadActiveCurrentWarTimerSQL, "end_time > now()") {
-		t.Fatalf("timer SQL must clean expired and read active only: cleanup=%s read=%s", deleteExpiredCurrentWarTimersSQL, loadActiveCurrentWarTimerSQL)
+	if !strings.Contains(deleteExpiredPlayerTimersSQL, "expires_at <= now()") || !strings.Contains(loadActivePlayerTimersSQL, "expires_at > now()") {
+		t.Fatalf("timer SQL must clean expired and read active only: cleanup=%s read=%s", deleteExpiredPlayerTimersSQL, loadActivePlayerTimersSQL)
 	}
 	store := newMemoryWarStore()
 	now := time.Now().UTC()
-	err := store.Store(context.Background(), models.WarIngest{CurrentWarTimers: []models.CurrentWarTimerRow{
-		{PlayerTag: "#EXPIRED", WarID: "war-old", ClanTag: "#AAA", OpponentTag: "#BBB", EndTime: now.Add(-time.Second)},
-		{PlayerTag: "#ACTIVE", WarID: "war-live", ClanTag: "#AAA", OpponentTag: "#BBB", EndTime: now.Add(time.Hour)},
+	err := store.Store(context.Background(), models.WarIngest{PlayerTimers: []models.PlayerTimerRow{
+		{PlayerTag: "#EXPIRED", EventType: "war", EventKey: "war-old", ExpiresAt: now.Add(-time.Second)},
+		{PlayerTag: "#ACTIVE", EventType: "war", EventKey: "war-live", ExpiresAt: now.Add(time.Hour)},
 	}})
 	if err != nil {
 		t.Fatal(err)
 	}
-	if _, ok, err := store.LoadActiveCurrentWarTimer(context.Background(), "#EXPIRED"); err != nil || ok {
-		t.Fatalf("expired read = ok:%v err:%v", ok, err)
+	if got, err := store.LoadActivePlayerTimers(context.Background(), "#EXPIRED"); err != nil || len(got) != 0 {
+		t.Fatalf("expired read = %#v err:%v", got, err)
 	}
-	if got, ok, err := store.LoadActiveCurrentWarTimer(context.Background(), "#ACTIVE"); err != nil || !ok || got.WarID != "war-live" {
-		t.Fatalf("active read = %#v ok:%v err:%v", got, ok, err)
+	if got, err := store.LoadActivePlayerTimers(context.Background(), "#ACTIVE"); err != nil || len(got) != 1 || got[0].EventKey != "war-live" {
+		t.Fatalf("active read = %#v err:%v", got, err)
 	}
-	deleted, err := store.DeleteExpiredCurrentWarTimers(context.Background())
+	deleted, err := store.DeleteExpiredPlayerTimers(context.Background())
 	if err != nil || deleted != 1 {
 		t.Fatalf("cleanup = %d, %v", deleted, err)
 	}
 }
 
-func TestCurrentWarTimerBulkUpsertSQL(t *testing.T) {
-	if !strings.Contains(upsertCurrentWarTimersSQL, "unnest(") || strings.Contains(upsertCurrentWarTimersSQL, "pgx.Batch") || !strings.Contains(upsertCurrentWarTimersSQL, "ON CONFLICT (player_tag)") {
-		t.Fatalf("current war timers must use one bulk upsert: %s", upsertCurrentWarTimersSQL)
+func TestPlayerTimerBulkUpsertSQL(t *testing.T) {
+	if !strings.Contains(upsertPlayerTimersSQL, "unnest(") || strings.Contains(upsertPlayerTimersSQL, "pgx.Batch") || !strings.Contains(upsertPlayerTimersSQL, "ON CONFLICT (player_tag, event_type, event_key)") {
+		t.Fatalf("player timers must use one bulk upsert: %s", upsertPlayerTimersSQL)
 	}
 }
 
-func TestBuildWarIngestFinishedAddsR2Payload(t *testing.T) {
+func TestBuildWarIngestFinishedAddsPermanentRows(t *testing.T) {
 	prep := time.Date(2026, 5, 24, 1, 0, 0, 0, time.UTC)
 	war := sampleWar(prep, prep.Add(time.Hour), prep.Add(2*time.Hour))
 
@@ -139,8 +135,8 @@ func TestBuildWarIngestFinishedAddsR2Payload(t *testing.T) {
 	if len(ingest.Schedules) != 0 {
 		t.Fatalf("finished ingest should not reschedule: %#v", ingest.Schedules)
 	}
-	if ingest.FinishedScheduleKey != "#AAA-#BBB-1" || ingest.FinishedWarID != "018f4ad0-26c7-7b0d-9a4c-5b6c7d8e9f01" || len(ingest.RawWarJSON) == 0 {
-		t.Fatalf("missing finished object fields: %#v", ingest)
+	if ingest.FinishedScheduleKey != "#AAA-#BBB-1" || ingest.FinishedWarID != "018f4ad0-26c7-7b0d-9a4c-5b6c7d8e9f01" {
+		t.Fatalf("missing finished-war fields: %#v", ingest)
 	}
 	if len(ingest.IndexRows) != 1 {
 		t.Fatalf("IndexRows len = %d, want 1", len(ingest.IndexRows))
@@ -234,6 +230,7 @@ func TestCWLGroupRowUsesFinalTypedSnapshotShape(t *testing.T) {
 }
 
 func TestCWLGroupWritesUseFinalSchemaWithoutStandings(t *testing.T) {
+	writeSQL := upsertCWLGroupsSQLShape + upsertCWLGroupClansSQL + upsertCWLGroupMembersSQL + deleteStaleCWLGroupMembersSQL
 	for _, fragment := range []string{
 		"cwl_id, season, cwl_league_id, state, war_size, rounds",
 		"cwl_group_clans (cwl_id, clan_tag, name, clan_level, badge_token)",
@@ -243,13 +240,12 @@ func TestCWLGroupWritesUseFinalSchemaWithoutStandings(t *testing.T) {
 		"AND clan_tag = $2",
 		"NOT (tag = ANY($3::text[]))",
 	} {
-		writeSQL := upsertCWLGroupsSQLShape + upsertCWLGroupClansSQL + upsertCWLGroupMembersSQL + deleteStaleCWLGroupMembersSQL
 		if !strings.Contains(writeSQL, fragment) {
 			t.Fatalf("final CWL write contract missing %q", fragment)
 		}
 	}
-	if !strings.Contains(loadCWLGroupMemberSourcesSQL, "FOR SHARE") {
-		t.Fatal("source roster must be locked for the transactional member replacement")
+	if strings.Contains(writeSQL, "basic_clan") {
+		t.Fatal("CWL master rosters must come from the official group response")
 	}
 	if strings.Contains(upsertCWLGroupClansSQL, "members)") {
 		t.Fatal("cwl_group_clans must not retain a members JSONB column")
@@ -275,10 +271,14 @@ func TestBasicClanMemberSnapshotIncludesTownHall(t *testing.T) {
 func TestCWLGroupClanBadgeIsTokenOnly(t *testing.T) {
 	group := &clashy.ClanWarLeagueGroup{Clans: []clashy.ClanWarLeagueClan{{
 		Tag: "#AAA", Badge: clashy.Badge{Medium: "https://api-assets.clashofclans.com/badges/200/example-token.png"},
+		Members: []clashy.ClanWarLeagueClanMember{{Tag: "#P1", Name: "One", TownHallLevel: 17}},
 	}}}
 	rows := cwlGroupClanRows(group)
 	if len(rows) != 1 || rows[0].BadgeToken != "example-token" {
 		t.Fatalf("badge snapshot = %#v", rows)
+	}
+	if len(rows[0].Members) != 1 || rows[0].Members[0].Tag != "#P1" || rows[0].Members[0].TownHall != 17 {
+		t.Fatalf("master roster snapshot = %#v", rows[0].Members)
 	}
 }
 
@@ -306,10 +306,10 @@ func TestMemoryWarStoreShiftMaintenance(t *testing.T) {
 				PrepTime: now.Add(-2 * time.Hour), EndTime: now.Add(-time.Hour), NextRunAt: now.Add(-time.Hour),
 			},
 		},
-		CurrentWarTimers: []models.CurrentWarTimerRow{
-			{PlayerTag: "#P1", WarID: "war-live", ClanTag: "#A", OpponentTag: "#B", EndTime: now.Add(time.Hour)},
-			{PlayerTag: "#P2", WarID: "war-live", ClanTag: "#B", OpponentTag: "#A", EndTime: now.Add(time.Hour)},
-			{PlayerTag: "#P3", WarID: "war-expired", ClanTag: "#C", OpponentTag: "#D", EndTime: now.Add(-time.Hour)},
+		PlayerTimers: []models.PlayerTimerRow{
+			{PlayerTag: "#P1", EventType: "war", EventKey: "#A-#B-1", ExpiresAt: now.Add(time.Hour)},
+			{PlayerTag: "#P2", EventType: "war", EventKey: "#A-#B-1", ExpiresAt: now.Add(time.Hour)},
+			{PlayerTag: "#P3", EventType: "war", EventKey: "#C-#D-1", ExpiresAt: now.Add(-time.Hour)},
 		},
 	})
 	if err != nil {
@@ -325,50 +325,40 @@ func TestMemoryWarStoreShiftMaintenance(t *testing.T) {
 	if got := store.schedules["#C-#D-1"].EndTime; !got.Equal(now.Add(-time.Hour)) {
 		t.Fatalf("expired schedule shifted = %s", got)
 	}
-	if got := store.currentWarTimers["#P1"].EndTime; !got.Equal(now.Add(time.Hour + 2*time.Minute)) {
+	if got := store.playerTimers["#P1|war|#A-#B-1"].ExpiresAt; !got.Equal(now.Add(time.Hour + 2*time.Minute)) {
 		t.Fatalf("live timer shifted = %s", got)
 	}
-	if got := store.currentWarTimers["#P2"].EndTime; !got.Equal(now.Add(time.Hour + 2*time.Minute)) {
+	if got := store.playerTimers["#P2|war|#A-#B-1"].ExpiresAt; !got.Equal(now.Add(time.Hour + 2*time.Minute)) {
 		t.Fatalf("second participant shifted = %s", got)
 	}
-	if got := store.currentWarTimers["#P3"].EndTime; !got.Equal(now.Add(-time.Hour)) {
+	if got := store.playerTimers["#P3|war|#C-#D-1"].ExpiresAt; !got.Equal(now.Add(-time.Hour)) {
 		t.Fatalf("expired timer shifted = %s", got)
 	}
 }
 
-func TestOfficialMaintenance500Only(t *testing.T) {
-	maintenance500 := &clashy.GatewayError{HTTPException: &clashy.HTTPException{Status: 500}}
-	if !isOfficialMaintenance500(maintenance500) {
-		t.Fatal("official HTTP 500 must start maintenance")
+func TestOfficialMaintenanceClassification(t *testing.T) {
+	maintenance500 := &clashy.GatewayError{HTTPException: &clashy.HTTPException{Status: 500, Message: "Game maintenance"}}
+	if !isOfficialMaintenance(maintenance500) {
+		t.Fatal("official maintenance response must start maintenance")
+	}
+	if !isOfficialMaintenance(&clashy.Maintenance{HTTPException: &clashy.HTTPException{Status: 503}}) {
+		t.Fatal("typed maintenance response must start maintenance")
 	}
 	for _, err := range []error{
 		&clashy.GatewayError{HTTPException: &clashy.HTTPException{Status: 502}},
-		&clashy.Maintenance{HTTPException: &clashy.HTTPException{Status: 503}},
+		&clashy.GatewayError{HTTPException: &clashy.HTTPException{Status: 500, Message: "proxy error"}},
 		&clashy.Forbidden{HTTPException: &clashy.HTTPException{Status: 403}},
 		errors.New("transport failure"),
 	} {
-		if isOfficialMaintenance500(err) {
-			t.Fatalf("non-500 error started maintenance: %v", err)
+		if isOfficialMaintenance(err) {
+			t.Fatalf("non-maintenance error started maintenance: %v", err)
 		}
-	}
-}
-
-func TestMaintenanceShiftDuration(t *testing.T) {
-	start := time.Date(2026, 7, 24, 12, 0, 0, 0, time.UTC)
-	if got, ok := maintenanceShiftDuration(start, start.Add(37*time.Second)); !ok || got != 37*time.Second {
-		t.Fatalf("duration = %s, %v", got, ok)
-	}
-	if got, ok := maintenanceShiftDuration(start, start); ok || got != 0 {
-		t.Fatalf("zero duration = %s, %v", got, ok)
-	}
-	if got, ok := maintenanceShiftDuration(time.Time{}, start); ok || got != 0 {
-		t.Fatalf("missing start = %s, %v", got, ok)
 	}
 }
 
 func TestShiftActiveWarMaintenanceSQLScopesSchedulesAndTimers(t *testing.T) {
 	for _, fragment := range []string{
-		"WITH shifted_wars", "WHERE end_time > now()", "RETURNING war_id", "timer.end_time > now()", "timer.war_id IN",
+		"WITH shifted_wars", "WHERE end_time > now()", "RETURNING schedule_key", "timer.expires_at > now()", "timer.event_key IN",
 	} {
 		if !strings.Contains(shiftActiveWarMaintenanceSQL, fragment) {
 			t.Fatalf("maintenance SQL missing %q: %s", fragment, shiftActiveWarMaintenanceSQL)

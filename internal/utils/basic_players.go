@@ -28,7 +28,7 @@ const UpsertBasicPlayerSQL = `
 `
 
 // UpsertBasicPlayers is shared by ingesters that learn basic player facts
-// incidentally while processing clan, battlelog, bot-player, or war data.
+// while processing player, clan, battlelog, leaderboard, or scheduled data.
 func UpsertBasicPlayers(ctx context.Context, tx pgx.Tx, players []models.BasicPlayerRow, domain string) error {
 	_, err := UpsertBasicPlayersCount(ctx, tx, players, domain)
 	return err

@@ -1,22 +1,19 @@
 package scripts
 
 import (
-	"bytes"
 	"context"
-	"crypto/aes"
-	"crypto/cipher"
-	"crypto/sha256"
-	"encoding/base64"
 	"encoding/json"
 	"errors"
 	"fmt"
 	"log/slog"
-	"net/http"
 	"strings"
 	"time"
 
 	"clashking_tracking/internal/platform"
+	"clashking_tracking/internal/utils"
+	"clashking_tracking/models"
 
+	clashy "github.com/clashkinginc/clashy.go"
 	"github.com/jackc/pgx/v5/pgxpool"
 	valkey "github.com/valkey-io/valkey-go"
 )
@@ -36,7 +33,6 @@ type mobileSubscription struct {
 	WarStartEnabled    bool
 	ScoreChangeEnabled bool
 	WarEndEnabled      bool
-	CWLRankEnabled     bool
 }
 
 type mobileWarEvent struct {
@@ -60,7 +56,7 @@ func (d *mobileEventsDomain) Run(ctx context.Context, app *platform.App) error {
 		client: app.Valkey,
 		cfg:    app.Config,
 		pool:   pool,
-		http:   &http.Client{Timeout: 15 * time.Second},
+		app:    app,
 		logger: app.Logger,
 	}
 	if err := worker.ensureGroup(ctx); err != nil {
@@ -100,23 +96,13 @@ func validateMobileEventsConfig(cfg platform.Config, client valkey.Client) error
 		return errors.New("events.reclaim_idle_seconds must be greater than zero for mobilepush")
 	}
 	if cfg.TimescaleURL == "" {
-		return errors.New("TIMESCALE_URL is required for mobilepush")
+		return errors.New("TIMESCALE_* connection variables are required for mobilepush")
 	}
-	hasAPNSToken := cfg.MobilePushAPNSBearerToken != ""
-	hasAPNSBundle := cfg.MobilePushAPNSBundleID != ""
-	if hasAPNSToken != hasAPNSBundle {
-		return errors.New("both MOBILE_PUSH_APNS_BEARER_TOKEN and MOBILE_PUSH_APNS_BUNDLE_ID are required for APNS")
-	}
-	hasFCMToken := cfg.MobilePushFCMBearerToken != ""
-	hasFCMProject := cfg.MobilePushFCMProjectID != ""
-	if hasFCMToken != hasFCMProject {
-		return errors.New("both MOBILE_PUSH_FCM_BEARER_TOKEN and MOBILE_PUSH_FCM_PROJECT_ID are required for FCM")
-	}
-	if !hasAPNSToken && !hasFCMToken {
-		return errors.New("APNS or FCM credentials are required for mobilepush")
+	if cfg.MobilePushFCMProjectID == "" {
+		return errors.New("MOBILE_PUSH_FCM_PROJECT_ID is required for mobilepush")
 	}
 	if cfg.MobilePushTokenKey == "" {
-		return errors.New("MOBILE_PUSH_TOKEN_KEY or ENCRYPTION_KEY is required for mobilepush delivery")
+		return errors.New("DATA_ENCRYPTION_KEY is required for mobilepush delivery")
 	}
 	return nil
 }
@@ -125,7 +111,7 @@ type mobileEventsWorker struct {
 	client valkey.Client
 	cfg    platform.Config
 	pool   *pgxpool.Pool
-	http   *http.Client
+	app    *platform.App
 	logger *slog.Logger
 }
 
@@ -237,7 +223,17 @@ func (w *mobileEventsWorker) ack(ctx context.Context, id string) error {
 }
 
 func (w *mobileEventsWorker) processEvent(ctx context.Context, event mobileWarEvent) error {
-	subscriptions, err := w.subscriptions(ctx, event.ClanTag)
+	if event.Topic == "reminder" {
+		switch stringValue(event.Value["type"]) {
+		case "war":
+			return w.processWarReminder(ctx, event)
+		case "raid_mobile":
+			return w.processRaidReminder(ctx, event)
+		default:
+			return nil
+		}
+	}
+	subscriptions, err := w.subscriptions(ctx, event.ClanTag, event.Topic)
 	if err != nil {
 		return err
 	}
@@ -246,39 +242,242 @@ func (w *mobileEventsWorker) processEvent(ctx context.Context, event mobileWarEv
 		if !subscriptionWantsEvent(sub, event) {
 			continue
 		}
-		token := decodeMobileToken(sub.TokenCiphertext, w.cfg.MobilePushTokenKey)
-		if token == "" {
+		token, err := utils.DecryptSecret(sub.TokenCiphertext, w.cfg.MobilePushTokenKey)
+		if err != nil || token == "" {
+			w.logDeliveryError("mobile FCM token decrypt failed", "clan_tag", event.ClanTag, "err", err)
 			continue
 		}
-		switch sub.Provider {
-		case "apns":
-			if err := w.sendAPNSNotification(ctx, sub.Environment, token, title, body); err != nil {
-				w.logDeliveryError("mobile APNS delivery failed", "clan_tag", event.ClanTag, "err", err)
-			}
-		case "fcm":
-			if err := w.sendFCMNotification(ctx, token, title, body); err != nil {
-				w.logDeliveryError("mobile FCM delivery failed", "clan_tag", event.ClanTag, "err", err)
-			}
+		if sub.Provider != "fcm" {
+			continue
+		}
+		if err := sendFCM(ctx, w.app, token, pushMessage{Title: title, Body: body, Data: map[string]string{"type": mobileNotificationRouteType(event), "target_tag": event.ClanTag}}); err != nil {
+			w.logDeliveryError("mobile FCM delivery failed", "clan_tag", event.ClanTag, "err", err)
 		}
 	}
 	return nil
 }
 
+func stringValue(value any) string { valueString, _ := value.(string); return valueString }
+
+func (w *mobileEventsWorker) processWarReminder(ctx context.Context, event mobileWarEvent) error {
+	raw, _ := event.Value["data"].(string)
+	minutes := intNumber(event.Value["minutes_remaining"])
+	if raw == "" || minutes <= 0 {
+		return nil
+	}
+	var war clashy.ClanWar
+	if err := json.Unmarshal([]byte(raw), &war); err != nil {
+		return err
+	}
+	attacksPerMember := 2
+	if war.WarTag != "" {
+		attacksPerMember = 1
+	}
+	type remainingAccount struct {
+		name      string
+		remaining int
+	}
+	remaining := map[string]remainingAccount{}
+	for _, side := range []*clashy.WarClan{war.Clan, war.Opponent} {
+		if side == nil {
+			continue
+		}
+		for _, member := range side.Members {
+			unused := attacksPerMember - len(member.Attacks)
+			if unused > 0 {
+				remaining[member.Tag] = remainingAccount{name: member.Name, remaining: unused}
+			}
+		}
+	}
+	if len(remaining) == 0 {
+		return nil
+	}
+	tags := make([]string, 0, len(remaining))
+	for tag := range remaining {
+		tags = append(tags, tag)
+	}
+	rows, err := w.pool.Query(ctx, `
+		SELECT account.user_id, account.player_tag, device.device_id,
+		       device.platform, device.provider, device.environment,
+		       device.token_ciphertext, device.locale
+		FROM mobile_notification_accounts account
+		JOIN mobile_push_devices device
+		  ON device.user_id = account.user_id
+		 AND device.enabled = true
+		 AND device.provider = 'fcm'
+		 AND device.war_reminders_enabled = true
+		 AND $2 = ANY(device.reminder_timings)
+		WHERE account.active = true
+		  AND account.source = 'verified'
+		  AND account.player_tag = ANY($1)
+	`, tags, minutes)
+	if err != nil {
+		return err
+	}
+	type recipient struct {
+		userID    string
+		remaining int
+		devices   map[string]models.PushDevice
+		players   map[string]struct{}
+	}
+	recipients := map[string]*recipient{}
+	for rows.Next() {
+		var userID, playerTag string
+		var device models.PushDevice
+		if err := rows.Scan(&userID, &playerTag, &device.DeviceID, &device.Platform,
+			&device.Provider, &device.Environment, &device.TokenCiphertext, &device.Locale); err != nil {
+			rows.Close()
+			return err
+		}
+		device.UserID = userID
+		if recipients[userID] == nil {
+			recipients[userID] = &recipient{userID: userID, devices: make(map[string]models.PushDevice), players: make(map[string]struct{})}
+		}
+		if _, counted := recipients[userID].players[playerTag]; !counted {
+			recipients[userID].remaining += remaining[playerTag].remaining
+			recipients[userID].players[playerTag] = struct{}{}
+		}
+		deviceKey := device.DeviceID + "\x00" + device.Environment
+		recipients[userID].devices[deviceKey] = device
+	}
+	rows.Close()
+	if err := rows.Err(); err != nil {
+		return err
+	}
+	warID := war.WarTag
+	if warID == "" && war.PreparationStartTime != nil {
+		warID = war.PreparationStartTime.RawTime
+	}
+	if warID == "" {
+		warID = event.ClanTag + ":" + raw
+	}
+	for _, recipient := range recipients {
+		if recipient.remaining <= 0 {
+			continue
+		}
+		deliveryKey := fmt.Sprintf("war_reminder:%s:%s:%d", warID, recipient.userID, minutes)
+		result, err := w.pool.Exec(ctx, `
+			INSERT INTO mobile_notification_deliveries (user_id, notification_key)
+			VALUES ($1, $2)
+			ON CONFLICT DO NOTHING
+		`, recipient.userID, deliveryKey)
+		if err != nil {
+			return err
+		}
+		if result.RowsAffected() == 0 {
+			continue
+		}
+		devices := make([]models.PushDevice, 0, len(recipient.devices))
+		for _, device := range recipient.devices {
+			devices = append(devices, device)
+		}
+		sent, _ := sendPushToDevices(ctx, w.app, devices, pushMessage{
+			Title: "War attacks remaining",
+			Body:  fmt.Sprintf("%s & %d attacks left in war!", formatReminderTime(minutes), recipient.remaining),
+			Data:  map[string]string{"type": "war_reminder", "target_tag": event.ClanTag},
+		})
+		if sent == 0 {
+			_, _ = w.pool.Exec(ctx, `DELETE FROM mobile_notification_deliveries WHERE user_id = $1 AND notification_key = $2`, recipient.userID, deliveryKey)
+		}
+	}
+	return nil
+}
+
+func (w *mobileEventsWorker) processRaidReminder(ctx context.Context, event mobileWarEvent) error {
+	userID := stringValue(event.Value["user_id"])
+	minutes := intNumber(event.Value["minutes_remaining"])
+	remaining := intNumber(event.Value["remaining_attacks"])
+	if userID == "" || minutes <= 0 || remaining <= 0 {
+		return nil
+	}
+	deliveryKey := fmt.Sprintf("raid_reminder:%s:%s:%d", stringValue(event.Value["raid_end"]), userID, minutes)
+	result, err := w.pool.Exec(ctx, `
+		INSERT INTO mobile_notification_deliveries (user_id, notification_key)
+		VALUES ($1, $2)
+		ON CONFLICT DO NOTHING
+	`, userID, deliveryKey)
+	if err != nil || result.RowsAffected() == 0 {
+		return err
+	}
+	rows, err := w.pool.Query(ctx, `
+		SELECT device_id, platform, provider, environment, token_ciphertext, locale
+		FROM mobile_push_devices
+		WHERE user_id = $1 AND enabled = true AND provider = 'fcm'
+		  AND raid_reminders_enabled = true
+		  AND $2 = ANY(raid_reminder_timings)
+	`, userID, minutes)
+	if err != nil {
+		return err
+	}
+	var devices []models.PushDevice
+	for rows.Next() {
+		var device models.PushDevice
+		device.UserID = userID
+		if err := rows.Scan(&device.DeviceID, &device.Platform, &device.Provider, &device.Environment,
+			&device.TokenCiphertext, &device.Locale); err != nil {
+			rows.Close()
+			return err
+		}
+		devices = append(devices, device)
+	}
+	rows.Close()
+	sent, _ := sendPushToDevices(ctx, w.app, devices, pushMessage{
+		Title: "Raid attacks remaining",
+		Body:  fmt.Sprintf("%s & %d attacks left in Raid Weekend!", formatReminderTime(minutes), remaining),
+		Data:  map[string]string{"type": "raid_reminder", "target_tag": event.ClanTag},
+	})
+	if sent == 0 {
+		_, _ = w.pool.Exec(ctx, `DELETE FROM mobile_notification_deliveries WHERE user_id = $1 AND notification_key = $2`, userID, deliveryKey)
+	}
+	return nil
+}
+
+func intNumber(value any) int {
+	switch typed := value.(type) {
+	case float64:
+		return int(typed)
+	case int:
+		return typed
+	case json.Number:
+		result, _ := typed.Int64()
+		return int(result)
+	default:
+		return 0
+	}
+}
+
+func formatReminderTime(minutes int) string {
+	if minutes%60 == 0 {
+		hours := minutes / 60
+		if hours == 1 {
+			return "1 hour"
+		}
+		return fmt.Sprintf("%d hours", hours)
+	}
+	return fmt.Sprintf("%d minutes", minutes)
+}
+
 const mobileSubscriptionsSQL = `
-	SELECT d.provider, d.environment, d.token_ciphertext,
-	       s.war_start_enabled, s.score_change_enabled, s.war_end_enabled,
-	       s.cwl_rank_enabled
-	FROM mobile_war_subscriptions s
+	SELECT DISTINCT d.provider, d.environment, d.token_ciphertext,
+	       d.war_state_enabled, d.war_attacks_enabled, d.war_state_enabled
+	FROM mobile_notification_accounts account
 	JOIN mobile_push_devices d
-	  ON d.user_id = s.user_id
-	 AND d.device_id = s.device_id
+	  ON d.user_id = account.user_id
 	 AND d.enabled = true
-	WHERE s.clan_tag = $1
-	  AND s.enabled = true
+	 AND d.provider = 'fcm'
+	JOIN player_timers timer
+	  ON timer.player_tag = account.player_tag
+	 AND timer.event_type = 'war'
+	 AND timer.expires_at > now()
+	JOIN war_schedule schedule ON schedule.schedule_key = timer.event_key
+	WHERE account.active = true
+	  AND account.source = 'verified'
+	  AND $2 IN ('war', 'cwl')
+	  AND $1 IN (schedule.source_clan_tag, schedule.opponent_tag)
 `
 
-func (w *mobileEventsWorker) subscriptions(ctx context.Context, clanTag string) ([]mobileSubscription, error) {
-	rows, err := w.pool.Query(ctx, mobileSubscriptionsSQL, clanTag)
+func (w *mobileEventsWorker) subscriptions(ctx context.Context, targetTag, topic string) ([]mobileSubscription, error) {
+	rows, err := w.pool.Query(ctx, mobileSubscriptionsSQL, targetTag, topic)
 	if err != nil {
 		return nil, err
 	}
@@ -286,7 +485,7 @@ func (w *mobileEventsWorker) subscriptions(ctx context.Context, clanTag string) 
 	var out []mobileSubscription
 	for rows.Next() {
 		var sub mobileSubscription
-		if err := rows.Scan(&sub.Provider, &sub.Environment, &sub.TokenCiphertext, &sub.WarStartEnabled, &sub.ScoreChangeEnabled, &sub.WarEndEnabled, &sub.CWLRankEnabled); err != nil {
+		if err := rows.Scan(&sub.Provider, &sub.Environment, &sub.TokenCiphertext, &sub.WarStartEnabled, &sub.ScoreChangeEnabled, &sub.WarEndEnabled); err != nil {
 			return nil, err
 		}
 		out = append(out, sub)
@@ -319,6 +518,8 @@ func mobilePushEventType(event mobileWarEvent) bool {
 	switch eventType {
 	case "new_war", "new_attacks", "war_state", "cwl_war_update", "cwl_new_attacks":
 		return event.Topic == "war" || event.Topic == "cwl"
+	case "war", "raid_mobile":
+		return event.Topic == "reminder"
 	default:
 		return false
 	}
@@ -333,8 +534,10 @@ func subscriptionWantsEvent(sub mobileSubscription, event mobileWarEvent) bool {
 		return sub.ScoreChangeEnabled
 	case "war_state":
 		return sub.WarEndEnabled || sub.WarStartEnabled
-	case "cwl_war_update", "cwl_new_attacks":
-		return sub.CWLRankEnabled || sub.ScoreChangeEnabled
+	case "cwl_war_update":
+		return sub.WarStartEnabled || sub.WarEndEnabled
+	case "cwl_new_attacks":
+		return sub.ScoreChangeEnabled
 	default:
 		return false
 	}
@@ -356,105 +559,9 @@ func mobileNotificationText(event mobileWarEvent) (string, string) {
 	}
 }
 
-func (w *mobileEventsWorker) sendAPNSNotification(ctx context.Context, environment, token, title, body string) error {
-	if w.cfg.MobilePushAPNSBearerToken == "" || w.cfg.MobilePushAPNSBundleID == "" {
-		return nil
+func mobileNotificationRouteType(event mobileWarEvent) string {
+	if eventType, ok := event.Value["type"].(string); ok && eventType != "" {
+		return eventType
 	}
-	topic := w.cfg.MobilePushAPNSBundleID
-	payload := map[string]any{"aps": map[string]any{"alert": map[string]string{"title": title, "body": body}, "sound": "default"}}
-	return w.postAPNS(ctx, environment, token, topic, "alert", payload)
-}
-
-func (w *mobileEventsWorker) postAPNS(ctx context.Context, environment, token, topic, pushType string, payload map[string]any) error {
-	host := "https://api.push.apple.com"
-	if environment == "sandbox" {
-		host = "https://api.sandbox.push.apple.com"
-	}
-	body, _ := json.Marshal(payload)
-	req, err := http.NewRequestWithContext(ctx, http.MethodPost, fmt.Sprintf("%s/3/device/%s", host, token), bytes.NewReader(body))
-	if err != nil {
-		return err
-	}
-	req.Header.Set("authorization", "bearer "+w.cfg.MobilePushAPNSBearerToken)
-	req.Header.Set("apns-topic", topic)
-	req.Header.Set("apns-push-type", pushType)
-	req.Header.Set("content-type", "application/json")
-	resp, err := w.http.Do(req)
-	if err != nil {
-		return err
-	}
-	defer resp.Body.Close()
-	if resp.StatusCode >= 300 {
-		return fmt.Errorf("apns returned status %d", resp.StatusCode)
-	}
-	return nil
-}
-
-func (w *mobileEventsWorker) sendFCMNotification(ctx context.Context, token, title, body string) error {
-	if w.cfg.MobilePushFCMBearerToken == "" || w.cfg.MobilePushFCMProjectID == "" {
-		return nil
-	}
-	payload := map[string]any{
-		"message": map[string]any{
-			"token": token,
-			"notification": map[string]string{
-				"title": title,
-				"body":  body,
-			},
-		},
-	}
-	raw, _ := json.Marshal(payload)
-	url := fmt.Sprintf("https://fcm.googleapis.com/v1/projects/%s/messages:send", w.cfg.MobilePushFCMProjectID)
-	req, err := http.NewRequestWithContext(ctx, http.MethodPost, url, bytes.NewReader(raw))
-	if err != nil {
-		return err
-	}
-	req.Header.Set("authorization", "Bearer "+w.cfg.MobilePushFCMBearerToken)
-	req.Header.Set("content-type", "application/json")
-	resp, err := w.http.Do(req)
-	if err != nil {
-		return err
-	}
-	defer resp.Body.Close()
-	if resp.StatusCode >= 300 {
-		return fmt.Errorf("fcm returned status %d", resp.StatusCode)
-	}
-	return nil
-}
-
-func decodeMobileToken(ciphertext, keySource string) string {
-	if strings.HasPrefix(ciphertext, "v1:") {
-		return decryptMobileToken(strings.TrimPrefix(ciphertext, "v1:"), keySource)
-	}
-	raw, err := base64.URLEncoding.DecodeString(ciphertext)
-	if err != nil {
-		return ""
-	}
-	return string(raw)
-}
-
-func decryptMobileToken(ciphertext, keySource string) string {
-	if keySource == "" {
-		return ""
-	}
-	key := sha256.Sum256([]byte(keySource))
-	block, err := aes.NewCipher(key[:])
-	if err != nil {
-		return ""
-	}
-	gcm, err := cipher.NewGCM(block)
-	if err != nil {
-		return ""
-	}
-	raw, err := base64.RawURLEncoding.DecodeString(ciphertext)
-	if err != nil || len(raw) <= gcm.NonceSize() {
-		return ""
-	}
-	nonce := raw[:gcm.NonceSize()]
-	sealed := raw[gcm.NonceSize():]
-	out, err := gcm.Open(nil, nonce, sealed, nil)
-	if err != nil {
-		return ""
-	}
-	return string(out)
+	return "war_update"
 }

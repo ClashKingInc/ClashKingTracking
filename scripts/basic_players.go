@@ -72,7 +72,7 @@ func (d *basicPlayersDomain) Run(ctx context.Context, app *platform.App) error {
 		return errors.New("basicplayers.requests_per_second must be greater than zero when basicplayers is enabled")
 	}
 	if !app.Config.DryRun && !app.Config.MockDB && app.Config.TimescaleURL == "" {
-		return errors.New("TIMESCALE_URL is required when basicplayers is enabled")
+		return errors.New("TIMESCALE_* connection variables are required when basicplayers is enabled")
 	}
 	if app.Config.TimescaleURL != "" && !app.Config.DryRun && !app.Config.MockDB {
 		store, err := newTimescaleBasicPlayerStore(ctx, app.Config.TimescaleURL)
@@ -144,7 +144,7 @@ func (d *basicPlayersDomain) Run(ctx context.Context, app *platform.App) error {
 			continue
 		}
 		if err := runBounded(ctx, platform.RequestConcurrency(app.Config.BasicPlayerRequestsPerSecond), page.Tags, func(workerCtx context.Context, tag string) error {
-			ingest, err := retryLimitedClashFetch(workerCtx, limiter, func(fetchCtx context.Context) (basicPlayerIngest, error) {
+			ingest, err := retryLimitedClashFetch(workerCtx, app, limiter, func(fetchCtx context.Context) (basicPlayerIngest, error) {
 				return d.do(fetchCtx, app, tag)
 			})
 			if err != nil {
@@ -266,7 +266,7 @@ func (s *timescaleBasicPlayerStore) Store(ctx context.Context, ingests []basicPl
 	}
 	defer tx.Rollback(ctx)
 
-	affectedRows, err := utils.UpsertPlayerProfiles(ctx, tx, profiles, basicPlayersDomainName, nil)
+	affectedRows, err := utils.UpsertPlayerProfiles(ctx, tx, profiles, basicPlayersDomainName)
 	if err != nil {
 		return requestedRows, affectedRows, err
 	}

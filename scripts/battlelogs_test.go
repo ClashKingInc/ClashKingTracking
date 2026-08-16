@@ -129,24 +129,6 @@ func TestEntriesAfterTimestamp(t *testing.T) {
 	}
 }
 
-func TestBattlelogTargetCursorRoundTrip(t *testing.T) {
-	ttl := time.Date(2026, 5, 20, 10, 0, 0, 123, time.UTC)
-	cursor := encodeBattlelogTargetCursor(ttl, "#PLAYER")
-	got, err := decodeBattlelogTargetCursor(cursor)
-	if err != nil {
-		t.Fatalf("decode cursor: %v", err)
-	}
-	if !got.Valid || !got.TTL.Equal(ttl) || got.Tag != "#PLAYER" {
-		t.Fatalf("unexpected cursor: %#v", got)
-	}
-}
-
-func TestPlayerSnapshotKey(t *testing.T) {
-	if got := playerSnapshotKey("#ABC"); got != "ps:#ABC" {
-		t.Fatalf("playerSnapshotKey = %q, want ps:#ABC", got)
-	}
-}
-
 func TestBattlelogRowFromEntryStoresPlayerAndOpponentNames(t *testing.T) {
 	entry := clashy.BattleLogEntry{
 		OpponentPlayerTag:     "#OPP",
@@ -316,13 +298,12 @@ func TestTimescaleBattlelogStoreCopiesRowsThroughStage(t *testing.T) {
 		_, _ = store.pool.Exec(context.Background(), `DELETE FROM basic_player WHERE tag = '#CODEXSMOKE'`)
 	})
 	if _, err := store.pool.Exec(ctx, `
-		INSERT INTO basic_player (tag, name, league_id, clan_tag, townhall_level, battlelogs_tracking_ttl, trophies)
-		VALUES ('#CODEXSMOKE', 'Smoke Player', 105000035, NULL, 17, NULL, 5000)
+		INSERT INTO basic_player (tag, name, league_id, clan_tag, townhall_level, trophies)
+		VALUES ('#CODEXSMOKE', 'Smoke Player', 105000035, NULL, 17, 5000)
 		ON CONFLICT (tag) DO UPDATE SET
 			name = EXCLUDED.name,
 			league_id = EXCLUDED.league_id,
 			townhall_level = EXCLUDED.townhall_level,
-			battlelogs_tracking_ttl = EXCLUDED.battlelogs_tracking_ttl,
 			trophies = EXCLUDED.trophies
 	`); err != nil {
 		t.Fatal(err)
