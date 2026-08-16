@@ -34,14 +34,15 @@ func run() error {
 		scriptdomains.NewTrackedPlayersDomain(),
 		scriptdomains.NewBasicPlayersDomain(),
 		scriptdomains.NewTrackedClansDomain(),
-		scriptdomains.NewWarsDomain(),
+		scriptdomains.NewWarDiscoveryDomain(),
+		scriptdomains.NewCWLDomain(),
+		scriptdomains.NewCapitalDomain(),
+		scriptdomains.NewRemindersDomain(),
+		scriptdomains.NewAvailabilityDomain(),
 		scriptdomains.NewScheduledDomain(),
-		scriptdomains.NewRedditDomain(),
-		scriptdomains.NewGiveawaysDomain(),
 		scriptdomains.NewEventsDomain(),
-		scriptdomains.NewMobileEventsDomain(),
-		scriptdomains.NewMobilePushDomain(),
-		scriptdomains.NewRosterAutomationsDomain(),
+		scriptdomains.NewNotificationsDomain(),
+		scriptdomains.NewBotAutomationsDomain(),
 	}
 
 	selected, err := selectedDomain(cfg.Script, domains)

@@ -3,7 +3,8 @@ package models
 import "time"
 
 type TrackedPlayerTarget struct {
-	Tag string
+	Tag      string
+	Verified bool
 }
 
 type PlayerProfileChangeRow struct {
@@ -27,11 +28,13 @@ type PlayerStatChangeRow struct {
 }
 
 type TrackedPlayerIngest struct {
-	Players        []BasicPlayerRow
-	ProfileChanges []PlayerProfileChangeRow
-	StatChanges    []PlayerStatChangeRow
-	LastOnlineAt   *time.Time
-	Event          Event
-	SnapshotTag    string
-	SnapshotRaw    []byte
+	Players          []BasicPlayerRow
+	ProfileChanges   []PlayerProfileChangeRow
+	StatChanges      []PlayerStatChangeRow
+	LastOnlineAt     *time.Time
+	Event            Event
+	SnapshotTag      string
+	SnapshotRaw      []byte
+	VerifiedTracking bool
+	CurrentClan      string
 }

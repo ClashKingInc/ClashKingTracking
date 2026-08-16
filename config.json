@@ -22,10 +22,11 @@
     "requests_per_second": 1000,
     "priority_requests_per_second": 100,
     "checkpoint_ttl_days": 15,
-    "first_seen_lookback_days": 1
+    "first_seen_lookback_days": 14
   },
   "wars": {
-    "requests_per_second": 950,
+    "requests_per_second": 500,
+    "dormant_requests_per_second": 50,
     "cwl_sync_seconds": 180
   },
   "trackedclans": {
@@ -33,6 +34,11 @@
     "target_refresh_seconds": 3600,
     "snapshot_prefix": "trackedclans:snapshot:",
     "cwl_state_snapshot": "cwlstate"
+  },
+  "capital": {
+    "requests_per_second": 250,
+    "target_refresh_seconds": 300,
+    "snapshot_prefix": "capital:raid:"
   },
   "trackedplayers": {
     "requests_per_second": 950

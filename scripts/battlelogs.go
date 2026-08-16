@@ -180,26 +180,14 @@ func (d *battlelogsDomain) runTracker(
 	if err != nil {
 		return err
 	}
-	cursor := ""
-	for {
-		page, err := d.sink.NextTargetPage(ctx, group, cursor, battlelogTargetPageSize)
+	processTags := func(tags []string) error {
+		checkpoints, err := d.checkpoint.GetMany(ctx, tags)
 		if err != nil {
 			return err
 		}
-		if len(page.Tags) == 0 {
-			cursor = ""
-			if err := sleepOrDone(ctx, time.Second); err != nil {
-				return err
-			}
-			continue
-		}
-		checkpoints, err := d.checkpoint.GetMany(ctx, page.Tags)
-		if err != nil {
-			return err
-		}
-		if err := runBounded(ctx, platform.RequestConcurrency(requestsPerSecond), page.Tags, func(workerCtx context.Context, tag string) error {
-			ingest, err := retryLimitedClashFetch(workerCtx, limiter, func(fetchCtx context.Context) (models.BattlelogIngest, error) {
-				return d.do(fetchCtx, app, statsName, tag, checkpoints[tag], group == "legend")
+		return runBounded(ctx, platform.RequestConcurrency(requestsPerSecond), tags, func(workerCtx context.Context, tag string) error {
+			ingest, err := retryLimitedClashFetch(workerCtx, app, limiter, func(fetchCtx context.Context) (models.BattlelogIngest, error) {
+				return d.do(fetchCtx, app, statsName, tag, checkpoints[tag])
 			})
 			if err != nil {
 				app.Logger.Error("battlelog processing failed", "tag", tag, "err", err)
@@ -213,10 +201,37 @@ func (d *battlelogsDomain) runTracker(
 			}
 			app.Stats.RecordTrackedTarget(statsName)
 			return nil
-		}); err != nil {
+		})
+	}
+	cursor := ""
+	for {
+		page, err := d.sink.NextTargetPage(ctx, group, cursor, battlelogTargetPageSize)
+		if err != nil {
+			return err
+		}
+		if len(page.Tags) == 0 {
+			cursor = ""
+			if err := sleepOrDone(ctx, time.Second); err != nil {
+				return err
+			}
+			continue
+		}
+		if err := processTags(page.Tags); err != nil {
 			return err
 		}
 		cursor = page.NextCursor
+		if group == "standard" && cursor == "" {
+			verified, err := activeVerifiedPlayerTags(ctx, app.Valkey)
+			if err != nil {
+				return err
+			}
+			for start := 0; start < len(verified); start += battlelogTargetPageSize {
+				end := min(start+battlelogTargetPageSize, len(verified))
+				if err := processTags(verified[start:end]); err != nil {
+					return err
+				}
+			}
+		}
 	}
 }
 

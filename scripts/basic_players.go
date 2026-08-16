@@ -144,7 +144,7 @@ func (d *basicPlayersDomain) Run(ctx context.Context, app *platform.App) error {
 			continue
 		}
 		if err := runBounded(ctx, platform.RequestConcurrency(app.Config.BasicPlayerRequestsPerSecond), page.Tags, func(workerCtx context.Context, tag string) error {
-			ingest, err := retryLimitedClashFetch(workerCtx, limiter, func(fetchCtx context.Context) (basicPlayerIngest, error) {
+			ingest, err := retryLimitedClashFetch(workerCtx, app, limiter, func(fetchCtx context.Context) (basicPlayerIngest, error) {
 				return d.do(fetchCtx, app, tag)
 			})
 			if err != nil {

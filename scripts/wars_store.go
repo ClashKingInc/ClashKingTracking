@@ -38,7 +38,7 @@ func (s *timescaleWarStore) LoadPendingSchedules(ctx context.Context) ([]models.
 	// Pending schedules are reloaded into the process-local timer wheel during Run startup.
 	rows, err := s.pool.Query(ctx, `
 		SELECT schedule_key, war_id, source_clan_tag, opponent_tag, prep_time,
-		       end_time, next_run_at, COALESCE(war_tag, '')
+		       end_time, next_run_at, war_type, COALESCE(war_tag, '')
 		FROM war_schedule
 		ORDER BY next_run_at
 	`)
@@ -49,12 +49,42 @@ func (s *timescaleWarStore) LoadPendingSchedules(ctx context.Context) ([]models.
 	var out []models.WarScheduleRow
 	for rows.Next() {
 		var row models.WarScheduleRow
-		if err := rows.Scan(&row.ScheduleKey, &row.WarID, &row.SourceClanTag, &row.OpponentTag, &row.PrepTime, &row.EndTime, &row.NextRunAt, &row.WarTag); err != nil {
+		if err := rows.Scan(&row.ScheduleKey, &row.WarID, &row.SourceClanTag, &row.OpponentTag, &row.PrepTime, &row.EndTime, &row.NextRunAt, &row.WarType, &row.WarTag); err != nil {
 			return nil, err
 		}
 		out = append(out, row)
 	}
 	return out, rows.Err()
+}
+
+func (s *timescaleWarStore) LoadDueSchedules(ctx context.Context, limit int) ([]models.WarScheduleRow, error) {
+	rows, err := s.pool.Query(ctx, `
+		SELECT schedule_key, war_id, source_clan_tag, opponent_tag, prep_time,
+		       end_time, next_run_at, war_type, COALESCE(war_tag, '')
+		FROM war_schedule
+		WHERE next_run_at <= now()
+		ORDER BY next_run_at
+		LIMIT $1
+	`, limit)
+	if err != nil {
+		return nil, warStoreError("load due schedules", err)
+	}
+	defer rows.Close()
+	var out []models.WarScheduleRow
+	for rows.Next() {
+		var row models.WarScheduleRow
+		if err := rows.Scan(&row.ScheduleKey, &row.WarID, &row.SourceClanTag, &row.OpponentTag,
+			&row.PrepTime, &row.EndTime, &row.NextRunAt, &row.WarType, &row.WarTag); err != nil {
+			return nil, err
+		}
+		out = append(out, row)
+	}
+	return out, rows.Err()
+}
+
+func (s *timescaleWarStore) Reschedule(ctx context.Context, scheduleKey string, nextRunAt time.Time) error {
+	_, err := s.pool.Exec(ctx, `UPDATE war_schedule SET next_run_at = $2 WHERE schedule_key = $1`, scheduleKey, nextRunAt)
+	return warStoreError("reschedule", err)
 }
 
 func (s *timescaleWarStore) LoadCWLLeague(ctx context.Context, tag string) (int, error) {
@@ -66,36 +96,42 @@ func (s *timescaleWarStore) LoadCWLLeague(ctx context.Context, tag string) (int,
 	return leagueID, nil
 }
 
-const loadActiveCurrentWarTimerSQL = `
-	SELECT player_tag, war_id, clan_tag, opponent_tag, end_time
-	FROM current_war_timers
-	WHERE player_tag = $1 AND end_time > now()
+const loadActivePlayerTimersSQL = `
+	SELECT player_tag, event_type, event_key, expires_at
+	FROM player_timers
+	WHERE player_tag = $1 AND expires_at > now()
+	ORDER BY expires_at, event_type, event_key
 `
 
-const deleteExpiredCurrentWarTimersSQL = `DELETE FROM current_war_timers WHERE end_time <= now()`
+const deleteExpiredPlayerTimersSQL = `DELETE FROM player_timers WHERE expires_at <= now()`
 
-func (s *timescaleWarStore) LoadActiveCurrentWarTimer(ctx context.Context, playerTag string) (models.CurrentWarTimerRow, bool, error) {
-	var row models.CurrentWarTimerRow
-	err := s.pool.QueryRow(ctx, loadActiveCurrentWarTimerSQL, playerTag).Scan(&row.PlayerTag, &row.WarID, &row.ClanTag, &row.OpponentTag, &row.EndTime)
-	if errors.Is(err, pgx.ErrNoRows) {
-		return models.CurrentWarTimerRow{}, false, nil
-	}
+func (s *timescaleWarStore) LoadActivePlayerTimers(ctx context.Context, playerTag string) ([]models.PlayerTimerRow, error) {
+	rows, err := s.pool.Query(ctx, loadActivePlayerTimersSQL, playerTag)
 	if err != nil {
-		return models.CurrentWarTimerRow{}, false, warStoreError("load active current war timer", err)
+		return nil, warStoreError("load active player timers", err)
 	}
-	return row, true, nil
+	defer rows.Close()
+	var out []models.PlayerTimerRow
+	for rows.Next() {
+		var row models.PlayerTimerRow
+		if err := rows.Scan(&row.PlayerTag, &row.EventType, &row.EventKey, &row.ExpiresAt); err != nil {
+			return nil, err
+		}
+		out = append(out, row)
+	}
+	return out, rows.Err()
 }
 
-func (s *timescaleWarStore) DeleteExpiredCurrentWarTimers(ctx context.Context) (int, error) {
-	result, err := s.pool.Exec(ctx, deleteExpiredCurrentWarTimersSQL)
+func (s *timescaleWarStore) DeleteExpiredPlayerTimers(ctx context.Context) (int, error) {
+	result, err := s.pool.Exec(ctx, deleteExpiredPlayerTimersSQL)
 	if err != nil {
-		return 0, warStoreError("delete expired current war timers", err)
+		return 0, warStoreError("delete expired player timers", err)
 	}
 	return int(result.RowsAffected()), nil
 }
 
 func (s *timescaleWarStore) Store(ctx context.Context, ingest models.WarIngest) error {
-	if len(ingest.IndexRows) == 0 && len(ingest.AttackRows) == 0 && len(ingest.Schedules) == 0 && len(ingest.CurrentWarTimers) == 0 && len(ingest.CWLGroups) == 0 {
+	if len(ingest.IndexRows) == 0 && len(ingest.AttackRows) == 0 && len(ingest.Schedules) == 0 && len(ingest.PlayerTimers) == 0 && len(ingest.CWLGroups) == 0 {
 		return nil
 	}
 	tx, err := s.pool.Begin(ctx)
@@ -120,7 +156,7 @@ func (s *timescaleWarStore) Store(ctx context.Context, ingest models.WarIngest) 
 	if err := upsertWarSchedules(ctx, tx, ingest.Schedules); err != nil {
 		return err
 	}
-	if err := upsertCurrentWarTimers(ctx, tx, ingest.CurrentWarTimers); err != nil {
+	if err := upsertPlayerTimers(ctx, tx, ingest.PlayerTimers); err != nil {
 		return err
 	}
 	if err := upsertCWLGroups(ctx, tx, ingest.CWLGroups); err != nil {
@@ -302,51 +338,52 @@ func upsertWarSchedules(ctx context.Context, tx pgx.Tx, rows []models.WarSchedul
 		batch.Queue(`
 			INSERT INTO war_schedule (
 				schedule_key, war_id, source_clan_tag, opponent_tag, prep_time,
-				end_time, next_run_at, war_tag
+				end_time, next_run_at, war_type, war_tag
 			)
-			VALUES ($1, $2, $3, $4, $5, $6, $7, NULLIF($8, ''))
+			VALUES ($1, $2, $3, $4, $5, $6, $7, $8, NULLIF($9, ''))
 			ON CONFLICT (schedule_key) DO UPDATE SET
 				source_clan_tag = EXCLUDED.source_clan_tag,
 				opponent_tag = EXCLUDED.opponent_tag,
 				prep_time = EXCLUDED.prep_time,
 				end_time = EXCLUDED.end_time,
 				next_run_at = EXCLUDED.next_run_at,
+				war_type = EXCLUDED.war_type,
 				war_tag = EXCLUDED.war_tag
-		`, row.ScheduleKey, row.WarID, row.SourceClanTag, row.OpponentTag, row.PrepTime, row.EndTime, row.NextRunAt, row.WarTag)
+		`, row.ScheduleKey, row.WarID, row.SourceClanTag, row.OpponentTag, row.PrepTime, row.EndTime, row.NextRunAt, row.WarType, row.WarTag)
+		batch.Queue(`
+			UPDATE basic_clan
+			SET last_war_at = GREATEST(COALESCE(last_war_at, '-infinity'::timestamptz), $2)
+			WHERE tag = ANY($1::text[])
+		`, []string{row.SourceClanTag, row.OpponentTag}, row.PrepTime)
 	}
 	return utils.SendBatch(ctx, tx, batch)
 }
 
-const upsertCurrentWarTimersSQL = `
-	INSERT INTO current_war_timers (player_tag, war_id, clan_tag, opponent_tag, end_time)
-	SELECT * FROM unnest($1::text[], $2::text[], $3::text[], $4::text[], $5::timestamptz[])
-	ON CONFLICT (player_tag) DO UPDATE SET
-		war_id = EXCLUDED.war_id,
-		clan_tag = EXCLUDED.clan_tag,
-		opponent_tag = EXCLUDED.opponent_tag,
-		end_time = EXCLUDED.end_time
+const upsertPlayerTimersSQL = `
+	INSERT INTO player_timers (player_tag, event_type, event_key, expires_at)
+	SELECT * FROM unnest($1::text[], $2::text[], $3::text[], $4::timestamptz[])
+	ON CONFLICT (player_tag, event_type, event_key) DO UPDATE SET
+		expires_at = EXCLUDED.expires_at
 `
 
-func upsertCurrentWarTimers(ctx context.Context, tx pgx.Tx, rows []models.CurrentWarTimerRow) error {
+func upsertPlayerTimers(ctx context.Context, tx pgx.Tx, rows []models.PlayerTimerRow) error {
 	playerTags := make([]string, 0, len(rows))
-	warIDs := make([]string, 0, len(rows))
-	clanTags := make([]string, 0, len(rows))
-	opponentTags := make([]string, 0, len(rows))
-	endTimes := make([]time.Time, 0, len(rows))
+	eventTypes := make([]string, 0, len(rows))
+	eventKeys := make([]string, 0, len(rows))
+	expiresAt := make([]time.Time, 0, len(rows))
 	for _, row := range rows {
-		if row.PlayerTag == "" || row.WarID == "" || row.ClanTag == "" || row.OpponentTag == "" || row.EndTime.IsZero() {
+		if row.PlayerTag == "" || row.EventType == "" || row.EventKey == "" || row.ExpiresAt.IsZero() {
 			continue
 		}
 		playerTags = append(playerTags, row.PlayerTag)
-		warIDs = append(warIDs, row.WarID)
-		clanTags = append(clanTags, row.ClanTag)
-		opponentTags = append(opponentTags, row.OpponentTag)
-		endTimes = append(endTimes, row.EndTime)
+		eventTypes = append(eventTypes, row.EventType)
+		eventKeys = append(eventKeys, row.EventKey)
+		expiresAt = append(expiresAt, row.ExpiresAt)
 	}
 	if len(playerTags) == 0 {
 		return nil
 	}
-	_, err := tx.Exec(ctx, upsertCurrentWarTimersSQL, playerTags, warIDs, clanTags, opponentTags, endTimes)
+	_, err := tx.Exec(ctx, upsertPlayerTimersSQL, playerTags, eventTypes, eventKeys, expiresAt)
 	return err
 }
 
@@ -502,39 +539,44 @@ func (s *timescaleWarStore) ShiftMaintenance(ctx context.Context, duration time.
 }
 
 // The CTE returns exactly the active scheduled wars shifted in this transaction.
-// Current timer rows move only when their war is in that set and are independently
-// guarded by end_time, so stale rows cannot be revived by maintenance.
+// War player timers and reminder jobs move only for those schedule keys, so raid
+// timers and stale rows are never changed by maintenance.
 const shiftActiveWarMaintenanceSQL = `
 	WITH shifted_wars AS (
 		UPDATE war_schedule
 		SET next_run_at = next_run_at + $1,
 		    end_time = end_time + $1
 		WHERE end_time > now()
-		RETURNING war_id
+		RETURNING schedule_key
+	), shifted_timers AS (
+		UPDATE player_timers AS timer
+		SET expires_at = timer.expires_at + $1
+		WHERE timer.event_type = 'war'
+		  AND timer.expires_at > now()
+		  AND timer.event_key IN (SELECT schedule_key FROM shifted_wars)
 	)
-	UPDATE current_war_timers AS timer
-	SET end_time = timer.end_time + $1
-	WHERE timer.end_time > now()
-	  AND timer.war_id IN (SELECT DISTINCT war_id FROM shifted_wars)
+	UPDATE war_reminder_jobs AS reminder
+	SET run_at = reminder.run_at + $1
+	WHERE reminder.schedule_key IN (SELECT schedule_key FROM shifted_wars)
 `
 
 type memoryWarStore struct {
-	mu               sync.Mutex
-	targets          []models.BasicClanRow
-	indexRows        map[string]models.WarLogIndexRow
-	attacks          map[string]models.WarAttackRow
-	schedules        map[string]models.WarScheduleRow
-	cwlGroups        map[string]models.CWLGroupRow
-	currentWarTimers map[string]models.CurrentWarTimerRow
+	mu           sync.Mutex
+	targets      []models.BasicClanRow
+	indexRows    map[string]models.WarLogIndexRow
+	attacks      map[string]models.WarAttackRow
+	schedules    map[string]models.WarScheduleRow
+	cwlGroups    map[string]models.CWLGroupRow
+	playerTimers map[string]models.PlayerTimerRow
 }
 
 func newMemoryWarStore() *memoryWarStore {
 	return &memoryWarStore{
-		indexRows:        make(map[string]models.WarLogIndexRow),
-		attacks:          make(map[string]models.WarAttackRow),
-		schedules:        make(map[string]models.WarScheduleRow),
-		cwlGroups:        make(map[string]models.CWLGroupRow),
-		currentWarTimers: make(map[string]models.CurrentWarTimerRow),
+		indexRows:    make(map[string]models.WarLogIndexRow),
+		attacks:      make(map[string]models.WarAttackRow),
+		schedules:    make(map[string]models.WarScheduleRow),
+		cwlGroups:    make(map[string]models.CWLGroupRow),
+		playerTimers: make(map[string]models.PlayerTimerRow),
 	}
 }
 
@@ -561,24 +603,27 @@ func (s *memoryWarStore) LoadCWLLeague(_ context.Context, tag string) (int, erro
 	return 0, sql.ErrNoRows
 }
 
-func (s *memoryWarStore) LoadActiveCurrentWarTimer(_ context.Context, playerTag string) (models.CurrentWarTimerRow, bool, error) {
+func (s *memoryWarStore) LoadActivePlayerTimers(_ context.Context, playerTag string) ([]models.PlayerTimerRow, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	row, ok := s.currentWarTimers[playerTag]
-	if !ok || !row.EndTime.After(time.Now().UTC()) {
-		return models.CurrentWarTimerRow{}, false, nil
+	now := time.Now().UTC()
+	var out []models.PlayerTimerRow
+	for _, row := range s.playerTimers {
+		if row.PlayerTag == playerTag && row.ExpiresAt.After(now) {
+			out = append(out, row)
+		}
 	}
-	return row, true, nil
+	return out, nil
 }
 
-func (s *memoryWarStore) DeleteExpiredCurrentWarTimers(_ context.Context) (int, error) {
+func (s *memoryWarStore) DeleteExpiredPlayerTimers(_ context.Context) (int, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	now := time.Now().UTC()
 	deleted := 0
-	for playerTag, row := range s.currentWarTimers {
-		if !row.EndTime.After(now) {
-			delete(s.currentWarTimers, playerTag)
+	for key, row := range s.playerTimers {
+		if !row.ExpiresAt.After(now) {
+			delete(s.playerTimers, key)
 			deleted++
 		}
 	}
@@ -605,9 +650,10 @@ func (s *memoryWarStore) Store(_ context.Context, ingest models.WarIngest) error
 	for _, row := range ingest.Schedules {
 		s.schedules[row.ScheduleKey] = row
 	}
-	for _, row := range ingest.CurrentWarTimers {
-		if row.PlayerTag != "" && row.WarID != "" && row.ClanTag != "" && row.OpponentTag != "" && !row.EndTime.IsZero() {
-			s.currentWarTimers[row.PlayerTag] = row
+	for _, row := range ingest.PlayerTimers {
+		if row.PlayerTag != "" && row.EventType != "" && row.EventKey != "" && !row.ExpiresAt.IsZero() {
+			key := row.PlayerTag + "|" + row.EventType + "|" + row.EventKey
+			s.playerTimers[key] = row
 		}
 	}
 	for _, row := range ingest.CWLGroups {
@@ -626,7 +672,7 @@ func (s *memoryWarStore) ShiftMaintenance(_ context.Context, duration time.Durat
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	now := time.Now().UTC()
-	shiftedWarIDs := make(map[string]struct{})
+	shiftedScheduleKeys := make(map[string]struct{})
 	for id, schedule := range s.schedules {
 		if !schedule.EndTime.After(now) {
 			continue
@@ -634,13 +680,40 @@ func (s *memoryWarStore) ShiftMaintenance(_ context.Context, duration time.Durat
 		schedule.NextRunAt = schedule.NextRunAt.Add(duration)
 		schedule.EndTime = schedule.EndTime.Add(duration)
 		s.schedules[id] = schedule
-		shiftedWarIDs[schedule.WarID] = struct{}{}
+		shiftedScheduleKeys[schedule.ScheduleKey] = struct{}{}
 	}
-	for playerTag, timer := range s.currentWarTimers {
-		if _, ok := shiftedWarIDs[timer.WarID]; ok && timer.EndTime.After(now) {
-			timer.EndTime = timer.EndTime.Add(duration)
-			s.currentWarTimers[playerTag] = timer
+	for key, timer := range s.playerTimers {
+		if _, ok := shiftedScheduleKeys[timer.EventKey]; ok && timer.EventType == "war" && timer.ExpiresAt.After(now) {
+			timer.ExpiresAt = timer.ExpiresAt.Add(duration)
+			s.playerTimers[key] = timer
 		}
+	}
+	return nil
+}
+
+func (s *memoryWarStore) LoadDueSchedules(_ context.Context, limit int) ([]models.WarScheduleRow, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	now := time.Now().UTC()
+	var out []models.WarScheduleRow
+	for _, row := range s.schedules {
+		if !row.NextRunAt.After(now) {
+			out = append(out, row)
+			if len(out) == limit {
+				break
+			}
+		}
+	}
+	return out, nil
+}
+
+func (s *memoryWarStore) Reschedule(_ context.Context, scheduleKey string, nextRunAt time.Time) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	row, ok := s.schedules[scheduleKey]
+	if ok {
+		row.NextRunAt = nextRunAt
+		s.schedules[scheduleKey] = row
 	}
 	return nil
 }

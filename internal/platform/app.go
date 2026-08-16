@@ -19,13 +19,14 @@ type Domain interface {
 }
 
 type App struct {
-	Config      Config
-	Logger      *slog.Logger
-	Valkey      valkey.Client
-	Clash       *clashy.Client
-	Stats       *Tracker
-	StatsWriter *TimescaleStatsWriter
-	Scheduler   *Scheduler
+	Config       Config
+	Logger       *slog.Logger
+	Valkey       valkey.Client
+	Clash        *clashy.Client
+	Stats        *Tracker
+	StatsWriter  *TimescaleStatsWriter
+	Scheduler    *Scheduler
+	Availability *AvailabilityGate
 }
 
 func New(ctx context.Context, cfg Config) (*App, error) {
@@ -77,13 +78,14 @@ func New(ctx context.Context, cfg Config) (*App, error) {
 		}
 	}
 	app := &App{
-		Config:      cfg,
-		Logger:      logger,
-		Valkey:      valkeyClient,
-		Clash:       clashClient,
-		Stats:       stats,
-		StatsWriter: statsWriter,
-		Scheduler:   NewScheduler(),
+		Config:       cfg,
+		Logger:       logger,
+		Valkey:       valkeyClient,
+		Clash:        clashClient,
+		Stats:        stats,
+		StatsWriter:  statsWriter,
+		Scheduler:    NewScheduler(),
+		Availability: NewAvailabilityGate(valkeyClient),
 	}
 	return app, nil
 }
@@ -107,10 +109,11 @@ func Run(ctx context.Context, app *App, domains []Domain) error {
 	if app.StatsWriter != nil {
 		go app.StatsWriter.Run(runCtx, app.Logger)
 	}
-	go func() {
-		// Keep delayed jobs alive in the same process as the domains that schedule them.
-		_ = app.Scheduler.Run(runCtx)
-	}()
+	if app.Availability != nil {
+		go app.Availability.Run(runCtx)
+	}
+	// Legacy in-process timers remain available to old helper code, but all active
+	// war and reminder scheduling reads durable SQL rows instead.
 
 	var wg sync.WaitGroup
 	errCh := make(chan error, len(domains))
@@ -149,7 +152,7 @@ func proxyConnectionLimit(cfg Config) int {
 		cfg.GlobalClanPriorityRequestsPerSecond+cfg.GlobalClanNonPriorityRequestsPerSecond,
 		cfg.BattlelogRequestsPerSecond,
 		cfg.BattlelogPriorityRequestsPerSecond,
-		cfg.WarRequestsPerSecond,
+		cfg.WarRequestsPerSecond+cfg.WarDormantRequestsPerSecond,
 		cfg.TrackedClanRequestsPerSecond,
 		cfg.TrackedPlayerRequestsPerSecond,
 		cfg.BasicPlayerRequestsPerSecond,
@@ -163,7 +166,7 @@ func proxyConnectionLimit(cfg Config) int {
 
 func needsClashClient(cfg Config) bool {
 	switch cfg.Script {
-	case "globalclans", "trackedplayers", "basicplayers", "trackedclans", "wars", "scheduled", "battlelogs", "leaderboards":
+	case "globalclans", "trackedplayers", "basicplayers", "trackedclans", "war-discovery", "cwl", "capital", "reminders", "availability", "scheduled", "battlelogs", "leaderboards", "notifications":
 		return true
 	default:
 		return false

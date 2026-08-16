@@ -111,6 +111,23 @@ func (d *trackedPlayersDomain) Run(ctx context.Context, app *platform.App) error
 	}
 	pageSize := app.Config.TrackedPlayerRequestsPerSecond * app.Config.TargetPageMultiplier
 	cursor := ""
+	processTargets := func(targets []models.TrackedPlayerTarget) error {
+		return runBounded(ctx, platform.RequestConcurrency(app.Config.TrackedPlayerRequestsPerSecond), targets, func(workerCtx context.Context, target models.TrackedPlayerTarget) error {
+			ingest, err := retryLimitedClashFetch(workerCtx, app, limiter, func(fetchCtx context.Context) (models.TrackedPlayerIngest, error) {
+				return d.fetchAndPreparePlayer(fetchCtx, app, target)
+			})
+			if err != nil {
+				app.Logger.Error("tracked player processing failed", "tag", target.Tag, "err", err)
+				app.Stats.SetReady(trackedPlayersDomainName, false, err.Error())
+				return err
+			}
+			if err := d.storePlayerIngest(workerCtx, app, ingest); err != nil {
+				return err
+			}
+			app.Stats.RecordTrackedTarget(trackedPlayersDomainName)
+			return nil
+		})
+	}
 	for {
 		page, err := d.store.NextTargetPage(ctx, cursor, pageSize)
 		if err != nil {
@@ -124,25 +141,27 @@ func (d *trackedPlayersDomain) Run(ctx context.Context, app *platform.App) error
 			continue
 		}
 		start := time.Now()
-		if err := runBounded(ctx, platform.RequestConcurrency(app.Config.TrackedPlayerRequestsPerSecond), page.Targets, func(workerCtx context.Context, target models.TrackedPlayerTarget) error {
-			ingest, err := retryLimitedClashFetch(workerCtx, limiter, func(fetchCtx context.Context) (models.TrackedPlayerIngest, error) {
-				return d.fetchAndPreparePlayer(fetchCtx, app, target)
-			})
-			if err != nil {
-				app.Logger.Error("tracked player processing failed", "tag", target.Tag, "err", err)
-				app.Stats.SetReady(trackedPlayersDomainName, false, err.Error())
-				return err
-			}
-			if err := d.storePlayerIngest(workerCtx, app, ingest); err != nil {
-				return err
-			}
-			app.Stats.RecordTrackedTarget(trackedPlayersDomainName)
-			return nil
-		}); err != nil {
+		if err := processTargets(page.Targets); err != nil {
 			return err
 		}
 		app.Stats.RecordProcess(trackedPlayersDomainName, time.Since(start))
 		cursor = page.NextCursor
+		if cursor == "" {
+			verifiedTags, err := activeVerifiedPlayerTags(ctx, app.Valkey)
+			if err != nil {
+				return err
+			}
+			verified := make([]models.TrackedPlayerTarget, 0, len(verifiedTags))
+			for _, tag := range verifiedTags {
+				verified = append(verified, models.TrackedPlayerTarget{Tag: tag, Verified: true})
+			}
+			for start := 0; start < len(verified); start += pageSize {
+				end := min(start+pageSize, len(verified))
+				if err := processTargets(verified[start:end]); err != nil {
+					return err
+				}
+			}
+		}
 	}
 }
 
@@ -189,10 +208,20 @@ func (d *trackedPlayersDomain) fetchAndPreparePlayer(
 	if player == nil {
 		return models.TrackedPlayerIngest{}, nil
 	}
-	return d.doPlayer(ctx, target.Tag, *player)
+	ingest, err := d.doPlayer(ctx, target.Tag, *player)
+	ingest.VerifiedTracking = target.Verified
+	if player.Clan != nil {
+		ingest.CurrentClan = player.Clan.Tag
+	}
+	return ingest, err
 }
 
 func (d *trackedPlayersDomain) storePlayerIngest(ctx context.Context, app *platform.App, ingest models.TrackedPlayerIngest) error {
+	if ingest.VerifiedTracking {
+		if err := updateVerifiedPlayerClan(ctx, app.Valkey, ingest.SnapshotTag, ingest.CurrentClan); err != nil {
+			return err
+		}
+	}
 	if len(ingest.Players) == 0 && len(ingest.ProfileChanges) == 0 && len(ingest.StatChanges) == 0 {
 		return d.savePlayerSnapshot(ctx, ingest.SnapshotTag, ingest.SnapshotRaw)
 	}
@@ -730,6 +759,10 @@ func (s *timescaleTrackedPlayerStore) StoreIngest(
 }
 
 const trackedPlayerTargetSetSQL = `
+		SELECT tag
+		FROM tracked_player_targets
+		WHERE enabled = true
+		UNION
 		SELECT member->>'tag' AS tag
 		FROM server_clans tracked_clan
 		JOIN servers server ON server.id = tracked_clan.server_id
@@ -737,14 +770,6 @@ const trackedPlayerTargetSetSQL = `
 		CROSS JOIN LATERAL jsonb_array_elements(COALESCE(members, '[]'::jsonb)) AS member
 		WHERE server.last_command_at >= now() - interval '90 days'
 		  AND member->>'tag' <> ''
-		UNION
-		SELECT account.player_tag AS tag
-		FROM mobile_notification_accounts account
-		JOIN mobile_push_devices device
-		  ON device.user_id = account.user_id
-		 AND device.enabled = true
-		 AND device.provider = 'fcm'
-		WHERE account.active = true
 `
 
 const trackedPlayerTargetsSQL = `

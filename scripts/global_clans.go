@@ -367,7 +367,7 @@ func (d *globalClansDomain) runGroup(
 		snapshots := make([]globalClanSnapshot, 0, len(page.Tags))
 		var snapshotsMu sync.Mutex
 		if err := runBounded(ctx, group.MaxInFlight, page.Tags, func(workerCtx context.Context, tag string) error {
-			clan, err := retryLimitedClashFetch(workerCtx, limiter, func(fetchCtx context.Context) (*clashy.Clan, error) {
+			clan, err := retryLimitedClashFetch(workerCtx, app, limiter, func(fetchCtx context.Context) (*clashy.Clan, error) {
 				return fetchGlobalClan(fetchCtx, app, group.Name, tag)
 			})
 			app.Stats.RecordTrackedTarget(statsName)
@@ -518,36 +518,12 @@ func (w *globalClanAsyncWriter) writeBatch(ctx context.Context, jobs []globalCla
 		)
 	}
 	w.app.Stats.RecordWrite(globalClansDomainName, result.WriteCount)
-	if err := publishGlobalClanEvents(ctx, w.app, group, result.EventClans); err != nil {
-		return err
-	}
 	w.app.Stats.SetReady(globalClansDomainName, true, "")
 	return nil
 }
 
 func durationMillis(value time.Duration) float64 {
 	return float64(value) / float64(time.Millisecond)
-}
-
-func publishGlobalClanEvents(ctx context.Context, app *platform.App, group string, clans []models.BasicClanRow) error {
-	for _, clan := range clans {
-		for {
-			err := app.PublishEvent(ctx, platform.Event{
-				Topic:   "clan",
-				ClanTag: clan.Tag,
-				Value:   map[string]any{"tag": clan.Tag, "name": clan.Name},
-			})
-			if err == nil {
-				break
-			}
-			app.Stats.SetReady(globalClansDomainName, false, err.Error())
-			app.Logger.Error("global clan event publish failed", "group", group, "clan_tag", clan.Tag, "err", err)
-			if err := sleepOrDone(ctx, time.Second); err != nil {
-				return err
-			}
-		}
-	}
-	return nil
 }
 
 func globalClanIngestWriteCount(ingest models.GlobalClanIngest) int {

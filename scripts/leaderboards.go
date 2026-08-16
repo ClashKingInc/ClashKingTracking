@@ -291,7 +291,7 @@ func (d *leaderboardsDomain) refreshMaterializedViewsIfDue(ctx context.Context, 
 }
 
 func (d *leaderboardsDomain) fetchLeagues(ctx context.Context, app *platform.App, limiter *clashy.Limiter) (map[int]leaderboardLeaguePayload, error) {
-	leagues, err := retryLimitedClashFetch(ctx, limiter, func(fetchCtx context.Context) ([]clashy.League, error) {
+	leagues, err := retryLimitedClashFetch(ctx, app, limiter, func(fetchCtx context.Context) ([]clashy.League, error) {
 		start := time.Now()
 		leagues, err := app.Clash.SearchLeagues(fetchCtx, clashy.PageOptions{Limit: 100})
 		app.Stats.RecordRequest(leaderboardsDomainName, time.Since(start), err)
@@ -314,7 +314,7 @@ func (d *leaderboardsDomain) fetchPlayers(ctx context.Context, app *platform.App
 	skipped := 0
 	notFound := 0
 	err := runBounded(ctx, platform.RequestConcurrency(app.Config.LeaderboardRequestsPerSecond), tags, func(workerCtx context.Context, tag string) error {
-		player, err := retryLimitedClashFetch(workerCtx, limiter, func(fetchCtx context.Context) (*clashy.Player, error) {
+		player, err := retryLimitedClashFetch(workerCtx, app, limiter, func(fetchCtx context.Context) (*clashy.Player, error) {
 			start := time.Now()
 			player, err := app.Clash.GetPlayer(fetchCtx, tag)
 			app.Stats.RecordRequest(leaderboardsDomainName, time.Since(start), err)

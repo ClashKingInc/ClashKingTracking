@@ -45,13 +45,19 @@ func ClashFetchRetryPolicy(err error) (ClashFetchRetry, bool) {
 	return ClashFetchRetry{}, false
 }
 
-func RetryClashFetch[T any](ctx context.Context, fetch func(context.Context) (T, error)) (T, error) {
+func RetryClashFetch[T any](ctx context.Context, gate *AvailabilityGate, fetch func(context.Context) (T, error)) (T, error) {
 	var zero T
 	retries := 0
 	for {
+		if err := gate.Wait(ctx); err != nil {
+			return zero, err
+		}
 		value, err := fetch(ctx)
 		if err == nil {
 			return value, nil
+		}
+		if gate.Observe(err) {
+			continue
 		}
 		decision, ok := ClashFetchRetryPolicy(err)
 		if !ok {

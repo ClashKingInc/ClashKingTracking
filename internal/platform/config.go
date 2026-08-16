@@ -29,12 +29,16 @@ type Config struct {
 	BattlelogCheckpointTTLDays             int
 	BattlelogFirstSeenLookbackDays         int
 	WarRequestsPerSecond                   int
+	WarDormantRequestsPerSecond            int
 	WarMaxInFlight                         int
 	WarCWLSyncSeconds                      int
 	TrackedClanRequestsPerSecond           int
 	TrackedClanTargetRefreshSeconds        int
 	TrackedClanSnapshotPrefix              string
 	TrackedClanCWLStateSnapshot            string
+	CapitalRequestsPerSecond               int
+	CapitalTargetRefreshSeconds            int
+	CapitalSnapshotPrefix                  string
 	StatsTimescaleFlushSeconds             int
 	EventStreamName                        string
 	EventStreamGroup                       string
@@ -110,6 +114,7 @@ type jsonConfig struct {
 	Battlelogs           jsonBattlelogsConfig       `json:"battlelogs"`
 	Wars                 jsonWarsConfig             `json:"wars"`
 	TrackedClans         jsonTrackedClansConfig     `json:"trackedclans"`
+	Capital              jsonCapitalConfig          `json:"capital"`
 	TrackedPlayers       jsonTrackedPlayersConfig   `json:"trackedplayers"`
 	BasicPlayers         jsonBasicPlayersConfig     `json:"basicplayers"`
 	Leaderboards         jsonLeaderboardsConfig     `json:"leaderboards"`
@@ -152,8 +157,9 @@ type jsonBattlelogsConfig struct {
 }
 
 type jsonWarsConfig struct {
-	RequestsPerSecond int `json:"requests_per_second"`
-	CWLSyncSeconds    int `json:"cwl_sync_seconds"`
+	RequestsPerSecond        int `json:"requests_per_second"`
+	DormantRequestsPerSecond int `json:"dormant_requests_per_second"`
+	CWLSyncSeconds           int `json:"cwl_sync_seconds"`
 }
 
 type jsonTrackedClansConfig struct {
@@ -165,6 +171,12 @@ type jsonTrackedClansConfig struct {
 
 type jsonTrackedPlayersConfig struct {
 	RequestsPerSecond int `json:"requests_per_second"`
+}
+
+type jsonCapitalConfig struct {
+	RequestsPerSecond    int    `json:"requests_per_second"`
+	TargetRefreshSeconds int    `json:"target_refresh_seconds"`
+	SnapshotPrefix       string `json:"snapshot_prefix"`
 }
 
 type jsonBasicPlayersConfig struct {
@@ -235,11 +247,15 @@ func loadConfigFile(path string) (Config, error) {
 		BattlelogCheckpointTTLDays:             file.Battlelogs.CheckpointTTLDays,
 		BattlelogFirstSeenLookbackDays:         file.Battlelogs.FirstSeenLookbackDays,
 		WarRequestsPerSecond:                   file.Wars.RequestsPerSecond,
+		WarDormantRequestsPerSecond:            file.Wars.DormantRequestsPerSecond,
 		WarCWLSyncSeconds:                      file.Wars.CWLSyncSeconds,
 		TrackedClanRequestsPerSecond:           file.TrackedClans.RequestsPerSecond,
 		TrackedClanTargetRefreshSeconds:        file.TrackedClans.TargetRefreshSeconds,
 		TrackedClanSnapshotPrefix:              file.TrackedClans.SnapshotPrefix,
 		TrackedClanCWLStateSnapshot:            file.TrackedClans.CWLStateSnapshot,
+		CapitalRequestsPerSecond:               file.Capital.RequestsPerSecond,
+		CapitalTargetRefreshSeconds:            file.Capital.TargetRefreshSeconds,
+		CapitalSnapshotPrefix:                  file.Capital.SnapshotPrefix,
 		TrackedPlayerRequestsPerSecond:         file.TrackedPlayers.RequestsPerSecond,
 		BasicPlayerRequestsPerSecond:           file.BasicPlayers.RequestsPerSecond,
 		LeaderboardRequestsPerSecond:           file.Leaderboards.RequestsPerSecond,
@@ -271,6 +287,9 @@ func applyEnvironment(cfg *Config) {
 
 func deriveConfig(cfg *Config) {
 	cfg.WarMaxInFlight = RequestConcurrency(cfg.WarRequestsPerSecond)
+	if cfg.WarDormantRequestsPerSecond == 0 {
+		cfg.WarDormantRequestsPerSecond = 50
+	}
 	if cfg.BattlelogPriorityRequestsPerSecond == 0 {
 		cfg.BattlelogPriorityRequestsPerSecond = 100
 	}
@@ -285,6 +304,15 @@ func deriveConfig(cfg *Config) {
 	}
 	if cfg.TrackedClanCWLStateSnapshot == "" {
 		cfg.TrackedClanCWLStateSnapshot = "cwlstate"
+	}
+	if cfg.CapitalRequestsPerSecond == 0 {
+		cfg.CapitalRequestsPerSecond = 250
+	}
+	if cfg.CapitalTargetRefreshSeconds == 0 {
+		cfg.CapitalTargetRefreshSeconds = 300
+	}
+	if cfg.CapitalSnapshotPrefix == "" {
+		cfg.CapitalSnapshotPrefix = "capital:raid:"
 	}
 	if cfg.BasicPlayerRequestsPerSecond == 0 {
 		cfg.BasicPlayerRequestsPerSecond = 30

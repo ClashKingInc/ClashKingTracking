@@ -86,10 +86,11 @@ sendLoop:
 
 func retryLimitedClashFetch[T any](
 	ctx context.Context,
+	app *platform.App,
 	limiter *clashy.Limiter,
 	fetch func(context.Context) (T, error),
 ) (T, error) {
-	return platform.RetryClashFetch(ctx, func(fetchCtx context.Context) (T, error) {
+	return platform.RetryClashFetch(ctx, app.Availability, func(fetchCtx context.Context) (T, error) {
 		release, err := limiter.Acquire(fetchCtx)
 		if err != nil {
 			var zero T

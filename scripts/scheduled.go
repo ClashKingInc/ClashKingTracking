@@ -399,7 +399,7 @@ func (d *scheduledDomain) doRankedGroupDiscovery(ctx context.Context, app *platf
 }
 
 func (d *scheduledDomain) fetchRankedSeedPlayer(ctx context.Context, app *platform.App, tag string) (*clashy.Player, bool, error) {
-	player, err := platform.RetryClashFetch(ctx, func(fetchCtx context.Context) (*clashy.Player, error) {
+	player, err := platform.RetryClashFetch(ctx, app.Availability, func(fetchCtx context.Context) (*clashy.Player, error) {
 		start := time.Now()
 		player, err := app.Clash.GetPlayer(fetchCtx, tag)
 		app.Stats.RecordRequest(scheduledDomainName, time.Since(start), err)
@@ -418,7 +418,7 @@ func (d *scheduledDomain) fetchRankedSeedPlayer(ctx context.Context, app *platfo
 }
 
 func (d *scheduledDomain) previousLeagueTierID(ctx context.Context, app *platform.App, tag string, seasonID int64) (int, bool, error) {
-	entries, err := platform.RetryClashFetch(ctx, func(fetchCtx context.Context) ([]clashy.LeagueHistoryEntry, error) {
+	entries, err := platform.RetryClashFetch(ctx, app.Availability, func(fetchCtx context.Context) ([]clashy.LeagueHistoryEntry, error) {
 		start := time.Now()
 		entries, err := app.Clash.GetPlayerLeagueHistory(fetchCtx, tag)
 		app.Stats.RecordRequest(scheduledDomainName, time.Since(start), err)
@@ -436,7 +436,7 @@ func (d *scheduledDomain) previousLeagueTierID(ctx context.Context, app *platfor
 }
 
 func (d *scheduledDomain) fetchRankedGroupMembers(ctx context.Context, app *platform.App, seedTag, groupTag string, seasonID int64, leagueTierID int) ([]models.RankedLeagueGroupMemberRow, error) {
-	group, err := platform.RetryClashFetch(ctx, func(fetchCtx context.Context) (*clashy.LeagueTierGroup, error) {
+	group, err := platform.RetryClashFetch(ctx, app.Availability, func(fetchCtx context.Context) (*clashy.LeagueTierGroup, error) {
 		start := time.Now()
 		group, err := app.Clash.GetPlayerLeagueGroup(fetchCtx, seedTag, groupTag, strconv.FormatInt(seasonID, 10))
 		app.Stats.RecordRequest(scheduledDomainName, time.Since(start), err)
@@ -527,7 +527,7 @@ func (d *scheduledDomain) loadLeaderboardLocationIDs(
 	ctx context.Context,
 	app *platform.App,
 ) ([]string, error) {
-	locations, err := platform.RetryClashFetch(ctx, func(fetchCtx context.Context) ([]clashy.Location, error) {
+	locations, err := platform.RetryClashFetch(ctx, app.Availability, func(fetchCtx context.Context) ([]clashy.Location, error) {
 		start := time.Now()
 		locations, err := app.Clash.SearchLocations(fetchCtx, clashy.PageOptions{})
 		app.Stats.RecordRequest(scheduledDomainName, time.Since(start), err)
@@ -553,7 +553,7 @@ func (d *scheduledDomain) doLeaderboardHistory(
 			if !shouldStoreLeaderboardHistoryKind(path.Kind, now) {
 				continue
 			}
-			payload, err := platform.RetryClashFetch(ctx, func(fetchCtx context.Context) (any, error) {
+			payload, err := platform.RetryClashFetch(ctx, app.Availability, func(fetchCtx context.Context) (any, error) {
 				start := time.Now()
 				payload, err := path.Load(fetchCtx, app.Clash, locationID)
 				app.Stats.RecordRequest(scheduledDomainName, time.Since(start), err)
@@ -633,7 +633,7 @@ func (d *scheduledDomain) doLegendHistory(
 }
 
 func loadOfficialLegendSeasons(ctx context.Context, app *platform.App) ([]string, error) {
-	return platform.RetryClashFetch(ctx, func(fetchCtx context.Context) ([]string, error) {
+	return platform.RetryClashFetch(ctx, app.Availability, func(fetchCtx context.Context) ([]string, error) {
 		start := time.Now()
 		seasons, err := app.Clash.GetSeasons(fetchCtx, legendLeagueID)
 		app.Stats.RecordRequest(scheduledDomainName, time.Since(start), err)
@@ -646,7 +646,7 @@ func loadOfficialLegendSeasonRankings(
 	app *platform.App,
 	season string,
 ) ([]legendRankingItem, error) {
-	return platform.RetryClashFetch(ctx, func(fetchCtx context.Context) ([]legendRankingItem, error) {
+	return platform.RetryClashFetch(ctx, app.Availability, func(fetchCtx context.Context) ([]legendRankingItem, error) {
 		return fetchAllLegendSeasonRankingPages(fetchCtx, app, season)
 	})
 }
@@ -891,7 +891,7 @@ func (d *scheduledDomain) doCurrentClanRankings(
 	var groupErrors []error
 	for _, locationID := range locationIDs {
 		for _, path := range currentClanRankingPaths {
-			rankings, err := platform.RetryClashFetch(ctx, func(fetchCtx context.Context) ([]clashy.RankedClan, error) {
+			rankings, err := platform.RetryClashFetch(ctx, app.Availability, func(fetchCtx context.Context) ([]clashy.RankedClan, error) {
 				start := time.Now()
 				rankings, err := path.Load(fetchCtx, app.Clash, locationID, clashy.PageOptions{Limit: currentClanRankingLimit})
 				app.Stats.RecordRequest(scheduledDomainName, time.Since(start), err)
