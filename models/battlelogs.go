@@ -22,8 +22,9 @@ type BattlelogCheckpoint struct {
 }
 
 type BattlelogIngest struct {
-	Rows        []BattlelogRow
-	Checkpoints []BattlelogCheckpoint
+	Rows          []BattlelogRow
+	Notifications []BattlelogRow
+	Checkpoints   []BattlelogCheckpoint
 }
 
 type BattlelogRow struct {
