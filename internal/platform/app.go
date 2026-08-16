@@ -23,7 +23,6 @@ type App struct {
 	Logger      *slog.Logger
 	Valkey      valkey.Client
 	Clash       *clashy.Client
-	R2          ObjectStore
 	Stats       *Tracker
 	StatsWriter *TimescaleStatsWriter
 	Scheduler   *Scheduler
@@ -77,31 +76,11 @@ func New(ctx context.Context, cfg Config) (*App, error) {
 			return nil, err
 		}
 	}
-	var objectStore ObjectStore
-	hasR2Config := cfg.R2Endpoint != "" || cfg.R2Bucket != "" || cfg.R2AccessKeyID != "" || cfg.R2SecretAccessKey != ""
-	if hasR2Config {
-		objectStore, err = NewR2ObjectStore(cfg)
-		if err != nil {
-			if clashClient != nil {
-				_ = clashClient.Close()
-			}
-			if valkeyClient != nil {
-				valkeyClient.Close()
-			}
-			if statsWriter != nil {
-				statsWriter.Close()
-			}
-			return nil, err
-		}
-	} else if cfg.R2MockUpload {
-		objectStore = MockObjectStore{}
-	}
 	app := &App{
 		Config:      cfg,
 		Logger:      logger,
 		Valkey:      valkeyClient,
 		Clash:       clashClient,
-		R2:          objectStore,
 		Stats:       stats,
 		StatsWriter: statsWriter,
 		Scheduler:   NewScheduler(),
@@ -171,8 +150,8 @@ func proxyConnectionLimit(cfg Config) int {
 		cfg.BattlelogRequestsPerSecond,
 		cfg.BattlelogPriorityRequestsPerSecond,
 		cfg.WarRequestsPerSecond,
-		cfg.BotClanRequestsPerSecond,
-		cfg.BotPlayerRequestsPerSecond,
+		cfg.TrackedClanRequestsPerSecond,
+		cfg.TrackedPlayerRequestsPerSecond,
 		cfg.BasicPlayerRequestsPerSecond,
 		cfg.LeaderboardRequestsPerSecond,
 	)
@@ -184,7 +163,7 @@ func proxyConnectionLimit(cfg Config) int {
 
 func needsClashClient(cfg Config) bool {
 	switch cfg.Script {
-	case "globalclans", "botplayers", "basicplayers", "botclans", "wars", "scheduled", "battlelogs", "leaderboards":
+	case "globalclans", "trackedplayers", "basicplayers", "trackedclans", "wars", "scheduled", "battlelogs", "leaderboards":
 		return true
 	default:
 		return false

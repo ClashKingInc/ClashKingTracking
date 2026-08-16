@@ -2,7 +2,6 @@ package utils
 
 import (
 	"context"
-	"time"
 
 	"clashking_tracking/models"
 
@@ -77,7 +76,6 @@ func UpsertPlayerProfiles(
 	tx pgx.Tx,
 	ingests []models.PlayerProfileIngest,
 	domain string,
-	activityAt *time.Time,
 ) (int, error) {
 	if len(ingests) == 0 {
 		return 0, nil
@@ -94,18 +92,6 @@ func UpsertPlayerProfiles(
 	affected, err := UpsertBasicPlayersCount(ctx, tx, players, domain)
 	if err != nil {
 		return affected, err
-	}
-	if activityAt != nil && len(tags) > 0 {
-		tag, err := tx.Exec(ctx, `
-			UPDATE basic_player
-			SET battlelogs_tracking_ttl = $1
-			WHERE tag = ANY($2::text[])
-			  AND (battlelogs_tracking_ttl IS NULL OR battlelogs_tracking_ttl < $1)
-		`, *activityAt, tags)
-		if err != nil {
-			return affected, err
-		}
-		affected += int(tag.RowsAffected())
 	}
 	if err := replacePlayerDetailRows(ctx, tx, ingests, tags); err != nil {
 		return affected, err

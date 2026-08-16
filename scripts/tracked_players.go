@@ -23,13 +23,15 @@ import (
 )
 
 const (
-	botPlayersDomainName = "botplayers"
+	trackedPlayersDomainName = "trackedplayers"
 
 	playerStatDonated            = "donated"
 	playerStatReceived           = "received"
 	playerStatClanGames          = "clan_games"
 	playerStatCapitalGoldDonated = "capital_gold_donated"
+	playerStatSeasonPass         = "season_pass"
 	playerClanGamesAchievement   = "Games Champion"
+	playerSeasonPassAchievement  = "Well Seasoned"
 )
 
 func playerSnapshotKey(tag string) string {
@@ -71,43 +73,43 @@ func equalBytes(a, b []byte) bool {
 	return true
 }
 
-type botPlayersDomain struct {
-	snapshots botPlayerSnapshotStore
-	store     botPlayerStore
+type trackedPlayersDomain struct {
+	snapshots trackedPlayerSnapshotStore
+	store     trackedPlayerStore
 }
 
-type botPlayerStore interface {
+type trackedPlayerStore interface {
 	Close()
-	NextTargetPage(context.Context, string, int) (botPlayerTargetPage, error)
-	StoreIngest(context.Context, models.BotPlayerIngest) error
+	NextTargetPage(context.Context, string, int) (trackedPlayerTargetPage, error)
+	StoreIngest(context.Context, models.TrackedPlayerIngest) error
 }
 
-type botPlayerTargetPage struct {
-	Targets    []models.BotPlayerTarget
+type trackedPlayerTargetPage struct {
+	Targets    []models.TrackedPlayerTarget
 	NextCursor string
 }
 
-func NewBotPlayersDomain() platform.Domain { return &botPlayersDomain{} }
+func NewTrackedPlayersDomain() platform.Domain { return &trackedPlayersDomain{} }
 
-func (d *botPlayersDomain) Name() string { return botPlayersDomainName }
+func (d *trackedPlayersDomain) Name() string { return trackedPlayersDomainName }
 
-func (d *botPlayersDomain) Run(ctx context.Context, app *platform.App) error {
-	if err := validateBotPlayersConfig(app.Config); err != nil {
+func (d *trackedPlayersDomain) Run(ctx context.Context, app *platform.App) error {
+	if err := validateTrackedPlayersConfig(app.Config); err != nil {
 		return err
 	}
-	store, err := newBotPlayerStore(ctx, app)
+	store, err := newTrackedPlayerStore(ctx, app)
 	if err != nil {
 		return err
 	}
 	defer store.Close()
-	d.snapshots = newBotPlayerSnapshotStore(app.Valkey)
+	d.snapshots = newTrackedPlayerSnapshotStore(app.Valkey)
 	d.store = store
 
-	limiter, err := newTrackingLimiter(app.Config.BotPlayerRequestsPerSecond)
+	limiter, err := newTrackingLimiter(app.Config.TrackedPlayerRequestsPerSecond)
 	if err != nil {
 		return err
 	}
-	pageSize := app.Config.BotPlayerRequestsPerSecond * app.Config.TargetPageMultiplier
+	pageSize := app.Config.TrackedPlayerRequestsPerSecond * app.Config.TargetPageMultiplier
 	cursor := ""
 	for {
 		page, err := d.store.NextTargetPage(ctx, cursor, pageSize)
@@ -122,85 +124,85 @@ func (d *botPlayersDomain) Run(ctx context.Context, app *platform.App) error {
 			continue
 		}
 		start := time.Now()
-		if err := runBounded(ctx, platform.RequestConcurrency(app.Config.BotPlayerRequestsPerSecond), page.Targets, func(workerCtx context.Context, target models.BotPlayerTarget) error {
-			ingest, err := retryLimitedClashFetch(workerCtx, limiter, func(fetchCtx context.Context) (models.BotPlayerIngest, error) {
+		if err := runBounded(ctx, platform.RequestConcurrency(app.Config.TrackedPlayerRequestsPerSecond), page.Targets, func(workerCtx context.Context, target models.TrackedPlayerTarget) error {
+			ingest, err := retryLimitedClashFetch(workerCtx, limiter, func(fetchCtx context.Context) (models.TrackedPlayerIngest, error) {
 				return d.fetchAndPreparePlayer(fetchCtx, app, target)
 			})
 			if err != nil {
-				app.Logger.Error("bot player processing failed", "tag", target.Tag, "err", err)
-				app.Stats.SetReady(botPlayersDomainName, false, err.Error())
+				app.Logger.Error("tracked player processing failed", "tag", target.Tag, "err", err)
+				app.Stats.SetReady(trackedPlayersDomainName, false, err.Error())
 				return err
 			}
 			if err := d.storePlayerIngest(workerCtx, app, ingest); err != nil {
 				return err
 			}
-			app.Stats.RecordTrackedTarget(botPlayersDomainName)
+			app.Stats.RecordTrackedTarget(trackedPlayersDomainName)
 			return nil
 		}); err != nil {
 			return err
 		}
-		app.Stats.RecordProcess(botPlayersDomainName, time.Since(start))
+		app.Stats.RecordProcess(trackedPlayersDomainName, time.Since(start))
 		cursor = page.NextCursor
 	}
 }
 
-func validateBotPlayersConfig(cfg platform.Config) error {
-	if cfg.BotPlayerRequestsPerSecond <= 0 {
-		return errors.New("botplayers.requests_per_second must be greater than zero")
+func validateTrackedPlayersConfig(cfg platform.Config) error {
+	if cfg.TrackedPlayerRequestsPerSecond <= 0 {
+		return errors.New("trackedplayers.requests_per_second must be greater than zero")
 	}
 	if cfg.TargetPageMultiplier <= 0 {
 		return errors.New("target_page_multiplier must be greater than zero")
 	}
 	if !cfg.DryRun && !cfg.MockDB && cfg.TimescaleURL == "" {
-		return errors.New("TIMESCALE_URL is required for botplayers")
+		return errors.New("TIMESCALE_* connection variables are required for trackedplayers")
 	}
 	if !cfg.DryRun && !cfg.MockDB && cfg.ValkeyAddr == "" {
-		return errors.New("valkey_addr is required for botplayers snapshots")
+		return errors.New("valkey_addr is required for trackedplayers snapshots")
 	}
 	return nil
 }
 
-func newBotPlayerStore(ctx context.Context, app *platform.App) (botPlayerStore, error) {
+func newTrackedPlayerStore(ctx context.Context, app *platform.App) (trackedPlayerStore, error) {
 	if app.Config.MockDB || app.Config.DryRun || app.Config.TimescaleURL == "" {
-		return newMemoryBotPlayerStore(), nil
+		return newMemoryTrackedPlayerStore(), nil
 	}
-	return newTimescaleBotPlayerStore(ctx, app.Config.TimescaleURL)
+	return newTimescaleTrackedPlayerStore(ctx, app.Config.TimescaleURL)
 }
 
-func (d *botPlayersDomain) fetchAndPreparePlayer(
+func (d *trackedPlayersDomain) fetchAndPreparePlayer(
 	ctx context.Context,
 	app *platform.App,
-	target models.BotPlayerTarget,
-) (models.BotPlayerIngest, error) {
+	target models.TrackedPlayerTarget,
+) (models.TrackedPlayerIngest, error) {
 	if target.Tag == "" {
-		return models.BotPlayerIngest{}, nil
+		return models.TrackedPlayerIngest{}, nil
 	}
 	start := time.Now()
 	player, err := app.Clash.GetPlayer(ctx, target.Tag)
-	app.Stats.RecordRequest(botPlayersDomainName, time.Since(start), err)
+	app.Stats.RecordRequest(trackedPlayersDomainName, time.Since(start), err)
 	if err != nil {
 		if _, ok := platform.ClashFetchRetryPolicy(err); ok {
-			return models.BotPlayerIngest{}, err
+			return models.TrackedPlayerIngest{}, err
 		}
-		return models.BotPlayerIngest{}, nil
+		return models.TrackedPlayerIngest{}, nil
 	}
 	if player == nil {
-		return models.BotPlayerIngest{}, nil
+		return models.TrackedPlayerIngest{}, nil
 	}
 	return d.doPlayer(ctx, target.Tag, *player)
 }
 
-func (d *botPlayersDomain) storePlayerIngest(ctx context.Context, app *platform.App, ingest models.BotPlayerIngest) error {
+func (d *trackedPlayersDomain) storePlayerIngest(ctx context.Context, app *platform.App, ingest models.TrackedPlayerIngest) error {
 	if len(ingest.Players) == 0 && len(ingest.ProfileChanges) == 0 && len(ingest.StatChanges) == 0 {
 		return d.savePlayerSnapshot(ctx, ingest.SnapshotTag, ingest.SnapshotRaw)
 	}
 	if err := d.store.StoreIngest(ctx, ingest); err != nil {
 		return err
 	}
-	app.Stats.RecordWrite(botPlayersDomainName,
+	app.Stats.RecordWrite(trackedPlayersDomainName,
 		len(ingest.Players)+len(ingest.ProfileChanges)+len(ingest.StatChanges),
 	)
-	app.Stats.SetReady(botPlayersDomainName, true, "")
+	app.Stats.SetReady(trackedPlayersDomainName, true, "")
 	if ingest.Event.Topic != "" {
 		if err := app.PublishEvent(ctx, platform.Event{
 			Topic:   ingest.Event.Topic,
@@ -213,57 +215,59 @@ func (d *botPlayersDomain) storePlayerIngest(ctx context.Context, app *platform.
 	return d.savePlayerSnapshot(ctx, ingest.SnapshotTag, ingest.SnapshotRaw)
 }
 
-func (d *botPlayersDomain) doPlayer(
+func (d *trackedPlayersDomain) doPlayer(
 	ctx context.Context,
 	tag string,
 	player clashy.Player,
-) (models.BotPlayerIngest, error) {
+) (models.TrackedPlayerIngest, error) {
 	raw, err := json.Marshal(player)
 	if err != nil {
-		return models.BotPlayerIngest{}, err
+		return models.TrackedPlayerIngest{}, err
 	}
 	current := playerMap(player)
 	previousRaw, err := d.loadPlayerSnapshot(ctx, tag)
 	if err != nil {
-		return models.BotPlayerIngest{}, err
+		return models.TrackedPlayerIngest{}, err
 	}
 	if len(previousRaw) == 0 {
-		return models.BotPlayerIngest{
-			Players:     []models.BasicPlayerRow{botPlayerRow(player)},
+		return models.TrackedPlayerIngest{
+			Players:     []models.BasicPlayerRow{trackedPlayerRow(player)},
 			SnapshotTag: tag,
 			SnapshotRaw: raw,
 		}, nil
 	}
 	if equalBytes(previousRaw, raw) {
-		return models.BotPlayerIngest{SnapshotTag: tag, SnapshotRaw: raw}, nil
+		return models.TrackedPlayerIngest{SnapshotTag: tag, SnapshotRaw: raw}, nil
 	}
 	var previousPlayer clashy.Player
 	if err := json.Unmarshal(previousRaw, &previousPlayer); err != nil {
-		return models.BotPlayerIngest{SnapshotTag: tag, SnapshotRaw: raw}, nil
+		return models.TrackedPlayerIngest{SnapshotTag: tag, SnapshotRaw: raw}, nil
 	}
 	previous := playerMap(previousPlayer)
 	if equalJSON(previous, current) {
-		return models.BotPlayerIngest{SnapshotTag: tag, SnapshotRaw: raw}, nil
+		return models.TrackedPlayerIngest{SnapshotTag: tag, SnapshotRaw: raw}, nil
 	}
 	now := time.Now().UTC()
-	changes, activityScore := playerChanges(tag, previous, current, now)
+	changes, activityDetected := playerChanges(tag, previous, current, now)
+	activityDetected = activityDetected || playerAchievementActivityDetected(previousPlayer, player)
 	statChanges := playerStatChanges(tag, previousPlayer, player, now)
-	if len(statChanges) > 0 {
+	if len(statChanges) > 0 || activityDetected {
 		statEventTime, err := d.reservePlayerStatEventTime(ctx, tag, previousRaw, now)
 		if err != nil {
-			return models.BotPlayerIngest{}, err
+			return models.TrackedPlayerIngest{}, err
 		}
 		for index := range statChanges {
 			statChanges[index].EventTime = statEventTime
 		}
+		now = statEventTime
 	}
 	clan := clanTag(current)
 	var lastOnline *time.Time
-	if activityScore > 0 {
+	if activityDetected {
 		lastOnline = &now
 	}
-	return models.BotPlayerIngest{
-		Players:        []models.BasicPlayerRow{botPlayerRow(player)},
+	return models.TrackedPlayerIngest{
+		Players:        []models.BasicPlayerRow{trackedPlayerRow(player)},
 		ProfileChanges: changes,
 		StatChanges:    statChanges,
 		LastOnlineAt:   lastOnline,
@@ -284,7 +288,7 @@ func (d *botPlayersDomain) doPlayer(
 	}, nil
 }
 
-func botPlayerRow(player clashy.Player) models.BasicPlayerRow {
+func trackedPlayerRow(player clashy.Player) models.BasicPlayerRow {
 	clan := ""
 	if player.Clan != nil {
 		clan = player.Clan.Tag
@@ -300,17 +304,17 @@ func botPlayerRow(player clashy.Player) models.BasicPlayerRow {
 	}
 }
 
-type botPlayerSnapshotStore interface {
+type trackedPlayerSnapshotStore interface {
 	Load(context.Context, string) ([]byte, bool, error)
 	ReserveStatEventTime(context.Context, string, string, time.Time) (time.Time, error)
 	StoreAndClear(context.Context, string, string, []byte) error
 }
 
-type valkeyBotPlayerSnapshotStore struct {
+type valkeyTrackedPlayerSnapshotStore struct {
 	client valkey.Client
 }
 
-type memoryBotPlayerSnapshotStore struct {
+type memoryTrackedPlayerSnapshotStore struct {
 	mu             sync.Mutex
 	values         map[string][]byte
 	statEventTimes map[string]memoryPlayerStatEventTime
@@ -321,17 +325,17 @@ type memoryPlayerStatEventTime struct {
 	EventTime    time.Time
 }
 
-func newBotPlayerSnapshotStore(client valkey.Client) botPlayerSnapshotStore {
+func newTrackedPlayerSnapshotStore(client valkey.Client) trackedPlayerSnapshotStore {
 	if client != nil {
-		return valkeyBotPlayerSnapshotStore{client: client}
+		return valkeyTrackedPlayerSnapshotStore{client: client}
 	}
-	return &memoryBotPlayerSnapshotStore{
+	return &memoryTrackedPlayerSnapshotStore{
 		values:         make(map[string][]byte),
 		statEventTimes: make(map[string]memoryPlayerStatEventTime),
 	}
 }
 
-func (s valkeyBotPlayerSnapshotStore) Load(ctx context.Context, key string) ([]byte, bool, error) {
+func (s valkeyTrackedPlayerSnapshotStore) Load(ctx context.Context, key string) ([]byte, bool, error) {
 	value, err := s.client.Do(ctx, s.client.B().Get().Key(key).Build()).ToString()
 	if err != nil {
 		if valkey.IsValkeyNil(err) {
@@ -343,7 +347,7 @@ func (s valkeyBotPlayerSnapshotStore) Load(ctx context.Context, key string) ([]b
 	return raw, err == nil, err
 }
 
-func (s valkeyBotPlayerSnapshotStore) ReserveStatEventTime(
+func (s valkeyTrackedPlayerSnapshotStore) ReserveStatEventTime(
 	ctx context.Context,
 	key string,
 	snapshotHash string,
@@ -365,7 +369,7 @@ func (s valkeyBotPlayerSnapshotStore) ReserveStatEventTime(
 	return time.Unix(0, nanoseconds).UTC(), nil
 }
 
-func (s valkeyBotPlayerSnapshotStore) StoreAndClear(
+func (s valkeyTrackedPlayerSnapshotStore) StoreAndClear(
 	ctx context.Context,
 	key string,
 	pendingKey string,
@@ -379,14 +383,14 @@ func (s valkeyBotPlayerSnapshotStore) StoreAndClear(
 	).Error()
 }
 
-func (s *memoryBotPlayerSnapshotStore) Load(_ context.Context, key string) ([]byte, bool, error) {
+func (s *memoryTrackedPlayerSnapshotStore) Load(_ context.Context, key string) ([]byte, bool, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	raw, ok := s.values[key]
 	return append([]byte(nil), raw...), ok, nil
 }
 
-func (s *memoryBotPlayerSnapshotStore) ReserveStatEventTime(
+func (s *memoryTrackedPlayerSnapshotStore) ReserveStatEventTime(
 	_ context.Context,
 	key string,
 	snapshotHash string,
@@ -405,7 +409,7 @@ func (s *memoryBotPlayerSnapshotStore) ReserveStatEventTime(
 	return proposed, nil
 }
 
-func (s *memoryBotPlayerSnapshotStore) StoreAndClear(
+func (s *memoryTrackedPlayerSnapshotStore) StoreAndClear(
 	_ context.Context,
 	key string,
 	pendingKey string,
@@ -418,7 +422,7 @@ func (s *memoryBotPlayerSnapshotStore) StoreAndClear(
 	return nil
 }
 
-func (d *botPlayersDomain) loadPlayerSnapshot(ctx context.Context, tag string) ([]byte, error) {
+func (d *trackedPlayersDomain) loadPlayerSnapshot(ctx context.Context, tag string) ([]byte, error) {
 	if d.snapshots == nil {
 		return nil, nil
 	}
@@ -426,7 +430,7 @@ func (d *botPlayersDomain) loadPlayerSnapshot(ctx context.Context, tag string) (
 	return raw, err
 }
 
-func (d *botPlayersDomain) savePlayerSnapshot(ctx context.Context, tag string, raw []byte) error {
+func (d *trackedPlayersDomain) savePlayerSnapshot(ctx context.Context, tag string, raw []byte) error {
 	if d.snapshots == nil || tag == "" || len(raw) == 0 {
 		return nil
 	}
@@ -438,7 +442,7 @@ func (d *botPlayersDomain) savePlayerSnapshot(ctx context.Context, tag string, r
 	)
 }
 
-func (d *botPlayersDomain) reservePlayerStatEventTime(
+func (d *trackedPlayersDomain) reservePlayerStatEventTime(
 	ctx context.Context,
 	tag string,
 	previousRaw []byte,
@@ -469,9 +473,9 @@ func playerChanges(
 	previous map[string]any,
 	current map[string]any,
 	eventTime time.Time,
-) ([]models.PlayerProfileChangeRow, int) {
+) ([]models.PlayerProfileChangeRow, bool) {
 	var profileChanges []models.PlayerProfileChangeRow
-	activityScore := 0
+	activityDetected := false
 	clan := clanTag(current)
 	townhall, _ := asInt(current["townHallLevel"])
 
@@ -492,10 +496,10 @@ func playerChanges(
 			})
 		}
 		if isOnlineField(key) {
-			activityScore++
+			activityDetected = true
 		}
 	}
-	return profileChanges, activityScore
+	return profileChanges, activityDetected
 }
 
 func playerStatChanges(
@@ -534,6 +538,11 @@ func playerStatChanges(
 			previous: int64(previous.ClanCapitalContributions),
 			current:  int64(current.ClanCapitalContributions),
 		},
+		{
+			statType: playerStatSeasonPass,
+			previous: playerAchievementValue(previous, playerSeasonPassAchievement),
+			current:  playerAchievementValue(current, playerSeasonPassAchievement),
+		},
 	}
 	rows := make([]models.PlayerStatChangeRow, 0, len(counters))
 	for _, counter := range counters {
@@ -554,11 +563,28 @@ func playerStatChanges(
 }
 
 func playerClanGamesValue(player clashy.Player) int64 {
-	achievement := player.GetAchievement(playerClanGamesAchievement)
+	return playerAchievementValue(player, playerClanGamesAchievement)
+}
+
+func playerAchievementValue(player clashy.Player, name string) int64 {
+	achievement := player.GetAchievement(name)
 	if achievement == nil {
 		return 0
 	}
 	return int64(achievement.Value)
+}
+
+func playerAchievementActivityDetected(previous, current clashy.Player) bool {
+	for _, name := range [...]string{
+		"Gold Grab", "Most Valuable Clanmate", "War League Legend", "Wall Buster",
+		"Well Seasoned", "Games Champion", "Elixir Escapade", "Heroic Heist",
+		"Nice and Tidy", "Anti-Artillery", "Firefighter", "X-Bow Exterminator",
+	} {
+		if playerAchievementValue(previous, name) != playerAchievementValue(current, name) {
+			return true
+		}
+	}
+	return false
 }
 
 func isHistoricalField(key string) bool {
@@ -618,74 +644,74 @@ func clanTag(player map[string]any) string {
 	return value
 }
 
-type timescaleBotPlayerStore struct {
+type timescaleTrackedPlayerStore struct {
 	pool *pgxpool.Pool
 }
 
-func newTimescaleBotPlayerStore(
+func newTimescaleTrackedPlayerStore(
 	ctx context.Context,
 	dsn string,
-) (*timescaleBotPlayerStore, error) {
+) (*timescaleTrackedPlayerStore, error) {
 	pool, err := pgxpool.New(ctx, dsn)
 	if err != nil {
 		return nil, err
 	}
-	return &timescaleBotPlayerStore{pool: pool}, nil
+	return &timescaleTrackedPlayerStore{pool: pool}, nil
 }
 
-func (s *timescaleBotPlayerStore) Close() {
+func (s *timescaleTrackedPlayerStore) Close() {
 	if s.pool != nil {
 		s.pool.Close()
 	}
 }
 
-func (s *timescaleBotPlayerStore) NextTargetPage(
+func (s *timescaleTrackedPlayerStore) NextTargetPage(
 	ctx context.Context,
 	cursor string,
 	limit int,
-) (botPlayerTargetPage, error) {
+) (trackedPlayerTargetPage, error) {
 	if limit <= 0 {
-		return botPlayerTargetPage{}, nil
+		return trackedPlayerTargetPage{}, nil
 	}
-	rows, err := s.pool.Query(ctx, botPlayerTargetsSQL, cursor, limit+1)
+	rows, err := s.pool.Query(ctx, trackedPlayerTargetsSQL, cursor, limit+1)
 	if err != nil {
-		return botPlayerTargetPage{}, err
+		return trackedPlayerTargetPage{}, err
 	}
 	defer rows.Close()
-	var targets []models.BotPlayerTarget
+	var targets []models.TrackedPlayerTarget
 	for rows.Next() {
-		var target models.BotPlayerTarget
+		var target models.TrackedPlayerTarget
 		if err := rows.Scan(&target.Tag); err != nil {
-			return botPlayerTargetPage{}, err
+			return trackedPlayerTargetPage{}, err
 		}
 		targets = append(targets, target)
 	}
 	if err := rows.Err(); err != nil {
-		return botPlayerTargetPage{}, err
+		return trackedPlayerTargetPage{}, err
 	}
 	nextCursor := ""
 	if len(targets) > limit {
 		nextCursor = targets[limit-1].Tag
 		targets = targets[:limit]
 	}
-	return botPlayerTargetPage{Targets: targets, NextCursor: nextCursor}, nil
+	return trackedPlayerTargetPage{Targets: targets, NextCursor: nextCursor}, nil
 }
 
-func (s *timescaleBotPlayerStore) StoreIngest(
+func (s *timescaleTrackedPlayerStore) StoreIngest(
 	ctx context.Context,
-	ingest models.BotPlayerIngest,
+	ingest models.TrackedPlayerIngest,
 ) error {
 	tx, err := s.pool.Begin(ctx)
 	if err != nil {
 		return err
 	}
 	defer tx.Rollback(ctx)
-	if len(ingest.StatChanges) > 0 {
+	if len(ingest.StatChanges) > 0 || ingest.LastOnlineAt != nil {
 		if _, err := tx.Exec(ctx, lockPlayerStatChangesSQL, ingest.SnapshotTag); err != nil {
 			return err
 		}
 	}
-	if err := utils.UpsertBasicPlayers(ctx, tx, ingest.Players, botPlayersDomainName); err != nil {
+	if err := utils.UpsertBasicPlayers(ctx, tx, ingest.Players, trackedPlayersDomainName); err != nil {
 		return err
 	}
 	if err := insertPlayerProfileChanges(ctx, tx, ingest.ProfileChanges); err != nil {
@@ -694,36 +720,48 @@ func (s *timescaleBotPlayerStore) StoreIngest(
 	if err := insertPlayerStatChanges(ctx, tx, ingest.StatChanges); err != nil {
 		return err
 	}
-	if ingest.LastOnlineAt != nil && ingest.SnapshotTag != "" {
-		if _, err := tx.Exec(ctx, updatePlayerLastActivitySQL, *ingest.LastOnlineAt, ingest.SnapshotTag); err != nil {
+	if ingest.LastOnlineAt != nil && len(ingest.Players) > 0 && ingest.Players[0].ClanTag != "" {
+		if _, err := tx.Exec(ctx, insertPlayerOnlineEventSQL,
+			*ingest.LastOnlineAt, ingest.SnapshotTag, ingest.Players[0].ClanTag); err != nil {
 			return err
 		}
 	}
 	return tx.Commit(ctx)
 }
 
-const botPlayerTargetsSQL = `
-	SELECT tag
-	FROM (
+const trackedPlayerTargetSetSQL = `
 		SELECT member->>'tag' AS tag
-		FROM basic_clan
+		FROM server_clans tracked_clan
+		JOIN servers server ON server.id = tracked_clan.server_id
+		JOIN basic_clan ON basic_clan.tag = tracked_clan.tag
 		CROSS JOIN LATERAL jsonb_array_elements(COALESCE(members, '[]'::jsonb)) AS member
-		WHERE member->>'tag' <> ''
+		WHERE server.last_command_at >= now() - interval '90 days'
+		  AND member->>'tag' <> ''
 		UNION
-		SELECT tag
-		FROM tracked_player_targets
-		WHERE enabled = true
-	) targets
+		SELECT account.player_tag AS tag
+		FROM mobile_notification_accounts account
+		JOIN mobile_push_devices device
+		  ON device.user_id = account.user_id
+		 AND device.enabled = true
+		 AND device.provider = 'fcm'
+		WHERE account.active = true
+`
+
+const trackedPlayerTargetsSQL = `
+	SELECT tag
+	FROM (` + trackedPlayerTargetSetSQL + `) targets
 	WHERE tag > $1
 	ORDER BY tag
 	LIMIT $2
 `
 
-const updatePlayerLastActivitySQL = `
-	UPDATE basic_player
-	SET battlelogs_tracking_ttl = $1
-	WHERE tag = $2
-	  AND (battlelogs_tracking_ttl IS NULL OR battlelogs_tracking_ttl < $1)
+const insertPlayerOnlineEventSQL = `
+	INSERT INTO player_online_events (seen_at, tag, clan_tag)
+	SELECT $1, $2, $3
+	WHERE NOT EXISTS (
+		SELECT 1 FROM player_online_events
+		WHERE seen_at = $1 AND tag = $2 AND clan_tag = $3
+	)
 `
 
 func insertPlayerProfileChanges(
@@ -834,60 +872,50 @@ func validPlayerStatType(statType string) bool {
 	case playerStatDonated,
 		playerStatReceived,
 		playerStatClanGames,
-		playerStatCapitalGoldDonated:
+		playerStatCapitalGoldDonated,
+		playerStatSeasonPass:
 		return true
 	default:
 		return false
 	}
 }
 
-type memoryBotPlayerStore struct {
-	targets []models.BotPlayerTarget
+type memoryTrackedPlayerStore struct {
+	targets []models.TrackedPlayerTarget
 }
 
-func newMemoryBotPlayerStore() *memoryBotPlayerStore {
-	return &memoryBotPlayerStore{}
+func newMemoryTrackedPlayerStore() *memoryTrackedPlayerStore {
+	return &memoryTrackedPlayerStore{}
 }
 
-func (s *memoryBotPlayerStore) Close() {}
+func (s *memoryTrackedPlayerStore) Close() {}
 
-func (s *memoryBotPlayerStore) NextTargetPage(
+func (s *memoryTrackedPlayerStore) NextTargetPage(
 	_ context.Context,
 	cursor string,
 	limit int,
-) (botPlayerTargetPage, error) {
+) (trackedPlayerTargetPage, error) {
 	if limit <= 0 || len(s.targets) == 0 {
-		return botPlayerTargetPage{}, nil
+		return trackedPlayerTargetPage{}, nil
 	}
-	targets := append([]models.BotPlayerTarget(nil), s.targets...)
+	targets := append([]models.TrackedPlayerTarget(nil), s.targets...)
 	sort.Slice(targets, func(i, j int) bool { return targets[i].Tag < targets[j].Tag })
 	start := sort.Search(len(targets), func(i int) bool { return targets[i].Tag > cursor })
 	if start >= len(targets) {
-		return botPlayerTargetPage{}, nil
+		return trackedPlayerTargetPage{}, nil
 	}
 	end := start + limit
 	if end > len(targets) {
 		end = len(targets)
 	}
-	pageTargets := append([]models.BotPlayerTarget(nil), targets[start:end]...)
+	pageTargets := append([]models.TrackedPlayerTarget(nil), targets[start:end]...)
 	nextCursor := ""
 	if end < len(targets) {
 		nextCursor = pageTargets[len(pageTargets)-1].Tag
 	}
-	return botPlayerTargetPage{Targets: pageTargets, NextCursor: nextCursor}, nil
+	return trackedPlayerTargetPage{Targets: pageTargets, NextCursor: nextCursor}, nil
 }
 
-func (s *memoryBotPlayerStore) StoreIngest(context.Context, models.BotPlayerIngest) error {
+func (s *memoryTrackedPlayerStore) StoreIngest(context.Context, models.TrackedPlayerIngest) error {
 	return nil
-}
-
-func sleepOrDone(ctx context.Context, delay time.Duration) error {
-	timer := time.NewTimer(delay)
-	defer timer.Stop()
-	select {
-	case <-ctx.Done():
-		return ctx.Err()
-	case <-timer.C:
-		return nil
-	}
 }

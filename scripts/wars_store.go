@@ -8,7 +8,6 @@ import (
 	"sync"
 	"time"
 
-	"clashking_tracking/internal/platform"
 	"clashking_tracking/internal/utils"
 	"clashking_tracking/models"
 
@@ -17,16 +16,15 @@ import (
 )
 
 type timescaleWarStore struct {
-	pool    *pgxpool.Pool
-	objects platform.ObjectStore
+	pool *pgxpool.Pool
 }
 
-func newTimescaleWarStore(ctx context.Context, dsn string, objects platform.ObjectStore) (*timescaleWarStore, error) {
+func newTimescaleWarStore(ctx context.Context, dsn string) (*timescaleWarStore, error) {
 	pool, err := pgxpool.New(ctx, dsn)
 	if err != nil {
 		return nil, err
 	}
-	return &timescaleWarStore{pool: pool, objects: objects}, nil
+	return &timescaleWarStore{pool: pool}, nil
 }
 
 func (s *timescaleWarStore) Close() error {
@@ -97,7 +95,7 @@ func (s *timescaleWarStore) DeleteExpiredCurrentWarTimers(ctx context.Context) (
 }
 
 func (s *timescaleWarStore) Store(ctx context.Context, ingest models.WarIngest) error {
-	if len(ingest.IndexRows) == 0 && len(ingest.AttackRows) == 0 && len(ingest.Players) == 0 && len(ingest.Schedules) == 0 && len(ingest.CurrentWarTimers) == 0 && len(ingest.CWLGroups) == 0 {
+	if len(ingest.IndexRows) == 0 && len(ingest.AttackRows) == 0 && len(ingest.Schedules) == 0 && len(ingest.CurrentWarTimers) == 0 && len(ingest.CWLGroups) == 0 {
 		return nil
 	}
 	tx, err := s.pool.Begin(ctx)
@@ -112,20 +110,11 @@ func (s *timescaleWarStore) Store(ctx context.Context, ingest models.WarIngest) 
 		if ingest.FinishedWarID == "" {
 			return nil
 		}
-		if err := s.storeFinishedWarObject(ctx, ingest); err != nil {
-			return err
-		}
-	}
-	if err := utils.UpsertBasicPlayers(ctx, tx, ingest.Players, warsDomainName); err != nil {
-		return err
 	}
 	if err := insertWarIndexRows(ctx, tx, ingest.IndexRows); err != nil {
 		return err
 	}
 	if err := insertWarAttackRows(ctx, tx, ingest.AttackRows); err != nil {
-		return err
-	}
-	if err := touchWarAttackPlayers(ctx, tx, ingest.AttackRows); err != nil {
 		return err
 	}
 	if err := upsertWarSchedules(ctx, tx, ingest.Schedules); err != nil {
@@ -162,7 +151,6 @@ func (s *timescaleWarStore) prepareFinishedWar(ctx context.Context, tx pgx.Tx, i
 		ingest.FinishedWarID = ""
 		ingest.IndexRows = nil
 		ingest.AttackRows = nil
-		ingest.Players = nil
 		return nil
 	}
 	if err != nil {
@@ -170,15 +158,6 @@ func (s *timescaleWarStore) prepareFinishedWar(ctx context.Context, tx pgx.Tx, i
 	}
 	rewriteWarIngestID(ingest, canonicalWarID)
 	return nil
-}
-
-func (s *timescaleWarStore) storeFinishedWarObject(ctx context.Context, ingest models.WarIngest) error {
-	if s.objects == nil {
-		return nil
-	}
-	// R2 stores the full API payload; SQL keeps lookup and analytics rows.
-	compressed := utils.Compress(ingest.RawWarJSON)
-	return s.objects.PutObject(ctx, warR2Key(ingest.FinishedWarID), compressed, "application/json")
 }
 
 func rewriteWarIngestID(ingest *models.WarIngest, warID string) {
@@ -311,33 +290,6 @@ func insertWarAttackRows(ctx context.Context, tx pgx.Tx, rows []models.WarAttack
 	return utils.SendBatch(ctx, tx, batch)
 }
 
-func touchWarAttackPlayers(ctx context.Context, tx pgx.Tx, rows []models.WarAttackRow) error {
-	if len(rows) == 0 {
-		return nil
-	}
-	seen := make(map[string]struct{}, len(rows))
-	tags := make([]string, 0, len(rows))
-	for _, row := range rows {
-		if row.AttackerTag == "" {
-			continue
-		}
-		if _, ok := seen[row.AttackerTag]; ok {
-			continue
-		}
-		seen[row.AttackerTag] = struct{}{}
-		tags = append(tags, row.AttackerTag)
-	}
-	if len(tags) == 0 {
-		return nil
-	}
-	_, err := tx.Exec(ctx, `
-		UPDATE basic_player
-		SET battlelogs_tracking_ttl = now()
-		WHERE tag = ANY($1)
-	`, tags)
-	return err
-}
-
 func upsertWarSchedules(ctx context.Context, tx pgx.Tx, rows []models.WarScheduleRow) error {
 	if len(rows) == 0 {
 		return nil
@@ -449,13 +401,6 @@ const upsertCWLGroupClansSQL = `
 		badge_token = EXCLUDED.badge_token
 `
 
-const loadCWLGroupMemberSourcesSQL = `
-	SELECT tag, members
-	FROM basic_clan
-	WHERE tag = ANY($1)
-	FOR SHARE
-`
-
 const upsertCWLGroupMembersSQL = `
 	INSERT INTO cwl_group_members (cwl_id, clan_tag, name, tag, town_hall)
 	SELECT $1, $2, source.name, source.tag, source.town_hall::smallint
@@ -496,32 +441,11 @@ func upsertCWLGroupClans(ctx context.Context, tx pgx.Tx, cwlID string, rows []mo
 	if _, err := tx.Exec(ctx, upsertCWLGroupClansSQL, cwlID, tags, names, levels, badges); err != nil {
 		return err
 	}
-	membersByClan := make(map[string][]models.BasicClanMember, len(tags))
-	sourceRows, err := tx.Query(ctx, loadCWLGroupMemberSourcesSQL, tags)
-	if err != nil {
-		return err
-	}
-	for sourceRows.Next() {
-		var clanTag string
-		var raw []byte
-		if err := sourceRows.Scan(&clanTag, &raw); err != nil {
-			sourceRows.Close()
-			return err
+	for _, row := range rows {
+		if row.ClanTag == "" {
+			continue
 		}
-		var members []models.BasicClanMember
-		if err := json.Unmarshal(raw, &members); err != nil {
-			sourceRows.Close()
-			return err
-		}
-		membersByClan[clanTag] = members
-	}
-	if err := sourceRows.Err(); err != nil {
-		sourceRows.Close()
-		return err
-	}
-	sourceRows.Close()
-	for _, clanTag := range tags {
-		if err := replaceCWLGroupMembers(ctx, tx, cwlID, clanTag, membersByClan[clanTag]); err != nil {
+		if err := replaceCWLGroupMembers(ctx, tx, cwlID, row.ClanTag, row.Members); err != nil {
 			return err
 		}
 	}
@@ -602,7 +526,6 @@ type memoryWarStore struct {
 	schedules        map[string]models.WarScheduleRow
 	cwlGroups        map[string]models.CWLGroupRow
 	currentWarTimers map[string]models.CurrentWarTimerRow
-	objects          map[string][]byte
 }
 
 func newMemoryWarStore() *memoryWarStore {
@@ -612,7 +535,6 @@ func newMemoryWarStore() *memoryWarStore {
 		schedules:        make(map[string]models.WarScheduleRow),
 		cwlGroups:        make(map[string]models.CWLGroupRow),
 		currentWarTimers: make(map[string]models.CurrentWarTimerRow),
-		objects:          make(map[string][]byte),
 	}
 }
 
@@ -692,8 +614,6 @@ func (s *memoryWarStore) Store(_ context.Context, ingest models.WarIngest) error
 		s.cwlGroups[row.CWLID] = row
 	}
 	if ingest.FinishedWarID != "" {
-		// Mirror the production ordering closely enough for store-ordering unit tests.
-		s.objects[warR2Key(ingest.FinishedWarID)] = utils.Compress(ingest.RawWarJSON)
 		delete(s.schedules, ingest.FinishedScheduleKey)
 	}
 	return nil

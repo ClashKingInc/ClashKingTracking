@@ -4,7 +4,6 @@ import (
 	"context"
 	"crypto/sha256"
 	"encoding/base64"
-	"encoding/json"
 	"errors"
 	"fmt"
 	"sort"
@@ -190,10 +189,7 @@ func validateWarConfig(app *platform.App) error {
 		return errors.New("wars.cwl_sync_seconds must be greater than zero when wars is enabled")
 	}
 	if !cfg.DryRun && !cfg.MockDB && cfg.TimescaleURL == "" {
-		return errors.New("TIMESCALE_URL is required when wars is enabled")
-	}
-	if !cfg.DryRun && !cfg.MockDB && app.R2 == nil {
-		return errors.New("R2 config is required when wars is enabled")
+		return errors.New("TIMESCALE_* connection variables are required when wars is enabled")
 	}
 	return nil
 }
@@ -202,7 +198,7 @@ func (d *warsDomain) openStore(ctx context.Context, app *platform.App) (warStore
 	if app.Config.DryRun || app.Config.MockDB {
 		return newMemoryWarStore(), nil
 	}
-	return newTimescaleWarStore(ctx, app.Config.TimescaleURL, app.R2)
+	return newTimescaleWarStore(ctx, app.Config.TimescaleURL)
 }
 
 func (d *warsDomain) openTargetSource(ctx context.Context, app *platform.App) (warTargetSource, error) {
@@ -458,7 +454,7 @@ func (d *warsDomain) storeIngest(ctx context.Context, app *platform.App, ingest 
 	for _, schedule := range ingest.Schedules {
 		d.scheduleStore(app, schedule)
 	}
-	app.Stats.RecordWrite(warsDomainName, len(ingest.AttackRows)+len(ingest.IndexRows)+len(ingest.Players)+len(ingest.Schedules)+len(ingest.CurrentWarTimers)+len(ingest.CWLGroups))
+	app.Stats.RecordWrite(warsDomainName, len(ingest.AttackRows)+len(ingest.IndexRows)+len(ingest.Schedules)+len(ingest.CurrentWarTimers)+len(ingest.CWLGroups))
 	app.Stats.SetQueueDepth(warsDomainName, len(ingest.Schedules))
 	return nil
 }
@@ -491,8 +487,8 @@ func buildWarIngest(war clashy.ClanWar, sourceClanTag string, finished bool, war
 		warType = "cwl"
 	}
 	if !finished {
-		// Active wars only create an end-time schedule. Permanent war rows and R2
-		// payloads are written by the scheduler after the war has ended.
+		// Active wars only create an end-time schedule. Permanent war rows are
+		// written by the scheduler after the war has ended.
 		return models.WarIngest{
 			Schedules: []models.WarScheduleRow{{
 				ScheduleKey:   scheduleKey,
@@ -514,16 +510,9 @@ func buildWarIngest(war clashy.ClanWar, sourceClanTag string, finished bool, war
 	ingest := models.WarIngest{
 		IndexRows:  indexRows,
 		AttackRows: warAttackRows(warID, war, warType, endAt),
-		Players:    warPlayerRows(war),
 	}
-	raw, err := json.Marshal(war)
-	if err != nil {
-		return models.WarIngest{}, err
-	}
-	// Finished wars include the full raw payload for R2; active-war snapshots do not.
 	ingest.FinishedScheduleKey = scheduleKey
 	ingest.FinishedWarID = warID
-	ingest.RawWarJSON = raw
 	return ingest, nil
 }
 
@@ -623,34 +612,6 @@ func warAttackRows(warID string, war clashy.ClanWar, warType string, warEndTime 
 	return rows
 }
 
-func warPlayerRows(war clashy.ClanWar) []models.BasicPlayerRow {
-	players := make(map[string]models.BasicPlayerRow)
-	add := func(members []clashy.ClanWarMember) {
-		for _, member := range members {
-			if member.Tag == "" || member.Name == "" || member.Townhall <= 0 {
-				continue
-			}
-			players[member.Tag] = models.BasicPlayerRow{
-				Tag:      member.Tag,
-				Name:     member.Name,
-				TownHall: member.Townhall,
-			}
-		}
-	}
-	if war.Clan != nil {
-		add(war.Clan.Members)
-	}
-	if war.Opponent != nil {
-		add(war.Opponent.Members)
-	}
-	out := make([]models.BasicPlayerRow, 0, len(players))
-	for _, player := range players {
-		out = append(out, player)
-	}
-	sort.Slice(out, func(i, j int) bool { return out[i].Tag < out[j].Tag })
-	return out
-}
-
 func warMembersByTag(war clashy.ClanWar) map[string]clashy.ClanWarMember {
 	out := make(map[string]clashy.ClanWarMember)
 	if war.Clan != nil {
@@ -701,10 +662,6 @@ func optionalWarTime(value *clashy.Timestamp) *time.Time {
 	}
 	out := value.Time.UTC()
 	return &out
-}
-
-func warR2Key(warID string) string {
-	return warID
 }
 
 func (d *warsDomain) reloadSchedules(ctx context.Context, app *platform.App) error {
@@ -864,7 +821,18 @@ func cwlGroupClanRows(group *clashy.ClanWarLeagueGroup) []models.CWLGroupClanRow
 			continue
 		}
 		seen[clan.Tag] = struct{}{}
-		rows = append(rows, models.CWLGroupClanRow{ClanTag: clan.Tag, Name: clan.Name, ClanLevel: clan.Level, BadgeToken: badgeToken(clan.Badge)})
+		members := make([]models.BasicClanMember, 0, len(clan.Members))
+		for _, member := range clan.Members {
+			members = append(members, models.BasicClanMember{
+				Tag:      member.Tag,
+				Name:     member.Name,
+				TownHall: member.TownHallLevel,
+			})
+		}
+		rows = append(rows, models.CWLGroupClanRow{
+			ClanTag: clan.Tag, Name: clan.Name, ClanLevel: clan.Level,
+			BadgeToken: badgeToken(clan.Badge), Members: members,
+		})
 	}
 	return rows
 }

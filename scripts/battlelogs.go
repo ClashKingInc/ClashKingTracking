@@ -78,7 +78,7 @@ func (d *battlelogsDomain) Run(ctx context.Context, app *platform.App) error {
 		return errors.New("battlelogs.first_seen_lookback_days must be greater than zero when battlelogs is enabled")
 	}
 	if !app.Config.DryRun && !app.Config.MockDB && app.Config.TimescaleURL == "" {
-		return errors.New("TIMESCALE_URL is required when battlelogs is enabled")
+		return errors.New("TIMESCALE_* connection variables are required when battlelogs is enabled")
 	}
 	if !app.Config.DryRun && !app.Config.MockDB && app.Config.ValkeyAddr == "" {
 		return errors.New("valkey_addr is required for battlelogs checkpoint persistence")
@@ -199,7 +199,7 @@ func (d *battlelogsDomain) runTracker(
 		}
 		if err := runBounded(ctx, platform.RequestConcurrency(requestsPerSecond), page.Tags, func(workerCtx context.Context, tag string) error {
 			ingest, err := retryLimitedClashFetch(workerCtx, limiter, func(fetchCtx context.Context) (models.BattlelogIngest, error) {
-				return d.do(fetchCtx, app, statsName, tag, checkpoints[tag])
+				return d.do(fetchCtx, app, statsName, tag, checkpoints[tag], group == "legend")
 			})
 			if err != nil {
 				app.Logger.Error("battlelog processing failed", "tag", tag, "err", err)
@@ -221,18 +221,21 @@ func (d *battlelogsDomain) runTracker(
 }
 
 func mergeBattlelogIngests(values []models.BattlelogIngest) models.BattlelogIngest {
-	var totalRows, totalCheckpoints int
+	var totalRows, totalNotifications, totalCheckpoints int
 	for _, value := range values {
 		totalRows += len(value.Rows)
+		totalNotifications += len(value.Notifications)
 		totalCheckpoints += len(value.Checkpoints)
 	}
 	out := models.BattlelogIngest{
-		Rows:        make([]models.BattlelogRow, 0, totalRows),
-		Checkpoints: make([]models.BattlelogCheckpoint, 0, totalCheckpoints),
+		Rows:          make([]models.BattlelogRow, 0, totalRows),
+		Notifications: make([]models.BattlelogRow, 0, totalNotifications),
+		Checkpoints:   make([]models.BattlelogCheckpoint, 0, totalCheckpoints),
 	}
 	checkpoints := make(map[string]models.BattlelogCheckpoint, totalCheckpoints)
 	for _, value := range values {
 		out.Rows = append(out.Rows, value.Rows...)
+		out.Notifications = append(out.Notifications, value.Notifications...)
 		for _, checkpoint := range value.Checkpoints {
 			if checkpoint.Tag == "" || checkpoint.Timestamp.IsZero() {
 				continue
@@ -263,6 +266,7 @@ func (d *battlelogsDomain) do(
 	statsName string,
 	playerTag string,
 	checkpoint models.BattlelogCheckpoint,
+	notifyLegend bool,
 ) (models.BattlelogIngest, error) {
 	entries, err := d.fetchBattleLog(ctx, app, statsName, playerTag)
 	if err != nil {
@@ -314,6 +318,9 @@ func (d *battlelogsDomain) do(
 	ingest := models.BattlelogIngest{
 		Rows: rows,
 	}
+	if notifyLegend && !checkpoint.Timestamp.IsZero() {
+		ingest.Notifications = append(ingest.Notifications, rows...)
+	}
 	if !checkpointTime.IsZero() {
 		ingest.Checkpoints = []models.BattlelogCheckpoint{{Tag: playerTag, Timestamp: checkpointTime}}
 	}
@@ -330,6 +337,23 @@ func (d *battlelogsDomain) store(ctx context.Context, app *platform.App, ingest 
 			return err
 		}
 	}
+	if len(ingest.Notifications) > 0 {
+		activeTags, err := activeLegendNotificationTags(ctx, app.Valkey, ingest.Notifications)
+		if err != nil {
+			return err
+		}
+		for _, battle := range ingest.Notifications {
+			if _, active := activeTags[battle.PlayerTag]; !active {
+				continue
+			}
+			if err := app.PublishEvent(ctx, platform.Event{
+				Topic: "legend",
+				Value: legendBattleEventValue(battle),
+			}); err != nil {
+				return err
+			}
+		}
+	}
 	if !app.Config.DryRun {
 		// Checkpoints move only after durable rows write successfully.
 		if err := d.checkpoint.UpdateMany(ctx, ingest.Checkpoints); err != nil {
@@ -340,6 +364,53 @@ func (d *battlelogsDomain) store(ctx context.Context, app *platform.App, ingest 
 	app.Stats.RecordStore(battlelogsDomainName, time.Since(start), len(ingest.Rows), insertedRows)
 	app.Stats.SetReady(battlelogsDomainName, true, "")
 	return nil
+}
+
+func activeLegendNotificationTags(ctx context.Context, client valkey.Client, rows []models.BattlelogRow) (map[string]struct{}, error) {
+	tagSet := make(map[string]struct{}, len(rows))
+	for _, row := range rows {
+		if row.PlayerTag != "" {
+			tagSet[row.PlayerTag] = struct{}{}
+		}
+	}
+	tags := make([]string, 0, len(tagSet))
+	for tag := range tagSet {
+		tags = append(tags, tag)
+	}
+	sort.Strings(tags)
+	if len(tags) == 0 {
+		return map[string]struct{}{}, nil
+	}
+	keys := make([]string, len(tags))
+	for i, tag := range tags {
+		keys[i] = legendNotificationActivityKey(tag)
+	}
+	values, err := client.Do(ctx, client.B().Mget().Key(keys...).Build()).ToArray()
+	if err != nil {
+		return nil, err
+	}
+	active := make(map[string]struct{}, len(tags))
+	for i, tag := range tags {
+		if i >= len(values) {
+			break
+		}
+		if _, err := values[i].ToString(); err == nil {
+			active[tag] = struct{}{}
+		}
+	}
+	return active, nil
+}
+
+func legendNotificationActivityKey(playerTag string) string {
+	return "mobile:legend:active:" + playerTag
+}
+
+func legendBattleEventValue(row models.BattlelogRow) map[string]any {
+	return map[string]any{
+		"type": "legend_battle", "battle_id": row.BattleID.String(), "player_tag": row.PlayerTag,
+		"opponent_name": row.OpponentName, "attack": row.Attack,
+		"stars": row.Stars, "destruction_percentage": row.DestructionPercentage,
+	}
 }
 
 func (d *battlelogsDomain) fetchBattleLog(ctx context.Context, app *platform.App, statsName string, tag string) ([]clashy.BattleLogEntry, error) {
@@ -374,31 +445,16 @@ func (s *timescaleBattlelogStore) NextTargetPage(
 	if limit <= 0 {
 		limit = battlelogTargetPageSize
 	}
-	decoded, err := decodeBattlelogTargetCursor(cursor)
-	if err != nil {
-		return battlelogTargetPage{}, err
-	}
-	page, err := s.scanActivePlayerPage(ctx, group, decoded, limit)
-	if err != nil {
-		return battlelogTargetPage{}, err
-	}
-	return page, nil
+	return s.scanPlayerPage(ctx, group, cursor, limit)
 }
 
 func (s *timescaleBattlelogStore) CountTargets(ctx context.Context, group string) (int, error) {
-	query := `
-		SELECT count(*)
-		FROM basic_player
-		WHERE battlelogs_tracking_ttl >= now() - interval '10 days'
-		  AND league_id IS DISTINCT FROM 105000036
-	`
+	query := `SELECT count(*)
+		FROM (` + trackedPlayerTargetSetSQL + `) target
+		JOIN basic_player player ON player.tag = target.tag
+		WHERE player.league_id IS DISTINCT FROM 105000036`
 	if group == "legend" {
-		query = `
-			SELECT count(*)
-			FROM basic_player
-			WHERE battlelogs_tracking_ttl >= now() - interval '10 days'
-			  AND league_id = 105000036
-		`
+		query = `SELECT count(*) FROM basic_player WHERE league_id = 105000036`
 	}
 	var count int
 	if err := s.pool.QueryRow(ctx, query).Scan(&count); err != nil {
@@ -407,94 +463,57 @@ func (s *timescaleBattlelogStore) CountTargets(ctx context.Context, group string
 	return count, nil
 }
 
-func (s *timescaleBattlelogStore) scanActivePlayerPage(
+func (s *timescaleBattlelogStore) scanPlayerPage(
 	ctx context.Context,
 	group string,
-	cursor battlelogTargetCursor,
+	cursor string,
 	limit int,
 ) (battlelogTargetPage, error) {
-	leaguePredicate := "league_id IS DISTINCT FROM 105000036"
+	query := `
+		SELECT player.tag
+		FROM (` + trackedPlayerTargetSetSQL + `) target
+		JOIN basic_player player ON player.tag = target.tag
+		WHERE player.league_id IS DISTINCT FROM 105000036
+		  AND player.tag > $1
+		ORDER BY player.tag
+		LIMIT $2
+	`
 	if group == "legend" {
-		leaguePredicate = "league_id = 105000036"
-	}
-	args := []any{int32(limit)}
-	cursorPredicate := ""
-	if cursor.Valid {
-		cursorPredicate = `
-		  AND (
-			battlelogs_tracking_ttl < $1
-			OR (battlelogs_tracking_ttl = $1 AND tag > $2)
-		  )
+		query = `
+			SELECT tag
+			FROM basic_player
+			WHERE league_id = 105000036
+			  AND tag > $1
+			ORDER BY tag
+			LIMIT $2
 		`
-		args = []any{cursor.TTL, cursor.Tag, int32(limit)}
 	}
-	limitPlaceholder := fmt.Sprintf("$%d", len(args))
-	query := fmt.Sprintf(`
-		SELECT tag, battlelogs_tracking_ttl
-		FROM basic_player
-		WHERE battlelogs_tracking_ttl >= now() - interval '10 days'
-		  AND %s
-		  %s
-		ORDER BY battlelogs_tracking_ttl DESC, tag
-		LIMIT %s
-	`, leaguePredicate, cursorPredicate, limitPlaceholder)
-	rows, err := s.pool.Query(ctx, query, args...)
+	rows, err := s.pool.Query(ctx, query, cursor, limit)
 	if err != nil {
 		return battlelogTargetPage{}, err
 	}
 	defer rows.Close()
 
 	page := battlelogTargetPage{Tags: make([]string, 0, limit)}
-	var lastTTL time.Time
 	var lastTag string
 	for rows.Next() {
 		var tag string
-		var ttl time.Time
-		if err := rows.Scan(&tag, &ttl); err != nil {
+		if err := rows.Scan(&tag); err != nil {
 			return battlelogTargetPage{}, err
 		}
 		if tag == "" {
 			continue
 		}
 		page.Tags = append(page.Tags, tag)
-		lastTTL = ttl
 		lastTag = tag
 	}
 	if err := rows.Err(); err != nil {
 		return battlelogTargetPage{}, err
 	}
 	if len(page.Tags) == limit {
-		page.NextCursor = encodeBattlelogTargetCursor(lastTTL, lastTag)
+		page.NextCursor = lastTag
 	}
 	return page, nil
-}
-
-type battlelogTargetCursor struct {
-	TTL   time.Time
-	Tag   string
-	Valid bool
-}
-
-func encodeBattlelogTargetCursor(ttl time.Time, tag string) string {
-	if ttl.IsZero() || tag == "" {
-		return ""
-	}
-	return ttl.UTC().Format(time.RFC3339Nano) + "|" + tag
-}
-
-func decodeBattlelogTargetCursor(cursor string) (battlelogTargetCursor, error) {
-	if cursor == "" {
-		return battlelogTargetCursor{}, nil
-	}
-	parts := strings.SplitN(cursor, "|", 2)
-	if len(parts) != 2 || parts[0] == "" || parts[1] == "" {
-		return battlelogTargetCursor{}, fmt.Errorf("invalid battlelog target cursor %q", cursor)
-	}
-	ttl, err := time.Parse(time.RFC3339Nano, parts[0])
-	if err != nil {
-		return battlelogTargetCursor{}, fmt.Errorf("invalid battlelog target cursor %q: %w", cursor, err)
-	}
-	return battlelogTargetCursor{TTL: ttl, Tag: parts[1], Valid: true}, nil
 }
 
 func (s *timescaleBattlelogStore) Store(ctx context.Context, ingest models.BattlelogIngest) (int, error) {

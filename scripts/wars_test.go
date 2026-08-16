@@ -37,12 +37,6 @@ func TestWarQueueRejectsIncompleteStoreWork(t *testing.T) {
 	}
 }
 
-func TestWarR2Key(t *testing.T) {
-	if got, want := warR2Key("018f4ad0-26c7-7b0d-9a4c-5b6c7d8e9f01"), "018f4ad0-26c7-7b0d-9a4c-5b6c7d8e9f01"; got != want {
-		t.Fatalf("warR2Key = %q, want %q", got, want)
-	}
-}
-
 func TestWarTargetsSQLOnlyUsesPublicWarLogs(t *testing.T) {
 	if !strings.Contains(warTargetsSQL, "public_war_log = true") {
 		t.Fatalf("war target query should require public war logs: %s", warTargetsSQL)
@@ -66,7 +60,7 @@ func TestBuildWarIngestSchedulesActiveWar(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if len(ingest.IndexRows) != 0 || len(ingest.AttackRows) != 0 || len(ingest.Players) != 0 {
+	if len(ingest.IndexRows) != 0 || len(ingest.AttackRows) != 0 {
 		t.Fatalf("active war should only schedule final store: %#v", ingest)
 	}
 	if len(ingest.Schedules) != 1 || ingest.Schedules[0].ScheduleKey == "" || ingest.Schedules[0].WarID == "" || !ingest.Schedules[0].NextRunAt.Equal(end) {
@@ -128,7 +122,7 @@ func TestCurrentWarTimerBulkUpsertSQL(t *testing.T) {
 	}
 }
 
-func TestBuildWarIngestFinishedAddsR2Payload(t *testing.T) {
+func TestBuildWarIngestFinishedAddsPermanentRows(t *testing.T) {
 	prep := time.Date(2026, 5, 24, 1, 0, 0, 0, time.UTC)
 	war := sampleWar(prep, prep.Add(time.Hour), prep.Add(2*time.Hour))
 
@@ -139,8 +133,8 @@ func TestBuildWarIngestFinishedAddsR2Payload(t *testing.T) {
 	if len(ingest.Schedules) != 0 {
 		t.Fatalf("finished ingest should not reschedule: %#v", ingest.Schedules)
 	}
-	if ingest.FinishedScheduleKey != "#AAA-#BBB-1" || ingest.FinishedWarID != "018f4ad0-26c7-7b0d-9a4c-5b6c7d8e9f01" || len(ingest.RawWarJSON) == 0 {
-		t.Fatalf("missing finished object fields: %#v", ingest)
+	if ingest.FinishedScheduleKey != "#AAA-#BBB-1" || ingest.FinishedWarID != "018f4ad0-26c7-7b0d-9a4c-5b6c7d8e9f01" {
+		t.Fatalf("missing finished-war fields: %#v", ingest)
 	}
 	if len(ingest.IndexRows) != 1 {
 		t.Fatalf("IndexRows len = %d, want 1", len(ingest.IndexRows))
@@ -234,6 +228,7 @@ func TestCWLGroupRowUsesFinalTypedSnapshotShape(t *testing.T) {
 }
 
 func TestCWLGroupWritesUseFinalSchemaWithoutStandings(t *testing.T) {
+	writeSQL := upsertCWLGroupsSQLShape + upsertCWLGroupClansSQL + upsertCWLGroupMembersSQL + deleteStaleCWLGroupMembersSQL
 	for _, fragment := range []string{
 		"cwl_id, season, cwl_league_id, state, war_size, rounds",
 		"cwl_group_clans (cwl_id, clan_tag, name, clan_level, badge_token)",
@@ -243,13 +238,12 @@ func TestCWLGroupWritesUseFinalSchemaWithoutStandings(t *testing.T) {
 		"AND clan_tag = $2",
 		"NOT (tag = ANY($3::text[]))",
 	} {
-		writeSQL := upsertCWLGroupsSQLShape + upsertCWLGroupClansSQL + upsertCWLGroupMembersSQL + deleteStaleCWLGroupMembersSQL
 		if !strings.Contains(writeSQL, fragment) {
 			t.Fatalf("final CWL write contract missing %q", fragment)
 		}
 	}
-	if !strings.Contains(loadCWLGroupMemberSourcesSQL, "FOR SHARE") {
-		t.Fatal("source roster must be locked for the transactional member replacement")
+	if strings.Contains(writeSQL, "basic_clan") {
+		t.Fatal("CWL master rosters must come from the official group response")
 	}
 	if strings.Contains(upsertCWLGroupClansSQL, "members)") {
 		t.Fatal("cwl_group_clans must not retain a members JSONB column")
@@ -275,10 +269,14 @@ func TestBasicClanMemberSnapshotIncludesTownHall(t *testing.T) {
 func TestCWLGroupClanBadgeIsTokenOnly(t *testing.T) {
 	group := &clashy.ClanWarLeagueGroup{Clans: []clashy.ClanWarLeagueClan{{
 		Tag: "#AAA", Badge: clashy.Badge{Medium: "https://api-assets.clashofclans.com/badges/200/example-token.png"},
+		Members: []clashy.ClanWarLeagueClanMember{{Tag: "#P1", Name: "One", TownHallLevel: 17}},
 	}}}
 	rows := cwlGroupClanRows(group)
 	if len(rows) != 1 || rows[0].BadgeToken != "example-token" {
 		t.Fatalf("badge snapshot = %#v", rows)
+	}
+	if len(rows[0].Members) != 1 || rows[0].Members[0].Tag != "#P1" || rows[0].Members[0].TownHall != 17 {
+		t.Fatalf("master roster snapshot = %#v", rows[0].Members)
 	}
 }
 

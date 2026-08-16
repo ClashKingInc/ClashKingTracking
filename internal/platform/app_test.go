@@ -69,8 +69,8 @@ func TestProxyConnectionLimitUsesLargestRequestRate(t *testing.T) {
 		GlobalClanNonPriorityRequestsPerSecond: 50,
 		BattlelogRequestsPerSecond:             10,
 		WarRequestsPerSecond:                   950,
-		BotClanRequestsPerSecond:               950,
-		BotPlayerRequestsPerSecond:             950,
+		TrackedClanRequestsPerSecond:           950,
+		TrackedPlayerRequestsPerSecond:         950,
 	}
 
 	if got, want := proxyConnectionLimit(cfg), 3000; got != want {

@@ -60,7 +60,7 @@ func validateGiveawaysConfig(cfg platform.Config) error {
 		return errors.New("giveaways.scan_seconds must be greater than zero")
 	}
 	if !cfg.DryRun && !cfg.MockDB && cfg.TimescaleURL == "" {
-		return errors.New("TIMESCALE_URL is required for giveaways")
+		return errors.New("TIMESCALE_* connection variables are required for giveaways")
 	}
 	return nil
 }

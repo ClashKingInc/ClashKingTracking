@@ -61,8 +61,6 @@ func sendPushToDevices(ctx context.Context, app *platform.App, devices []models.
 				switch device.Provider {
 				case "fcm":
 					sendErr = sendFCM(ctx, app, token, msg)
-				case "apns":
-					sendErr = sendAPNS(ctx, app, token, device.Environment, msg)
 				default:
 					app.Logger.Warn("mobile_push: unknown provider", "device_id", device.DeviceID, "provider", device.Provider)
 					mu.Lock()
@@ -129,15 +127,10 @@ func sendFCM(ctx context.Context, app *platform.App, token string, msg pushMessa
 	return doSend(req)
 }
 
-// fcmAccessToken keeps the existing explicit bearer token as a backwards-
-// compatible escape hatch, but normally uses Application Default
-// Credentials. ReuseTokenSource caches valid OAuth tokens and refreshes them
+// fcmAccessToken uses service-account JSON or Application Default Credentials.
+// ReuseTokenSource caches valid OAuth tokens and refreshes them
 // automatically before expiry, so long-running schedulers need no restart.
 func fcmAccessToken(app *platform.App) (string, error) {
-	if app.Config.MobilePushFCMBearerToken != "" {
-		return app.Config.MobilePushFCMBearerToken, nil
-	}
-
 	fcmADC.Lock()
 	if fcmADC.source == nil {
 		var source oauth2.TokenSource
@@ -173,43 +166,6 @@ func fcmAccessToken(app *platform.App) (string, error) {
 		return "", fmt.Errorf("FCM Application Default Credentials returned an empty access token")
 	}
 	return token.AccessToken, nil
-}
-
-// sendAPNS relies on net/http's automatic HTTP/2-over-TLS negotiation
-// (built into the standard library since Go 1.6) — APNs requires HTTP/2 and
-// no extra transport setup is needed for that to happen here.
-func sendAPNS(ctx context.Context, app *platform.App, token, environment string, msg pushMessage) error {
-	if app.Config.MobilePushAPNSBearerToken == "" || app.Config.MobilePushAPNSBundleID == "" {
-		return fmt.Errorf("APNs is not configured")
-	}
-	payload := map[string]any{
-		"aps": map[string]any{
-			"alert": map[string]string{
-				"title": msg.Title,
-				"body":  msg.Body,
-			},
-		},
-	}
-	for key, value := range msg.Data {
-		payload[key] = value
-	}
-	body, err := json.Marshal(payload)
-	if err != nil {
-		return err
-	}
-	host := "api.push.apple.com"
-	if environment == "sandbox" {
-		host = "api.sandbox.push.apple.com"
-	}
-	url := fmt.Sprintf("https://%s/3/device/%s", host, token)
-	req, err := http.NewRequestWithContext(ctx, http.MethodPost, url, bytes.NewReader(body))
-	if err != nil {
-		return err
-	}
-	req.Header.Set("authorization", "bearer "+app.Config.MobilePushAPNSBearerToken)
-	req.Header.Set("apns-topic", app.Config.MobilePushAPNSBundleID)
-	req.Header.Set("apns-push-type", "alert")
-	return doSend(req)
 }
 
 func doSend(req *http.Request) error {

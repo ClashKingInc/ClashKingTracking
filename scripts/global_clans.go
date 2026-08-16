@@ -171,7 +171,7 @@ func validateGlobalClanConfig(cfg platform.Config) error {
 		return errors.New("target_page_multiplier must be greater than zero when globalclans is enabled")
 	}
 	if !cfg.DryRun && !cfg.MockDB && cfg.TimescaleURL == "" {
-		return errors.New("TIMESCALE_URL is required when globalclans is enabled")
+		return errors.New("TIMESCALE_* connection variables are required when globalclans is enabled")
 	}
 	if !cfg.DryRun && !cfg.MockDB && cfg.ValkeyAddr == "" {
 		return errors.New("valkey_addr is required for globalclans event publishing")

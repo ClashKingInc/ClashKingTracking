@@ -39,8 +39,8 @@ func TestPlayerChangesBuildsSQLRows(t *testing.T) {
 		time.Date(2026, 7, 28, 12, 0, 0, 0, time.UTC),
 	)
 
-	if activity == 0 {
-		t.Fatalf("activity score was not detected")
+	if !activity {
+		t.Fatalf("activity was not detected")
 	}
 	if len(changes) != 2 {
 		t.Fatalf("profile change count = %d, want 2", len(changes))
@@ -50,31 +50,70 @@ func TestPlayerChangesBuildsSQLRows(t *testing.T) {
 	}
 }
 
+func TestMultipleActivitySignalsProduceOneOnlineObservation(t *testing.T) {
+	snapshots := newTrackedPlayerSnapshotStore(nil)
+	previous := clashy.Player{
+		Tag:       "#PLAYER",
+		Name:      "Old Name",
+		Donations: 10,
+		Clan:      &clashy.PlayerClan{Tag: "#CLAN"},
+		Achievements: []clashy.Achievement{{
+			Name: playerSeasonPassAchievement, Value: 100,
+		}},
+	}
+	previousRaw, err := json.Marshal(previous)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := snapshots.StoreAndClear(
+		t.Context(), playerSnapshotKey(previous.Tag), playerStatPendingKey(previous.Tag), previousRaw,
+	); err != nil {
+		t.Fatal(err)
+	}
+	domain := &trackedPlayersDomain{snapshots: snapshots}
+	current := previous
+	current.Name = "New Name"
+	current.Donations = 20
+	current.Achievements = []clashy.Achievement{{
+		Name: playerSeasonPassAchievement, Value: 150,
+	}}
+	ingest, err := domain.doPlayer(t.Context(), current.Tag, current)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if ingest.LastOnlineAt == nil {
+		t.Fatal("multiple activity signals did not produce an online observation")
+	}
+	if len(ingest.StatChanges) != 2 {
+		t.Fatalf("stat changes = %d, want donations and season pass", len(ingest.StatChanges))
+	}
+}
+
 func TestPlayerStatChangesBuildOnlyTypedPositiveDeltas(t *testing.T) {
 	eventTime := time.Date(2026, 7, 28, 12, 0, 0, 0, time.UTC)
 	previous := clashy.Player{
 		Donations:                10,
 		Received:                 4,
 		ClanCapitalContributions: 100,
-		Achievements: []clashy.Achievement{{
-			Name:  playerClanGamesAchievement,
-			Value: 1_000,
-		}},
+		Achievements: []clashy.Achievement{
+			{Name: playerClanGamesAchievement, Value: 1_000},
+			{Name: playerSeasonPassAchievement, Value: 10_000},
+		},
 	}
 	current := clashy.Player{
 		Donations:                15,
 		Received:                 8,
 		ClanCapitalContributions: 175,
 		Clan:                     &clashy.PlayerClan{Tag: "#CURRENT"},
-		Achievements: []clashy.Achievement{{
-			Name:  playerClanGamesAchievement,
-			Value: 1_500,
-		}},
+		Achievements: []clashy.Achievement{
+			{Name: playerClanGamesAchievement, Value: 1_500},
+			{Name: playerSeasonPassAchievement, Value: 10_200},
+		},
 	}
 
 	rows := playerStatChanges("#PLAYER", previous, current, eventTime)
-	if len(rows) != 4 {
-		t.Fatalf("stat change rows = %d, want 4: %#v", len(rows), rows)
+	if len(rows) != 5 {
+		t.Fatalf("stat change rows = %d, want 5: %#v", len(rows), rows)
 	}
 	want := []struct {
 		statType string
@@ -86,6 +125,7 @@ func TestPlayerStatChangesBuildOnlyTypedPositiveDeltas(t *testing.T) {
 		{playerStatReceived, 4, 8, 4},
 		{playerStatClanGames, 1_000, 1_500, 500},
 		{playerStatCapitalGoldDonated, 100, 175, 75},
+		{playerStatSeasonPass, 10_000, 10_200, 200},
 	}
 	for index, expected := range want {
 		row := rows[index]
@@ -133,7 +173,7 @@ func TestPlayerStatChangesIgnoreEqualAndResetCounters(t *testing.T) {
 }
 
 func TestFirstObservationWritesNoPlayerStatChanges(t *testing.T) {
-	domain := &botPlayersDomain{snapshots: newBotPlayerSnapshotStore(nil)}
+	domain := &trackedPlayersDomain{snapshots: newTrackedPlayerSnapshotStore(nil)}
 	ingest, err := domain.doPlayer(t.Context(), "#PLAYER", clashy.Player{
 		Tag:       "#PLAYER",
 		Donations: 100,
@@ -151,7 +191,7 @@ func TestFirstObservationWritesNoPlayerStatChanges(t *testing.T) {
 }
 
 func TestCounterResetStillAdvancesSnapshotAfterSuccessfulIngest(t *testing.T) {
-	snapshots := newBotPlayerSnapshotStore(nil)
+	snapshots := newTrackedPlayerSnapshotStore(nil)
 	previous := clashy.Player{Tag: "#PLAYER", Donations: 100}
 	previousRaw, _ := json.Marshal(previous)
 	if err := snapshots.StoreAndClear(
@@ -162,9 +202,9 @@ func TestCounterResetStillAdvancesSnapshotAfterSuccessfulIngest(t *testing.T) {
 	); err != nil {
 		t.Fatal(err)
 	}
-	domain := &botPlayersDomain{
+	domain := &trackedPlayersDomain{
 		snapshots: snapshots,
-		store:     newMemoryBotPlayerStore(),
+		store:     newMemoryTrackedPlayerStore(),
 	}
 	current := clashy.Player{Tag: "#PLAYER", Donations: 0}
 	ingest, err := domain.doPlayer(t.Context(), "#PLAYER", current)
@@ -190,7 +230,7 @@ func TestCounterResetStillAdvancesSnapshotAfterSuccessfulIngest(t *testing.T) {
 	}
 }
 
-func TestBotPlayerStatSQLUsesOnlyFinalTypedColumns(t *testing.T) {
+func TestTrackedPlayerStatSQLUsesOnlyFinalTypedColumns(t *testing.T) {
 	for _, column := range []string{
 		"event_time",
 		"player_tag",
@@ -239,10 +279,21 @@ func TestBotPlayerStatSQLUsesOnlyFinalTypedColumns(t *testing.T) {
 	if !strings.Contains(lockPlayerStatChangesSQL, "pg_advisory_xact_lock") {
 		t.Fatalf("player stat writer lacks per-player transaction lock: %s", lockPlayerStatChangesSQL)
 	}
+	for _, fragment := range []string{
+		"INSERT INTO player_online_events",
+		"WHERE NOT EXISTS",
+		"seen_at = $1",
+		"tag = $2",
+		"clan_tag = $3",
+	} {
+		if !strings.Contains(insertPlayerOnlineEventSQL, fragment) {
+			t.Fatalf("player online INSERT omits %q: %s", fragment, insertPlayerOnlineEventSQL)
+		}
+	}
 }
 
-func TestBotPlayersSourceHasNoSeasonStatsRuntime(t *testing.T) {
-	source, err := os.ReadFile("bot_players.go")
+func TestTrackedPlayersSourceHasNoSeasonStatsRuntime(t *testing.T) {
+	source, err := os.ReadFile("tracked_players.go")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -253,20 +304,20 @@ func TestBotPlayersSourceHasNoSeasonStatsRuntime(t *testing.T) {
 		"upsertPlayer" + "SeasonStats",
 	} {
 		if strings.Contains(string(source), stale) {
-			t.Fatalf("bot_players runtime retains %q", stale)
+			t.Fatalf("tracked_players runtime retains %q", stale)
 		}
 	}
 }
 
-func TestMemoryBotPlayerStorePagesByLocalCursor(t *testing.T) {
-	store := newMemoryBotPlayerStore()
-	store.targets = []models.BotPlayerTarget{{Tag: "#A"}, {Tag: "#B"}, {Tag: "#C"}}
+func TestMemoryTrackedPlayerStorePagesByLocalCursor(t *testing.T) {
+	store := newMemoryTrackedPlayerStore()
+	store.targets = []models.TrackedPlayerTarget{{Tag: "#A"}, {Tag: "#B"}, {Tag: "#C"}}
 
 	first, err := store.NextTargetPage(t.Context(), "", 2)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if want := []models.BotPlayerTarget{{Tag: "#A"}, {Tag: "#B"}}; !reflect.DeepEqual(first.Targets, want) {
+	if want := []models.TrackedPlayerTarget{{Tag: "#A"}, {Tag: "#B"}}; !reflect.DeepEqual(first.Targets, want) {
 		t.Fatalf("first targets = %#v, want %#v", first.Targets, want)
 	}
 	if first.NextCursor != "#B" {
@@ -277,7 +328,7 @@ func TestMemoryBotPlayerStorePagesByLocalCursor(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if want := []models.BotPlayerTarget{{Tag: "#C"}}; !reflect.DeepEqual(second.Targets, want) {
+	if want := []models.TrackedPlayerTarget{{Tag: "#C"}}; !reflect.DeepEqual(second.Targets, want) {
 		t.Fatalf("second targets = %#v, want %#v", second.Targets, want)
 	}
 	if second.NextCursor != "" {
@@ -285,8 +336,8 @@ func TestMemoryBotPlayerStorePagesByLocalCursor(t *testing.T) {
 	}
 }
 
-func TestMemoryBotPlayerSnapshotsPersistRawBytes(t *testing.T) {
-	store := newBotPlayerSnapshotStore(nil)
+func TestMemoryTrackedPlayerSnapshotsPersistRawBytes(t *testing.T) {
+	store := newTrackedPlayerSnapshotStore(nil)
 	if err := store.StoreAndClear(
 		t.Context(),
 		"ps:#A",
@@ -305,7 +356,7 @@ func TestMemoryBotPlayerSnapshotsPersistRawBytes(t *testing.T) {
 }
 
 func TestPlayerStatRetryReusesEventTimeUntilSnapshotAdvances(t *testing.T) {
-	domain := &botPlayersDomain{snapshots: newBotPlayerSnapshotStore(nil)}
+	domain := &trackedPlayersDomain{snapshots: newTrackedPlayerSnapshotStore(nil)}
 	previousRaw := []byte(`{"tag":"#A","donations":10}`)
 	firstProposal := time.Date(2026, 7, 28, 12, 0, 0, 123456789, time.UTC)
 	first, err := domain.reservePlayerStatEventTime(

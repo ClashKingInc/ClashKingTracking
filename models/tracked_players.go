@@ -2,7 +2,7 @@ package models
 
 import "time"
 
-type BotPlayerTarget struct {
+type TrackedPlayerTarget struct {
 	Tag string
 }
 
@@ -26,7 +26,7 @@ type PlayerStatChangeRow struct {
 	Delta         int64
 }
 
-type BotPlayerIngest struct {
+type TrackedPlayerIngest struct {
 	Players        []BasicPlayerRow
 	ProfileChanges []PlayerProfileChangeRow
 	StatChanges    []PlayerStatChangeRow

@@ -86,16 +86,15 @@ type CWLGroupClanRow struct {
 	Name       string
 	ClanLevel  int
 	BadgeToken string
+	Members    []BasicClanMember
 }
 
 type WarIngest struct {
 	IndexRows           []WarLogIndexRow
 	AttackRows          []WarAttackRow
-	Players             []BasicPlayerRow
 	Schedules           []WarScheduleRow
 	CurrentWarTimers    []CurrentWarTimerRow
 	CWLGroups           []CWLGroupRow
 	FinishedScheduleKey string
 	FinishedWarID       string
-	RawWarJSON          []byte
 }

@@ -160,8 +160,6 @@ type leaderboardPlayerRow struct {
 	League leaderboardLeaguePayload
 }
 
-func NewLeaderboardsDomain() platform.Domain { return &leaderboardsDomain{} }
-
 func (d *leaderboardsDomain) Name() string { return leaderboardsDomainName }
 
 func (d *leaderboardsDomain) Run(ctx context.Context, app *platform.App) error {
@@ -214,7 +212,7 @@ func validateLeaderboardsConfig(cfg platform.Config) error {
 		return errors.New("leaderboards.null_asset_url is required")
 	}
 	if cfg.TimescaleURL == "" {
-		return errors.New("TIMESCALE_URL is required for leaderboards")
+		return errors.New("TIMESCALE_* connection variables are required for leaderboards")
 	}
 	if cfg.ValkeyAddr == "" {
 		return errors.New("valkey_addr is required for leaderboards")
