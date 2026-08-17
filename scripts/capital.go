@@ -196,8 +196,19 @@ func (d *capitalDomain) pollTarget(ctx context.Context, app *platform.App, limit
 	if previousErr != nil && !isValkeyMiss(previousErr) {
 		return previousErr
 	}
-	if err := upsertRaidPlayerTimers(ctx, d.pool, target.Tag, raid); err != nil {
+	if len(previous) > 0 && bytes.Equal(previous, compressed) {
+		app.Stats.RecordTrackedTarget(capitalDomainName)
+		return nil
+	}
+	previousRaid, hasPrevious := decodeCachedRaid(previous)
+	participantTags := newRaidParticipantTags(previousRaid, raid)
+	storeStart := time.Now()
+	inserted, err := insertRaidPlayerTimers(ctx, d.pool, target.Tag, raid.EndTime.Time.UTC(), participantTags)
+	if err != nil {
 		return err
+	}
+	if len(participantTags) > 0 {
+		app.Stats.RecordStore(capitalDomainName, time.Since(storeStart), len(participantTags), inserted)
 	}
 	if !d.stillTargeted(target.Tag) {
 		return nil
@@ -205,37 +216,89 @@ func (d *capitalDomain) pollTarget(ctx context.Context, app *platform.App, limit
 	if err := app.Valkey.Do(ctx, app.Valkey.B().Set().Key(key).Value(string(compressed)).Ex(capitalCacheTTL).Build()).Error(); err != nil {
 		return err
 	}
-	if target.EmitEvents && len(previous) > 0 && !bytes.Equal(previous, compressed) {
-		return app.PublishEvent(ctx, platform.Event{
-			Topic: "capital", ClanTag: target.Tag,
-			Value: map[string]any{"type": "raid_update", "clan_tag": target.Tag},
-		})
+	app.Stats.RecordWrite(capitalDomainName, inserted+1)
+	if target.EmitEvents && hasPrevious {
+		event, eventErr := capitalRaidUpdateEvent(target.Tag, previousRaid, raw)
+		if eventErr != nil {
+			return eventErr
+		}
+		return app.PublishEvent(ctx, event)
 	}
 	app.Stats.RecordTrackedTarget(capitalDomainName)
 	return nil
 }
 
-func upsertRaidPlayerTimers(ctx context.Context, pool *pgxpool.Pool, clanTag string, raid clashy.RaidLogEntry) error {
-	if raid.EndTime == nil || raid.EndTime.Time.IsZero() || len(raid.Members) == 0 {
-		return nil
+func capitalRaidUpdateEvent(clanTag string, previousRaw, currentRaw []byte) (platform.Event, error) {
+	if !json.Valid(previousRaw) || !json.Valid(currentRaw) {
+		return platform.Event{}, errors.New("capital update contains invalid raid JSON")
 	}
-	tags := make([]string, 0, len(raid.Members))
-	for _, member := range raid.Members {
-		if member.Tag != "" {
-			tags = append(tags, member.Tag)
+	return platform.Event{
+		Topic:   "capital",
+		ClanTag: clanTag,
+		Value: map[string]any{
+			"type":          "raid_update",
+			"clan_tag":      clanTag,
+			"previous_raid": json.RawMessage(previousRaw),
+			"raid":          json.RawMessage(currentRaw),
+		},
+	}, nil
+}
+
+func decodeCachedRaid(compressed []byte) ([]byte, bool) {
+	if len(compressed) == 0 {
+		return nil, false
+	}
+	raw, err := decompressRaidPayload(compressed)
+	if err != nil || !json.Valid(raw) {
+		return nil, false
+	}
+	return raw, true
+}
+
+func newRaidParticipantTags(previousRaw []byte, current clashy.RaidLogEntry) []string {
+	previous := make(map[string]struct{})
+	if len(previousRaw) > 0 {
+		var raid clashy.RaidLogEntry
+		if json.Unmarshal(previousRaw, &raid) == nil {
+			for _, member := range raid.Members {
+				if member.Tag != "" {
+					previous[member.Tag] = struct{}{}
+				}
+			}
 		}
 	}
-	if len(tags) == 0 {
-		return nil
+	seen := make(map[string]struct{}, len(current.Members))
+	tags := make([]string, 0, len(current.Members))
+	for _, member := range current.Members {
+		if member.Tag == "" {
+			continue
+		}
+		if _, exists := previous[member.Tag]; exists {
+			continue
+		}
+		if _, duplicate := seen[member.Tag]; duplicate {
+			continue
+		}
+		seen[member.Tag] = struct{}{}
+		tags = append(tags, member.Tag)
 	}
-	_, err := pool.Exec(ctx, `
+	return tags
+}
+
+func insertRaidPlayerTimers(ctx context.Context, pool *pgxpool.Pool, clanTag string, expiresAt time.Time, tags []string) (int, error) {
+	if len(tags) == 0 || clanTag == "" || expiresAt.IsZero() {
+		return 0, nil
+	}
+	result, err := pool.Exec(ctx, `
 		INSERT INTO player_timers (player_tag, event_type, event_key, expires_at)
 		SELECT tag, 'raid', $2, $3
 		FROM unnest($1::text[]) tag
-		ON CONFLICT (player_tag, event_type, event_key) DO UPDATE
-		SET expires_at = EXCLUDED.expires_at
-	`, tags, clanTag, raid.EndTime.Time.UTC())
-	return err
+		ON CONFLICT (player_tag, event_type, event_key) DO NOTHING
+	`, tags, clanTag, expiresAt)
+	if err != nil {
+		return 0, err
+	}
+	return int(result.RowsAffected()), nil
 }
 
 func capitalCacheKey(prefix, clanTag string) string { return prefix + clanTag }

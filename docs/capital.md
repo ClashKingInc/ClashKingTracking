@@ -25,7 +25,8 @@ Refresh target union
   -> during weekend, GET latest raid season for each target
   -> no current weekend response? skip
   -> compare with previous compressed snapshot
-  -> upsert raid player_timers for every observed attacker
+  -> unchanged? make no SQL or cache write
+  -> insert raid player_timers only for newly observed attackers
   -> publish Capital changes only when configured
   -> store compressed snapshot with six-hour safety TTL
 ```
@@ -39,9 +40,10 @@ if raid_weekend_active:
   for clan in targets:
     raid = GET /clans/{tag}/capitalraidseasons?limit=1
     if raid belongs to current weekend:
-      for member in raid.members:
-        upsert player_timer(member.tag, 'raid', clan.tag, raid.end_time)
-      emit requested diffs
+      new_members = raid.members - previous_raid.members
+      insert missing player_timer(member.tag, 'raid', clan.tag, raid.end_time)
+      if the clan has a configured Capital consumer and the snapshot changed:
+        emit raid_update with nested raid and previous_raid objects
       cache gzip(raid), TTL 6 hours
 ```
 
@@ -55,13 +57,13 @@ The Clash API returns Raid Weekend members only after they attack. There is no z
 
 ## Data read and written
 
-Reads server Capital configuration and the verified player-to-clan Valkey hash. Writes `player_timers` with `event_type = raid`, `event_key = clan tag`, and the API Raid Weekend end time.
+Reads server Capital configuration and the verified player-to-clan Valkey hash. Writes `player_timers` with `event_type = raid`, `event_key = clan tag`, and the API Raid Weekend end time. Existing rows are never rewritten: the end is fixed for the weekend, so each newly observed participant uses `ON CONFLICT DO NOTHING`.
 
-Valkey stores a gzip-compressed latest raid response under `capital.snapshot_prefix`. Removed targets are deleted immediately to prevent a stale response being reused if the clan returns. The six-hour TTL is a safety net for orphaned keys and maintenance periods; next weekend always starts from a fresh comparison.
+Valkey stores a gzip-compressed latest raid response under `capital.snapshot_prefix`. An unchanged API response does not rewrite that payload; if its six-hour TTL eventually expires, the next poll repopulates it without emitting a false change. Removed targets are deleted immediately to prevent a stale response being reused if the clan returns. The TTL is a safety net for orphaned keys and maintenance periods, and next weekend always starts from a fresh comparison.
 
 ## Events and interaction
 
-Configured Capital consumers receive only relevant state/member/attack changes. Mobile and Discord Raid reminders read this cache first, then fetch on demand if it is missing. `trackedplayers` supplies current verified clans; `capital` never polls bookmarked players.
+Configured Capital consumers receive one v2 `raid_update` containing nested `raid` and `previous_raid` objects whenever the snapshot changes. The consumer can calculate the exact state, member, or attack message from that pair without another cache or API read. Mobile and Discord Raid reminders read the cache first, then fetch on demand if it is missing. `trackedplayers` supplies current verified clans; `capital` never polls bookmarked players.
 
 ```mermaid
 flowchart LR

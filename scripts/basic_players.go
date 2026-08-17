@@ -3,6 +3,8 @@ package scripts
 import (
 	"context"
 	"errors"
+	"fmt"
+	"sync"
 	"time"
 
 	"clashking_tracking/internal/platform"
@@ -129,36 +131,90 @@ func (d *basicPlayersDomain) Run(ctx context.Context, app *platform.App) error {
 	if err != nil {
 		return err
 	}
+
+	scanCtx, cancelScan := context.WithCancel(ctx)
+	jobs := make(chan string)
+	errCh := make(chan error, 1)
+	var reportOnce sync.Once
+	reportError := func(err error) {
+		if err == nil {
+			return
+		}
+		reportOnce.Do(func() {
+			errCh <- err
+			cancelScan()
+		})
+	}
+	var workers sync.WaitGroup
+	for range bulkFetchWorkerCount(
+		app.Config.BasicPlayerRequestsPerSecond,
+		platform.RequestConcurrency(app.Config.BasicPlayerRequestsPerSecond),
+	) {
+		workers.Add(1)
+		go func() {
+			defer workers.Done()
+			for {
+				var tag string
+				select {
+				case <-scanCtx.Done():
+					return
+				case tag = <-jobs:
+				}
+				ingest, err := retryLimitedClashFetch(scanCtx, app, limiter, func(fetchCtx context.Context) (basicPlayerIngest, error) {
+					return d.do(fetchCtx, app, tag)
+				})
+				app.Stats.RecordTrackedTarget(basicPlayersDomainName)
+				if err != nil {
+					if scanCtx.Err() != nil {
+						return
+					}
+					if isDeferredBulkFetch(err) {
+						continue
+					}
+					reportError(fmt.Errorf("basic player processing %s: %w", tag, err))
+					return
+				}
+				if err := writer.Enqueue(scanCtx, ingest); err != nil {
+					if scanCtx.Err() == nil {
+						reportError(err)
+					}
+					return
+				}
+			}
+		}()
+	}
+	defer func() {
+		cancelScan()
+		workers.Wait()
+	}()
+
 	pageSize := app.Config.BasicPlayerRequestsPerSecond * app.Config.TargetPageMultiplier
 	cursor := ""
 	for {
-		page, err := d.store.NextTargetPage(ctx, cursor, pageSize)
+		select {
+		case err := <-errCh:
+			return err
+		default:
+		}
+		page, err := d.store.NextTargetPage(scanCtx, cursor, pageSize)
 		if err != nil {
 			return err
 		}
 		if len(page.Tags) == 0 {
 			cursor = ""
-			if err := sleepOrDone(ctx, time.Second); err != nil {
+			if err := sleepOrDone(scanCtx, time.Second); err != nil {
 				return err
 			}
 			continue
 		}
-		if err := runBounded(ctx, platform.RequestConcurrency(app.Config.BasicPlayerRequestsPerSecond), page.Tags, func(workerCtx context.Context, tag string) error {
-			ingest, err := retryLimitedClashFetch(workerCtx, app, limiter, func(fetchCtx context.Context) (basicPlayerIngest, error) {
-				return d.do(fetchCtx, app, tag)
-			})
-			if err != nil {
-				app.Logger.Error("basic player processing failed", "tag", tag, "err", err)
-				app.Stats.SetReady(basicPlayersDomainName, false, err.Error())
+		for _, tag := range page.Tags {
+			select {
+			case err := <-errCh:
 				return err
+			case <-scanCtx.Done():
+				return scanCtx.Err()
+			case jobs <- tag:
 			}
-			if err := writer.Enqueue(workerCtx, ingest); err != nil {
-				return err
-			}
-			app.Stats.RecordTrackedTarget(basicPlayersDomainName)
-			return nil
-		}); err != nil {
-			return err
 		}
 		cursor = page.NextCursor
 	}

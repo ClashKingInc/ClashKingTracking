@@ -24,6 +24,7 @@ type Config struct {
 	TargetPageMultiplier                   int
 	GlobalClanPriorityRequestsPerSecond    int
 	GlobalClanNonPriorityRequestsPerSecond int
+	GlobalClanWriteWorkers                 int
 	BattlelogRequestsPerSecond             int
 	BattlelogPriorityRequestsPerSecond     int
 	BattlelogCheckpointTTLDays             int
@@ -47,6 +48,7 @@ type Config struct {
 	EventStreamBatchSize                   int
 	EventStreamReclaimIdleSeconds          int
 	TrackedPlayerRequestsPerSecond         int
+	TrackedPlayerTargetRefreshSeconds      int
 	BasicPlayerRequestsPerSecond           int
 	LeaderboardRequestsPerSecond           int
 	LeaderboardIntervalSeconds             int
@@ -147,6 +149,7 @@ type jsonEventsConfig struct {
 type jsonGlobalClansConfig struct {
 	PriorityRequestsPerSecond    int `json:"priority_requests_per_second"`
 	NonPriorityRequestsPerSecond int `json:"non_priority_requests_per_second"`
+	WriteWorkers                 int `json:"write_workers"`
 }
 
 type jsonBattlelogsConfig struct {
@@ -170,7 +173,8 @@ type jsonTrackedClansConfig struct {
 }
 
 type jsonTrackedPlayersConfig struct {
-	RequestsPerSecond int `json:"requests_per_second"`
+	RequestsPerSecond    int `json:"requests_per_second"`
+	TargetRefreshSeconds int `json:"target_refresh_seconds"`
 }
 
 type jsonCapitalConfig struct {
@@ -242,6 +246,7 @@ func loadConfigFile(path string) (Config, error) {
 		EventStreamReclaimIdleSeconds:          file.Events.ReclaimIdleSeconds,
 		GlobalClanPriorityRequestsPerSecond:    file.GlobalClans.PriorityRequestsPerSecond,
 		GlobalClanNonPriorityRequestsPerSecond: file.GlobalClans.NonPriorityRequestsPerSecond,
+		GlobalClanWriteWorkers:                 file.GlobalClans.WriteWorkers,
 		BattlelogRequestsPerSecond:             file.Battlelogs.RequestsPerSecond,
 		BattlelogPriorityRequestsPerSecond:     file.Battlelogs.PriorityRequestsPerSecond,
 		BattlelogCheckpointTTLDays:             file.Battlelogs.CheckpointTTLDays,
@@ -257,6 +262,7 @@ func loadConfigFile(path string) (Config, error) {
 		CapitalTargetRefreshSeconds:            file.Capital.TargetRefreshSeconds,
 		CapitalSnapshotPrefix:                  file.Capital.SnapshotPrefix,
 		TrackedPlayerRequestsPerSecond:         file.TrackedPlayers.RequestsPerSecond,
+		TrackedPlayerTargetRefreshSeconds:      file.TrackedPlayers.TargetRefreshSeconds,
 		BasicPlayerRequestsPerSecond:           file.BasicPlayers.RequestsPerSecond,
 		LeaderboardRequestsPerSecond:           file.Leaderboards.RequestsPerSecond,
 		LeaderboardIntervalSeconds:             file.Leaderboards.IntervalSeconds,
@@ -286,6 +292,9 @@ func applyEnvironment(cfg *Config) {
 }
 
 func deriveConfig(cfg *Config) {
+	if cfg.GlobalClanWriteWorkers == 0 {
+		cfg.GlobalClanWriteWorkers = 1
+	}
 	cfg.WarMaxInFlight = RequestConcurrency(cfg.WarRequestsPerSecond)
 	if cfg.WarDormantRequestsPerSecond == 0 {
 		cfg.WarDormantRequestsPerSecond = 50
@@ -313,6 +322,9 @@ func deriveConfig(cfg *Config) {
 	}
 	if cfg.CapitalSnapshotPrefix == "" {
 		cfg.CapitalSnapshotPrefix = "capital:raid:"
+	}
+	if cfg.TrackedPlayerTargetRefreshSeconds == 0 {
+		cfg.TrackedPlayerTargetRefreshSeconds = 3600
 	}
 	if cfg.BasicPlayerRequestsPerSecond == 0 {
 		cfg.BasicPlayerRequestsPerSecond = 30

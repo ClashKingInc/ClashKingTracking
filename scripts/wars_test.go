@@ -4,12 +4,18 @@ package scripts
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
+	"net/http"
+	"net/http/httptest"
+	"path"
 	"reflect"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
+	"clashking_tracking/internal/platform"
 	"clashking_tracking/models"
 
 	clashy "github.com/clashkinginc/clashy.go"
@@ -47,6 +53,19 @@ func TestWarTargetsSQLOnlyUsesPublicWarLogs(t *testing.T) {
 		}
 		if !strings.Contains(query, "30 days") || !strings.Contains(query, "NOT EXISTS") || !strings.Contains(query, "war_schedule") {
 			t.Fatalf("%s war target query should tier by recent war and skip scheduled clans: %s", name, query)
+		}
+	}
+}
+
+func TestCWLTargetsSkipKnownGroupSiblingsDuringDiscovery(t *testing.T) {
+	for _, required := range []string{
+		"EXTRACT(DAY FROM now() AT TIME ZONE 'UTC') <= 3",
+		"NOT EXISTS (\n\t        SELECT 1\n\t        FROM cwl_group_clans known_clan",
+		"known_group.season = to_char(now() AT TIME ZONE 'UTC', 'YYYY-MM')",
+		"SELECT min(candidate.clan_tag)",
+	} {
+		if !strings.Contains(cwlTargetsSQL, required) {
+			t.Fatalf("CWL target query is missing group-deduplication rule %q: %s", required, cwlTargetsSQL)
 		}
 	}
 }
@@ -118,6 +137,32 @@ func TestPlayerTimerCleanupAndActiveReads(t *testing.T) {
 	}
 }
 
+func TestAbandonedWarScheduleDeletesOnlyItsTimers(t *testing.T) {
+	store := newMemoryWarStore()
+	now := time.Now().UTC()
+	if err := store.Store(context.Background(), models.WarIngest{
+		Schedules: []models.WarScheduleRow{{ScheduleKey: "missing-war", WarID: "war-id", SourceClanTag: "#A", OpponentTag: "#B", EndTime: now}},
+		PlayerTimers: []models.PlayerTimerRow{
+			{PlayerTag: "#P1", EventType: "war", EventKey: "missing-war", ExpiresAt: now},
+			{PlayerTag: "#P1", EventType: "raid", EventKey: "#A", ExpiresAt: now.Add(time.Hour)},
+		},
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.DeleteSchedule(context.Background(), "missing-war"); err != nil {
+		t.Fatal(err)
+	}
+	if _, ok := store.schedules["missing-war"]; ok {
+		t.Fatal("abandoned war schedule was retained")
+	}
+	if _, ok := store.playerTimers["#P1|war|missing-war"]; ok {
+		t.Fatal("abandoned war timer was retained")
+	}
+	if _, ok := store.playerTimers["#P1|raid|#A"]; !ok {
+		t.Fatal("unrelated raid timer was removed")
+	}
+}
+
 func TestPlayerTimerBulkUpsertSQL(t *testing.T) {
 	if !strings.Contains(upsertPlayerTimersSQL, "unnest(") || strings.Contains(upsertPlayerTimersSQL, "pgx.Batch") || !strings.Contains(upsertPlayerTimersSQL, "ON CONFLICT (player_tag, event_type, event_key)") {
 		t.Fatalf("player timers must use one bulk upsert: %s", upsertPlayerTimersSQL)
@@ -162,6 +207,26 @@ func TestBuildWarIngestUsesTwoAttacksForRegularWar(t *testing.T) {
 	}
 	if len(ingest.IndexRows) != 1 || ingest.IndexRows[0].AttacksPerMember != 2 {
 		t.Fatalf("regular war index rows = %#v, want attacks_per_member 2", ingest.IndexRows)
+	}
+}
+
+func TestScheduledWarIdentityAcceptsEitherPerspectiveAndRejectsNextWar(t *testing.T) {
+	prep := time.Date(2026, 8, 15, 5, 51, 49, 0, time.UTC)
+	war := sampleWar(prep, prep.Add(24*time.Hour), prep.Add(48*time.Hour))
+	request := warFetchRequest{
+		ClanTag: "#AAA", OpponentTag: "#BBB", StoreOnly: true,
+		ScheduleKey: models.ComputeWarKey("#AAA", "#BBB", prep),
+	}
+	if !scheduledWarMatches(request, war) {
+		t.Fatal("the scheduled war should match from its canonical tags and preparation time")
+	}
+	war.Clan, war.Opponent = war.Opponent, war.Clan
+	if !scheduledWarMatches(request, war) {
+		t.Fatal("the opponent perspective should resolve to the same schedule")
+	}
+	war.PreparationStartTime = &clashy.Timestamp{Time: prep.Add(48 * time.Hour)}
+	if scheduledWarMatches(request, war) {
+		t.Fatal("a later war between the same clans must not finalize the old schedule")
 	}
 }
 
@@ -233,6 +298,7 @@ func TestCWLGroupWritesUseFinalSchemaWithoutStandings(t *testing.T) {
 	writeSQL := upsertCWLGroupsSQLShape + upsertCWLGroupClansSQL + upsertCWLGroupMembersSQL + deleteStaleCWLGroupMembersSQL
 	for _, fragment := range []string{
 		"cwl_id, season, cwl_league_id, state, war_size, rounds",
+		"war_size = COALESCE(EXCLUDED.war_size, cwl_groups.war_size)",
 		"cwl_group_clans (cwl_id, clan_tag, name, clan_level, badge_token)",
 		"cwl_group_members (cwl_id, clan_tag, name, tag, town_hall)",
 		"ON CONFLICT (cwl_id, tag)",
@@ -291,6 +357,171 @@ func TestCWLWarTagsDropsPlaceholdersAndDuplicates(t *testing.T) {
 	}}
 	if want := []string{"#WAR1", "#WAR2", "#WAR3"}; !reflect.DeepEqual(warTags(group), want) {
 		t.Fatalf("war tags = %#v, want %#v", warTags(group), want)
+	}
+}
+
+func TestGlobalCWLSyncSchedulesOverlappingBattleAndPreparationOnce(t *testing.T) {
+	now := time.Date(2026, 8, 7, 12, 0, 0, 0, time.UTC)
+	apiNow := time.Now().UTC().Truncate(time.Second)
+	group := map[string]any{
+		"state": "inWar", "season": "2026-08",
+		"clans": []map[string]any{
+			{"tag": "#AAA", "name": "Alpha", "clanLevel": 20, "members": []map[string]any{{"tag": "#P1", "name": "One", "townHallLevel": 18}}},
+			{"tag": "#BBB", "name": "Beta", "clanLevel": 20, "members": []map[string]any{{"tag": "#P2", "name": "Two", "townHallLevel": 18}}},
+		},
+		"rounds": []map[string]any{{"warTags": []string{"#BATTLE"}}, {"warTags": []string{"#PREP"}}},
+	}
+	warPayload := func(state string, prep, start, end time.Time) map[string]any {
+		return map[string]any{
+			"state": state, "teamSize": 15,
+			"preparationStartTime": prep.UTC().Format("20060102T150405.000Z"),
+			"startTime":            start.UTC().Format("20060102T150405.000Z"),
+			"endTime":              end.UTC().Format("20060102T150405.000Z"),
+			"clan":                 map[string]any{"tag": "#AAA", "name": "Alpha", "members": []map[string]any{{"tag": "#P1", "name": "One", "townhallLevel": 18, "mapPosition": 1}}},
+			"opponent":             map[string]any{"tag": "#BBB", "name": "Beta", "members": []map[string]any{{"tag": "#P2", "name": "Two", "townhallLevel": 18, "mapPosition": 1}}},
+		}
+	}
+	wars := map[string]map[string]any{
+		"#BATTLE": warPayload("inWar", apiNow.Add(-25*time.Hour), apiNow.Add(-24*time.Hour), apiNow.Add(time.Hour)),
+		"#PREP":   warPayload("preparation", apiNow.Add(-time.Hour), apiNow.Add(23*time.Hour), apiNow.Add(47*time.Hour)),
+	}
+	var callsMu sync.Mutex
+	calls := make(map[string]int)
+	server := httptest.NewServer(http.HandlerFunc(func(response http.ResponseWriter, request *http.Request) {
+		key := path.Base(request.URL.Path)
+		callsMu.Lock()
+		calls[key]++
+		callsMu.Unlock()
+		response.Header().Set("Content-Type", "application/json")
+		if strings.Contains(request.URL.Path, "leaguegroup") {
+			_ = json.NewEncoder(response).Encode(group)
+			return
+		}
+		war, ok := wars[key]
+		if !ok {
+			http.NotFound(response, request)
+			return
+		}
+		_ = json.NewEncoder(response).Encode(war)
+	}))
+	defer server.Close()
+
+	clientConfig := clashy.DefaultClientConfig()
+	clientConfig.BaseURL = server.URL + "/v1"
+	clientConfig.LookupCache = false
+	clientConfig.UpdateCache = false
+	client, err := clashy.NewClient(clientConfig)
+	if err != nil {
+		t.Fatal(err)
+	}
+	store := newMemoryWarStore()
+	store.targets = []models.BasicClanRow{{Tag: "#AAA", CWLLeagueID: 48000012}}
+	domain := &warsDomain{
+		name: cwlDomainName, mode: cwlMode, store: store,
+		targets: newMemoryWarTargetSource(store.targets), now: func() time.Time { return now },
+		scheduled: make(map[string]time.Time),
+	}
+	app := &platform.App{
+		Config:       platform.Config{MockDB: true, WarRequestsPerSecond: 100, TargetPageMultiplier: 5},
+		Clash:        client,
+		Stats:        platform.NewTracker(),
+		Availability: platform.NewAvailabilityGate(nil),
+	}
+	limiter, err := newTrackingLimiter(100)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := domain.syncCWLGroups(t.Context(), app, limiter); err != nil {
+		t.Fatal(err)
+	}
+	if len(store.schedules) != 2 {
+		t.Fatalf("overlapping schedules = %d, want battle and preparation", len(store.schedules))
+	}
+	seenWarTags := map[string]bool{}
+	for _, schedule := range store.schedules {
+		seenWarTags[schedule.WarTag] = true
+	}
+	if !seenWarTags["#BATTLE"] || !seenWarTags["#PREP"] {
+		t.Fatalf("scheduled war tags = %#v", seenWarTags)
+	}
+	if len(store.cwlGroups) != 1 {
+		t.Fatalf("stored groups = %d, want 1", len(store.cwlGroups))
+	}
+	for _, stored := range store.cwlGroups {
+		if stored.WarSize == nil || *stored.WarSize != 15 || stored.CWLLeagueID == nil || *stored.CWLLeagueID != 48000012 {
+			t.Fatalf("stored group dimensions = %#v", stored)
+		}
+	}
+	if err := domain.syncCWLGroups(t.Context(), app, limiter); err != nil {
+		t.Fatal(err)
+	}
+	callsMu.Lock()
+	defer callsMu.Unlock()
+	if calls["#BATTLE"] != 1 || calls["#PREP"] != 1 {
+		t.Fatalf("known tagged wars were refetched: calls=%#v", calls)
+	}
+}
+
+func TestGlobalCWLSyncUsesBoundedConcurrentGroupRequests(t *testing.T) {
+	now := time.Date(2026, 8, 2, 12, 0, 0, 0, time.UTC)
+	targets := []models.BasicClanRow{
+		{Tag: "#AAA", CWLLeagueID: 1}, {Tag: "#BBB", CWLLeagueID: 1},
+		{Tag: "#CCC", CWLLeagueID: 1}, {Tag: "#DDD", CWLLeagueID: 1},
+		{Tag: "#EEE", CWLLeagueID: 1}, {Tag: "#FFF", CWLLeagueID: 1},
+	}
+	var callsMu sync.Mutex
+	active, maxActive := 0, 0
+	server := httptest.NewServer(http.HandlerFunc(func(response http.ResponseWriter, request *http.Request) {
+		callsMu.Lock()
+		active++
+		if active > maxActive {
+			maxActive = active
+		}
+		callsMu.Unlock()
+		time.Sleep(40 * time.Millisecond)
+		tag := path.Base(path.Dir(path.Dir(request.URL.Path)))
+		response.Header().Set("Content-Type", "application/json")
+		_ = json.NewEncoder(response).Encode(map[string]any{
+			"state": "preparation", "season": "2026-08",
+			"clans":  []map[string]any{{"tag": tag, "name": tag}},
+			"rounds": []map[string]any{},
+		})
+		callsMu.Lock()
+		active--
+		callsMu.Unlock()
+	}))
+	defer server.Close()
+
+	clientConfig := clashy.DefaultClientConfig()
+	clientConfig.BaseURL = server.URL + "/v1"
+	clientConfig.LookupCache = false
+	clientConfig.UpdateCache = false
+	client, err := clashy.NewClient(clientConfig)
+	if err != nil {
+		t.Fatal(err)
+	}
+	store := newMemoryWarStore()
+	store.targets = targets
+	domain := &warsDomain{
+		name: cwlDomainName, mode: cwlMode, store: store,
+		targets: newMemoryWarTargetSource(targets), now: func() time.Time { return now },
+		scheduled: make(map[string]time.Time),
+	}
+	app := &platform.App{
+		Config: platform.Config{MockDB: true, WarRequestsPerSecond: 100, TargetPageMultiplier: 5},
+		Clash:  client, Stats: platform.NewTracker(), Availability: platform.NewAvailabilityGate(nil),
+	}
+	limiter, err := newTrackingLimiter(100)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := domain.syncCWLGroups(t.Context(), app, limiter); err != nil {
+		t.Fatal(err)
+	}
+	callsMu.Lock()
+	defer callsMu.Unlock()
+	if maxActive < 2 {
+		t.Fatalf("global CWL group requests remained sequential: max concurrent = %d", maxActive)
 	}
 }
 

@@ -190,6 +190,43 @@ func TestFirstObservationWritesNoPlayerStatChanges(t *testing.T) {
 	}
 }
 
+func TestUnchangedPlayerDoesNotRewriteSnapshot(t *testing.T) {
+	snapshots := newTrackedPlayerSnapshotStore(nil)
+	player := clashy.Player{Tag: "#PLAYER", Name: "Same"}
+	raw, err := json.Marshal(player)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := snapshots.StoreAndClear(
+		t.Context(), playerSnapshotKey(player.Tag), playerStatPendingKey(player.Tag), raw,
+	); err != nil {
+		t.Fatal(err)
+	}
+	domain := &trackedPlayersDomain{snapshots: snapshots}
+	ingest, err := domain.doPlayer(t.Context(), player.Tag, player)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(ingest.SnapshotRaw) != 0 {
+		t.Fatalf("unchanged player requested a snapshot rewrite: %d bytes", len(ingest.SnapshotRaw))
+	}
+}
+
+func TestTrackedPlayerTargetsAreTH9ConfiguredClanMembers(t *testing.T) {
+	if strings.Contains(trackedPlayerTargetSetSQL, "tracked_player_targets") {
+		t.Fatalf("obsolete explicit target table remains in query: %s", trackedPlayerTargetSetSQL)
+	}
+	for _, fragment := range []string{
+		"server.last_command_at >= now() - interval '90 days'",
+		"member->>'town_hall'",
+		">= 9",
+	} {
+		if !strings.Contains(trackedPlayerTargetSetSQL, fragment) {
+			t.Fatalf("tracked player target query omits %q: %s", fragment, trackedPlayerTargetSetSQL)
+		}
+	}
+}
+
 func TestCounterResetStillAdvancesSnapshotAfterSuccessfulIngest(t *testing.T) {
 	snapshots := newTrackedPlayerSnapshotStore(nil)
 	previous := clashy.Player{Tag: "#PLAYER", Donations: 100}
@@ -214,6 +251,9 @@ func TestCounterResetStillAdvancesSnapshotAfterSuccessfulIngest(t *testing.T) {
 	if len(ingest.StatChanges) != 0 {
 		t.Fatalf("counter reset emitted stat changes: %#v", ingest.StatChanges)
 	}
+	if ingest.Event.Topic != "" {
+		t.Fatalf("counter reset emitted an empty player event: %#v", ingest.Event)
+	}
 	app := &platform.App{
 		Config: platform.Config{MockDB: true},
 		Stats:  platform.NewTracker(),
@@ -227,6 +267,72 @@ func TestCounterResetStillAdvancesSnapshotAfterSuccessfulIngest(t *testing.T) {
 	}
 	if !ok || !equalBytes(stored, ingest.SnapshotRaw) {
 		t.Fatalf("snapshot was not advanced after reset: ok=%v stored=%s", ok, stored)
+	}
+}
+
+func TestSupportedProfileChangePublishesPlayerEvent(t *testing.T) {
+	snapshots := newTrackedPlayerSnapshotStore(nil)
+	previous := clashy.Player{
+		Tag:  "#PLAYER",
+		Name: "Before",
+		Clan: &clashy.PlayerClan{Tag: "#CLAN"},
+	}
+	previousRaw, err := json.Marshal(previous)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := snapshots.StoreAndClear(
+		t.Context(), playerSnapshotKey(previous.Tag), playerStatPendingKey(previous.Tag), previousRaw,
+	); err != nil {
+		t.Fatal(err)
+	}
+	domain := &trackedPlayersDomain{
+		snapshots: snapshots,
+		eventInterests: map[string]map[string]struct{}{
+			"#CLAN": {"name_change": {}},
+		},
+	}
+	current := previous
+	current.Name = "After"
+	ingest, err := domain.doPlayer(t.Context(), current.Tag, current)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if ingest.Event.Topic != "player" {
+		t.Fatalf("supported profile change event = %#v", ingest.Event)
+	}
+	if _, exists := ingest.Event.Value["new_player"]; exists {
+		t.Fatalf("player event contains the full new profile: %#v", ingest.Event.Value)
+	}
+	if _, exists := ingest.Event.Value["old_player"]; exists {
+		t.Fatalf("player event contains the full old profile: %#v", ingest.Event.Value)
+	}
+	changes, ok := ingest.Event.Value["changes"].([]map[string]any)
+	if !ok || len(changes) != 1 || changes[0]["type"] != "name" {
+		t.Fatalf("compact player event changes = %#v", ingest.Event.Value["changes"])
+	}
+}
+
+func TestPlayerEventRequiresMatchingConfiguredConsumer(t *testing.T) {
+	domain := &trackedPlayersDomain{
+		eventInterests: map[string]map[string]struct{}{
+			"#CLAN": {"hero_upgrade": {}},
+		},
+	}
+	changes := []models.PlayerProfileChangeRow{
+		{ChangeType: "name"},
+		{ChangeType: "heroes"},
+		{ChangeType: "bestTrophies"},
+	}
+	filtered, logs := domain.interestedPlayerChanges("#CLAN", changes)
+	if len(filtered) != 1 || filtered[0].ChangeType != "heroes" {
+		t.Fatalf("filtered changes = %#v", filtered)
+	}
+	if !reflect.DeepEqual(logs, []string{"hero_upgrade"}) {
+		t.Fatalf("matched log types = %#v", logs)
+	}
+	if filtered, _ := domain.interestedPlayerChanges("#OTHER", changes); len(filtered) != 0 {
+		t.Fatalf("unconfigured clan received changes: %#v", filtered)
 	}
 }
 

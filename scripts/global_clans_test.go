@@ -151,6 +151,77 @@ func TestGlobalClanWriterBulkLoadsPreviousRows(t *testing.T) {
 	}
 }
 
+func TestGlobalClanWriterShardsEachClanDeterministically(t *testing.T) {
+	store := newMemoryGlobalClanStore()
+	app := &platform.App{
+		Logger: slog.New(slog.NewTextHandler(io.Discard, nil)),
+		Stats:  platform.NewTracker(),
+	}
+	writer := newGlobalClanAsyncWriter(app, store, 3)
+	snapshots := []globalClanSnapshot{
+		{Row: models.BasicClanRow{Tag: "#A"}},
+		{Row: models.BasicClanRow{Tag: "#B"}},
+		{Row: models.BasicClanRow{Tag: "#C"}},
+		{Row: models.BasicClanRow{Tag: "#D"}},
+	}
+	if err := writer.enqueue(t.Context(), globalClanWriteJob{Group: "non_priority", Snapshots: snapshots}); err != nil {
+		t.Fatal(err)
+	}
+
+	seen := make(map[string]int)
+	for index, queue := range writer.jobs {
+		for len(queue) > 0 {
+			job := <-queue
+			for _, snapshot := range job.Snapshots {
+				if got := globalClanWriterShard(snapshot.Row.Tag, len(writer.jobs)); got != index {
+					t.Fatalf("tag %s queued on shard %d, want %d", snapshot.Row.Tag, index, got)
+				}
+				seen[snapshot.Row.Tag]++
+			}
+		}
+	}
+	for _, snapshot := range snapshots {
+		if seen[snapshot.Row.Tag] != 1 {
+			t.Fatalf("tag %s queued %d times, want once", snapshot.Row.Tag, seen[snapshot.Row.Tag])
+		}
+	}
+	if writer.batchSize != globalClanAsyncWriteBatchSize*3 {
+		t.Fatalf("batch size = %d, want %d", writer.batchSize, globalClanAsyncWriteBatchSize*3)
+	}
+	for index, queue := range writer.jobs {
+		if cap(queue) != globalClanAsyncWriteQueueSize {
+			t.Fatalf("queue %d capacity = %d, want %d", index, cap(queue), globalClanAsyncWriteQueueSize)
+		}
+	}
+}
+
+func TestGlobalClanFetchWorkerCountUsesOneSecondRequestPopulation(t *testing.T) {
+	if got := bulkFetchWorkerCount(3750, 11250); got != 3750 {
+		t.Fatalf("workers = %d, want 3750", got)
+	}
+	if got := bulkFetchWorkerCount(100, 40); got != 40 {
+		t.Fatalf("capped workers = %d, want 40", got)
+	}
+}
+
+func TestGlobalClanOnlyDefersGatewayTimeout(t *testing.T) {
+	timeout := &clashy.GatewayError{HTTPException: &clashy.HTTPException{Status: 504}}
+	if !isDeferredBulkFetch(timeout) {
+		t.Fatal("504 gateway timeout should be deferred to the next scan")
+	}
+	unavailable := &clashy.GatewayError{HTTPException: &clashy.HTTPException{Status: 502}}
+	if isDeferredBulkFetch(unavailable) {
+		t.Fatal("502 proxy outage must remain governed by the availability gate")
+	}
+	throttled := &clashy.HTTPException{Status: 429}
+	if !isDeferredBulkFetch(throttled) {
+		t.Fatal("exhausted 429 should be deferred to the next scan")
+	}
+	if !isDeferredBulkFetch(io.ErrUnexpectedEOF) {
+		t.Fatal("exhausted truncated response should be deferred to the next scan")
+	}
+}
+
 func TestBasicClanRowUsesUnrankedWarLeagueWhenMissing(t *testing.T) {
 	got := basicClanRow(clashy.Clan{
 		Tag:               "#CLAN",
@@ -303,7 +374,7 @@ func TestBuildGlobalClanIngestSkipsHistoryForFirstHydration(t *testing.T) {
 	now := time.Date(2026, 5, 20, 10, 0, 0, 0, time.UTC)
 	previous := models.BasicClanRow{
 		Tag:         "#CLAN",
-		MemberCount: 0,
+		MemberCount: 2,
 	}
 	current := clashy.Clan{
 		Tag:           "#CLAN",

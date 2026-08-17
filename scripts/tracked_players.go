@@ -23,7 +23,12 @@ import (
 )
 
 const (
-	trackedPlayersDomainName = "trackedplayers"
+	trackedPlayersDomainName         = "trackedplayers"
+	playerSnapshotTTL                = 30 * 24 * time.Hour
+	playerSnapshotRefreshThreshold   = 23 * 24 * time.Hour
+	removedPlayerSnapshotTTL         = 24 * time.Hour
+	trackedPlayerSnapshotTargetsKey  = "tracking:tracked_player_snapshot_targets"
+	trackedPlayerRegistryCommandSize = 1_000
 
 	playerStatDonated            = "donated"
 	playerStatReceived           = "received"
@@ -51,14 +56,26 @@ var reservePlayerStatEventTimeScript = valkey.NewLuaScript(`
 		end
 	end
 	local value = ARGV[1] .. '|' .. ARGV[2]
-	redis.call('SET', KEYS[1], value)
+	redis.call('SET', KEYS[1], value, 'EX', ARGV[3])
 	return ARGV[2]
 `)
 
 var storePlayerSnapshotScript = valkey.NewLuaScript(`
-	redis.call('SET', KEYS[1], ARGV[1])
+	redis.call('SET', KEYS[1], ARGV[1], 'EX', ARGV[2])
 	redis.call('DEL', KEYS[2])
 	return 1
+`)
+
+var loadAndRefreshPlayerSnapshotScript = valkey.NewLuaScript(`
+	local value = redis.call('GET', KEYS[1])
+	if not value then
+		return false
+	end
+	local ttl = redis.call('TTL', KEYS[1])
+	if ttl == -1 or (ttl >= 0 and ttl < tonumber(ARGV[1])) then
+		redis.call('EXPIRE', KEYS[1], ARGV[2])
+	end
+	return value
 `)
 
 func equalBytes(a, b []byte) bool {
@@ -74,13 +91,16 @@ func equalBytes(a, b []byte) bool {
 }
 
 type trackedPlayersDomain struct {
-	snapshots trackedPlayerSnapshotStore
-	store     trackedPlayerStore
+	snapshots              trackedPlayerSnapshotStore
+	store                  trackedPlayerStore
+	eventInterests         map[string]map[string]struct{}
+	eventInterestsLoadedAt time.Time
 }
 
 type trackedPlayerStore interface {
 	Close()
 	NextTargetPage(context.Context, string, int) (trackedPlayerTargetPage, error)
+	ListEventInterests(context.Context) (map[string]map[string]struct{}, error)
 	StoreIngest(context.Context, models.TrackedPlayerIngest) error
 }
 
@@ -104,6 +124,9 @@ func (d *trackedPlayersDomain) Run(ctx context.Context, app *platform.App) error
 	defer store.Close()
 	d.snapshots = newTrackedPlayerSnapshotStore(app.Valkey)
 	d.store = store
+	if err := d.reloadEventInterests(ctx); err != nil {
+		return err
+	}
 
 	limiter, err := newTrackingLimiter(app.Config.TrackedPlayerRequestsPerSecond)
 	if err != nil {
@@ -111,12 +134,29 @@ func (d *trackedPlayersDomain) Run(ctx context.Context, app *platform.App) error
 	}
 	pageSize := app.Config.TrackedPlayerRequestsPerSecond * app.Config.TargetPageMultiplier
 	cursor := ""
+	previousTargets, err := loadTrackedPlayerSnapshotTargets(ctx, app.Valkey)
+	if err != nil {
+		return err
+	}
+	cycleTargets := make(map[string]struct{}, max(pageSize, len(previousTargets)))
+	cycle := make([]models.TrackedPlayerTarget, 0, pageSize)
 	processTargets := func(targets []models.TrackedPlayerTarget) error {
+		for _, target := range targets {
+			if target.Tag != "" {
+				cycleTargets[target.Tag] = struct{}{}
+			}
+		}
 		return runBounded(ctx, platform.RequestConcurrency(app.Config.TrackedPlayerRequestsPerSecond), targets, func(workerCtx context.Context, target models.TrackedPlayerTarget) error {
 			ingest, err := retryLimitedClashFetch(workerCtx, app, limiter, func(fetchCtx context.Context) (models.TrackedPlayerIngest, error) {
 				return d.fetchAndPreparePlayer(fetchCtx, app, target)
 			})
 			if err != nil {
+				if workerCtx.Err() != nil {
+					return workerCtx.Err()
+				}
+				if errors.Is(err, context.Canceled) {
+					return err
+				}
 				app.Logger.Error("tracked player processing failed", "tag", target.Tag, "err", err)
 				app.Stats.SetReady(trackedPlayersDomainName, false, err.Error())
 				return err
@@ -128,6 +168,39 @@ func (d *trackedPlayersDomain) Run(ctx context.Context, app *platform.App) error
 			return nil
 		})
 	}
+	loadVerifiedTargets := func() ([]models.TrackedPlayerTarget, error) {
+		verifiedTags, err := activeVerifiedPlayerTags(ctx, app.Valkey)
+		if err != nil {
+			return nil, err
+		}
+		verified := make([]models.TrackedPlayerTarget, 0, len(verifiedTags))
+		for _, tag := range verifiedTags {
+			verified = append(verified, models.TrackedPlayerTarget{Tag: tag, Verified: true})
+		}
+		return verified, nil
+	}
+	finishCycle := func() error {
+		verified, err := loadVerifiedTargets()
+		if err != nil {
+			return err
+		}
+		cycle = append(cycle, verified...)
+		if err := processTargets(cycle); err != nil {
+			return err
+		}
+		if err := reconcileTrackedPlayerSnapshotTargets(ctx, app.Valkey, previousTargets, cycleTargets); err != nil {
+			return err
+		}
+		previousTargets = cycleTargets
+		cycleTargets = make(map[string]struct{}, max(pageSize, len(previousTargets)))
+		cycle = cycle[:0]
+		if time.Since(d.eventInterestsLoadedAt) >= time.Duration(app.Config.TrackedPlayerTargetRefreshSeconds)*time.Second {
+			if err := d.reloadEventInterests(ctx); err != nil {
+				return err
+			}
+		}
+		return nil
+	}
 	for {
 		page, err := d.store.NextTargetPage(ctx, cursor, pageSize)
 		if err != nil {
@@ -135,32 +208,22 @@ func (d *trackedPlayersDomain) Run(ctx context.Context, app *platform.App) error
 		}
 		if len(page.Targets) == 0 {
 			cursor = ""
+			if err := finishCycle(); err != nil {
+				return err
+			}
 			if err := sleepOrDone(ctx, time.Second); err != nil {
 				return err
 			}
 			continue
 		}
-		start := time.Now()
-		if err := processTargets(page.Targets); err != nil {
-			return err
-		}
-		app.Stats.RecordProcess(trackedPlayersDomainName, time.Since(start))
+		cycle = append(cycle, page.Targets...)
 		cursor = page.NextCursor
 		if cursor == "" {
-			verifiedTags, err := activeVerifiedPlayerTags(ctx, app.Valkey)
-			if err != nil {
+			start := time.Now()
+			if err := finishCycle(); err != nil {
 				return err
 			}
-			verified := make([]models.TrackedPlayerTarget, 0, len(verifiedTags))
-			for _, tag := range verifiedTags {
-				verified = append(verified, models.TrackedPlayerTarget{Tag: tag, Verified: true})
-			}
-			for start := 0; start < len(verified); start += pageSize {
-				end := min(start+pageSize, len(verified))
-				if err := processTargets(verified[start:end]); err != nil {
-					return err
-				}
-			}
+			app.Stats.RecordProcess(trackedPlayersDomainName, time.Since(start))
 		}
 	}
 }
@@ -172,11 +235,99 @@ func validateTrackedPlayersConfig(cfg platform.Config) error {
 	if cfg.TargetPageMultiplier <= 0 {
 		return errors.New("target_page_multiplier must be greater than zero")
 	}
+	if cfg.TrackedPlayerTargetRefreshSeconds <= 0 {
+		return errors.New("trackedplayers.target_refresh_seconds must be greater than zero")
+	}
 	if !cfg.DryRun && !cfg.MockDB && cfg.TimescaleURL == "" {
 		return errors.New("TIMESCALE_* connection variables are required for trackedplayers")
 	}
 	if !cfg.DryRun && !cfg.MockDB && cfg.ValkeyAddr == "" {
 		return errors.New("valkey_addr is required for trackedplayers snapshots")
+	}
+	return nil
+}
+
+func (d *trackedPlayersDomain) reloadEventInterests(ctx context.Context) error {
+	interests, err := d.store.ListEventInterests(ctx)
+	if err != nil {
+		return err
+	}
+	d.eventInterests = interests
+	d.eventInterestsLoadedAt = time.Now()
+	return nil
+}
+
+func loadTrackedPlayerSnapshotTargets(ctx context.Context, client valkey.Client) (map[string]struct{}, error) {
+	targets := make(map[string]struct{})
+	if client == nil {
+		return targets, nil
+	}
+	values, err := client.Do(ctx, client.B().Smembers().Key(trackedPlayerSnapshotTargetsKey).Build()).AsStrSlice()
+	if err != nil {
+		return nil, err
+	}
+	for _, tag := range values {
+		if tag != "" {
+			targets[tag] = struct{}{}
+		}
+	}
+	return targets, nil
+}
+
+func reconcileTrackedPlayerSnapshotTargets(
+	ctx context.Context,
+	client valkey.Client,
+	previous map[string]struct{},
+	current map[string]struct{},
+) error {
+	if client == nil {
+		return nil
+	}
+	added := make([]string, 0)
+	removed := make([]string, 0)
+	for tag := range current {
+		if _, exists := previous[tag]; !exists {
+			added = append(added, tag)
+		}
+	}
+	for tag := range previous {
+		if _, exists := current[tag]; !exists {
+			removed = append(removed, tag)
+		}
+	}
+	sort.Strings(added)
+	sort.Strings(removed)
+
+	commands := make([]valkey.Completed, 0, 2+(2*len(removed)))
+	for start := 0; start < len(added); start += trackedPlayerRegistryCommandSize {
+		end := min(start+trackedPlayerRegistryCommandSize, len(added))
+		commands = append(commands, client.B().Sadd().
+			Key(trackedPlayerSnapshotTargetsKey).
+			Member(added[start:end]...).
+			Build())
+	}
+	for start := 0; start < len(removed); start += trackedPlayerRegistryCommandSize {
+		end := min(start+trackedPlayerRegistryCommandSize, len(removed))
+		commands = append(commands, client.B().Srem().
+			Key(trackedPlayerSnapshotTargetsKey).
+			Member(removed[start:end]...).
+			Build())
+	}
+	for _, tag := range removed {
+		commands = append(commands,
+			client.B().Expire().Key(playerSnapshotKey(tag)).
+				Seconds(int64(removedPlayerSnapshotTTL/time.Second)).Lt().Build(),
+			client.B().Expire().Key(playerStatPendingKey(tag)).
+				Seconds(int64(removedPlayerSnapshotTTL/time.Second)).Lt().Build(),
+		)
+	}
+	for start := 0; start < len(commands); start += trackedPlayerRegistryCommandSize {
+		end := min(start+trackedPlayerRegistryCommandSize, len(commands))
+		for _, result := range client.DoMulti(ctx, commands[start:end]...) {
+			if err := result.Error(); err != nil {
+				return err
+			}
+		}
 	}
 	return nil
 }
@@ -200,10 +351,10 @@ func (d *trackedPlayersDomain) fetchAndPreparePlayer(
 	player, err := app.Clash.GetPlayer(ctx, target.Tag)
 	app.Stats.RecordRequest(trackedPlayersDomainName, time.Since(start), err)
 	if err != nil {
-		if _, ok := platform.ClashFetchRetryPolicy(err); ok {
-			return models.TrackedPlayerIngest{}, err
+		if isClashNotFound(err) {
+			return models.TrackedPlayerIngest{}, nil
 		}
-		return models.TrackedPlayerIngest{}, nil
+		return models.TrackedPlayerIngest{}, err
 	}
 	if player == nil {
 		return models.TrackedPlayerIngest{}, nil
@@ -253,7 +404,6 @@ func (d *trackedPlayersDomain) doPlayer(
 	if err != nil {
 		return models.TrackedPlayerIngest{}, err
 	}
-	current := playerMap(player)
 	previousRaw, err := d.loadPlayerSnapshot(ctx, tag)
 	if err != nil {
 		return models.TrackedPlayerIngest{}, err
@@ -266,15 +416,16 @@ func (d *trackedPlayersDomain) doPlayer(
 		}, nil
 	}
 	if equalBytes(previousRaw, raw) {
-		return models.TrackedPlayerIngest{SnapshotTag: tag, SnapshotRaw: raw}, nil
+		return models.TrackedPlayerIngest{SnapshotTag: tag}, nil
 	}
 	var previousPlayer clashy.Player
 	if err := json.Unmarshal(previousRaw, &previousPlayer); err != nil {
 		return models.TrackedPlayerIngest{SnapshotTag: tag, SnapshotRaw: raw}, nil
 	}
+	current := playerMap(player)
 	previous := playerMap(previousPlayer)
 	if equalJSON(previous, current) {
-		return models.TrackedPlayerIngest{SnapshotTag: tag, SnapshotRaw: raw}, nil
+		return models.TrackedPlayerIngest{SnapshotTag: tag}, nil
 	}
 	now := time.Now().UTC()
 	changes, activityDetected := playerChanges(tag, previous, current, now)
@@ -295,26 +446,99 @@ func (d *trackedPlayersDomain) doPlayer(
 	if activityDetected {
 		lastOnline = &now
 	}
-	return models.TrackedPlayerIngest{
+	ingest := models.TrackedPlayerIngest{
 		Players:        []models.BasicPlayerRow{trackedPlayerRow(player)},
 		ProfileChanges: changes,
 		StatChanges:    statChanges,
 		LastOnlineAt:   lastOnline,
-		Event: models.Event{
+		SnapshotTag:    tag,
+		SnapshotRaw:    raw,
+	}
+	eventChanges, eventLogTypes := d.interestedPlayerChanges(clan, changes)
+	if len(eventChanges) > 0 {
+		ingest.Event = models.Event{
 			Topic: "player",
 			Key:   clan,
 			Type:  "player_update",
 			Value: map[string]any{
-				"tag":           tag,
-				"changed_types": playerChangeTypes(changes),
-				"new_player":    current,
-				"old_player":    previous,
+				"tag":             tag,
+				"name":            player.Name,
+				"clan_tag":        clan,
+				"town_hall_level": player.TownHall,
+				"changed_types":   playerChangeTypes(eventChanges),
+				"log_types":       eventLogTypes,
+				"changes":         playerEventChanges(eventChanges),
 			},
 			CreatedAt: now,
-		},
-		SnapshotTag: tag,
-		SnapshotRaw: raw,
-	}, nil
+		}
+	}
+	return ingest, nil
+}
+
+func playerEventChanges(changes []models.PlayerProfileChangeRow) []map[string]any {
+	out := make([]map[string]any, 0, len(changes))
+	for _, change := range changes {
+		out = append(out, map[string]any{
+			"type":     change.ChangeType,
+			"previous": change.PreviousValue,
+			"current":  change.CurrentValue,
+		})
+	}
+	return out
+}
+
+func (d *trackedPlayersDomain) interestedPlayerChanges(
+	clanTag string,
+	changes []models.PlayerProfileChangeRow,
+) ([]models.PlayerProfileChangeRow, []string) {
+	if clanTag == "" || len(changes) == 0 {
+		return nil, nil
+	}
+	interests := d.eventInterests[clanTag]
+	if len(interests) == 0 {
+		return nil, nil
+	}
+	filtered := make([]models.PlayerProfileChangeRow, 0, len(changes))
+	matchedLogs := make(map[string]struct{})
+	for _, change := range changes {
+		matched := false
+		for _, logType := range playerLogTypesForChange(change.ChangeType) {
+			if _, exists := interests[logType]; exists {
+				matched = true
+				matchedLogs[logType] = struct{}{}
+			}
+		}
+		if matched {
+			filtered = append(filtered, change)
+		}
+	}
+	logTypes := make([]string, 0, len(matchedLogs))
+	for logType := range matchedLogs {
+		logTypes = append(logTypes, logType)
+	}
+	sort.Strings(logTypes)
+	return filtered, logTypes
+}
+
+func playerLogTypesForChange(changeType string) []string {
+	switch changeType {
+	case "troops":
+		return []string{"super_troop_boost", "troop_upgrade"}
+	case "heroes":
+		return []string{"hero_upgrade"}
+	case "spells":
+		return []string{"spell_upgrade"}
+	case "heroEquipment":
+		return []string{"hero_equipment_upgrade"}
+	case "townHallLevel":
+		return []string{"th_upgrade"}
+	case "leagueTier":
+		return []string{"league_change"}
+	case "name":
+		return []string{"name_change"}
+	default:
+		return nil
+	}
 }
 
 func trackedPlayerRow(player clashy.Player) models.BasicPlayerRow {
@@ -365,7 +589,15 @@ func newTrackedPlayerSnapshotStore(client valkey.Client) trackedPlayerSnapshotSt
 }
 
 func (s valkeyTrackedPlayerSnapshotStore) Load(ctx context.Context, key string) ([]byte, bool, error) {
-	value, err := s.client.Do(ctx, s.client.B().Get().Key(key).Build()).ToString()
+	value, err := loadAndRefreshPlayerSnapshotScript.Exec(
+		ctx,
+		s.client,
+		[]string{key},
+		[]string{
+			strconv.FormatInt(int64(playerSnapshotRefreshThreshold/time.Second), 10),
+			strconv.FormatInt(int64(playerSnapshotTTL/time.Second), 10),
+		},
+	).ToString()
 	if err != nil {
 		if valkey.IsValkeyNil(err) {
 			return nil, false, nil
@@ -386,7 +618,11 @@ func (s valkeyTrackedPlayerSnapshotStore) ReserveStatEventTime(
 		ctx,
 		s.client,
 		[]string{key},
-		[]string{snapshotHash, strconv.FormatInt(proposed.UTC().UnixNano(), 10)},
+		[]string{
+			snapshotHash,
+			strconv.FormatInt(proposed.UTC().UnixNano(), 10),
+			strconv.FormatInt(int64(playerSnapshotTTL/time.Second), 10),
+		},
 	).ToString()
 	if err != nil {
 		return time.Time{}, err
@@ -408,7 +644,10 @@ func (s valkeyTrackedPlayerSnapshotStore) StoreAndClear(
 		ctx,
 		s.client,
 		[]string{key, pendingKey},
-		[]string{valkey.BinaryString(utils.Compress(raw))},
+		[]string{
+			valkey.BinaryString(utils.Compress(raw)),
+			strconv.FormatInt(int64(playerSnapshotTTL/time.Second), 10),
+		},
 	).Error()
 }
 
@@ -619,7 +858,7 @@ func playerAchievementActivityDetected(previous, current clashy.Player) bool {
 func isHistoricalField(key string) bool {
 	switch key {
 	case "name", "troops", "heroes", "spells", "heroEquipment", "townHallLevel",
-		"warStars", "warPreference", "bestBuilderBaseTrophies", "bestTrophies",
+		"leagueTier", "warStars", "warPreference", "bestBuilderBaseTrophies", "bestTrophies",
 		"expLevel":
 		return true
 	default:
@@ -726,6 +965,28 @@ func (s *timescaleTrackedPlayerStore) NextTargetPage(
 	return trackedPlayerTargetPage{Targets: targets, NextCursor: nextCursor}, nil
 }
 
+func (s *timescaleTrackedPlayerStore) ListEventInterests(
+	ctx context.Context,
+) (map[string]map[string]struct{}, error) {
+	rows, err := s.pool.Query(ctx, trackedPlayerEventInterestsSQL)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	interests := make(map[string]map[string]struct{})
+	for rows.Next() {
+		var clanTag, logType string
+		if err := rows.Scan(&clanTag, &logType); err != nil {
+			return nil, err
+		}
+		if interests[clanTag] == nil {
+			interests[clanTag] = make(map[string]struct{})
+		}
+		interests[clanTag][logType] = struct{}{}
+	}
+	return interests, rows.Err()
+}
+
 func (s *timescaleTrackedPlayerStore) StoreIngest(
 	ctx context.Context,
 	ingest models.TrackedPlayerIngest,
@@ -759,10 +1020,6 @@ func (s *timescaleTrackedPlayerStore) StoreIngest(
 }
 
 const trackedPlayerTargetSetSQL = `
-		SELECT tag
-		FROM tracked_player_targets
-		WHERE enabled = true
-		UNION
 		SELECT member->>'tag' AS tag
 		FROM server_clans tracked_clan
 		JOIN servers server ON server.id = tracked_clan.server_id
@@ -770,6 +1027,7 @@ const trackedPlayerTargetSetSQL = `
 		CROSS JOIN LATERAL jsonb_array_elements(COALESCE(members, '[]'::jsonb)) AS member
 		WHERE server.last_command_at >= now() - interval '90 days'
 		  AND member->>'tag' <> ''
+		  AND COALESCE(NULLIF(member->>'town_hall', ''), '0')::integer >= 9
 `
 
 const trackedPlayerTargetsSQL = `
@@ -778,6 +1036,20 @@ const trackedPlayerTargetsSQL = `
 	WHERE tag > $1
 	ORDER BY tag
 	LIMIT $2
+`
+
+const trackedPlayerEventInterestsSQL = `
+	SELECT DISTINCT log.clan_tag, log.type
+	FROM server_logs log
+	JOIN servers server ON server.id = log.server_id
+	WHERE server.last_command_at >= now() - interval '90 days'
+	  AND log.disabled = false
+	  AND log.clan_tag <> ''
+	  AND log.type IN (
+	      'troop_upgrade', 'super_troop_boost', 'th_upgrade',
+	      'league_change', 'spell_upgrade', 'hero_upgrade',
+	      'hero_equipment_upgrade', 'name_change'
+	  )
 `
 
 const insertPlayerOnlineEventSQL = `
@@ -939,6 +1211,12 @@ func (s *memoryTrackedPlayerStore) NextTargetPage(
 		nextCursor = pageTargets[len(pageTargets)-1].Tag
 	}
 	return trackedPlayerTargetPage{Targets: pageTargets, NextCursor: nextCursor}, nil
+}
+
+func (s *memoryTrackedPlayerStore) ListEventInterests(
+	context.Context,
+) (map[string]map[string]struct{}, error) {
+	return map[string]map[string]struct{}{}, nil
 }
 
 func (s *memoryTrackedPlayerStore) StoreIngest(context.Context, models.TrackedPlayerIngest) error {

@@ -20,6 +20,21 @@ type remindersDomain struct {
 	pool *pgxpool.Pool
 }
 
+const discordReminderPayloadSQL = `jsonb_build_object(
+	'id', reminder.id::text,
+	'server_id', reminder.server_id,
+	'type_name', reminder.type_name,
+	'clan_tag', reminder.clan_tag,
+	'channel_id', COALESCE(reminder.channel_id, ''),
+	'trigger_time', COALESCE(reminder.trigger_time, ''),
+	'minutes_remaining', reminder.minutes_remaining,
+	'custom_text', reminder.custom_text,
+	'town_halls', COALESCE(reminder.townhalls, '{}'::integer[]),
+	'roles', reminder.roles,
+	'war_types', reminder.war_type_names,
+	'trigger_threshold', COALESCE(reminder.trigger_threshold, 0)
+)`
+
 func NewRemindersDomain() platform.Domain { return &remindersDomain{} }
 func (d *remindersDomain) Name() string   { return remindersDomainName }
 
@@ -84,7 +99,7 @@ func (d *remindersDomain) sendClanGamesReminderInterval(ctx context.Context, app
 	}
 	minutes := int(end.Sub(now).Round(time.Minute) / time.Minute)
 	rows, err := d.pool.Query(ctx, `
-		SELECT reminder.clan_tag, reminder.data,
+		SELECT reminder.clan_tag, `+discordReminderPayloadSQL+`,
 		       COALESCE(jsonb_agg(jsonb_build_object(
 		           'name', member->>'name', 'tag', member->>'tag',
 		           'townhall', COALESCE((member->>'town_hall')::int, 0),
@@ -101,7 +116,7 @@ func (d *remindersDomain) sendClanGamesReminderInterval(ctx context.Context, app
 		) points ON true
 		WHERE reminder.type_name = 'Clan Games' AND reminder.minutes_remaining = $1
 		  AND COALESCE(points.value, 0) <= COALESCE(reminder.trigger_threshold, 0)
-		GROUP BY reminder.id, reminder.clan_tag, reminder.data
+		GROUP BY reminder.id, reminder.clan_tag
 	`, minutes, start)
 	if err != nil {
 		return err
@@ -111,8 +126,16 @@ func (d *remindersDomain) sendClanGamesReminderInterval(ctx context.Context, app
 }
 
 func (d *remindersDomain) sendInactivityReminderInterval(ctx context.Context, app *platform.App, now time.Time) error {
-	rows, err := d.pool.Query(ctx, `
-		SELECT reminder.clan_tag, reminder.data,
+	rows, err := d.pool.Query(ctx, inactivityReminderRowsSQL, now)
+	if err != nil {
+		return err
+	}
+	defer rows.Close()
+	return d.publishFixedReminderRows(ctx, app, rows, "inactivity")
+}
+
+const inactivityReminderRowsSQL = `
+		SELECT reminder.clan_tag, ` + discordReminderPayloadSQL + `,
 		       COALESCE(jsonb_agg(jsonb_build_object(
 		           'name', member->>'name', 'tag', member->>'tag',
 		           'townhall', COALESCE((member->>'town_hall')::int, 0),
@@ -126,16 +149,10 @@ func (d *remindersDomain) sendInactivityReminderInterval(ctx context.Context, ap
 			FROM player_online_events event WHERE event.tag = member->>'tag'
 		) online ON true
 		WHERE lower(reminder.type_name) = 'inactivity'
-		  AND online.last_seen >= $1 - make_interval(mins => reminder.minutes_remaining + 15)
-		  AND online.last_seen <  $1 - make_interval(mins => reminder.minutes_remaining)
-		GROUP BY reminder.id, reminder.clan_tag, reminder.data
-	`, now)
-	if err != nil {
-		return err
-	}
-	defer rows.Close()
-	return d.publishFixedReminderRows(ctx, app, rows, "inactivity")
-}
+		  AND online.last_seen >= $1::timestamptz - make_interval(mins => reminder.minutes_remaining + 15)
+		  AND online.last_seen <  $1::timestamptz - make_interval(mins => reminder.minutes_remaining)
+		GROUP BY reminder.id, reminder.clan_tag
+`
 
 type reminderRows interface {
 	Next() bool
@@ -162,7 +179,7 @@ func (d *remindersDomain) publishFixedReminderRows(ctx context.Context, app *pla
 			continue
 		}
 		roles := reminderStringList(reminderData["roles"])
-		townHalls := reminderIntList(reminderData["townhalls"])
+		townHalls := reminderIntList(reminderData["town_halls"])
 		members := make(map[string]clashy.ClanMember, len(clan.Members))
 		for _, member := range clan.Members {
 			members[member.Tag] = member
@@ -183,7 +200,7 @@ func (d *remindersDomain) publishFixedReminderRows(ctx context.Context, app *pla
 			continue
 		}
 		if err := app.PublishEvent(ctx, platform.Event{Topic: "reminder", ClanTag: clanTag, Value: map[string]any{
-			"type": reminderType, "clan_data": clan, "reminder_data": reminderData, "missing": missing,
+			"type": reminderType, "clan": clan, "reminder": reminderData, "members": missing,
 		}}); err != nil {
 			return err
 		}
@@ -278,6 +295,7 @@ func (d *remindersDomain) reconcileWar(ctx context.Context, scheduleKey string) 
 			WHERE reminder.type_name = 'War'
 			  AND reminder.clan_tag IN (schedule.source_clan_tag, schedule.opponent_tag)
 			  AND reminder.minutes_remaining = job.minutes_remaining
+			  AND (cardinality(reminder.war_type_names) = 0 OR schedule.war_type = ANY(reminder.war_type_names))
 		  )
 		  AND NOT EXISTS (
 			SELECT 1
@@ -353,27 +371,59 @@ func (d *remindersDomain) runEventLoop(ctx context.Context, app *platform.App) e
 			topic := entry.FieldValues["topic"]
 			clanTag := entry.FieldValues["clan_tag"]
 			var value map[string]any
-			_ = json.Unmarshal([]byte(entry.FieldValues["value"]), &value)
-			switch topic {
-			case "war_schedule":
-				if key, _ := value["schedule_key"].(string); key != "" {
-					_ = d.reconcileWar(ctx, key)
-				}
-			case "reminder_config":
-				rows, queryErr := d.pool.Query(ctx, `SELECT schedule_key FROM war_schedule WHERE end_time > now() AND $1 IN (source_clan_tag, opponent_tag)`, clanTag)
-				if queryErr == nil {
-					for rows.Next() {
-						var key string
-						if rows.Scan(&key) == nil {
-							_ = d.reconcileWar(ctx, key)
-						}
-					}
-					rows.Close()
-				}
+			if err := json.Unmarshal([]byte(entry.FieldValues["value"]), &value); err != nil {
+				return err
 			}
-			_ = app.Valkey.Do(ctx, app.Valkey.B().Xack().Key(app.Config.EventStreamName).Group(group).Id(entry.ID).Build()).Error()
+			if err := d.handleReconciliationEvent(ctx, topic, clanTag, value); err != nil {
+				return err
+			}
+			if err := app.Valkey.Do(ctx, app.Valkey.B().Xack().Key(app.Config.EventStreamName).Group(group).Id(entry.ID).Build()).Error(); err != nil {
+				return err
+			}
 		}
 	}
+}
+
+func (d *remindersDomain) handleReconciliationEvent(ctx context.Context, topic, clanTag string, value map[string]any) error {
+	switch topic {
+	case "war_schedule":
+		key, _ := value["schedule_key"].(string)
+		if key == "" {
+			return errors.New("war_schedule event requires schedule_key")
+		}
+		return d.reconcileWar(ctx, key)
+	case "reminder_config":
+		if clanTag == "" {
+			return errors.New("reminder_config event requires clan_tag")
+		}
+		rows, err := d.pool.Query(ctx, `
+			SELECT schedule_key
+			FROM war_schedule
+			WHERE end_time > now()
+			  AND $1 IN (source_clan_tag, opponent_tag)
+		`, clanTag)
+		if err != nil {
+			return err
+		}
+		defer rows.Close()
+		var keys []string
+		for rows.Next() {
+			var key string
+			if err := rows.Scan(&key); err != nil {
+				return err
+			}
+			keys = append(keys, key)
+		}
+		if err := rows.Err(); err != nil {
+			return err
+		}
+		for _, key := range keys {
+			if err := d.reconcileWar(ctx, key); err != nil {
+				return err
+			}
+		}
+	}
+	return nil
 }
 
 func (d *remindersDomain) runDueWarJobs(ctx context.Context, app *platform.App) error {
@@ -387,7 +437,7 @@ func (d *remindersDomain) runDueWarJobs(ctx context.Context, app *platform.App) 
 		}
 		rows, err := d.pool.Query(ctx, `
 			SELECT job.schedule_key, job.minutes_remaining, schedule.source_clan_tag,
-			       schedule.war_tag
+			       COALESCE(schedule.war_tag, '')
 			FROM war_reminder_jobs job
 			JOIN war_schedule schedule ON schedule.schedule_key = job.schedule_key
 			WHERE job.run_at <= now()
@@ -444,7 +494,8 @@ func (d *remindersDomain) runDueWarJobs(ctx context.Context, app *platform.App) 
 			if war != nil && war.EndTime != nil && war.EndTime.Time.After(time.Now().UTC()) {
 				raw, _ := json.Marshal(war)
 				_ = app.PublishEvent(ctx, platform.Event{Topic: "reminder", ClanTag: job.clanTag, Value: map[string]any{
-					"type": "war", "schedule_key": job.key, "minutes_remaining": job.minutes, "data": string(raw),
+					"type": "war", "schedule_key": job.key, "minutes_remaining": job.minutes,
+					"data": json.RawMessage(raw),
 				}})
 			}
 			_, _ = d.pool.Exec(ctx, `DELETE FROM war_reminder_jobs WHERE schedule_key = $1 AND minutes_remaining = $2`, job.key, job.minutes)
@@ -531,31 +582,17 @@ func (d *remindersDomain) sendRaidReminderInterval(ctx context.Context, app *pla
 	for _, group := range groups {
 		raid, ok := loadCachedRaid(ctx, app, group.clanTag)
 		if !ok {
-			entries, fetchErr := app.Clash.GetRaidLog(ctx, group.clanTag, clashy.PageOptions{Limit: 1})
-			if fetchErr != nil || len(entries) == 0 {
+			var fetchErr error
+			raid, ok, fetchErr = fetchReminderRaid(ctx, app, group.clanTag)
+			if fetchErr != nil || !ok {
 				continue
 			}
-			raid = entries[0]
 		}
 		members := make(map[string]clashy.RaidMember, len(raid.Members))
 		for _, member := range raid.Members {
 			members[member.Tag] = member
 		}
-		remaining := 0
-		for _, tag := range group.tags {
-			member, found := members[tag]
-			if !found {
-				remaining += 5
-				continue
-			}
-			limit := member.AttackLimit + member.BonusAttackLimit
-			if limit == 0 {
-				limit = 5
-			}
-			if unused := limit - member.AttackCount; unused > 0 {
-				remaining += unused
-			}
-		}
+		remaining := remainingRaidAttacks(group.tags, members)
 		if remaining > 0 {
 			_ = app.PublishEvent(ctx, platform.Event{Topic: "reminder", ClanTag: group.clanTag, Value: map[string]any{
 				"type": "raid_mobile", "user_id": group.userID, "minutes_remaining": minutes,
@@ -564,6 +601,25 @@ func (d *remindersDomain) sendRaidReminderInterval(ctx context.Context, app *pla
 		}
 	}
 	return nil
+}
+
+func remainingRaidAttacks(tags []string, members map[string]clashy.RaidMember) int {
+	remaining := 0
+	for _, tag := range tags {
+		member, found := members[tag]
+		if !found {
+			remaining += 5
+			continue
+		}
+		limit := member.AttackLimit + member.BonusAttackLimit
+		if limit == 0 {
+			limit = 5
+		}
+		if unused := limit - member.AttackCount; unused > 0 {
+			remaining += unused
+		}
+	}
+	return remaining
 }
 
 func (d *remindersDomain) sendDiscordRaidReminders(ctx context.Context, app *platform.App, minutes int) error {
@@ -596,13 +652,13 @@ func (d *remindersDomain) sendDiscordRaidReminders(ctx context.Context, app *pla
 	for clanTag, reminders := range byClan {
 		raid, ok := loadCachedRaid(ctx, app, clanTag)
 		if !ok {
-			entries, fetchErr := app.Clash.GetRaidLog(ctx, clanTag, clashy.PageOptions{Limit: 1})
-			if fetchErr != nil || len(entries) == 0 {
+			var fetchErr error
+			raid, ok, fetchErr = fetchReminderRaid(ctx, app, clanTag)
+			if fetchErr != nil || !ok {
 				continue
 			}
-			raid = entries[0]
 		}
-		clan, fetchErr := app.Clash.GetClan(ctx, clanTag)
+		clan, fetchErr := fetchReminderClan(ctx, app, clanTag)
 		if fetchErr != nil || clan == nil {
 			continue
 		}
@@ -612,14 +668,36 @@ func (d *remindersDomain) sendDiscordRaidReminders(ctx context.Context, app *pla
 				continue
 			}
 			if err := app.PublishEvent(ctx, platform.Event{Topic: "reminder", ClanTag: clanTag, Value: map[string]any{
-				"type": "raid", "clan_data": clan, "raid_data": &raid,
-				"reminder_data": reminder.eventData(), "missing": missing,
+				"type": "raid", "clan": clan, "raid": &raid,
+				"reminder": reminder.eventData(), "members": missing,
 			}}); err != nil {
 				return err
 			}
 		}
 	}
 	return nil
+}
+
+func fetchReminderRaid(ctx context.Context, app *platform.App, clanTag string) (clashy.RaidLogEntry, bool, error) {
+	entries, err := platform.RetryClashFetch(ctx, app.Availability, func(fetchCtx context.Context) ([]clashy.RaidLogEntry, error) {
+		start := time.Now()
+		entries, fetchErr := app.Clash.GetRaidLog(fetchCtx, clanTag, clashy.PageOptions{Limit: 1})
+		app.Stats.RecordRequest(remindersDomainName, time.Since(start), fetchErr)
+		return entries, fetchErr
+	})
+	if err != nil || len(entries) == 0 {
+		return clashy.RaidLogEntry{}, false, err
+	}
+	return entries[0], true, nil
+}
+
+func fetchReminderClan(ctx context.Context, app *platform.App, clanTag string) (*clashy.Clan, error) {
+	return platform.RetryClashFetch(ctx, app.Availability, func(fetchCtx context.Context) (*clashy.Clan, error) {
+		start := time.Now()
+		clan, err := app.Clash.GetClan(fetchCtx, clanTag)
+		app.Stats.RecordRequest(remindersDomainName, time.Since(start), err)
+		return clan, err
+	})
 }
 
 func loadCachedRaid(ctx context.Context, app *platform.App, clanTag string) (clashy.RaidLogEntry, bool) {

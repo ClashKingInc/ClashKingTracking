@@ -129,6 +129,23 @@ func TestEntriesAfterTimestamp(t *testing.T) {
 	}
 }
 
+func TestBattlelogRequestConcurrencyIsMemoryBounded(t *testing.T) {
+	tests := []struct {
+		rps  int
+		want int
+	}{
+		{rps: 0, want: 0},
+		{rps: 100, want: 100},
+		{rps: 900, want: 900},
+		{rps: 4000, want: 1000},
+	}
+	for _, test := range tests {
+		if got := battlelogRequestConcurrency(test.rps); got != test.want {
+			t.Fatalf("battlelogRequestConcurrency(%d) = %d, want %d", test.rps, got, test.want)
+		}
+	}
+}
+
 func TestBattlelogRowFromEntryStoresPlayerAndOpponentNames(t *testing.T) {
 	entry := clashy.BattleLogEntry{
 		OpponentPlayerTag:     "#OPP",
@@ -200,12 +217,20 @@ type fakeBattlelogStore struct {
 	calls  int
 }
 
-func (s *fakeBattlelogStore) NextTargetPage(context.Context, string, string, int) (battlelogTargetPage, error) {
-	return battlelogTargetPage{}, nil
+func (s *fakeBattlelogStore) LoadTargets(context.Context, string) ([]string, error) {
+	return nil, nil
 }
 
-func (s *fakeBattlelogStore) CountTargets(context.Context, string) (int, error) {
-	return 0, nil
+func (s *fakeBattlelogStore) FilterStandardTargets(_ context.Context, tags []string) ([]string, error) {
+	return tags, nil
+}
+
+func TestMergeUniqueBattlelogTargets(t *testing.T) {
+	got := mergeUniqueTags([]string{"#B", "#A", "#B"}, []string{"#C", "#A", ""})
+	want := []string{"#A", "#B", "#C"}
+	if !reflect.DeepEqual(got, want) {
+		t.Fatalf("mergeUniqueTags() = %#v, want %#v", got, want)
+	}
 }
 
 func (s *fakeBattlelogStore) Store(_ context.Context, ingest models.BattlelogIngest) (int, error) {

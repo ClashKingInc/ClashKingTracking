@@ -8,6 +8,8 @@ The event system carries requested live changes between independently running tr
 
 Every published entry has a topic, optional clan tag, timestamp, and JSON value. Topics identify broad consumers such as `clan`, `war`, `war_schedule`, `capital`, `reminder`, `reminder_config`, and maintenance recovery.
 
+This is a v2-only contract. Structured payloads remain JSON objects instead of JSON encoded inside strings: clan changes use `clan`, war changes use `war` and optional `previous_war`, Capital changes use `raid` and optional `previous_raid`, and scheduled war reminders use `data`. Discord member reminders use `clan`, `reminder`, and `members`, adding `raid` for Raid Weekend. War events also state `war_type`, `war_role`, and `panel_target`; this lets a consumer keep one panel on the battle war while independently handling an overlapping CWL preparation war. There are no duplicate compatibility aliases or old `_data` names.
+
 ## Publishing decision
 
 Trackers should answer “does anybody consume this class of event?” before publishing. `trackedclans` keeps this interest in its batched in-memory target registry. Global clan tracking never publishes joins/leaves, and reminder-only war targets do not publish attack/state events.

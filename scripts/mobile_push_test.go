@@ -2,12 +2,22 @@ package scripts
 
 import (
 	"context"
+	"encoding/json"
+	"io"
+	"net/http"
+	"strings"
 	"testing"
 	"time"
 
 	"clashking_tracking/internal/platform"
 	"clashking_tracking/models"
+
+	"golang.org/x/oauth2"
 )
+
+type roundTripFunc func(*http.Request) (*http.Response, error)
+
+func (f roundTripFunc) RoundTrip(request *http.Request) (*http.Response, error) { return f(request) }
 
 func TestCampaignNotificationPreference(t *testing.T) {
 	if got := campaignNotificationPreference(models.NotificationCampaign{Key: "monthly-support"}); got != "monthly_support" {
@@ -277,5 +287,61 @@ func TestFCMServiceAccountJSONIsValidated(t *testing.T) {
 	app := &platform.App{Config: platform.Config{MobilePushFCMServiceAccountJSON: "{"}}
 	if _, err := fcmAccessToken(app); err == nil {
 		t.Fatal("invalid FCM service-account JSON must be rejected")
+	}
+}
+
+func TestSendFCMBuildsV2RequestAtTransportBoundary(t *testing.T) {
+	fcmADC.Lock()
+	previousSource := fcmADC.source
+	fcmADC.source = oauth2.StaticTokenSource(&oauth2.Token{AccessToken: "access-token"})
+	fcmADC.Unlock()
+	previousClient := pushHTTPClient
+	t.Cleanup(func() {
+		fcmADC.Lock()
+		fcmADC.source = previousSource
+		fcmADC.Unlock()
+		pushHTTPClient = previousClient
+	})
+
+	var captured map[string]any
+	pushHTTPClient = &http.Client{Transport: roundTripFunc(func(request *http.Request) (*http.Response, error) {
+		if request.Method != http.MethodPost {
+			t.Fatalf("method = %s, want POST", request.Method)
+		}
+		if request.URL.String() != "https://fcm.googleapis.com/v1/projects/test-project/messages:send" {
+			t.Fatalf("url = %s", request.URL)
+		}
+		if request.Header.Get("Authorization") != "Bearer access-token" {
+			t.Fatalf("authorization = %q", request.Header.Get("Authorization"))
+		}
+		if request.Header.Get("Content-Type") != "application/json" {
+			t.Fatalf("content type = %q", request.Header.Get("Content-Type"))
+		}
+		if err := json.NewDecoder(request.Body).Decode(&captured); err != nil {
+			t.Fatal(err)
+		}
+		return &http.Response{StatusCode: http.StatusOK, Body: io.NopCloser(strings.NewReader(`{"name":"projects/test/messages/1"}`)), Header: make(http.Header)}, nil
+	})}
+
+	app := &platform.App{Config: platform.Config{MobilePushFCMProjectID: "test-project"}}
+	err := sendFCM(t.Context(), app, "device-token", pushMessage{
+		Title: "War attacks remaining",
+		Body:  "45 minutes & 7 attacks left in war!",
+		Data:  map[string]string{"type": "war_reminder", "target_tag": "#AAA"},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	message, ok := captured["message"].(map[string]any)
+	if !ok || message["token"] != "device-token" {
+		t.Fatalf("message = %#v", captured["message"])
+	}
+	notification, ok := message["notification"].(map[string]any)
+	if !ok || notification["title"] != "War attacks remaining" || notification["body"] != "45 minutes & 7 attacks left in war!" {
+		t.Fatalf("notification = %#v", message["notification"])
+	}
+	data, ok := message["data"].(map[string]any)
+	if !ok || data["type"] != "war_reminder" || data["target_tag"] != "#AAA" {
+		t.Fatalf("data = %#v", message["data"])
 	}
 }

@@ -3,14 +3,17 @@ package platform
 import (
 	"context"
 	"errors"
+	"io"
 	"time"
 
 	clashy "github.com/clashkinginc/clashy.go"
 )
 
 const (
-	ClashGatewayTimeoutRetryDelay = 5 * time.Second
+	ClashGatewayTimeoutRetryDelay = 500 * time.Millisecond
 	ClashGatewayTimeoutMaxRetries = 3
+	ClashThrottledRetryDelay      = time.Second
+	ClashThrottledMaxRetries      = 3
 	ClashUnavailableRetryDelay    = 60 * time.Second
 )
 
@@ -20,6 +23,13 @@ type ClashFetchRetry struct {
 }
 
 func ClashFetchRetryPolicy(err error) (ClashFetchRetry, bool) {
+	if errors.Is(err, io.EOF) || errors.Is(err, io.ErrUnexpectedEOF) {
+		return ClashFetchRetry{
+			RetryAfter: ClashGatewayTimeoutRetryDelay,
+			MaxRetries: ClashGatewayTimeoutMaxRetries,
+		}, true
+	}
+
 	var gateway *clashy.GatewayError
 	if errors.As(err, &gateway) {
 		switch gateway.Status {
@@ -39,6 +49,14 @@ func ClashFetchRetryPolicy(err error) (ClashFetchRetry, bool) {
 	if errors.As(err, &maintenance) {
 		return ClashFetchRetry{
 			RetryAfter: ClashUnavailableRetryDelay,
+		}, true
+	}
+
+	var httpErr *clashy.HTTPException
+	if errors.As(err, &httpErr) && httpErr.Status == 429 {
+		return ClashFetchRetry{
+			RetryAfter: ClashThrottledRetryDelay,
+			MaxRetries: ClashThrottledMaxRetries,
 		}, true
 	}
 

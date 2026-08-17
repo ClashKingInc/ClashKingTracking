@@ -260,13 +260,8 @@ func (w *mobileEventsWorker) processEvent(ctx context.Context, event mobileWarEv
 func stringValue(value any) string { valueString, _ := value.(string); return valueString }
 
 func (w *mobileEventsWorker) processWarReminder(ctx context.Context, event mobileWarEvent) error {
-	raw, _ := event.Value["data"].(string)
-	minutes := intNumber(event.Value["minutes_remaining"])
-	if raw == "" || minutes <= 0 {
-		return nil
-	}
-	var war clashy.ClanWar
-	if err := json.Unmarshal([]byte(raw), &war); err != nil {
+	war, minutes, err := decodeWarReminderEvent(event)
+	if err != nil {
 		return err
 	}
 	attacksPerMember := 2
@@ -349,7 +344,7 @@ func (w *mobileEventsWorker) processWarReminder(ctx context.Context, event mobil
 		warID = war.PreparationStartTime.RawTime
 	}
 	if warID == "" {
-		warID = event.ClanTag + ":" + raw
+		return errors.New("war reminder payload has no stable war identity")
 	}
 	for _, recipient := range recipients {
 		if recipient.remaining <= 0 {
@@ -381,6 +376,26 @@ func (w *mobileEventsWorker) processWarReminder(ctx context.Context, event mobil
 		}
 	}
 	return nil
+}
+
+func decodeWarReminderEvent(event mobileWarEvent) (clashy.ClanWar, int, error) {
+	payload, ok := event.Value["data"].(map[string]any)
+	if !ok {
+		return clashy.ClanWar{}, 0, errors.New("war reminder data must be a nested object")
+	}
+	minutes := intNumber(event.Value["minutes_remaining"])
+	if minutes <= 0 {
+		return clashy.ClanWar{}, 0, errors.New("war reminder minutes_remaining must be a positive integer")
+	}
+	raw, err := json.Marshal(payload)
+	if err != nil {
+		return clashy.ClanWar{}, 0, err
+	}
+	var war clashy.ClanWar
+	if err := json.Unmarshal(raw, &war); err != nil {
+		return clashy.ClanWar{}, 0, err
+	}
+	return war, minutes, nil
 }
 
 func (w *mobileEventsWorker) processRaidReminder(ctx context.Context, event mobileWarEvent) error {
@@ -516,8 +531,8 @@ func mobileEventFromEntry(entry valkey.XRangeEntry) (mobileWarEvent, bool) {
 func mobilePushEventType(event mobileWarEvent) bool {
 	eventType, _ := event.Value["type"].(string)
 	switch eventType {
-	case "new_war", "new_attacks", "war_state", "cwl_war_update", "cwl_new_attacks":
-		return event.Topic == "war" || event.Topic == "cwl"
+	case "new_war", "new_attacks", "war_state":
+		return event.Topic == "war"
 	case "war", "raid_mobile":
 		return event.Topic == "reminder"
 	default:
@@ -526,6 +541,9 @@ func mobilePushEventType(event mobileWarEvent) bool {
 }
 
 func subscriptionWantsEvent(sub mobileSubscription, event mobileWarEvent) bool {
+	if stringValue(event.Value["war_role"]) == string(cwlWarPreparation) {
+		return false
+	}
 	eventType, _ := event.Value["type"].(string)
 	switch eventType {
 	case "new_war":
@@ -534,10 +552,6 @@ func subscriptionWantsEvent(sub mobileSubscription, event mobileWarEvent) bool {
 		return sub.ScoreChangeEnabled
 	case "war_state":
 		return sub.WarEndEnabled || sub.WarStartEnabled
-	case "cwl_war_update":
-		return sub.WarStartEnabled || sub.WarEndEnabled
-	case "cwl_new_attacks":
-		return sub.ScoreChangeEnabled
 	default:
 		return false
 	}
@@ -548,12 +562,10 @@ func mobileNotificationText(event mobileWarEvent) (string, string) {
 	switch eventType {
 	case "new_war":
 		return "Clan war started", "A new war is available for your selected clan."
-	case "new_attacks", "cwl_new_attacks":
+	case "new_attacks":
 		return "War score updated", "A new attack changed the clan war score."
 	case "war_state":
 		return "War status changed", "Your clan war status changed."
-	case "cwl_war_update":
-		return "CWL updated", "Your Clan War League round has new information."
 	default:
 		return "ClashKing war update", "Your selected clan has a war update."
 	}

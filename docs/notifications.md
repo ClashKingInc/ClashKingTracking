@@ -31,6 +31,8 @@ Read Valkey consumer group
 
 Mobile accounts are verified accounts only. Bookmarked-player and Legend notification paths do not exist.
 
+War reminder events use a single v2 representation: `data` must be a nested war object and `minutes_remaining` must be a positive integer. Stringified JSON and formatted-hour compatibility fields are deliberately rejected so producers and consumers cannot silently disagree about the contract.
+
 ## Sender flow
 
 ```text
@@ -47,6 +49,8 @@ FCM is the only provider; Android and iOS both use it. Provider is still stored 
 ## War and Raid grouping
 
 For war reminders, every verified account belonging to one user and the same war is combined. Five accounts do not create five pushes; remaining attacks are totalled into one message.
+
+An overlapping CWL preparation event is not treated as a live “war started” mobile push. Its schedule can still produce the user's configured future reminders, while live start/score/end preferences apply only to the battle-role war.
 
 For Raid Weekend, the reminder producer has already grouped the user's verified accounts by current clan and supplied the remaining total. A player that has not attacked may reasonably count as having the base attack allowance because the Clash raid response has no zero-attack roster.
 

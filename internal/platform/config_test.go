@@ -28,7 +28,8 @@ func TestLoadWithArgsReadsConfigJSON(t *testing.T) {
 		},
 		"globalclans": {
 			"priority_requests_per_second": 123,
-			"non_priority_requests_per_second": 45
+			"non_priority_requests_per_second": 45,
+			"write_workers": 3
 		},
 		"battlelogs": {
 			"requests_per_second": 11,
@@ -47,7 +48,8 @@ func TestLoadWithArgsReadsConfigJSON(t *testing.T) {
 			"cwl_state_snapshot": "test-cwlstate"
 		},
 		"trackedplayers": {
-			"requests_per_second": 88
+			"requests_per_second": 88,
+			"target_refresh_seconds": 3900
 		},
 		"basicplayers": {
 			"requests_per_second": 30
@@ -88,6 +90,7 @@ func TestLoadWithArgsReadsConfigJSON(t *testing.T) {
 		t.Fatalf("runtime stats config was not applied: %+v", cfg)
 	}
 	if cfg.GlobalClanPriorityRequestsPerSecond != 123 || cfg.GlobalClanNonPriorityRequestsPerSecond != 45 ||
+		cfg.GlobalClanWriteWorkers != 3 ||
 		cfg.TargetPageMultiplier != 9 {
 		t.Fatalf("globalclans config was not applied: %+v", cfg)
 	}
@@ -107,7 +110,8 @@ func TestLoadWithArgsReadsConfigJSON(t *testing.T) {
 		cfg.EventStreamRetentionSeconds != 300 || cfg.EventStreamReclaimIdleSeconds != 30 {
 		t.Fatalf("events config was not applied: %+v", cfg)
 	}
-	if cfg.TrackedPlayerRequestsPerSecond != 88 || cfg.BasicPlayerRequestsPerSecond != 30 ||
+	if cfg.TrackedPlayerRequestsPerSecond != 88 || cfg.TrackedPlayerTargetRefreshSeconds != 3900 ||
+		cfg.BasicPlayerRequestsPerSecond != 30 ||
 		cfg.LeaderboardRequestsPerSecond != 66 ||
 		cfg.LeaderboardIntervalSeconds != 600 || cfg.ScheduledIntervalSeconds != 900 ||
 		cfg.LeaderboardLimit != 500 || cfg.LeaderboardNullAssetURL != "https://assets/null" ||

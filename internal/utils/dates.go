@@ -27,12 +27,7 @@ func CurrentGamesSeason(now time.Time) string {
 
 func IsCWL(now time.Time) bool {
 	now = now.UTC()
-	// CWL tracking intentionally mirrors the game's visible window rather than calendar month boundaries.
-	if now.Day() < 1 || now.Day() > 10 {
-		return false
-	}
-	if now.Day() == 1 && now.Hour() < 8 {
-		return false
-	}
-	return !(now.Day() == 11 && now.Hour() >= 8)
+	// Global CWL discovery is useful through the fifteenth. Live tracked clans
+	// can continue beyond this window when their persisted group is not ended.
+	return now.Day() >= 1 && now.Day() <= 15
 }

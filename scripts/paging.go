@@ -3,6 +3,7 @@ package scripts
 import (
 	"context"
 	"errors"
+	"io"
 	"sync"
 	"time"
 
@@ -31,6 +32,32 @@ func sleepOrDone(ctx context.Context, delay time.Duration) error {
 
 func newTrackingLimiter(requestsPerSecond int) (*clashy.Limiter, error) {
 	return clashy.NewLimiter(requestsPerSecond, platform.RequestConcurrency(requestsPerSecond))
+}
+
+func bulkFetchWorkerCount(requestsPerSecond, maxInFlight int) int {
+	workers := requestsPerSecond
+	if workers <= 0 {
+		workers = 1
+	}
+	if maxInFlight > 0 && workers > maxInFlight {
+		workers = maxInFlight
+	}
+	return workers
+}
+
+// A broad SQL-backed scan can safely leave these targets for its next full
+// pass. Other failures still stop the process so configuration and data-shape
+// problems remain visible.
+func isDeferredBulkFetch(err error) bool {
+	if errors.Is(err, io.EOF) || errors.Is(err, io.ErrUnexpectedEOF) {
+		return true
+	}
+	var gateway *clashy.GatewayError
+	if errors.As(err, &gateway) && gateway.HTTPException != nil && gateway.Status == 504 {
+		return true
+	}
+	var httpErr *clashy.HTTPException
+	return errors.As(err, &httpErr) && httpErr.Status == 429
 }
 
 // runBounded processes one application-owned page with a fixed worker count.

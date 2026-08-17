@@ -24,6 +24,8 @@ var fcmADC = struct {
 	source oauth2.TokenSource
 }{}
 
+var pushHTTPClient = &http.Client{Timeout: 10 * time.Second}
+
 type pushMessage struct {
 	Title string
 	Body  string
@@ -169,8 +171,7 @@ func fcmAccessToken(app *platform.App) (string, error) {
 }
 
 func doSend(req *http.Request) error {
-	client := &http.Client{Timeout: 10 * time.Second}
-	resp, err := client.Do(req)
+	resp, err := pushHTTPClient.Do(req)
 	if err != nil {
 		return err
 	}

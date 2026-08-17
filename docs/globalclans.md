@@ -12,6 +12,8 @@ It runs continuously as the `globalclans` script. Two loops run at the same time
 - The non-priority loop handles the remaining clans and uses `globalclans.non_priority_requests_per_second`.
 
 Each loop has its own cursor. A large inactive population therefore cannot stop active clans from being revisited.
+The two configured rates are a shared proxy load. Request starts are spaced evenly instead of being released in one-second bursts. `write_workers` controls tag-sharded SQL writers, so first-time player hydration can use database concurrency without allowing two workers to update the same clan concurrently.
+Clan requests flow continuously rather than waiting for every request in a SQL page to finish. A request that still returns a gateway timeout, truncated response, or rate-limit response after its bounded retries is left in the target table and tried again on the next full scan. This keeps one unusually slow or briefly throttled clan from pausing thousands of unrelated clans.
 
 ## How a clan becomes a target
 
@@ -63,6 +65,9 @@ Writes:
 - `clan_change_history`: durable description, level, league, and other supported profile changes.
 
 Only columns whose incoming values are different are updated. This reduces database writes when a clan response is unchanged.
+Member summaries are copied into a connection-local temporary staging table before the set-based `basic_player` upsert. The table clears at transaction commit and is reused by that database connection, avoiding one temporary-table create/drop cycle for every write batch.
+
+An imported clan can already have `member_count` without having its first `members` snapshot. The empty snapshot is treated as first hydration: the current members seed `basic_clan` and `basic_player`, but they are not recorded as joins and do not promote the clan into priority tracking. Join/leave comparison starts with the following successful poll.
 
 ## Valkey and events
 
@@ -89,13 +94,14 @@ flowchart LR
 
 - `globalclans.priority_requests_per_second`
 - `globalclans.non_priority_requests_per_second`
+- `globalclans.write_workers`
 - `target_page_multiplier`
 - Timescale/PostgreSQL connection settings
 - Proxy origin and credentials shared by all Clash callers
 
 ## Outages and restarts
 
-Every request waits at the shared availability gate. A proxy outage pauses without changing game time. Official Clash maintenance also pauses; this process needs no clock shifting because clan snapshots have no scheduled end time. Database cursors let a restart resume broad paging without an expensive full count.
+Every request waits at the shared availability gate. A proxy outage pauses without changing game time. Official Clash maintenance also pauses; this process needs no clock shifting because clan snapshots have no scheduled end time. A process restart begins each ordered target pool from the first tag again; unchanged-row checks make that safe, though a future durable cursor could avoid the repeated prefix.
 
 ## What it deliberately does not do
 

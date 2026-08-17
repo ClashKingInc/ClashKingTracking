@@ -6,7 +6,7 @@
 
 ## When it runs
 
-It runs continuously as `trackedclans`. A clan loop and a current-war loop run independently at `trackedclans.requests_per_second`. The target registry is reloaded every `trackedclans.target_refresh_seconds`.
+It runs continuously as `trackedclans`. A clan loop, a regular current-war loop, and a live CWL loop share the `trackedclans.requests_per_second` limiter. The target registry is reloaded every `trackedclans.target_refresh_seconds`; the CWL loop wakes every `wars.cwl_sync_seconds` and only calls CWL endpoints for a current active season.
 
 ## How a clan becomes a target
 
@@ -35,7 +35,7 @@ These events are delivery signals. Durable `basic_clan` and `join_leave_history`
 ```text
 Target has a war feature
   -> GET current war
-  -> ignore CWL responses; the CWL process owns those
+  -> ignore CWL responses in this regular-war loop; the live CWL loop handles them
   -> compute key from sorted clan tags + preparation time
   -> upsert war_schedule and all participating player_timers
   -> publish war_schedule so reminders reconcile immediately
@@ -57,12 +57,17 @@ if war is usable and not CWL:
 store current live snapshot
 ```
 
+For CWL, the live loop keeps explicit `battle` and `preparation` slots because a clan can have today's battle running while tomorrow's lineup is already in preparation. Each slot has its own war-tag snapshot, durable `war_schedule` row, participant timers, and reminders. A preparation war is never mislabeled as current just because it is round one. The entire 3rd remains a discovery day; a clan is marked as not participating only after that window closes.
+
+A clan with no current group is checked at most every 15 minutes during signup. Once a group exists but has not exposed its first war tags, it stays on the faster CWL loop so reminders are scheduled promptly. After tags are known, the tracker calls those tagged-war endpoints directly, refreshes the group only every 15 minutes or on a round transition, and shares each war-tag response across both participating tracked clans for the cycle.
+
+Every CWL event includes `war_type: "cwl"`, `war_role`, `war_tag`, and `panel_target`. The one Discord panel follows events where `panel_target` is true: the ongoing battle wins, round-one preparation is eligible only while no battle exists, and preparation becomes the panel target when it enters `inWar`. The overlapping preparation war still emits `new_war` and `cwl_lineup_change` events with `panel_target: false`, allowing reminder and lineup consumers to act without replacing the battle panel. The separate `cwl` process remains responsible for the global durable group/member snapshot.
+
 ## Clash API used
 
 - `GET /v1/clans/{clanTag}` for live member comparison.
 - `GET /v1/clans/{clanTag}/currentwar` for regular/friendly war tracking.
-
-The currently retained legacy helper code contains Capital/CWL functions, but the active `Run` path starts only clan and regular-war loops; `capital` and `cwl` are separate scripts.
+- Current CWL league group and CWL war-tag endpoints for configured-clan live tracking.
 
 ## Data read and written
 
@@ -75,6 +80,9 @@ It does not write `basic_player`. It does not perform the global durable clan/me
 - `clan`: `member_join` and `member_leave` for configured consumers.
 - `war_schedule`: a canonical war became available or was refreshed.
 - `war`: live `new_war`, `new_attacks`, and `war_state` only when a war log/panel consumer exists.
+- `war`: CWL battle attack/state changes plus preparation discovery and lineup changes. Explicit `war_role` and `panel_target` fields make the single-panel choice deterministic.
+
+These are v2-only contracts. Current objects are nested under `clan`, `war`, or `raid`; previous values use `previous_war` or `previous_raid`. JSON is never placed inside a string, and no duplicate legacy field names are published.
 
 ## Interaction with other processes
 
@@ -82,8 +90,8 @@ It does not write `basic_player`. It does not perform the global durable clan/me
 flowchart LR
   Config[(logs, panels, reminders)] --> R[In-memory target registry]
   R --> T[trackedclans]
-  T --> API[Clan and current-war endpoints]
-  T --> S[(war_schedule)]
+  T --> API[Clan, current-war, and live CWL endpoints]
+  T --> S[(one war_schedule row per current/preparation war)]
   T --> P[(player_timers)]
   T --> E[Valkey event stream]
   S --> W[war-discovery finalizer]
@@ -107,6 +115,7 @@ Requests pause at the shared gate. The SQL schedule survives restarts. Valkey li
 
 - No global clan/member persistence.
 - No join/leave event from the global crawler.
-- No active CWL or Capital loop.
+- No Capital loop; the separate `capital` process owns Raid Weekend polling.
+- No global CWL group/member persistence; the separate `cwl` process owns that durable snapshot.
 - No per-response SQL/Valkey interest lookup.
 - No in-memory future reminder scheduler.

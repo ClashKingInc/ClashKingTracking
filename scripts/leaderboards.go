@@ -45,6 +45,12 @@ var leaderboardMaterializedViewRefreshQueries = [...]string{
 	`REFRESH MATERIALIZED VIEW CONCURRENTLY townhall_counts`,
 }
 
+var leaderboardMaterializedViewBootstrapQueries = [...]string{
+	`REFRESH MATERIALIZED VIEW clan_leaderboards`,
+	`REFRESH MATERIALIZED VIEW war_league_counts`,
+	`REFRESH MATERIALIZED VIEW townhall_counts`,
+}
+
 const leaderboardCandidateSQL = `
 	WITH league_ids AS (
 		SELECT generate_series(105000001, 105000036) AS league_id
@@ -669,23 +675,27 @@ func (s *timescaleLeaderboardStore) CacheBoards(ctx context.Context, cache leade
 }
 
 func (s *timescaleLeaderboardStore) RefreshMaterializedViews(ctx context.Context) error {
-	if _, err := s.pool.Exec(ctx, leaderboardMaterializedViewRefreshQueries[0]); err != nil {
-		var pgErr *pgconn.PgError
-		if !errors.As(err, &pgErr) || pgErr.Code != "55000" {
-			return err
-		}
-		// A new database starts this view WITH NO DATA, which PostgreSQL requires
-		// us to populate once before concurrent refreshes are allowed.
-		if _, err := s.pool.Exec(ctx, `REFRESH MATERIALIZED VIEW clan_leaderboards`); err != nil {
-			return err
-		}
-	}
-	for _, query := range leaderboardMaterializedViewRefreshQueries[1:] {
+	for i, query := range leaderboardMaterializedViewRefreshQueries {
 		if _, err := s.pool.Exec(ctx, query); err != nil {
-			return err
+			var pgErr *pgconn.PgError
+			if !errors.As(err, &pgErr) || !isUnpopulatedMaterializedViewError(pgErr) {
+				return err
+			}
+			// A new database starts these views WITH NO DATA. PostgreSQL rejects
+			// CONCURRENTLY until each view has completed one ordinary refresh.
+			if _, bootstrapErr := s.pool.Exec(ctx, leaderboardMaterializedViewBootstrapQueries[i]); bootstrapErr != nil {
+				return bootstrapErr
+			}
 		}
 	}
 	return nil
+}
+
+func isUnpopulatedMaterializedViewError(err *pgconn.PgError) bool {
+	if err == nil || (err.Code != "0A000" && err.Code != "55000") {
+		return false
+	}
+	return err.Message == "CONCURRENTLY cannot be used when the materialized view is not populated"
 }
 
 func leaderboardCacheKey(kind, key string) string {

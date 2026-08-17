@@ -2,6 +2,7 @@ package platform
 
 import (
 	"errors"
+	"io"
 	"testing"
 
 	clashy "github.com/clashkinginc/clashy.go"
@@ -25,7 +26,21 @@ func TestClashFetchRetryPolicy(t *testing.T) {
 			name:      "gateway timeout",
 			err:       &clashy.GatewayError{HTTPException: &clashy.HTTPException{Status: 504}},
 			wantOK:    true,
-			wantDelay: "5s",
+			wantDelay: "500ms",
+			wantMax:   3,
+		},
+		{
+			name:      "request throttled",
+			err:       &clashy.HTTPException{Status: 429},
+			wantOK:    true,
+			wantDelay: "1s",
+			wantMax:   3,
+		},
+		{
+			name:      "truncated response",
+			err:       io.ErrUnexpectedEOF,
+			wantOK:    true,
+			wantDelay: "500ms",
 			wantMax:   3,
 		},
 		{

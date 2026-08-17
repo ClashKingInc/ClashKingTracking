@@ -38,6 +38,8 @@ New war_schedule event
 
 Discord reconciliation is event-driven on new war, config create/update/delete, and startup. This allows a reminder added during a running war to take effect immediately without a permanent five-minute Discord scan. Mobile preferences have a five-minute safety reconciliation because device/app configuration can change through a different path.
 
+An event is acknowledged only after its SQL reconciliation succeeds. If the process fails during that work, restart-time reconciliation rebuilds all active clocks from durable configuration and `war_schedule`, so a transient failure cannot turn into a permanently stale Discord reminder. Removal also applies the reminder's war-type filter, preventing a normal-war-only configuration from preserving a stale CWL clock or vice versa.
+
 ## When a war clock fires
 
 ```text
@@ -49,11 +51,13 @@ Load due clock
   -> delete the clock
 ```
 
-The notification consumer groups all of one user's participating verified accounts and totals their remaining attacks. The intended mobile text is `45 minutes & 7 attacks left in war!`.
+The event uses one v2 contract: `minutes_remaining` is an integer and `data` is the current war object. It does not duplicate the offset as a formatted legacy string. The notification consumer groups all of one user's participating verified accounts and totals their remaining attacks. The intended mobile text is `45 minutes & 7 attacks left in war!`.
 
 ## Raid Weekend reminders
 
 Raid Weekend ends at the same time for everyone, so there are no individual future rows. On each quarter-hour during the weekend, the process selects Discord/mobile preferences whose configured remaining minutes equal the current remaining minutes. It uses the compressed Capital cache first, falls back to the raid endpoint, totals mobile attacks per user and clan, and publishes only when attacks remain.
+
+Discord member reminders use one v2 shape: `clan` is the current clan, `reminder` is a typed configuration built from SQL columns, and `members` is the filtered list that still needs the reminder. Raid reminders additionally include the current response as `raid`. Old `_data` names, Mongo-style `_id`, and opaque `reminder.data` blobs are not published.
 
 ## Clan Games and inactivity reminders
 

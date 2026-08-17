@@ -16,7 +16,8 @@
   },
   "globalclans": {
     "priority_requests_per_second": 50,
-    "non_priority_requests_per_second": 1000
+    "non_priority_requests_per_second": 1000,
+    "write_workers": 2
   },
   "battlelogs": {
     "requests_per_second": 1000,
@@ -41,7 +42,8 @@
     "snapshot_prefix": "capital:raid:"
   },
   "trackedplayers": {
-    "requests_per_second": 950
+    "requests_per_second": 950,
+    "target_refresh_seconds": 3600
   },
   "basicplayers": {
     "requests_per_second": 30

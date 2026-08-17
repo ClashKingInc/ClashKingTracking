@@ -1,6 +1,7 @@
 package scripts
 
 import (
+	"encoding/json"
 	"strings"
 	"testing"
 )
@@ -10,6 +11,33 @@ func TestMobilePushConsumesWarAndRaidReminders(t *testing.T) {
 		if !mobilePushEventType(mobileWarEvent{Topic: "reminder", Value: map[string]any{"type": eventType}}) {
 			t.Fatalf("%s reminder was not accepted as a mobile event", eventType)
 		}
+	}
+}
+
+func TestWarReminderDecoderAcceptsOnlyV2NestedData(t *testing.T) {
+	event := mobileWarEvent{Value: map[string]any{
+		"minutes_remaining": json.Number("45"),
+		"data": map[string]any{
+			"state": "inWar",
+			"clan":  map[string]any{"tag": "#AAA"},
+		},
+	}}
+	war, minutes, err := decodeWarReminderEvent(event)
+	if err != nil {
+		t.Fatalf("decode v2 reminder: %v", err)
+	}
+	if minutes != 45 || war.State != "inWar" || war.Clan == nil || war.Clan.Tag != "#AAA" {
+		t.Fatalf("decoded reminder = minutes %d, war %#v", minutes, war)
+	}
+
+	event.Value["data"] = `{"state":"inWar"}`
+	if _, _, err := decodeWarReminderEvent(event); err == nil {
+		t.Fatal("stringified legacy reminder data was accepted")
+	}
+	delete(event.Value, "minutes_remaining")
+	event.Value["data"] = map[string]any{"state": "inWar"}
+	if _, _, err := decodeWarReminderEvent(event); err == nil {
+		t.Fatal("reminder without numeric minutes_remaining was accepted")
 	}
 }
 
@@ -57,10 +85,12 @@ func TestSubscriptionWantsWarAndCWLEvents(t *testing.T) {
 			want:  true,
 		},
 		{
-			name:  "cwl update",
-			sub:   mobileSubscription{WarStartEnabled: true},
-			event: mobileWarEvent{Topic: "cwl", Value: map[string]any{"type": "cwl_war_update"}},
-			want:  true,
+			name: "cwl preparation does not look like a battle start",
+			sub:  mobileSubscription{WarStartEnabled: true},
+			event: mobileWarEvent{Topic: "war", Value: map[string]any{
+				"type": "new_war", "war_type": "cwl", "war_role": "preparation",
+			}},
+			want: false,
 		},
 		{
 			name:  "disabled preference",

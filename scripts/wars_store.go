@@ -87,6 +87,21 @@ func (s *timescaleWarStore) Reschedule(ctx context.Context, scheduleKey string, 
 	return warStoreError("reschedule", err)
 }
 
+func (s *timescaleWarStore) DeleteSchedule(ctx context.Context, scheduleKey string) error {
+	tx, err := s.pool.Begin(ctx)
+	if err != nil {
+		return warStoreError("delete schedule", err)
+	}
+	defer tx.Rollback(ctx)
+	if _, err := tx.Exec(ctx, `DELETE FROM player_timers WHERE event_type = 'war' AND event_key = $1`, scheduleKey); err != nil {
+		return warStoreError("delete schedule player timers", err)
+	}
+	if _, err := tx.Exec(ctx, `DELETE FROM war_schedule WHERE schedule_key = $1`, scheduleKey); err != nil {
+		return warStoreError("delete schedule", err)
+	}
+	return tx.Commit(ctx)
+}
+
 func (s *timescaleWarStore) LoadCWLLeague(ctx context.Context, tag string) (int, error) {
 	var leagueID int
 	err := s.pool.QueryRow(ctx, `SELECT cwl_league_id FROM basic_clan WHERE tag = $1`, tag).Scan(&leagueID)
@@ -94,6 +109,45 @@ func (s *timescaleWarStore) LoadCWLLeague(ctx context.Context, tag string) (int,
 		return 0, warStoreError("load cwl league", err)
 	}
 	return leagueID, nil
+}
+
+func (s *timescaleWarStore) KnownCWLWarTags(ctx context.Context, warTags []string) (map[string]int, error) {
+	known := make(map[string]int, len(warTags))
+	if len(warTags) == 0 {
+		return known, nil
+	}
+	rows, err := s.pool.Query(ctx, `
+		WITH known AS (
+			SELECT war_tag, size AS war_size
+			FROM wars
+			WHERE war_tag = ANY($1::text[])
+			UNION ALL
+			SELECT schedule.war_tag, (count(timer.player_tag) / 2)::int AS war_size
+			FROM war_schedule schedule
+			LEFT JOIN player_timers timer
+			  ON timer.event_type = 'war' AND timer.event_key = schedule.schedule_key
+			WHERE schedule.war_tag = ANY($1::text[])
+			GROUP BY schedule.schedule_key, schedule.war_tag
+		)
+		SELECT war_tag, max(war_size)::int
+		FROM known
+		GROUP BY war_tag
+	`, warTags)
+	if err != nil {
+		return nil, warStoreError("load known CWL war tags", err)
+	}
+	defer rows.Close()
+	for rows.Next() {
+		var warTag string
+		var warSize int
+		if err := rows.Scan(&warTag, &warSize); err != nil {
+			return nil, err
+		}
+		if warTag != "" {
+			known[warTag] = warSize
+		}
+	}
+	return known, rows.Err()
 }
 
 const loadActivePlayerTimersSQL = `
@@ -396,13 +450,13 @@ const upsertCWLGroupsSQLShape = `
 		season = EXCLUDED.season,
 		cwl_league_id = COALESCE(EXCLUDED.cwl_league_id, cwl_groups.cwl_league_id),
 		state = EXCLUDED.state,
-		war_size = EXCLUDED.war_size,
+		war_size = COALESCE(EXCLUDED.war_size, cwl_groups.war_size),
 		rounds = EXCLUDED.rounds
 	WHERE
 		cwl_groups.season IS DISTINCT FROM EXCLUDED.season OR
 		cwl_groups.cwl_league_id IS DISTINCT FROM COALESCE(EXCLUDED.cwl_league_id, cwl_groups.cwl_league_id) OR
 		cwl_groups.state IS DISTINCT FROM EXCLUDED.state OR
-		cwl_groups.war_size IS DISTINCT FROM EXCLUDED.war_size OR
+		cwl_groups.war_size IS DISTINCT FROM COALESCE(EXCLUDED.war_size, cwl_groups.war_size) OR
 		cwl_groups.rounds IS DISTINCT FROM EXCLUDED.rounds
 `
 
@@ -603,6 +657,33 @@ func (s *memoryWarStore) LoadCWLLeague(_ context.Context, tag string) (int, erro
 	return 0, sql.ErrNoRows
 }
 
+func (s *memoryWarStore) KnownCWLWarTags(_ context.Context, warTags []string) (map[string]int, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	requested := make(map[string]struct{}, len(warTags))
+	for _, warTag := range warTags {
+		requested[warTag] = struct{}{}
+	}
+	known := make(map[string]int)
+	for _, schedule := range s.schedules {
+		if _, ok := requested[schedule.WarTag]; ok && schedule.WarTag != "" {
+			timerCount := 0
+			for _, timer := range s.playerTimers {
+				if timer.EventType == "war" && timer.EventKey == schedule.ScheduleKey {
+					timerCount++
+				}
+			}
+			known[schedule.WarTag] = timerCount / 2
+		}
+	}
+	for _, war := range s.indexRows {
+		if _, ok := requested[war.WarTag]; ok && war.WarTag != "" {
+			known[war.WarTag] = war.Size
+		}
+	}
+	return known, nil
+}
+
 func (s *memoryWarStore) LoadActivePlayerTimers(_ context.Context, playerTag string) ([]models.PlayerTimerRow, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -714,6 +795,18 @@ func (s *memoryWarStore) Reschedule(_ context.Context, scheduleKey string, nextR
 	if ok {
 		row.NextRunAt = nextRunAt
 		s.schedules[scheduleKey] = row
+	}
+	return nil
+}
+
+func (s *memoryWarStore) DeleteSchedule(_ context.Context, scheduleKey string) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	delete(s.schedules, scheduleKey)
+	for key, timer := range s.playerTimers {
+		if timer.EventType == "war" && timer.EventKey == scheduleKey {
+			delete(s.playerTimers, key)
+		}
 	}
 	return nil
 }

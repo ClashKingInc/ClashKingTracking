@@ -14,6 +14,7 @@ import (
 	"clashking_tracking/models"
 
 	clashy "github.com/clashkinginc/clashy.go"
+	"github.com/jackc/pgx/v5/pgconn"
 )
 
 func TestBuildLeaderboardCacheRanksFreshPlayersAndExcludesUnrankedLeague(t *testing.T) {
@@ -137,6 +138,30 @@ func TestLeaderboardMaterializedViewRefreshSet(t *testing.T) {
 			leaderboardMaterializedViewCount,
 			len(leaderboardMaterializedViewRefreshQueries),
 		)
+	}
+	if len(leaderboardMaterializedViewBootstrapQueries) != len(leaderboardMaterializedViewRefreshQueries) {
+		t.Fatalf(
+			"materialized view bootstrap queries = %d, refresh queries = %d",
+			len(leaderboardMaterializedViewBootstrapQueries),
+			len(leaderboardMaterializedViewRefreshQueries),
+		)
+	}
+	for i, query := range leaderboardMaterializedViewBootstrapQueries {
+		if strings.Contains(query, "CONCURRENTLY") {
+			t.Fatalf("bootstrap query %d uses CONCURRENTLY: %s", i, query)
+		}
+	}
+}
+
+func TestUnpopulatedMaterializedViewErrorIsMatchedNarrowly(t *testing.T) {
+	message := "CONCURRENTLY cannot be used when the materialized view is not populated"
+	for _, code := range []string{"0A000", "55000"} {
+		if !isUnpopulatedMaterializedViewError(&pgconn.PgError{Code: code, Message: message}) {
+			t.Fatalf("unpopulated materialized view error %s was not recognized", code)
+		}
+	}
+	if isUnpopulatedMaterializedViewError(&pgconn.PgError{Code: "0A000", Message: "another unsupported operation"}) {
+		t.Fatal("unrelated feature-not-supported error was accepted as an empty materialized view")
 	}
 }
 

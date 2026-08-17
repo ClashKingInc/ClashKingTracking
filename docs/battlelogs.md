@@ -11,20 +11,22 @@ It runs continuously as `battlelogs`. Two independent target loops share the tot
 - Legend targets use `battlelogs.priority_requests_per_second`.
 - Standard tracked-player targets use the remaining `battlelogs.requests_per_second` budget.
 
-Each group has its own database cursor and progress statistics.
+Each group has its own progress statistics. Its target tags are loaded once per complete pass and kept as a small in-memory slice; this avoids re-expanding configured-clan member JSON for every page.
 
 ## How a player becomes a target
 
-Legend targets are players whose stored league is Legend League. Standard targets are the same durable SQL target union used by `trackedplayers`: enabled `tracked_player_targets` plus members of recently active configured server clans. Active verified app accounts are also loaded from the seven-day Valkey target set.
+Legend targets are players whose stored league is Legend League. Standard SQL targets are Town Hall 9 or higher members of recently active configured server clans, matching `trackedplayers`. Active verified app accounts are loaded from the seven-day Valkey target set on each pass without a Town Hall filter and use the same standard request budget. Verified players already in Legend League are removed from the standard pool so the two workers cannot publish the same newly observed battle twice.
 
 Bookmarks and war participation do not create battle-log targets. There is no `battlelogs_tracking_ttl`.
 
 ## Decision flow
 
 ```text
-Load target page
+Load and deduplicate the current target set once
+  -> split it into checkpoint batches
+  -> load each batch's checkpoints with one Valkey MGET
+  -> stream player jobs through the fixed worker pool
   -> GET the player's battle log
-  -> load the player's checkpoint from Valkey
   -> identify stable battle identities not seen before
   -> reject newly discovered rows older than the first-seen lookback
   -> insert new battles in SQL
@@ -34,9 +36,12 @@ Load target page
 Pseudocode:
 
 ```text
-for target in target_page:
+targets = SQL target set UNION active verified accounts
+for target_batch in targets:
+  checkpoints = Valkey MGET for target_batch
+  stream targets through bounded workers:
   log = GET /players/{tag}/battlelog
-  checkpoint = Valkey GET battlelog checkpoint
+  checkpoint = checkpoints[target]
   for battle in log:
     if battle identity is already checkpointed: skip
     if no checkpoint and battle time is older than 14 days: skip
@@ -46,7 +51,7 @@ for target in target_page:
   save new checkpoint with its TTL
 ```
 
-The 14-day rule applies only when deciding whether a battle is newly discoverable. The stored battle itself keeps its real API timestamp.
+Checkpoint batches feed one long-lived pool rather than waiting for every retry at a batch boundary, so one slow 504 does not idle the rest of the request budget. Loading the roughly 100,000 current tags once per pass uses only a few megabytes and removes repeated JSON expansion from Postgres. The response-worker count, SQL batch, and pending-write queue are capped separately, which keeps the first-start history seed bounded. The 14-day rule applies only when deciding whether a battle is newly discoverable; the stored battle itself keeps its real API timestamp.
 
 ## Clash API used
 
@@ -56,7 +61,7 @@ The 14-day rule applies only when deciding whether a battle is newly discoverabl
 
 Reads target tables and `basic_player.league_id`. Writes normalized rows to `battlelogs`. A row includes the player/opponent identity, attack direction, battle type, result, trophy change, destruction, stars, town halls, armies, and the API battle time.
 
-Valkey checkpoint keys remember the battle identities most recently seen for each player. `battlelogs.checkpoint_ttl_days` controls their lifetime. The checkpoint is comparison state, not target membership.
+Valkey checkpoint keys remember the newest battle time seen for each player. `battlelogs.checkpoint_ttl_days` controls their lifetime. The checkpoint is comparison state, not target membership.
 
 ## Events and interaction
 

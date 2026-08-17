@@ -37,19 +37,24 @@ The canonical schedule key is a hash of the two alphabetically sorted clan tags 
 
 ```text
 war_schedule.next_run_at is due
-  -> fetch by regular clan endpoint or CWL war tag
+  -> fetch exact CWL war tag, or try both regular-war clan perspectives
+  -> require canonical tags + preparation time to match this schedule
   -> API still says active? move next_run_at one minute forward
   -> ended? store permanent war, members, attacks, and missed attacks
   -> delete completed schedule and its reminder jobs
+  -> still unavailable six hours after shifted end? remove the dead schedule
 ```
 
 Pseudocode:
 
 ```text
 for schedule in due_schedules:
-  final = fetch_current_war(schedule)
+  final = fetch_exact_war_from_either_side(schedule)
   if final is not ended:
-    reschedule(now + 1 minute)
+    if now < shifted_end + 6 hours:
+      reschedule(now + 1 minute)
+    else:
+      remove dead schedule and its war timers
   else:
     transaction:
       insert canonical war and attack data
@@ -98,6 +103,8 @@ flowchart LR
 ## Outages and restarts
 
 Discovery waits at the availability gate. `war_schedule` is PostgreSQL-backed, so active clocks survive restarts without rebuilding an in-memory job list. During official Clash maintenance, `end_time`, `next_run_at`, related player expiry, and reminder run times are shifted together. A proxy-only outage pauses but does not shift game time.
+
+At finalization, both clan perspectives are tried because one public endpoint may already say `notInWar` while its opponent still exposes the exact ended war. The canonical identity check prevents a newer war between the same clans from being stored under the old schedule. If neither perspective can expose the exact war, the finalizer retries for six hours and then removes the unrecoverable schedule instead of leaving a dead row forever.
 
 ## What it deliberately does not do
 
