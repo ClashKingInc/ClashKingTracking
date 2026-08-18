@@ -1,0 +1,58 @@
+package platform
+
+import (
+	"context"
+	"encoding/json"
+	"errors"
+	"strconv"
+	"time"
+
+	valkey "github.com/valkey-io/valkey-go"
+)
+
+// PublishEvent appends domain events to Valkey Streams for the independent events script.
+func (a *App) PublishEvent(ctx context.Context, event Event) error {
+	if event.Timestamp.IsZero() {
+		event.Timestamp = time.Now().UTC()
+	}
+	if a.Valkey == nil || a.Config.EventStreamName == "" {
+		if a.Config.DryRun || a.Config.MockDB {
+			return nil
+		}
+		return errors.New("Valkey and events.stream are required to publish events")
+	}
+	return AppendEvent(ctx, a.Valkey, a.Config, event)
+}
+
+func AppendEvent(ctx context.Context, client valkey.Client, cfg Config, event Event) error {
+	raw, err := json.Marshal(event.Value)
+	if err != nil {
+		return err
+	}
+	builder := client.B().Xadd().Key(cfg.EventStreamName)
+	var cmd valkey.Completed
+	if cfg.EventStreamRetentionSeconds > 0 {
+		cmd = builder.Minid().Almost().Threshold(
+			eventStreamMinID(time.Now().UTC(), cfg.EventStreamRetentionSeconds),
+		).
+			Id("*").FieldValue().
+			FieldValue("topic", event.Topic).
+			FieldValue("clan_tag", event.ClanTag).
+			FieldValue("timestamp", event.Timestamp.UTC().Format(time.RFC3339Nano)).
+			FieldValue("value", string(raw)).
+			Build()
+	} else {
+		cmd = builder.Id("*").FieldValue().
+			FieldValue("topic", event.Topic).
+			FieldValue("clan_tag", event.ClanTag).
+			FieldValue("timestamp", event.Timestamp.UTC().Format(time.RFC3339Nano)).
+			FieldValue("value", string(raw)).
+			Build()
+	}
+	return client.Do(ctx, cmd).Error()
+}
+
+func eventStreamMinID(now time.Time, retentionSeconds int) string {
+	cutoff := now.UTC().Add(-time.Duration(retentionSeconds) * time.Second)
+	return strconv.FormatInt(cutoff.UnixMilli(), 10) + "-0"
+}
