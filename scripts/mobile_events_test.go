@@ -43,6 +43,8 @@ func TestWarReminderDecoderAcceptsOnlyV2NestedData(t *testing.T) {
 
 func TestMobileSubscriptionsUseOnlyOrdinaryNotificationColumns(t *testing.T) {
 	for _, column := range []string{
+		"d.user_id",
+		"d.device_id",
 		"war_state_enabled",
 		"war_attacks_enabled",
 		"mobile_notification_accounts",
@@ -56,6 +58,17 @@ func TestMobileSubscriptionsUseOnlyOrdinaryNotificationColumns(t *testing.T) {
 		if strings.Contains(mobileSubscriptionsSQL, retired) {
 			t.Fatalf("subscription query still reads retired %q", retired)
 		}
+	}
+}
+
+func TestMobileLiveEventDeliveryKeyIsPerDevice(t *testing.T) {
+	first := mobileLiveEventDeliveryKey("123-0", mobileSubscription{DeviceID: "phone", Environment: "production"})
+	second := mobileLiveEventDeliveryKey("123-0", mobileSubscription{DeviceID: "tablet", Environment: "production"})
+	if first == second {
+		t.Fatalf("delivery keys must differ by device: %q", first)
+	}
+	if got := mobileLiveEventDeliveryKey("123-0", mobileSubscription{DeviceID: "phone", Environment: "production"}); got != first {
+		t.Fatalf("delivery key is not stable: %q != %q", got, first)
 	}
 }
 

@@ -27,6 +27,8 @@ func NewMobileEventsDomain() platform.Domain { return &mobileEventsDomain{} }
 func (d *mobileEventsDomain) Name() string { return mobileEventsDomainName }
 
 type mobileSubscription struct {
+	UserID             string
+	DeviceID           string
 	Provider           string
 	Environment        string
 	TokenCiphertext    string
@@ -203,7 +205,7 @@ func (w *mobileEventsWorker) processEntries(ctx context.Context, entries []valke
 			}
 			continue
 		}
-		if err := w.processEvent(ctx, event); err != nil {
+		if err := w.processEvent(ctx, entry.ID, event); err != nil {
 			return err
 		}
 		if err := w.ack(ctx, entry.ID); err != nil {
@@ -222,7 +224,7 @@ func (w *mobileEventsWorker) ack(ctx context.Context, id string) error {
 	).Error()
 }
 
-func (w *mobileEventsWorker) processEvent(ctx context.Context, event mobileWarEvent) error {
+func (w *mobileEventsWorker) processEvent(ctx context.Context, streamID string, event mobileWarEvent) error {
 	if event.Topic == "reminder" {
 		switch stringValue(event.Value["type"]) {
 		case "war":
@@ -238,6 +240,7 @@ func (w *mobileEventsWorker) processEvent(ctx context.Context, event mobileWarEv
 		return err
 	}
 	title, body := mobileNotificationText(event)
+	var deliveryErrors []error
 	for _, sub := range subscriptions {
 		if !subscriptionWantsEvent(sub, event) {
 			continue
@@ -250,11 +253,29 @@ func (w *mobileEventsWorker) processEvent(ctx context.Context, event mobileWarEv
 		if sub.Provider != "fcm" {
 			continue
 		}
+		deliveryKey := mobileLiveEventDeliveryKey(streamID, sub)
+		result, err := w.pool.Exec(ctx, `
+			INSERT INTO mobile_notification_deliveries (user_id, notification_key)
+			VALUES ($1, $2)
+			ON CONFLICT DO NOTHING
+		`, sub.UserID, deliveryKey)
+		if err != nil {
+			return err
+		}
+		if result.RowsAffected() == 0 {
+			continue
+		}
 		if err := sendFCM(ctx, w.app, token, pushMessage{Title: title, Body: body, Data: map[string]string{"type": mobileNotificationRouteType(event), "target_tag": event.ClanTag}}); err != nil {
 			w.logDeliveryError("mobile FCM delivery failed", "clan_tag", event.ClanTag, "err", err)
+			_, _ = w.pool.Exec(ctx, `DELETE FROM mobile_notification_deliveries WHERE user_id = $1 AND notification_key = $2`, sub.UserID, deliveryKey)
+			deliveryErrors = append(deliveryErrors, fmt.Errorf("deliver live event to device %s: %w", sub.DeviceID, err))
 		}
 	}
-	return nil
+	return errors.Join(deliveryErrors...)
+}
+
+func mobileLiveEventDeliveryKey(streamID string, sub mobileSubscription) string {
+	return fmt.Sprintf("live_event:%s:%s:%s", streamID, sub.DeviceID, sub.Environment)
 }
 
 func stringValue(value any) string { valueString, _ := value.(string); return valueString }
@@ -473,7 +494,7 @@ func formatReminderTime(minutes int) string {
 }
 
 const mobileSubscriptionsSQL = `
-	SELECT DISTINCT d.provider, d.environment, d.token_ciphertext,
+	SELECT DISTINCT d.user_id, d.device_id, d.provider, d.environment, d.token_ciphertext,
 	       d.war_state_enabled, d.war_attacks_enabled, d.war_state_enabled
 	FROM mobile_notification_accounts account
 	JOIN mobile_push_devices d
@@ -500,7 +521,7 @@ func (w *mobileEventsWorker) subscriptions(ctx context.Context, targetTag, topic
 	var out []mobileSubscription
 	for rows.Next() {
 		var sub mobileSubscription
-		if err := rows.Scan(&sub.Provider, &sub.Environment, &sub.TokenCiphertext, &sub.WarStartEnabled, &sub.ScoreChangeEnabled, &sub.WarEndEnabled); err != nil {
+		if err := rows.Scan(&sub.UserID, &sub.DeviceID, &sub.Provider, &sub.Environment, &sub.TokenCiphertext, &sub.WarStartEnabled, &sub.ScoreChangeEnabled, &sub.WarEndEnabled); err != nil {
 			return nil, err
 		}
 		out = append(out, sub)

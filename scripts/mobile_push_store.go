@@ -962,7 +962,7 @@ func (s *timescaleMobilePushStore) ClaimDueCampaigns(ctx context.Context, now ti
 			(campaign_id, scheduled_for, eligible_count, sent_count, skipped_count, status, attempted_at)
 			VALUES ($1, $2::date, 0, 0, 0, 'processing', $3)
 			ON CONFLICT (campaign_id, scheduled_for) DO UPDATE SET status='processing', attempted_at=$3
-			WHERE admin_campaign_delivery_attempts.status IN ('failed', 'partial', 'processing')
+			WHERE admin_campaign_delivery_attempts.status = 'processing'
 			  AND admin_campaign_delivery_attempts.attempted_at <= $3 - interval '5 minutes'`,
 			campaign.ID, campaignScheduledFor(campaign, now), now)
 		if err != nil {
@@ -1454,7 +1454,7 @@ func (s *memoryMobilePushStore) ClaimDueCampaigns(_ context.Context, now time.Ti
 		if due {
 			lastClaim, claimed := s.campaignClaims[claimKey]
 			lastStatus := s.campaignStatuses[claimKey]
-			if !claimed || ((lastStatus == "failed" || lastStatus == "partial" || lastStatus == "processing") && !lastClaim.After(now.Add(-5*time.Minute))) {
+			if !claimed || (lastStatus == "processing" && !lastClaim.After(now.Add(-5*time.Minute))) {
 				s.campaignClaims[claimKey] = now
 				s.campaignStatuses[claimKey] = "processing"
 				out = append(out, campaign)

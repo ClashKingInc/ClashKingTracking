@@ -177,7 +177,7 @@ func TestDuePostsSkipExpiredPublicationWindows(t *testing.T) {
 	}
 }
 
-func TestCampaignClaimPreventsDuplicateAndRetriesFailures(t *testing.T) {
+func TestCampaignClaimRunsOncePerScheduledOccurrence(t *testing.T) {
 	store := newMemoryMobilePushStore()
 	now := time.Now().UTC()
 	sendAt := now.Add(-time.Minute)
@@ -196,8 +196,28 @@ func TestCampaignClaimPreventsDuplicateAndRetriesFailures(t *testing.T) {
 		t.Fatal(err)
 	}
 	claimed, err = store.ClaimDueCampaigns(context.Background(), now.Add(6*time.Minute))
+	if err != nil || len(claimed) != 0 {
+		t.Fatalf("failed campaign was reclaimed = %d, err=%v", len(claimed), err)
+	}
+}
+
+func TestPartialCampaignDoesNotResendSuccessfulAudience(t *testing.T) {
+	store := newMemoryMobilePushStore()
+	now := time.Now().UTC()
+	sendAt := now.Add(-time.Minute)
+	campaign := models.NotificationCampaign{ID: "campaign", Status: "scheduled", TriggerType: "manual", SendAt: &sendAt}
+	store.campaigns[campaign.ID] = campaign
+
+	claimed, err := store.ClaimDueCampaigns(context.Background(), now)
 	if err != nil || len(claimed) != 1 {
-		t.Fatalf("retry claim = %d, err=%v", len(claimed), err)
+		t.Fatalf("first claim = %d, err=%v", len(claimed), err)
+	}
+	if err := store.RecordCampaignDelivery(context.Background(), campaign, now, 2, 1, 1, "partial"); err != nil {
+		t.Fatal(err)
+	}
+	claimed, err = store.ClaimDueCampaigns(context.Background(), now.Add(6*time.Minute))
+	if err != nil || len(claimed) != 0 {
+		t.Fatalf("partial campaign was reclaimed = %d, err=%v", len(claimed), err)
 	}
 }
 
