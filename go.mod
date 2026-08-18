@@ -2,10 +2,8 @@ module clashking_tracking
 
 go 1.26.4
 
-replace github.com/clashkinginc/clashy.go => ../../GolandProjects/clashy.go
-
 require (
-	github.com/clashkinginc/clashy.go v0.1.2
+	github.com/clashkinginc/clashy.go v0.1.14
 	github.com/golang/snappy v1.0.0
 	github.com/google/uuid v1.6.0
 	github.com/jackc/pgx/v5 v5.9.2
