@@ -15,23 +15,30 @@
     "reclaim_idle_seconds": 60
   },
   "globalclans": {
-    "priority_requests_per_second": 50,
-    "non_priority_requests_per_second": 1000,
+    "priority_requests_per_second": 450,
+    "non_priority_requests_per_second": 50,
     "write_workers": 2
   },
   "battlelogs": {
-    "requests_per_second": 1000,
+    "requests_per_second": 250,
     "priority_requests_per_second": 100,
     "checkpoint_ttl_days": 15,
     "first_seen_lookback_days": 14
   },
-  "wars": {
-    "requests_per_second": 500,
-    "dormant_requests_per_second": 50,
-    "cwl_sync_seconds": 180
+  "war_discovery": {
+    "active_requests_per_second": 450,
+    "dormant_requests_per_second": 50
+  },
+  "cwl": {
+    "requests_per_second": 150,
+    "sync_seconds": 180
+  },
+  "war_archiver": {
+    "scan_seconds": 30,
+    "pack_size": 10000
   },
   "trackedclans": {
-    "requests_per_second": 950,
+    "requests_per_second": 100,
     "target_refresh_seconds": 3600,
     "snapshot_prefix": "trackedclans:snapshot:",
     "cwl_state_snapshot": "cwlstate"
@@ -42,20 +49,23 @@
     "snapshot_prefix": "capital:raid:"
   },
   "trackedplayers": {
-    "requests_per_second": 950,
+    "requests_per_second": 250,
     "target_refresh_seconds": 3600
   },
   "basicplayers": {
     "requests_per_second": 30
   },
   "leaderboards": {
-    "requests_per_second": 300,
     "interval_seconds": 600,
     "limit": 500,
     "null_asset_url": "https://api-assets.clashofclans.com/null"
   },
   "scheduled": {
+    "requests_per_second": 100,
     "interval_seconds": 86400
+  },
+  "reminders": {
+    "requests_per_second": 50
   },
   "giveaways": {
     "scan_seconds": 60

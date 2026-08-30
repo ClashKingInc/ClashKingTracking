@@ -37,9 +37,17 @@ func TestLoadWithArgsReadsConfigJSON(t *testing.T) {
 			"checkpoint_ttl_days": 34,
 			"first_seen_lookback_days": 56
 		},
-		"wars": {
-			"requests_per_second": 99,
-			"cwl_sync_seconds": 22
+		"war_discovery": {
+			"active_requests_per_second": 99,
+			"dormant_requests_per_second": 12
+		},
+		"cwl": {
+			"requests_per_second": 44,
+			"sync_seconds": 22
+		},
+		"war_archiver": {
+			"scan_seconds": 31,
+			"pack_size": 9999
 		},
 		"trackedclans": {
 			"requests_per_second": 77,
@@ -55,13 +63,16 @@ func TestLoadWithArgsReadsConfigJSON(t *testing.T) {
 			"requests_per_second": 30
 		},
 		"leaderboards": {
-			"requests_per_second": 66,
 			"interval_seconds": 600,
 			"limit": 500,
 			"null_asset_url": "https://assets/null"
 		},
 		"scheduled": {
+			"requests_per_second": 66,
 			"interval_seconds": 900
+		},
+		"reminders": {
+			"requests_per_second": 7
 		},
 		"giveaways": {
 			"scan_seconds": 60
@@ -98,8 +109,10 @@ func TestLoadWithArgsReadsConfigJSON(t *testing.T) {
 		cfg.BattlelogCheckpointTTLDays != 34 || cfg.BattlelogFirstSeenLookbackDays != 56 {
 		t.Fatalf("battlelogs config was not applied: %+v", cfg)
 	}
-	if cfg.WarCWLSyncSeconds != 22 {
-		t.Fatalf("wars config was not applied: %+v", cfg)
+	if cfg.WarDiscoveryActiveRequestsPerSecond != 99 || cfg.WarDiscoveryDormantRequestsPerSecond != 12 ||
+		cfg.CWLRequestsPerSecond != 44 || cfg.CWLSyncSeconds != 22 ||
+		cfg.WarArchiveScanSeconds != 31 || cfg.WarArchivePackSize != 9999 {
+		t.Fatalf("war runtime config was not applied: %+v", cfg)
 	}
 	if cfg.TrackedClanRequestsPerSecond != 77 || cfg.TrackedClanTargetRefreshSeconds != 3800 ||
 		cfg.TrackedClanSnapshotPrefix != "trackedclans:test:" ||
@@ -112,7 +125,7 @@ func TestLoadWithArgsReadsConfigJSON(t *testing.T) {
 	}
 	if cfg.TrackedPlayerRequestsPerSecond != 88 || cfg.TrackedPlayerTargetRefreshSeconds != 3900 ||
 		cfg.BasicPlayerRequestsPerSecond != 30 ||
-		cfg.LeaderboardRequestsPerSecond != 66 ||
+		cfg.ScheduledRequestsPerSecond != 66 || cfg.ReminderRequestsPerSecond != 7 ||
 		cfg.LeaderboardIntervalSeconds != 600 || cfg.ScheduledIntervalSeconds != 900 ||
 		cfg.LeaderboardLimit != 500 || cfg.LeaderboardNullAssetURL != "https://assets/null" ||
 		cfg.GiveawayScanSeconds != 60 || cfg.RedditPollSeconds != 120 ||
@@ -137,9 +150,13 @@ func TestLoadWithArgsOnlyScriptComesFromCLI(t *testing.T) {
 			"checkpoint_ttl_days": 15,
 			"first_seen_lookback_days": 14
 		},
-		"wars": {
-			"requests_per_second": 50,
-			"cwl_sync_seconds": 10
+		"war_discovery": {
+			"active_requests_per_second": 50,
+			"dormant_requests_per_second": 5
+		},
+		"cwl": {
+			"requests_per_second": 25,
+			"sync_seconds": 10
 		}
 	}`)
 	t.Setenv("TARGET_PAGE_MULTIPLIER", "3")
@@ -157,8 +174,8 @@ func TestLoadWithArgsOnlyScriptComesFromCLI(t *testing.T) {
 		cfg.ProxyURL != "http://canonical-proxy/v1" || !cfg.DryRun {
 		t.Fatalf("operational env knobs or canonical connectivity were not handled correctly: %+v", cfg)
 	}
-	if cfg.WarMaxInFlight != RequestConcurrency(cfg.WarRequestsPerSecond) {
-		t.Fatalf("war max in-flight = %d, want concurrency %d", cfg.WarMaxInFlight, RequestConcurrency(cfg.WarRequestsPerSecond))
+	if cfg.WarDiscoveryMaxInFlight != RequestConcurrency(cfg.WarDiscoveryActiveRequestsPerSecond) {
+		t.Fatalf("war max in-flight = %d, want concurrency %d", cfg.WarDiscoveryMaxInFlight, RequestConcurrency(cfg.WarDiscoveryActiveRequestsPerSecond))
 	}
 }
 
@@ -176,9 +193,13 @@ func TestLoadWithArgsReadsSecretsFromEnv(t *testing.T) {
 			"checkpoint_ttl_days": 15,
 			"first_seen_lookback_days": 14
 		},
-		"wars": {
-			"requests_per_second": 50,
-			"cwl_sync_seconds": 10
+		"war_discovery": {
+			"active_requests_per_second": 50,
+			"dormant_requests_per_second": 5
+		},
+		"cwl": {
+			"requests_per_second": 25,
+			"sync_seconds": 10
 		}
 	}`)
 	t.Setenv("TIMESCALE_HOST", "timescale")
@@ -266,6 +287,15 @@ func clearConfigEnv(t *testing.T) {
 		"DATA_ENCRYPTION_KEY",
 		"MOBILE_PUSH_FCM_PROJECT_ID",
 		"MOBILE_PUSH_FCM_SERVICE_ACCOUNT_JSON",
+		"R2_ACCOUNT_ID",
+		"R2_ACCESS_KEY_ID",
+		"R2_SECRET_ACCESS_KEY",
+		"WAR_ARCHIVE_S3_ENDPOINT",
+		"WAR_ARCHIVE_ORIGIN",
+		"WAR_ARCHIVE_BUCKET",
+		"R2_ENDPOINT",
+		"R2_ENDPOINT_URL",
+		"R2_WARS_BUCKET",
 	}
 	for _, key := range keys {
 		previous, ok := os.LookupEnv(key)

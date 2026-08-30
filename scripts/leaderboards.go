@@ -103,6 +103,7 @@ const leaderboardCandidateSQL = `
 
 type leaderboardsDomain struct {
 	store                       *timescaleLeaderboardStore
+	limiter                     *clashy.Limiter
 	limit                       int
 	nullAssetURL                string
 	nextMaterializedViewRefresh time.Time
@@ -205,8 +206,8 @@ func (d *leaderboardsDomain) Run(ctx context.Context, app *platform.App) error {
 }
 
 func validateLeaderboardsConfig(cfg platform.Config) error {
-	if cfg.LeaderboardRequestsPerSecond <= 0 {
-		return errors.New("leaderboards.requests_per_second must be greater than zero")
+	if cfg.ScheduledRequestsPerSecond <= 0 {
+		return errors.New("scheduled.requests_per_second must be greater than zero")
 	}
 	if cfg.LeaderboardIntervalSeconds <= 0 {
 		return errors.New("leaderboards.interval_seconds must be greater than zero")
@@ -235,9 +236,8 @@ func (d *leaderboardsDomain) openStore(ctx context.Context, app *platform.App) (
 }
 
 func (d *leaderboardsDomain) runCycle(ctx context.Context, app *platform.App) error {
-	limiter, err := newTrackingLimiter(app.Config.LeaderboardRequestsPerSecond)
-	if err != nil {
-		return err
+	if d.limiter == nil {
+		return errors.New("scheduled shared request limiter is required for leaderboards")
 	}
 	candidates, err := d.store.LoadCandidates(ctx, d.limit)
 	if err != nil {
@@ -248,11 +248,11 @@ func (d *leaderboardsDomain) runCycle(ctx context.Context, app *platform.App) er
 		cache := buildLeaderboardCache(candidates, nil, nil, time.Now().UTC(), d.limit, d.nullAssetURL)
 		return d.store.CacheBoards(ctx, cache)
 	}
-	leagues, err := d.fetchLeagues(ctx, app, limiter)
+	leagues, err := d.fetchLeagues(ctx, app, d.limiter)
 	if err != nil {
 		return err
 	}
-	players, deletedTags, err := d.fetchPlayers(ctx, app, limiter, tags, leagues)
+	players, deletedTags, err := d.fetchPlayers(ctx, app, d.limiter, tags, leagues)
 	if err != nil {
 		return err
 	}
@@ -319,7 +319,7 @@ func (d *leaderboardsDomain) fetchPlayers(ctx context.Context, app *platform.App
 	deleteTags := make([]string, 0)
 	skipped := 0
 	notFound := 0
-	err := runBounded(ctx, platform.RequestConcurrency(app.Config.LeaderboardRequestsPerSecond), tags, func(workerCtx context.Context, tag string) error {
+	err := runBounded(ctx, platform.RequestConcurrency(app.Config.ScheduledRequestsPerSecond), tags, func(workerCtx context.Context, tag string) error {
 		player, err := retryLimitedClashFetch(workerCtx, app, limiter, func(fetchCtx context.Context) (*clashy.Player, error) {
 			start := time.Now()
 			player, err := app.Clash.GetPlayer(fetchCtx, tag)

@@ -6,7 +6,7 @@
 
 ## When it runs
 
-It runs continuously as `trackedclans`. A clan loop, a regular current-war loop, and a live CWL loop share the `trackedclans.requests_per_second` limiter. The target registry is reloaded every `trackedclans.target_refresh_seconds`; the CWL loop wakes every `wars.cwl_sync_seconds` and only calls CWL endpoints for a current active season.
+It runs continuously as `trackedclans`. A clan loop, a regular current-war loop, and a live CWL loop share the `trackedclans.requests_per_second` limiter. The target registry is reloaded every `trackedclans.target_refresh_seconds`; the CWL loop wakes every `cwl.sync_seconds` and only calls CWL endpoints for a current active season.
 
 ## How a clan becomes a target
 

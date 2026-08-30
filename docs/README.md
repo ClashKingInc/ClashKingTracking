@@ -11,6 +11,7 @@ The processes remain separate so each workload can be enabled, stopped, and obse
 | Global clan crawl | [globalclans.md](globalclans.md) |
 | Live clan and war tracking | [trackedclans.md](trackedclans.md) |
 | Global war discovery | [war-discovery.md](war-discovery.md) |
+| Finished-war R2 archiver | [war-archiver.md](war-archiver.md) |
 | CWL | [cwl.md](cwl.md) |
 | Tracked players | [trackedplayers.md](trackedplayers.md) |
 | Basic players | [basicplayers.md](basicplayers.md) |

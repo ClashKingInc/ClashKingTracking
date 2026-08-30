@@ -108,6 +108,8 @@ flowchart LR
 - `target_page_multiplier`
 - Valkey, Timescale/PostgreSQL, event stream, and proxy settings
 
+Each completed target refresh sets the operational target total to the combined SQL and verified-player cycle before workers begin. Processed-target progress therefore represents the actual current pass instead of an unbounded counter.
+
 ## Outages and restarts
 
 The availability gate pauses requests. The previous snapshot remains intact until SQL storage succeeds, preventing a failed write from becoming the new comparison baseline. Stat event times are reserved so retries do not create duplicate deltas.

@@ -185,6 +185,7 @@ func (d *trackedPlayersDomain) Run(ctx context.Context, app *platform.App) error
 			return err
 		}
 		cycle = append(cycle, verified...)
+		app.Stats.SetTrackingTargets(trackedPlayersDomainName, len(cycle))
 		if err := processTargets(cycle); err != nil {
 			return err
 		}

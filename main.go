@@ -36,6 +36,7 @@ func run() error {
 		scriptdomains.NewTrackedClansDomain(),
 		scriptdomains.NewWarDiscoveryDomain(),
 		scriptdomains.NewCWLDomain(),
+		scriptdomains.NewWarArchiverDomain(),
 		scriptdomains.NewCapitalDomain(),
 		scriptdomains.NewRemindersDomain(),
 		scriptdomains.NewAvailabilityDomain(),

@@ -19,7 +19,7 @@ import (
 )
 
 func TestValidateScheduledConfig(t *testing.T) {
-	cfg := platform.Config{MockDB: true}
+	cfg := platform.Config{MockDB: true, ScheduledRequestsPerSecond: 100}
 	cfg.ScheduledIntervalSeconds = 0
 	if err := validateScheduledConfig(cfg); err == nil {
 		t.Fatal("expected invalid interval error")
@@ -232,8 +232,12 @@ func TestLeaderboardHistoryFetchReturnsSuccessfulGroupsWithErrors(t *testing.T) 
 			},
 		},
 	}
-	domain := &scheduledDomain{}
-	app := &platform.App{Stats: platform.NewTracker()}
+	limiter, err := newTrackingLimiter(100)
+	if err != nil {
+		t.Fatal(err)
+	}
+	domain := &scheduledDomain{limiter: limiter}
+	app := &platform.App{Stats: platform.NewTracker(), Availability: platform.NewAvailabilityGate(nil)}
 	groups, err := domain.doLeaderboardHistory(
 		t.Context(),
 		app,

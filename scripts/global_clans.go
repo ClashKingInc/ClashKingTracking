@@ -590,7 +590,7 @@ func isGlobalClanFirstHydration(previous models.BasicClanRow, current clashy.Cla
 func fetchGlobalClan(ctx context.Context, app *platform.App, group, tag string) (*clashy.Clan, error) {
 	start := time.Now()
 	clan, err := app.Clash.GetClan(ctx, tag)
-	app.Stats.RecordRequest(globalClansDomainName, time.Since(start), err)
+	app.Stats.RecordRequest(trackingProgressName(globalClansDomainName, group), time.Since(start), err)
 	if err != nil || clan == nil {
 		return clan, err
 	}

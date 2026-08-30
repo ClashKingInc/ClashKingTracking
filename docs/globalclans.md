@@ -99,6 +99,8 @@ flowchart LR
 - Timescale/PostgreSQL connection settings
 - Proxy origin and credentials shared by all Clash callers
 
+Operational request and progress metrics are split into `globalclans.priority` and `globalclans.non_priority`. Each pool therefore shows its own observed RPS, errors, latency, target count, loop progress, and completion estimate instead of combining both configured rates into one opaque number.
+
 ## Outages and restarts
 
 Every request waits at the shared availability gate. A proxy outage pauses without changing game time. Official Clash maintenance also pauses; this process needs no clock shifting because clan snapshots have no scheduled end time. A process restart begins each ordered target pool from the first tag again; unchanged-row checks make that safe, though a future durable cursor could avoid the repeated prefix.

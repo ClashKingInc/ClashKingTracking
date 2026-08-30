@@ -58,6 +58,8 @@ For Raid Weekend, the reminder producer has already grouped the user's verified 
 
 Consumes the configured Valkey event stream. Reads mobile account/device configuration and war participation data as required. Writes mobile posts/campaigns, delivery attempts, retry times, and logical delivery keys. Calls Firebase Cloud Messaging; it never sends a Discord webhook.
 
+The event consumer reports `mobilepush.events` active-batch depth, processing duration, and readiness. The scheduled delivery worker reports its existing `mobilepush` run and write metrics; neither uses target progress because both consume ongoing work.
+
 ## Interaction diagram
 
 ```mermaid

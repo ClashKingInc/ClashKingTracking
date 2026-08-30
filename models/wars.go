@@ -3,11 +3,11 @@ package models
 import "time"
 
 type WarLogIndexRow struct {
-	WarID                         string
+	WarID                         int32
 	ClanTag                       string
 	OpponentTag                   string
 	PrepTime                      time.Time
-	StartTime                     *time.Time
+	StartTime                     time.Time
 	EndTime                       time.Time
 	Size                          int
 	AttacksPerMember              int
@@ -29,30 +29,9 @@ type WarLogIndexRow struct {
 	OpponentDestructionPercentage float64
 }
 
-type WarAttackRow struct {
-	WarID                 string
-	WarEndTime            time.Time
-	WarType               string
-	WarSize               int
-	AttackingClanTag      string
-	DefendingClanTag      string
-	AttackerTag           string
-	DefenderTag           string
-	DefenderName          string
-	AttackerTownHall      int
-	DefenderTownHall      int
-	AttackerMapPosition   int
-	DefenderMapPosition   int
-	Stars                 int
-	DestructionPercentage int
-	Duration              int
-	AttackOrder           int
-	BattleModifier        string
-}
-
 type WarScheduleRow struct {
 	ScheduleKey   string
-	WarID         string
+	WarID         int32
 	SourceClanTag string
 	OpponentTag   string
 	PrepTime      time.Time
@@ -91,10 +70,11 @@ type CWLGroupClanRow struct {
 
 type WarIngest struct {
 	IndexRows           []WarLogIndexRow
-	AttackRows          []WarAttackRow
+	ArchivePayload      []byte
+	ArchiveParticipants []string
 	Schedules           []WarScheduleRow
 	PlayerTimers        []PlayerTimerRow
 	CWLGroups           []CWLGroupRow
 	FinishedScheduleKey string
-	FinishedWarID       string
+	FinishedWarID       int32
 }

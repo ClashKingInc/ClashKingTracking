@@ -239,7 +239,7 @@ func (s *timescaleTrackedClanStore) Close() {
 }
 
 func (s *timescaleTrackedClanStore) UpsertCurrentWar(ctx context.Context, sourceTag string, war clashy.ClanWar, warTag string) (string, error) {
-	ingest, err := buildWarIngest(war, sourceTag, false, warTag, "", "")
+	ingest, err := buildWarIngest(war, sourceTag, false, warTag, "", 0)
 	if err != nil || len(ingest.Schedules) == 0 {
 		return "", err
 	}
@@ -316,7 +316,7 @@ func (s memoryTrackedClanStore) ListTargets(context.Context) ([]trackedClanTarge
 }
 
 func (memoryTrackedClanStore) UpsertCurrentWar(_ context.Context, sourceTag string, war clashy.ClanWar, warTag string) (string, error) {
-	ingest, err := buildWarIngest(war, sourceTag, false, warTag, "", "")
+	ingest, err := buildWarIngest(war, sourceTag, false, warTag, "", 0)
 	if err != nil || len(ingest.Schedules) == 0 {
 		return "", err
 	}
@@ -1193,7 +1193,7 @@ func (c *cwlCycleWarCache) fetch(ctx context.Context, warTag string, fetch func(
 }
 
 func (d *trackedClansDomain) runCWLLoop(ctx context.Context, app *platform.App, limiter *clashy.Limiter) error {
-	interval := time.Duration(app.Config.WarCWLSyncSeconds) * time.Second
+	interval := time.Duration(app.Config.CWLSyncSeconds) * time.Second
 	if interval <= 0 {
 		interval = 3 * time.Minute
 	}

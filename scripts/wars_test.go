@@ -16,6 +16,7 @@ import (
 	"time"
 
 	"clashking_tracking/internal/platform"
+	"clashking_tracking/internal/wararchive"
 	"clashking_tracking/models"
 
 	clashy "github.com/clashkinginc/clashy.go"
@@ -33,13 +34,31 @@ func TestWarQueueRejectsIncompleteStoreWork(t *testing.T) {
 		ClanTag:     "#A",
 		OpponentTag: "#B",
 		ScheduleKey: "#A-#B-1",
-		WarID:       "018f4ad0-26c7-7b0d-9a4c-5b6c7d8e9f01",
+		WarID:       42,
 		PrepTime:    time.Now(),
 		EndTime:     time.Now().Add(time.Hour),
 		StoreOnly:   true,
 	})
 	if err != nil {
 		t.Fatalf("complete store request rejected: %v", err)
+	}
+}
+
+func TestPrimeWarArchiveCacheUsesOneByteGet(t *testing.T) {
+	var method, byteRange string
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		method = r.Method
+		byteRange = r.Header.Get("Range")
+		w.Header().Set("CF-Cache-Status", "MISS")
+		w.WriteHeader(http.StatusPartialContent)
+		_, _ = w.Write([]byte{0})
+	}))
+	defer server.Close()
+	if err := primeWarArchiveCache(context.Background(), server.URL, "packs/000001.pack"); err != nil {
+		t.Fatal(err)
+	}
+	if method != http.MethodGet || byteRange != "bytes=0-0" {
+		t.Fatalf("cache prime request = %s %q, want GET bytes=0-0", method, byteRange)
 	}
 }
 
@@ -60,13 +79,27 @@ func TestWarTargetsSQLOnlyUsesPublicWarLogs(t *testing.T) {
 func TestCWLTargetsSkipKnownGroupSiblingsDuringDiscovery(t *testing.T) {
 	for _, required := range []string{
 		"EXTRACT(DAY FROM now() AT TIME ZONE 'UTC') <= 3",
-		"NOT EXISTS (\n\t        SELECT 1\n\t        FROM cwl_group_clans known_clan",
+		"FROM cwl_group_clans known_clan",
 		"known_group.season = to_char(now() AT TIME ZONE 'UTC', 'YYYY-MM')",
 		"SELECT min(candidate.clan_tag)",
 	} {
 		if !strings.Contains(cwlTargetsSQL, required) {
 			t.Fatalf("CWL target query is missing group-deduplication rule %q: %s", required, cwlTargetsSQL)
 		}
+	}
+}
+
+func TestMemoryWarTargetSourceCountsFinitePools(t *testing.T) {
+	source := newMemoryWarTargetSource([]models.BasicClanRow{{Tag: "#A"}, {Tag: "#B"}})
+	for _, kind := range []warTargetKind{activeWarTargets, cwlTargets} {
+		count, err := source.CountTargets(t.Context(), kind)
+		if err != nil || count != 2 {
+			t.Fatalf("CountTargets(%q) = %d, %v; want 2", kind, count, err)
+		}
+	}
+	count, err := source.CountTargets(t.Context(), dormantWarTargets)
+	if err != nil || count != 0 {
+		t.Fatalf("CountTargets(dormant) = %d, %v; want 0", count, err)
 	}
 }
 
@@ -77,14 +110,14 @@ func TestBuildWarIngestSchedulesActiveWar(t *testing.T) {
 	end := start.Add(24 * time.Hour)
 	war := sampleWar(prep, start, end)
 
-	ingest, err := buildWarIngest(war, "#AAA", false, "", "", "")
+	ingest, err := buildWarIngest(war, "#AAA", false, "", "", 0)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if len(ingest.IndexRows) != 0 || len(ingest.AttackRows) != 0 {
+	if len(ingest.IndexRows) != 0 || len(ingest.ArchivePayload) != 0 {
 		t.Fatalf("active war should only schedule final store: %#v", ingest)
 	}
-	if len(ingest.Schedules) != 1 || ingest.Schedules[0].ScheduleKey == "" || ingest.Schedules[0].WarID == "" || !ingest.Schedules[0].NextRunAt.Equal(end) {
+	if len(ingest.Schedules) != 1 || ingest.Schedules[0].ScheduleKey == "" || ingest.Schedules[0].WarID != 0 || !ingest.Schedules[0].NextRunAt.Equal(end) {
 		t.Fatalf("unexpected schedule: %#v", ingest.Schedules)
 	}
 	if got := ingest.PlayerTimers; len(got) != 2 || got[0].PlayerTag != "#P1" || got[1].PlayerTag != "#P2" || got[0].EventType != "war" || got[0].EventKey != ingest.Schedules[0].ScheduleKey || !got[0].ExpiresAt.Equal(end) {
@@ -141,7 +174,7 @@ func TestAbandonedWarScheduleDeletesOnlyItsTimers(t *testing.T) {
 	store := newMemoryWarStore()
 	now := time.Now().UTC()
 	if err := store.Store(context.Background(), models.WarIngest{
-		Schedules: []models.WarScheduleRow{{ScheduleKey: "missing-war", WarID: "war-id", SourceClanTag: "#A", OpponentTag: "#B", EndTime: now}},
+		Schedules: []models.WarScheduleRow{{ScheduleKey: "missing-war", WarID: 42, SourceClanTag: "#A", OpponentTag: "#B", EndTime: now}},
 		PlayerTimers: []models.PlayerTimerRow{
 			{PlayerTag: "#P1", EventType: "war", EventKey: "missing-war", ExpiresAt: now},
 			{PlayerTag: "#P1", EventType: "raid", EventKey: "#A", ExpiresAt: now.Add(time.Hour)},
@@ -173,14 +206,14 @@ func TestBuildWarIngestFinishedAddsPermanentRows(t *testing.T) {
 	prep := time.Date(2026, 5, 24, 1, 0, 0, 0, time.UTC)
 	war := sampleWar(prep, prep.Add(time.Hour), prep.Add(2*time.Hour))
 
-	ingest, err := buildWarIngest(war, "#AAA", true, "#WAR", "#AAA-#BBB-1", "018f4ad0-26c7-7b0d-9a4c-5b6c7d8e9f01")
+	ingest, err := buildWarIngest(war, "#AAA", true, "#WAR", "#AAA-#BBB-1", 42)
 	if err != nil {
 		t.Fatal(err)
 	}
 	if len(ingest.Schedules) != 0 {
 		t.Fatalf("finished ingest should not reschedule: %#v", ingest.Schedules)
 	}
-	if ingest.FinishedScheduleKey != "#AAA-#BBB-1" || ingest.FinishedWarID != "018f4ad0-26c7-7b0d-9a4c-5b6c7d8e9f01" {
+	if ingest.FinishedScheduleKey != "#AAA-#BBB-1" || ingest.FinishedWarID != 42 {
 		t.Fatalf("missing finished-war fields: %#v", ingest)
 	}
 	if len(ingest.IndexRows) != 1 {
@@ -189,19 +222,63 @@ func TestBuildWarIngestFinishedAddsPermanentRows(t *testing.T) {
 	if ingest.IndexRows[0].AttacksPerMember != 1 {
 		t.Fatalf("AttacksPerMember = %d, want 1 for a CWL war", ingest.IndexRows[0].AttacksPerMember)
 	}
-	if len(ingest.AttackRows) != 1 {
-		t.Fatalf("AttackRows len = %d, want 1", len(ingest.AttackRows))
+	if ingest.IndexRows[0].BattleModifier != wararchive.BattleModifierNone {
+		t.Fatalf("BattleModifier = %q, want %q", ingest.IndexRows[0].BattleModifier, wararchive.BattleModifierNone)
 	}
-	attack := ingest.AttackRows[0]
-	if attack.AttackingClanTag != "#AAA" || attack.DefendingClanTag != "#BBB" || attack.AttackerTownHall != 16 || attack.DefenderTownHall != 15 {
-		t.Fatalf("unexpected attack row: %#v", attack)
+	archived, err := wararchive.Unmarshal(ingest.ArchivePayload)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(archived.Clan.Members) != 1 || len(archived.Clan.Members[0].Attacks) != 1 || archived.Clan.Members[0].Attacks[0].DefenderTag != "#P2" {
+		t.Fatalf("unexpected archive payload: %#v", archived)
+	}
+	if archived.BattleModifier != wararchive.BattleModifierNone {
+		t.Fatalf("archived BattleModifier = %q, want %q", archived.BattleModifier, wararchive.BattleModifierNone)
+	}
+	if !reflect.DeepEqual(ingest.ArchiveParticipants, []string{"#P1", "#P2"}) {
+		t.Fatalf("archive participants = %#v", ingest.ArchiveParticipants)
+	}
+}
+
+func TestBuildWarIngestPreservesCanonicalBattleModifier(t *testing.T) {
+	prep := time.Date(2026, 5, 24, 1, 0, 0, 0, time.UTC)
+	war := sampleWar(prep, prep.Add(time.Hour), prep.Add(2*time.Hour))
+	war.BattleModifier = clashy.BattleModifierHardMode
+
+	ingest, err := buildWarIngest(war, "#AAA", true, "#WAR", "#AAA-#BBB-1", 42)
+	if err != nil {
+		t.Fatal(err)
+	}
+	archived, err := wararchive.Unmarshal(ingest.ArchivePayload)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if ingest.IndexRows[0].BattleModifier != wararchive.BattleModifierHardMode || archived.BattleModifier != wararchive.BattleModifierHardMode {
+		t.Fatalf("battle modifiers = index %q, archive %q; want %q", ingest.IndexRows[0].BattleModifier, archived.BattleModifier, wararchive.BattleModifierHardMode)
+	}
+}
+
+func TestBuildWarIngestRejectsFinishedWarWithoutStartTime(t *testing.T) {
+	prep := time.Date(2026, 5, 24, 1, 0, 0, 0, time.UTC)
+	war := sampleWar(prep, prep.Add(time.Hour), prep.Add(2*time.Hour))
+	war.StartTime = nil
+	if _, err := buildWarIngest(war, "#AAA", true, "", "#AAA-#BBB-1", 42); err == nil {
+		t.Fatal("finished war without startTime was accepted")
+	}
+}
+
+func TestBuildWarIngestRejectsFinishedWarWithoutSQLID(t *testing.T) {
+	prep := time.Date(2026, 5, 24, 1, 0, 0, 0, time.UTC)
+	war := sampleWar(prep, prep.Add(time.Hour), prep.Add(2*time.Hour))
+	if _, err := buildWarIngest(war, "#AAA", true, "", "#AAA-#BBB-1", 0); err == nil {
+		t.Fatal("finished war without its SQL war ID was accepted")
 	}
 }
 
 func TestBuildWarIngestUsesTwoAttacksForRegularWar(t *testing.T) {
 	prep := time.Date(2026, 5, 24, 1, 0, 0, 0, time.UTC)
 	war := sampleWar(prep, prep.Add(time.Hour), prep.Add(2*time.Hour))
-	ingest, err := buildWarIngest(war, "#AAA", true, "", "#AAA-#BBB-1", "018f4ad0-26c7-7b0d-9a4c-5b6c7d8e9f01")
+	ingest, err := buildWarIngest(war, "#AAA", true, "", "#AAA-#BBB-1", 42)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -234,14 +311,14 @@ func TestBuildWarIngestDoesNotScheduleEndedActiveWar(t *testing.T) {
 	now := time.Now().UTC().Truncate(time.Second)
 	war := sampleWar(now.Add(-3*time.Hour), now.Add(-2*time.Hour), now.Add(-time.Hour))
 
-	ingest, err := buildWarIngest(war, "#AAA", false, "", "", "")
+	ingest, err := buildWarIngest(war, "#AAA", false, "", "", 0)
 	if err != nil {
 		t.Fatal(err)
 	}
 	if len(ingest.Schedules) != 0 {
 		t.Fatalf("ended active war should not schedule final store: %#v", ingest.Schedules)
 	}
-	if len(ingest.IndexRows) != 0 || len(ingest.AttackRows) != 0 {
+	if len(ingest.IndexRows) != 0 || len(ingest.ArchivePayload) != 0 {
 		t.Fatalf("ended active war should be skipped until fetched as finished: %#v", ingest)
 	}
 }
@@ -422,7 +499,7 @@ func TestGlobalCWLSyncSchedulesOverlappingBattleAndPreparationOnce(t *testing.T)
 		scheduled: make(map[string]time.Time),
 	}
 	app := &platform.App{
-		Config:       platform.Config{MockDB: true, WarRequestsPerSecond: 100, TargetPageMultiplier: 5},
+		Config:       platform.Config{MockDB: true, CWLRequestsPerSecond: 100, TargetPageMultiplier: 5},
 		Clash:        client,
 		Stats:        platform.NewTracker(),
 		Availability: platform.NewAvailabilityGate(nil),
@@ -431,8 +508,13 @@ func TestGlobalCWLSyncSchedulesOverlappingBattleAndPreparationOnce(t *testing.T)
 	if err != nil {
 		t.Fatal(err)
 	}
+	domain.refreshWarTargetCounts(t.Context(), app)
 	if err := domain.syncCWLGroups(t.Context(), app, limiter); err != nil {
 		t.Fatal(err)
+	}
+	progress := app.Stats.Domain("cwl.groups")
+	if progress.TargetCount != 1 || progress.TargetCycle != 2 || progress.TargetProcessed != 0 {
+		t.Fatalf("CWL progress = %#v", progress)
 	}
 	if len(store.schedules) != 2 {
 		t.Fatalf("overlapping schedules = %d, want battle and preparation", len(store.schedules))
@@ -508,7 +590,7 @@ func TestGlobalCWLSyncUsesBoundedConcurrentGroupRequests(t *testing.T) {
 		scheduled: make(map[string]time.Time),
 	}
 	app := &platform.App{
-		Config: platform.Config{MockDB: true, WarRequestsPerSecond: 100, TargetPageMultiplier: 5},
+		Config: platform.Config{MockDB: true, CWLRequestsPerSecond: 100, TargetPageMultiplier: 5},
 		Clash:  client, Stats: platform.NewTracker(), Availability: platform.NewAvailabilityGate(nil),
 	}
 	limiter, err := newTrackingLimiter(100)
@@ -530,10 +612,10 @@ func TestMemoryWarStoreShiftMaintenance(t *testing.T) {
 	now := time.Now().UTC()
 	err := store.Store(context.Background(), models.WarIngest{
 		Schedules: []models.WarScheduleRow{
-			{ScheduleKey: "#A-#B-1", WarID: "war-live", SourceClanTag: "#A", OpponentTag: "#B",
+			{ScheduleKey: "#A-#B-1", WarID: 1, SourceClanTag: "#A", OpponentTag: "#B",
 				PrepTime: now, EndTime: now.Add(time.Hour), NextRunAt: now.Add(time.Hour),
 			},
-			{ScheduleKey: "#C-#D-1", WarID: "war-expired", SourceClanTag: "#C", OpponentTag: "#D",
+			{ScheduleKey: "#C-#D-1", WarID: 2, SourceClanTag: "#C", OpponentTag: "#D",
 				PrepTime: now.Add(-2 * time.Hour), EndTime: now.Add(-time.Hour), NextRunAt: now.Add(-time.Hour),
 			},
 		},

@@ -547,7 +547,7 @@ type capturingTrackedClanStore struct {
 func (s *capturingTrackedClanStore) UpsertCurrentWar(_ context.Context, sourceTag string, war clashy.ClanWar, warTag string) (string, error) {
 	s.warTag = warTag
 	s.calls++
-	ingest, err := buildWarIngest(war, sourceTag, false, warTag, "", "")
+	ingest, err := buildWarIngest(war, sourceTag, false, warTag, "", 0)
 	if err != nil || len(ingest.Schedules) == 0 {
 		return "", err
 	}

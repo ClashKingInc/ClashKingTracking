@@ -205,6 +205,7 @@ type legendRankingItem struct {
 
 type scheduledDomain struct {
 	store                   scheduledStore
+	limiter                 *clashy.Limiter
 	lastRankedGroupSeasonID int64
 	loadLegendSeasons       legendSeasonsLoader
 	loadLegendRankings      legendSeasonRankingsLoader
@@ -231,6 +232,11 @@ func (d *scheduledDomain) Run(ctx context.Context, app *platform.App) error {
 	if err := validateScheduledConfig(app.Config); err != nil {
 		return err
 	}
+	limiter, err := newTrackingLimiter(app.Config.ScheduledRequestsPerSecond)
+	if err != nil {
+		return err
+	}
+	d.limiter = limiter
 	store, err := newScheduledStore(ctx, app)
 	if err != nil {
 		return err
@@ -243,7 +249,7 @@ func (d *scheduledDomain) Run(ctx context.Context, app *platform.App) error {
 	leaderboardCtx, stopLeaderboards := context.WithCancel(ctx)
 	leaderboardDone := make(chan error, 1)
 	go func() {
-		leaderboardDone <- (&leaderboardsDomain{}).Run(leaderboardCtx, app)
+		leaderboardDone <- (&leaderboardsDomain{limiter: limiter}).Run(leaderboardCtx, app)
 	}()
 	defer func() {
 		stopLeaderboards()
@@ -278,6 +284,9 @@ func (d *scheduledDomain) Run(ctx context.Context, app *platform.App) error {
 }
 
 func validateScheduledConfig(cfg platform.Config) error {
+	if cfg.ScheduledRequestsPerSecond <= 0 {
+		return errors.New("scheduled.requests_per_second must be greater than zero")
+	}
 	if cfg.ScheduledIntervalSeconds <= 0 {
 		return errors.New("scheduled.interval_seconds must be greater than zero")
 	}
@@ -399,7 +408,7 @@ func (d *scheduledDomain) doRankedGroupDiscovery(ctx context.Context, app *platf
 }
 
 func (d *scheduledDomain) fetchRankedSeedPlayer(ctx context.Context, app *platform.App, tag string) (*clashy.Player, bool, error) {
-	player, err := platform.RetryClashFetch(ctx, app.Availability, func(fetchCtx context.Context) (*clashy.Player, error) {
+	player, err := retryLimitedClashFetch(ctx, app, d.limiter, func(fetchCtx context.Context) (*clashy.Player, error) {
 		start := time.Now()
 		player, err := app.Clash.GetPlayer(fetchCtx, tag)
 		app.Stats.RecordRequest(scheduledDomainName, time.Since(start), err)
@@ -418,7 +427,7 @@ func (d *scheduledDomain) fetchRankedSeedPlayer(ctx context.Context, app *platfo
 }
 
 func (d *scheduledDomain) previousLeagueTierID(ctx context.Context, app *platform.App, tag string, seasonID int64) (int, bool, error) {
-	entries, err := platform.RetryClashFetch(ctx, app.Availability, func(fetchCtx context.Context) ([]clashy.LeagueHistoryEntry, error) {
+	entries, err := retryLimitedClashFetch(ctx, app, d.limiter, func(fetchCtx context.Context) ([]clashy.LeagueHistoryEntry, error) {
 		start := time.Now()
 		entries, err := app.Clash.GetPlayerLeagueHistory(fetchCtx, tag)
 		app.Stats.RecordRequest(scheduledDomainName, time.Since(start), err)
@@ -436,7 +445,7 @@ func (d *scheduledDomain) previousLeagueTierID(ctx context.Context, app *platfor
 }
 
 func (d *scheduledDomain) fetchRankedGroupMembers(ctx context.Context, app *platform.App, seedTag, groupTag string, seasonID int64, leagueTierID int) ([]models.RankedLeagueGroupMemberRow, error) {
-	group, err := platform.RetryClashFetch(ctx, app.Availability, func(fetchCtx context.Context) (*clashy.LeagueTierGroup, error) {
+	group, err := retryLimitedClashFetch(ctx, app, d.limiter, func(fetchCtx context.Context) (*clashy.LeagueTierGroup, error) {
 		start := time.Now()
 		group, err := app.Clash.GetPlayerLeagueGroup(fetchCtx, seedTag, groupTag, strconv.FormatInt(seasonID, 10))
 		app.Stats.RecordRequest(scheduledDomainName, time.Since(start), err)
@@ -527,7 +536,7 @@ func (d *scheduledDomain) loadLeaderboardLocationIDs(
 	ctx context.Context,
 	app *platform.App,
 ) ([]string, error) {
-	locations, err := platform.RetryClashFetch(ctx, app.Availability, func(fetchCtx context.Context) ([]clashy.Location, error) {
+	locations, err := retryLimitedClashFetch(ctx, app, d.limiter, func(fetchCtx context.Context) ([]clashy.Location, error) {
 		start := time.Now()
 		locations, err := app.Clash.SearchLocations(fetchCtx, clashy.PageOptions{})
 		app.Stats.RecordRequest(scheduledDomainName, time.Since(start), err)
@@ -553,7 +562,7 @@ func (d *scheduledDomain) doLeaderboardHistory(
 			if !shouldStoreLeaderboardHistoryKind(path.Kind, now) {
 				continue
 			}
-			payload, err := platform.RetryClashFetch(ctx, app.Availability, func(fetchCtx context.Context) (any, error) {
+			payload, err := retryLimitedClashFetch(ctx, app, d.limiter, func(fetchCtx context.Context) (any, error) {
 				start := time.Now()
 				payload, err := path.Load(fetchCtx, app.Clash, locationID)
 				app.Stats.RecordRequest(scheduledDomainName, time.Since(start), err)
@@ -594,10 +603,12 @@ func (d *scheduledDomain) doLegendHistory(
 		return 0, err
 	}
 	loadSeasons := d.loadLegendSeasons
+	var officialSeasons []string
 	if loadSeasons == nil {
-		loadSeasons = loadOfficialLegendSeasons
+		officialSeasons, err = loadOfficialLegendSeasons(ctx, app, d.limiter)
+	} else {
+		officialSeasons, err = loadSeasons(ctx, app)
 	}
-	officialSeasons, err := loadSeasons(ctx, app)
 	if err != nil {
 		return 0, err
 	}
@@ -606,13 +617,15 @@ func (d *scheduledDomain) doLegendHistory(
 		return 0, err
 	}
 	loadRankings := d.loadLegendRankings
-	if loadRankings == nil {
-		loadRankings = loadOfficialLegendSeasonRankings
-	}
 	writes := 0
 	var seasonErrors []error
 	for _, season := range missing {
-		rankings, err := loadRankings(ctx, app, season)
+		var rankings []legendRankingItem
+		if loadRankings == nil {
+			rankings, err = loadOfficialLegendSeasonRankings(ctx, app, d.limiter, season)
+		} else {
+			rankings, err = loadRankings(ctx, app, season)
+		}
 		if err != nil {
 			seasonErrors = append(seasonErrors, fmt.Errorf("fetch legend season %s: %w", season, err))
 			continue
@@ -632,8 +645,8 @@ func (d *scheduledDomain) doLegendHistory(
 	return writes, errors.Join(seasonErrors...)
 }
 
-func loadOfficialLegendSeasons(ctx context.Context, app *platform.App) ([]string, error) {
-	return platform.RetryClashFetch(ctx, app.Availability, func(fetchCtx context.Context) ([]string, error) {
+func loadOfficialLegendSeasons(ctx context.Context, app *platform.App, limiter *clashy.Limiter) ([]string, error) {
+	return retryLimitedClashFetch(ctx, app, limiter, func(fetchCtx context.Context) ([]string, error) {
 		start := time.Now()
 		seasons, err := app.Clash.GetSeasons(fetchCtx, legendLeagueID)
 		app.Stats.RecordRequest(scheduledDomainName, time.Since(start), err)
@@ -644,16 +657,16 @@ func loadOfficialLegendSeasons(ctx context.Context, app *platform.App) ([]string
 func loadOfficialLegendSeasonRankings(
 	ctx context.Context,
 	app *platform.App,
+	limiter *clashy.Limiter,
 	season string,
 ) ([]legendRankingItem, error) {
-	return platform.RetryClashFetch(ctx, app.Availability, func(fetchCtx context.Context) ([]legendRankingItem, error) {
-		return fetchAllLegendSeasonRankingPages(fetchCtx, app, season)
-	})
+	return fetchAllLegendSeasonRankingPages(ctx, app, limiter, season)
 }
 
 func fetchAllLegendSeasonRankingPages(
 	ctx context.Context,
 	app *platform.App,
+	limiter *clashy.Limiter,
 	season string,
 ) ([]legendRankingItem, error) {
 	if _, err := officialLegendSeasonWindow(season); err != nil {
@@ -669,13 +682,13 @@ func fetchAllLegendSeasonRankingPages(
 	return collectLegendSeasonRankingPages(season, func(after string) ([]legendRankingItem, string, error) {
 		endpoint := legendSeasonRankingPageURL(cfg.BaseURL, season, after)
 		start := time.Now()
-		response, err := httpClient.Do(
-			ctx,
-			http.MethodGet,
-			endpoint,
-			nil,
-			clashy.RequestOptions{SkipAuth: true},
-		)
+		body, err := retryLimitedClashFetch(ctx, app, limiter, func(fetchCtx context.Context) ([]byte, error) {
+			response, err := httpClient.Do(fetchCtx, http.MethodGet, endpoint, nil, clashy.RequestOptions{SkipAuth: true})
+			if err != nil {
+				return nil, err
+			}
+			return response.Body, nil
+		})
 		app.Stats.RecordRequest(scheduledDomainName, time.Since(start), err)
 		if err != nil {
 			return nil, "", err
@@ -688,7 +701,7 @@ func fetchAllLegendSeasonRankingPages(
 				} `json:"cursors"`
 			} `json:"paging"`
 		}
-		if err := json.Unmarshal(response.Body, &page); err != nil {
+		if err := json.Unmarshal(body, &page); err != nil {
 			return nil, "", err
 		}
 		items := make([]legendRankingItem, 0, len(page.Items))
@@ -891,7 +904,7 @@ func (d *scheduledDomain) doCurrentClanRankings(
 	var groupErrors []error
 	for _, locationID := range locationIDs {
 		for _, path := range currentClanRankingPaths {
-			rankings, err := platform.RetryClashFetch(ctx, app.Availability, func(fetchCtx context.Context) ([]clashy.RankedClan, error) {
+			rankings, err := retryLimitedClashFetch(ctx, app, d.limiter, func(fetchCtx context.Context) ([]clashy.RankedClan, error) {
 				start := time.Now()
 				rankings, err := path.Load(fetchCtx, app.Clash, locationID, clashy.PageOptions{Limit: currentClanRankingLimit})
 				app.Stats.RecordRequest(scheduledDomainName, time.Since(start), err)

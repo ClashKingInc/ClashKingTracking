@@ -152,11 +152,13 @@ func proxyConnectionLimit(cfg Config) int {
 		cfg.GlobalClanPriorityRequestsPerSecond+cfg.GlobalClanNonPriorityRequestsPerSecond,
 		cfg.BattlelogRequestsPerSecond,
 		cfg.BattlelogPriorityRequestsPerSecond,
-		cfg.WarRequestsPerSecond+cfg.WarDormantRequestsPerSecond,
+		cfg.WarDiscoveryActiveRequestsPerSecond+cfg.WarDiscoveryDormantRequestsPerSecond,
+		cfg.CWLRequestsPerSecond,
 		cfg.TrackedClanRequestsPerSecond,
 		cfg.TrackedPlayerRequestsPerSecond,
 		cfg.BasicPlayerRequestsPerSecond,
-		cfg.LeaderboardRequestsPerSecond,
+		cfg.ScheduledRequestsPerSecond,
+		cfg.ReminderRequestsPerSecond,
 	)
 	if rate <= 0 {
 		return 100

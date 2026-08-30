@@ -45,8 +45,9 @@ Scheduled statistics normally write SQL/cache snapshots and do not emit live Dis
 
 ## Configuration
 
+- `scheduled.requests_per_second`, shared by every Clash request in this process, including leaderboards
 - `scheduled.interval_seconds`
-- All `leaderboards.*` fields
+- `leaderboards.interval_seconds`, `leaderboards.limit`, and `leaderboards.null_asset_url`
 - SQL, proxy, and shared stats settings
 
 ## Outages and restarts

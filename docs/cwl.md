@@ -6,7 +6,7 @@ The CWL process discovers league groups, stores group membership and league meta
 
 ## When it runs
 
-It is a separate `cwl` script. It wakes every `wars.cwl_sync_seconds`. New group discovery runs from the 1st through the 3rd UTC because clans cannot sign up later; current-season groups already found keep syncing through the 15th or until their stored state becomes `ended`.
+It is a separate `cwl` script. It wakes every `cwl.sync_seconds`. New group discovery runs from the 1st through the 3rd UTC because clans cannot sign up later; current-season groups already found keep syncing through the 15th or until their stored state becomes `ended`.
 
 ## How a clan becomes a target
 
@@ -72,10 +72,12 @@ flowchart LR
 
 ## Configuration
 
-- `wars.cwl_sync_seconds`
-- `wars.requests_per_second`
+- `cwl.sync_seconds`
+- `cwl.requests_per_second`
 - `target_page_multiplier`
 - SQL, event stream, and proxy settings
+
+Operational metrics use `cwl.groups` for the finite candidate pass. The eligible target total is recounted every 15 minutes, every attempted candidate advances progress, and group plus previously unseen league-war requests are attributed to the same domain. Outside the CWL calendar window the process remains idle rather than reporting fake target progress.
 
 ## Outages and restarts
 
