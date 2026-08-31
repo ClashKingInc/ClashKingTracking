@@ -16,6 +16,7 @@ type BasicClanRow struct {
 	ClanPoints           int
 	BuilderBasePoints    int
 	CapitalPoints        int
+	CapitalGoldTotal     int64
 	MemberCount          int
 	BadgeURL             string
 	TroopsDonated        int

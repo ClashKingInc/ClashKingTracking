@@ -58,7 +58,7 @@ Reads:
 
 Writes:
 
-- `basic_clan`: current profile, public-war-log flag, members, activity fields, and known Clash IDs.
+- `basic_clan`: current profile, public-war-log flag, members, activity fields, known Clash IDs, and the clan's cumulative Capital Gold deposits.
 - `clan_records`: best clan points and war streak records.
 - `basic_player`: inexpensive member facts learned from the clan response.
 - `join_leave_history`: durable join and leave rows.

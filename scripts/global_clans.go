@@ -706,6 +706,9 @@ func basicClanRow(clan clashy.Clan) models.BasicClanRow {
 		TroopsReceived:    totalReceived(clan.Members),
 		CWLLeagueID:       unrankedWarLeagueID,
 	}
+	if clan.ClanCapital != nil {
+		row.CapitalGoldTotal = clan.ClanCapital.ClanGoldSinkTotal
+	}
 	if clan.Location != nil {
 		row.LocationID = intPtr(clan.Location.ID)
 	}
@@ -1084,7 +1087,7 @@ func (s *timescaleGlobalClanStore) Load(ctx context.Context, tags []string) (map
 		SELECT
 			c.tag, c.name, c.description, c.clan_level, c.location_id, c.cwl_league_id, c.capital_league_id,
 			c.public_war_log, c.war_wins, c.war_win_streak, c.clan_points,
-			c.builder_base_points, c.capital_points,
+			c.builder_base_points, c.capital_points, c.capital_gold_total,
 			COALESCE(r.war_win_streak, 0), r.war_win_streak_at,
 			COALESCE(r.clan_points, 0), r.clan_points_at, c.member_count, c.badge_token, c.troops_donated,
 			c.troops_received, c.members, c.last_active
@@ -1108,7 +1111,7 @@ func (s *timescaleGlobalClanStore) Load(ctx context.Context, tags []string) (map
 		if err := rows.Scan(
 			&row.Tag, &row.Name, &row.Description, &row.ClanLevel, &locationID, &cwlLeagueID, &capitalLeagueID,
 			&row.PublicWarLog, &row.WarWins, &row.WarWinStreak, &row.ClanPoints,
-			&row.BuilderBasePoints, &row.CapitalPoints,
+			&row.BuilderBasePoints, &row.CapitalPoints, &row.CapitalGoldTotal,
 			&row.RecordWarWinStreak, &recordWarWinStreakAt,
 			&row.RecordClanPoints, &recordClanPointsAt, &row.MemberCount, &row.BadgeURL, &row.TroopsDonated,
 			&row.TroopsReceived, &membersPayload, &lastActive,
@@ -1210,11 +1213,11 @@ func (s *timescaleGlobalClanStore) Store(ctx context.Context, ingest models.Glob
 const upsertBasicClanSQL = `
 	INSERT INTO basic_clan (
 		tag, name, description, clan_level, location_id, cwl_league_id, capital_league_id,
-		public_war_log, war_wins, war_win_streak, clan_points, builder_base_points, capital_points,
+		public_war_log, war_wins, war_win_streak, clan_points, builder_base_points, capital_points, capital_gold_total,
 		member_count, badge_token, troops_donated, troops_received, members
 	)
 	VALUES (
-		$1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18::jsonb
+		$1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18, $19::jsonb
 	)
 	ON CONFLICT (tag) DO UPDATE SET
 		name = EXCLUDED.name,
@@ -1229,6 +1232,7 @@ const upsertBasicClanSQL = `
 		clan_points = EXCLUDED.clan_points,
 		builder_base_points = EXCLUDED.builder_base_points,
 		capital_points = EXCLUDED.capital_points,
+		capital_gold_total = EXCLUDED.capital_gold_total,
 		member_count = EXCLUDED.member_count,
 		badge_token = EXCLUDED.badge_token,
 		troops_donated = EXCLUDED.troops_donated,
@@ -1247,6 +1251,7 @@ const upsertBasicClanSQL = `
 		basic_clan.clan_points IS DISTINCT FROM EXCLUDED.clan_points OR
 		basic_clan.builder_base_points IS DISTINCT FROM EXCLUDED.builder_base_points OR
 		basic_clan.capital_points IS DISTINCT FROM EXCLUDED.capital_points OR
+		basic_clan.capital_gold_total IS DISTINCT FROM EXCLUDED.capital_gold_total OR
 		basic_clan.member_count IS DISTINCT FROM EXCLUDED.member_count OR
 		basic_clan.badge_token IS DISTINCT FROM EXCLUDED.badge_token OR
 		basic_clan.troops_donated IS DISTINCT FROM EXCLUDED.troops_donated OR
@@ -1270,7 +1275,7 @@ func upsertBasicClans(ctx context.Context, tx pgx.Tx, clans []models.BasicClanRo
 			clan.CWLLeagueID,
 			optionalIntValue(clan.CapitalLeagueID),
 			clan.PublicWarLog, clan.WarWins, clan.WarWinStreak, clan.ClanPoints,
-			clan.BuilderBasePoints, clan.CapitalPoints, clan.MemberCount, clan.BadgeURL, clan.TroopsDonated,
+			clan.BuilderBasePoints, clan.CapitalPoints, clan.CapitalGoldTotal, clan.MemberCount, clan.BadgeURL, clan.TroopsDonated,
 			clan.TroopsReceived, string(membersPayload),
 		)
 	}
@@ -1612,6 +1617,9 @@ func basicClanRowsEqual(left, right models.BasicClanRow) bool {
 		left.WarWins == right.WarWins &&
 		left.WarWinStreak == right.WarWinStreak &&
 		left.ClanPoints == right.ClanPoints &&
+		left.BuilderBasePoints == right.BuilderBasePoints &&
+		left.CapitalPoints == right.CapitalPoints &&
+		left.CapitalGoldTotal == right.CapitalGoldTotal &&
 		left.MemberCount == right.MemberCount &&
 		left.BadgeURL == right.BadgeURL &&
 		left.TroopsDonated == right.TroopsDonated &&
