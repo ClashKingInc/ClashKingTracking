@@ -3,7 +3,7 @@ module clashking_tracking
 go 1.26.4
 
 require (
-	github.com/clashkinginc/clashy.go v0.1.15-0.20260831171408-739835308c5a
+	github.com/clashkinginc/clashy.go v0.1.15-0.20260901045716-ed49cb54e8ea
 	github.com/golang/snappy v1.0.0
 	github.com/google/uuid v1.6.0
 	github.com/jackc/pgx/v5 v5.9.2

@@ -229,7 +229,7 @@ func TestBasicClanRowUsesUnrankedWarLeagueWhenMissing(t *testing.T) {
 		Points:            50000,
 		BuilderBasePoints: 42000,
 		CapitalPoints:     3100,
-		ClanCapital:       &clashy.ClanCapital{ClanGoldSinkTotal: 9876543210},
+		ClanCapital:       clashy.ClanCapital{ClanGoldSinkTotal: 9876543210},
 	})
 	if got.LocationID != nil || got.CWLLeagueID != unrankedWarLeagueID || got.CapitalLeagueID != nil {
 		t.Fatalf("optional ids/war league mismatch when missing: %#v", got)

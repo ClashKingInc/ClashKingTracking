@@ -706,9 +706,7 @@ func basicClanRow(clan clashy.Clan) models.BasicClanRow {
 		TroopsReceived:    totalReceived(clan.Members),
 		CWLLeagueID:       unrankedWarLeagueID,
 	}
-	if clan.ClanCapital != nil {
-		row.CapitalGoldTotal = clan.ClanCapital.ClanGoldSinkTotal
-	}
+	row.CapitalGoldTotal = clan.ClanCapital.ClanGoldSinkTotal
 	if clan.Location != nil {
 		row.LocationID = intPtr(clan.Location.ID)
 	}
