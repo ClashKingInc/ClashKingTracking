@@ -1,27 +1,35 @@
-# syntax=docker/dockerfile:1.7
+FROM python:3.13.7-slim
 
-FROM golang:1.26.4-bookworm AS build
+LABEL org.opencontainers.image.source=https://github.com/ClashKingInc/ClashKingTracking
+LABEL org.opencontainers.image.description="Image for the ClashKing Tracking Services"
+LABEL org.opencontainers.image.licenses=MIT
 
-WORKDIR /src
+# Install uv and system dependencies
+COPY --from=ghcr.io/astral-sh/uv:latest /uv /uvx /bin/
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    libsnappy-dev \
+    git \
+    curl \
+    build-essential \
+    gcc \
+    python3-dev \
+    && apt-get clean && rm -rf /var/lib/apt/lists/*
 
-COPY go.mod go.sum ./
-RUN --mount=type=cache,target=/go/pkg/mod \
-    --mount=type=cache,target=/root/.cache/go-build \
-    go mod download
-
-COPY . ./
-RUN --mount=type=cache,target=/go/pkg/mod \
-    --mount=type=cache,target=/root/.cache/go-build \
-    go build -trimpath -o /out/tracking .
-
-FROM debian:bookworm-slim
-
-RUN apt-get update \
-    && apt-get install -y --no-install-recommends ca-certificates \
-    && rm -rf /var/lib/apt/lists/*
-
+# Set the working directory in the container
 WORKDIR /app
-COPY --from=build /out/tracking /usr/local/bin/tracking
-COPY config.json /app/config.json
 
-ENTRYPOINT ["tracking"]
+# Copy pyproject.toml first for better caching
+COPY pyproject.toml .
+
+# Install dependencies using uv
+RUN uv pip install --system . \
+    && apt-get remove -y build-essential gcc python3-dev \
+    && apt-get autoremove -y \
+    && rm -rf /var/lib/apt/lists/* /root/.cache/pip
+
+# Copy the rest of the application code into the container
+COPY . .
+
+EXPOSE 8027 8000
+
+CMD ["uv", "run", "python", "main.py"]

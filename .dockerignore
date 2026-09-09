@@ -1,5 +1,0 @@
-.git
-.gocache
-.env
-*.log
-tmp
