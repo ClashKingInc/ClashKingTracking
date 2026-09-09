@@ -2,9 +2,11 @@
 
 ## Discovery and refresh
 
-Discovery pages through all `basic_clan` rows during the existing 1st–15th UTC recovery window, without requiring public war logs or a cached league. Each pass drains its pages immediately behind the configured request limiter. Clans belonging to an already-stored current-season group are excluded; discovering one group therefore removes all its sibling clans from subsequent discovery pages. Empty pages finish the pass. The next sweep starts after `cwl.sync_seconds` (default 1800).
+Discovery pages through all `basic_clan` rows once on every process startup, regardless of date, without requiring public war logs or a cached league. It repeats during the normal signup window plus four hours: from the 1st at 08:00 UTC until the 3rd at 12:00 UTC. Each pass drains its pages behind the configured request limiter and finishes even if the cutoff occurs mid-pass. Successful passes repeat with a one-second idle floor; failures retain the configured sync backoff. Clans belonging to an already-stored current-season group are excluded, including all sibling clans. Calendar gating lives in the scheduler, not the SQL, so startup recovery works outside the window.
 
-An independent refresh sweep runs immediately on startup and every 30 minutes after a completed sweep, sharing the group-request limiter. It reads one representative per current-season group whose state is not `ended`. It does not join war schedules or try to predict whether the group needs refreshing. Refresh continues throughout the month, independently of the discovery calendar window.
+An independent refresh sweep runs immediately on startup and every 30 minutes after a completed sweep, sharing the group-request limiter, until the 15th at 00:00 UTC. It reads one representative per current-season group whose state is not `ended`. It does not join war schedules or try to predict whether the group needs refreshing. Stopping group refresh does not stop the archiver from draining queued or scheduled wars. The process stays alive for next month's window.
+
+The usual 08:00 UTC start is documented by [Clash Ninja](https://www.clash.ninja/guides/when-are-the-next-ingame-events); [Supercell](https://support.supercell.com/clash-of-clans/en/articles/about-cwl-3.html) confirms the two-day signup period. This is the normal recurring schedule, not automatic detection of exceptional event changes.
 
 Season selection uses `season >= '2026-09' AND season < '2026-10'` (bounds calculated in UTC), so exact stored values such as `2026-09-01`, `2026-09-02`, and `2026-09-03` are included without applying a function to the indexed column.
 
@@ -31,6 +33,12 @@ The handoff uses a deduplicated Valkey sorted set with no expiry. Enqueue happen
 An already-ended war is stored from its first response, without scheduling a second HTTP fetch. Future wars receive their final fetch 30 minutes after end time; a still-unfinished response then retries after five minutes. The archiver stores observed war size back on the group. CWL league remains group metadata, never a new war column.
 
 ## League resolution and configuration
+
+### War-worker throughput and size assignment
+
+When a group first exposes real tags, the checker marks one job `setSize: true`; other jobs explicitly carry `false`. The designated job fills `war_size` only when it is null, using its fetched or already-stored war size. Temporary failures retain the flag. A permanently unavailable designated tag hands responsibility to the next stored round tag, when available. Legacy queued jobs without a flag remain supported: one job per group per process attempts the conditional update, so existing values are never rewritten.
+
+The archiver continuously feeds up to 256 in-flight hydration jobs from a bounded buffer. Known war tags are checked in batches. Each free slot refills without waiting for the slowest request; polling waits only when there are no additional jobs due. Hydration and finalization still share the configured request-start limiter. Run one archiver consumer: its in-flight set prevents duplicate dispatch within that process, and restart replay remains safe through SQL deduplication.
 
 The existing one-time league resolution is retained: reuse the group's saved league, otherwise use sibling `basic_clan` league data or the configured clan-profile lookup. A failed league lookup does not prevent storing the group; a later refresh can resolve it.
 

@@ -19,6 +19,8 @@ Both pools require `basic_clan.public_war_log = true`. They are separated by `ba
 
 Finding a war updates `last_war_at`, which naturally promotes a dormant clan into the active pool.
 
+New regular-war discovery only schedules `preparation` or `inWar` responses with valid identities and an end time strictly in the future. It ignores ended, past-end, and `notInWar` responses so stale API results cannot recreate schedules that the finalizer already removed. Existing scheduled wars still finish normally; CWL tagged-war catch-up is separate and still stores past completed rounds.
+
 ## Discovery decision flow
 
 ```text
