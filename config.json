@@ -1,0 +1,89 @@
+{
+  "dry_run": false,
+  "mock_db": false,
+  "target_page_multiplier": 5,
+  "stats": {
+    "timescale_flush_seconds": 60
+  },
+  "events": {
+    "stream": "tracking:events",
+    "consumer": "events-1",
+    "retention_seconds": 300,
+    "reclaim_idle_seconds": 60
+  },
+  "globalclans": {
+    "priority_requests_per_second": 450,
+    "non_priority_requests_per_second": 50,
+    "write_workers": 2
+  },
+  "battlelogs": {
+    "requests_per_second": 600,
+    "priority_requests_per_second": 100,
+    "checkpoint_ttl_days": 15,
+    "first_seen_lookback_days": 14
+  },
+  "war_discovery": {
+    "active_requests_per_second": 450,
+    "dormant_requests_per_second": 50
+  },
+  "cwl": {
+    "requests_per_second": 250,
+    "war_requests_per_second": 1000,
+    "sync_seconds": 180,
+    "resolve_league_from_clan_profile": true
+  },
+  "war_archiver": {
+    "scan_seconds": 30,
+    "pack_size": 10000
+  },
+  "trackedclans": {
+    "requests_per_second": 100,
+    "target_refresh_seconds": 3600,
+    "snapshot_prefix": "trackedclans:snapshot:",
+    "cwl_state_snapshot": "cwlstate"
+  },
+  "capital": {
+    "requests_per_second": 250,
+    "target_refresh_seconds": 300,
+    "snapshot_prefix": "capital:raid:"
+  },
+  "trackedplayers": {
+    "requests_per_second": 250,
+    "target_refresh_seconds": 3600
+  },
+  "basicplayers": {
+    "requests_per_second": 30
+  },
+  "leaderboards": {
+    "interval_seconds": 600,
+    "limit": 500,
+    "null_asset_url": "https://api-assets.clashofclans.com/null"
+  },
+  "scheduled": {
+    "requests_per_second": 100,
+    "interval_seconds": 86400
+  },
+  "reminders": {
+    "requests_per_second": 50
+  },
+  "giveaways": {
+    "scan_seconds": 60
+  },
+  "reddit": {
+    "poll_seconds": 120
+  },
+  "mobile_push": {
+    "scan_seconds": 15
+  },
+  "roster_automations": {
+    "scan_seconds": 15,
+    "batch_size": 100
+  },
+  "discord_gateway": {
+    "queue_size": 4096,
+    "message_create_enabled": true
+  },
+  "discord_delivery": {
+    "batch_size": 50
+  }
+}

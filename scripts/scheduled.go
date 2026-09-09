@@ -1,0 +1,2726 @@
+package scripts
+
+import (
+	"context"
+	"encoding/json"
+	"errors"
+	"fmt"
+	"net/http"
+	"net/url"
+	"sort"
+	"strconv"
+	"strings"
+	"time"
+
+	"clashking_tracking/internal/cwlstats"
+	"clashking_tracking/internal/platform"
+	"clashking_tracking/internal/utils"
+	"clashking_tracking/models"
+
+	clashy "github.com/clashkinginc/clashy.go"
+	"github.com/jackc/pgx/v5"
+	"github.com/jackc/pgx/v5/pgxpool"
+)
+
+const (
+	scheduledDomainName = "scheduled"
+
+	leaderboardHistoryPlayerHomeTrophies        = "player_home_trophies"
+	leaderboardHistoryPlayerBuilderBaseTrophies = "player_builder_base_trophies"
+	leaderboardHistoryClanHomePoints            = "clan_home_points"
+	leaderboardHistoryClanBuilderBasePoints     = "clan_builder_base_points"
+	leaderboardHistoryClanCapitalPoints         = "clan_capital_points"
+
+	legendLeagueID       = 29000022
+	legendSeasonPageSize = 25000
+	legendSeasonV2Prefix = "v2-"
+	legendSeasonV2Length = 28 * 24 * time.Hour
+
+	currentClanRankingLimit     = 200
+	cwlSeasonStatisticsInterval = 7 * 24 * time.Hour
+)
+
+type leaderboardLoader func(context.Context, *clashy.Client, string) (any, error)
+type currentClanRankingLoader func(context.Context, *clashy.Client, string, clashy.PageOptions) ([]clashy.RankedClan, error)
+type legendSeasonsLoader func(context.Context, *platform.App) ([]string, error)
+type legendSeasonRankingsLoader func(context.Context, *platform.App, string) ([]legendRankingItem, error)
+
+var leaderboardHistoryPaths = []struct {
+	Kind string
+	Load leaderboardLoader
+}{
+	{Kind: leaderboardHistoryPlayerHomeTrophies, Load: func(ctx context.Context, client *clashy.Client, locationID string) (any, error) {
+		return client.GetLocationPlayersByLocationID(ctx, locationID, clashy.PageOptions{})
+	}},
+	{Kind: leaderboardHistoryPlayerBuilderBaseTrophies, Load: func(ctx context.Context, client *clashy.Client, locationID string) (any, error) {
+		return client.GetLocationPlayersBuilderBaseByLocationID(ctx, locationID, clashy.PageOptions{})
+	}},
+	{Kind: leaderboardHistoryClanHomePoints, Load: func(ctx context.Context, client *clashy.Client, locationID string) (any, error) {
+		return client.GetLocationClansByLocationID(ctx, locationID, clashy.PageOptions{})
+	}},
+	{Kind: leaderboardHistoryClanBuilderBasePoints, Load: func(ctx context.Context, client *clashy.Client, locationID string) (any, error) {
+		return client.GetLocationClansBuilderBaseByLocationID(ctx, locationID, clashy.PageOptions{})
+	}},
+	{Kind: leaderboardHistoryClanCapitalPoints, Load: func(ctx context.Context, client *clashy.Client, locationID string) (any, error) {
+		return client.GetLocationClansCapitalByLocationID(ctx, locationID, clashy.PageOptions{})
+	}},
+}
+
+var typedLeaderboardHistorySpecs = []typedLeaderboardHistorySpec{
+	{
+		Kind:      leaderboardHistoryPlayerHomeTrophies,
+		Table:     "leaderboard_history_player_home",
+		TagColumn: "player_tag",
+		Columns: []string{
+			"location_id", "date", "player_tag", "player_name", "exp_level",
+			"trophies", "attack_wins", "defense_wins", "rank", "previous_rank",
+			"clan_tag", "clan_name", "clan_badge_token", "league_id",
+		},
+		UpdateCols: []string{
+			"player_name", "exp_level", "trophies", "attack_wins", "defense_wins",
+			"rank", "previous_rank", "clan_tag", "clan_name", "clan_badge_token", "league_id",
+		},
+	},
+	{
+		Kind:      leaderboardHistoryPlayerBuilderBaseTrophies,
+		Table:     "leaderboard_history_player_builder_base",
+		TagColumn: "player_tag",
+		Columns: []string{
+			"location_id", "date", "player_tag", "player_name", "exp_level",
+			"builder_base_trophies", "builder_base_battle_wins", "rank", "previous_rank",
+			"clan_tag", "clan_name", "clan_badge_token", "league_id",
+		},
+		UpdateCols: []string{
+			"player_name", "exp_level", "builder_base_trophies", "builder_base_battle_wins",
+			"rank", "previous_rank", "clan_tag", "clan_name", "clan_badge_token", "league_id",
+		},
+	},
+	{
+		Kind:      leaderboardHistoryClanHomePoints,
+		Table:     "leaderboard_history_clan_home",
+		TagColumn: "clan_tag",
+		Columns: []string{
+			"location_id", "date", "clan_tag", "clan_name", "clan_badge_token",
+			"clan_level", "clan_points", "members", "clan_location_id", "rank", "previous_rank",
+		},
+		UpdateCols: []string{
+			"clan_name", "clan_badge_token", "clan_level", "clan_points",
+			"members", "clan_location_id", "rank", "previous_rank",
+		},
+	},
+	{
+		Kind:      leaderboardHistoryClanBuilderBasePoints,
+		Table:     "leaderboard_history_clan_builder_base",
+		TagColumn: "clan_tag",
+		Columns: []string{
+			"location_id", "date", "clan_tag", "clan_name", "clan_badge_token",
+			"clan_level", "builder_base_points", "members", "clan_location_id", "rank", "previous_rank",
+		},
+		UpdateCols: []string{
+			"clan_name", "clan_badge_token", "clan_level", "builder_base_points",
+			"members", "clan_location_id", "rank", "previous_rank",
+		},
+	},
+	{
+		Kind:      leaderboardHistoryClanCapitalPoints,
+		Table:     "leaderboard_history_clan_capital",
+		TagColumn: "clan_tag",
+		Columns: []string{
+			"location_id", "date", "clan_tag", "clan_name", "clan_badge_token",
+			"clan_level", "capital_points", "members", "clan_location_id", "rank", "previous_rank",
+		},
+		UpdateCols: []string{
+			"clan_name", "clan_badge_token", "clan_level", "capital_points",
+			"members", "clan_location_id", "rank", "previous_rank",
+		},
+	},
+}
+
+var currentClanRankingPaths = []struct {
+	RankingType string
+	Load        currentClanRankingLoader
+	Points      func(clashy.RankedClan) int
+}{
+	{
+		RankingType: "home",
+		Load: func(ctx context.Context, client *clashy.Client, locationID string, page clashy.PageOptions) ([]clashy.RankedClan, error) {
+			return client.GetLocationClansByLocationID(ctx, locationID, page)
+		},
+		Points: func(clan clashy.RankedClan) int { return clan.Points },
+	},
+	{
+		RankingType: "builder_base",
+		Load: func(ctx context.Context, client *clashy.Client, locationID string, page clashy.PageOptions) ([]clashy.RankedClan, error) {
+			return client.GetLocationClansBuilderBaseByLocationID(ctx, locationID, page)
+		},
+		Points: func(clan clashy.RankedClan) int { return clan.BuilderBasePoints },
+	},
+	{
+		RankingType: "capital",
+		Load: func(ctx context.Context, client *clashy.Client, locationID string, page clashy.PageOptions) ([]clashy.RankedClan, error) {
+			return client.GetLocationClansCapitalByLocationID(ctx, locationID, page)
+		},
+		Points: func(clan clashy.RankedClan) int { return clan.CapitalPoints },
+	},
+}
+
+type currentClanRankingRow struct {
+	ClanTag   string
+	Rank      int
+	Points    int
+	UpdatedAt time.Time
+}
+
+type currentClanRankingGroup struct {
+	RankingType string
+	LocationID  string
+	Rows        []currentClanRankingRow
+}
+
+type leaderboardHistoryGroup struct {
+	Kind       string
+	LocationID string
+	Date       time.Time
+	Rows       any
+}
+
+type leaderboardHistoryScope struct {
+	LocationID string
+	Date       time.Time
+}
+
+type typedLeaderboardHistoryBatch struct {
+	Scopes map[string][]leaderboardHistoryScope
+	Rows   map[string][][]any
+}
+
+type typedLeaderboardHistorySpec struct {
+	Kind       string
+	Table      string
+	TagColumn  string
+	Columns    []string
+	UpdateCols []string
+}
+
+type legendRankingItem struct {
+	Player clashy.RankedPlayer
+}
+
+type scheduledDomain struct {
+	store              scheduledStore
+	limiter            *clashy.Limiter
+	loadLegendSeasons  legendSeasonsLoader
+	loadLegendRankings legendSeasonRankingsLoader
+}
+
+type scheduledStore interface {
+	Close()
+	ReplaceLeaderboardHistory(context.Context, []leaderboardHistoryGroup) (int, error)
+	CompletedLegendSeasons(context.Context) (map[string]struct{}, error)
+	ReplaceLegendSeason(context.Context, string, []models.LegendHistoryRow) (int, error)
+	ReplaceCurrentClanRankingGroup(context.Context, currentClanRankingGroup) (int, error)
+	ListRankedGroupTargets(context.Context, int64) ([]string, error)
+	StorePlayerProfiles(context.Context, []models.PlayerProfileIngest) (int, error)
+	DeletePlayers(context.Context, []string) error
+	StoreRankedLeagueGroup(context.Context, []models.RankedLeagueGroupMemberRow) (int, error)
+	MissingRankedGroupPlayers(context.Context, int64) ([]string, error)
+	FinalizeRankedTournament(context.Context, int64) (int, error)
+	ReconcileCWLSeasonStatistics(context.Context, []string) error
+	FinalizeLegendDay(context.Context, time.Time) (int, error)
+	FinalizeArmyFamilies(context.Context, time.Time, platform.Config) (int, error)
+}
+
+func NewScheduledDomain() platform.Domain { return &scheduledDomain{} }
+
+func (d *scheduledDomain) Name() string { return scheduledDomainName }
+
+func (d *scheduledDomain) Run(ctx context.Context, app *platform.App) error {
+	if err := validateScheduledConfig(app.Config); err != nil {
+		return err
+	}
+	limiter, err := newTrackingLimiter(app.Config.ScheduledRequestsPerSecond)
+	if err != nil {
+		return err
+	}
+	d.limiter = limiter
+	store, err := newScheduledStore(ctx, app)
+	if err != nil {
+		return err
+	}
+	defer store.Close()
+	d.store = store
+
+	// Current player leaderboards are another scheduled data refresh, so they
+	// share this process while retaining their own cadence and readiness stats.
+	leaderboardCtx, stopLeaderboards := context.WithCancel(ctx)
+	leaderboardDone := make(chan error, 1)
+	go func() {
+		leaderboardDone <- (&leaderboardsDomain{limiter: limiter}).Run(leaderboardCtx, app)
+	}()
+	cwlStatisticsDone := make(chan error, 1)
+	go func() { cwlStatisticsDone <- d.runCWLSeasonStatisticsLoop(leaderboardCtx, app) }()
+	leagueCloseoutDone := make(chan error, 1)
+	go func() { leagueCloseoutDone <- d.runLeagueCloseoutLoop(leaderboardCtx, app) }()
+	defer func() {
+		stopLeaderboards()
+		<-leaderboardDone
+		<-cwlStatisticsDone
+		<-leagueCloseoutDone
+	}()
+
+	interval := time.Duration(app.Config.ScheduledIntervalSeconds) * time.Second
+	for {
+		start := time.Now()
+		err = d.runCycle(ctx, app)
+		app.Stats.RecordProcess(scheduledDomainName, time.Since(start))
+		if err != nil {
+			app.Stats.SetReady(scheduledDomainName, false, err.Error())
+		}
+		timer := time.NewTimer(interval)
+		select {
+		case err := <-leaderboardDone:
+			if !timer.Stop() {
+				<-timer.C
+			}
+			stopLeaderboards()
+			leaderboardDone <- err
+			return fmt.Errorf("scheduled leaderboard refresh stopped: %w", err)
+		case err := <-cwlStatisticsDone:
+			if !timer.Stop() {
+				<-timer.C
+			}
+			stopLeaderboards()
+			cwlStatisticsDone <- err
+			return fmt.Errorf("scheduled CWL season statistics refresh stopped: %w", err)
+		case err := <-leagueCloseoutDone:
+			if !timer.Stop() {
+				<-timer.C
+			}
+			stopLeaderboards()
+			leagueCloseoutDone <- err
+			return fmt.Errorf("scheduled league closeout stopped: %w", err)
+		case <-ctx.Done():
+			if !timer.Stop() {
+				<-timer.C
+			}
+			return ctx.Err()
+		case <-timer.C:
+		}
+	}
+}
+
+func (d *scheduledDomain) runCWLSeasonStatisticsLoop(ctx context.Context, app *platform.App) error {
+	for {
+		started := time.Now()
+		if err := d.store.ReconcileCWLSeasonStatistics(ctx, cwlstats.CurrentAndPreviousUTC(started)); err != nil {
+			return err
+		}
+		app.Stats.RecordProcess(trackingProgressName(scheduledDomainName, "cwl-season-statistics"), time.Since(started))
+		timer := time.NewTimer(cwlSeasonStatisticsInterval)
+		select {
+		case <-ctx.Done():
+			if !timer.Stop() {
+				<-timer.C
+			}
+			return ctx.Err()
+		case <-timer.C:
+		}
+	}
+}
+
+func (d *scheduledDomain) runLeagueCloseoutLoop(ctx context.Context, app *platform.App) error {
+	for {
+		now := time.Now().UTC()
+		day := latestEligibleLegendDay(now)
+		started := time.Now()
+		writes, err := d.store.FinalizeLegendDay(ctx, day)
+		if err != nil {
+			return err
+		}
+		familyWrites, err := d.store.FinalizeArmyFamilies(ctx, day, app.Config)
+		if err != nil {
+			return err
+		}
+		app.Stats.RecordWrite(trackingProgressName(scheduledDomainName, "legend-closeout"), writes)
+		app.Stats.RecordWrite(trackingProgressName(scheduledDomainName, "army-family-closeout"), familyWrites)
+		app.Stats.RecordProcess(trackingProgressName(scheduledDomainName, "league-closeout"), time.Since(started))
+		if rankedCloseoutDue(now) {
+			rankedWrites, err := d.doRankedGroupDiscovery(ctx, app, now)
+			if err != nil {
+				return err
+			}
+			app.Stats.RecordWrite(trackingProgressName(scheduledDomainName, "ranked-closeout"), rankedWrites)
+		}
+		timer := time.NewTimer(time.Until(nextLeagueCloseout(now)))
+		select {
+		case <-ctx.Done():
+			if !timer.Stop() {
+				<-timer.C
+			}
+			return ctx.Err()
+		case <-timer.C:
+		}
+	}
+}
+
+func validateScheduledConfig(cfg platform.Config) error {
+	if cfg.ScheduledRequestsPerSecond <= 0 {
+		return errors.New("scheduled.requests_per_second must be greater than zero")
+	}
+	if cfg.ScheduledIntervalSeconds <= 0 {
+		return errors.New("scheduled.interval_seconds must be greater than zero")
+	}
+	if !cfg.DryRun && !cfg.MockDB && cfg.TimescaleURL == "" {
+		return errors.New("TIMESCALE_* connection variables are required for scheduled")
+	}
+	return nil
+}
+
+func newScheduledStore(ctx context.Context, app *platform.App) (scheduledStore, error) {
+	if app.Config.MockDB || app.Config.DryRun || app.Config.TimescaleURL == "" {
+		return newMemoryScheduledStore(), nil
+	}
+	return newTimescaleScheduledStore(ctx, app.Config.TimescaleURL)
+}
+
+func (d *scheduledDomain) runCycle(ctx context.Context, app *platform.App) error {
+	locationIDs, err := d.loadLeaderboardLocationIDs(ctx, app)
+	if err != nil {
+		return err
+	}
+	now := time.Now().UTC()
+	var cycleErrors []error
+	historyGroups, historyFetchErr := d.doLeaderboardHistory(ctx, app, locationIDs, now)
+	if historyWrites, err := d.store.ReplaceLeaderboardHistory(ctx, historyGroups); err != nil {
+		cycleErrors = append(cycleErrors, err)
+	} else {
+		app.Stats.RecordWrite(scheduledDomainName, historyWrites)
+	}
+	if historyFetchErr != nil {
+		cycleErrors = append(cycleErrors, historyFetchErr)
+	}
+	legendWrites, err := d.doLegendHistory(ctx, app, now)
+	app.Stats.RecordWrite(scheduledDomainName, legendWrites)
+	if err != nil {
+		cycleErrors = append(cycleErrors, err)
+	}
+	currentRankingWrites, err := d.doCurrentClanRankings(ctx, app, locationIDs, now)
+	app.Stats.RecordWrite(scheduledDomainName, currentRankingWrites)
+	if err != nil {
+		cycleErrors = append(cycleErrors, err)
+	}
+	if err := errors.Join(cycleErrors...); err != nil {
+		return err
+	}
+	app.Stats.SetReady(scheduledDomainName, true, "")
+	return nil
+}
+
+func latestEligibleLegendDay(now time.Time) time.Time {
+	now = now.UTC()
+	today := time.Date(now.Year(), now.Month(), now.Day(), 0, 0, 0, 0, time.UTC)
+	if now.Before(today.Add(5*time.Hour + 10*time.Minute)) {
+		return today.AddDate(0, 0, -2)
+	}
+	return today.AddDate(0, 0, -1)
+}
+
+func nextLeagueCloseout(now time.Time) time.Time {
+	now = now.UTC()
+	next := time.Date(now.Year(), now.Month(), now.Day(), 5, 10, 0, 0, time.UTC)
+	if !next.After(now) {
+		next = next.AddDate(0, 0, 1)
+	}
+	return next
+}
+
+func rankedCloseoutDue(now time.Time) bool {
+	now = now.UTC()
+	return now.Weekday() == time.Monday && !now.Before(time.Date(now.Year(), now.Month(), now.Day(), 5, 10, 0, 0, time.UTC))
+}
+
+func (d *scheduledDomain) doRankedGroupDiscovery(ctx context.Context, app *platform.App, _ time.Time) (int, error) {
+	targets, err := d.store.ListRankedGroupTargets(ctx, 0)
+	if err != nil {
+		return 0, err
+	}
+	writes := 0
+	seenGroups := make(map[string]struct{})
+	seasons := make(map[int64]struct{})
+	for _, tag := range targets {
+		player, ok, err := d.fetchRankedSeedPlayer(ctx, app, tag)
+		if err != nil {
+			return writes, err
+		}
+		if !ok {
+			continue
+		}
+		affected, err := d.store.StorePlayerProfiles(ctx, []models.PlayerProfileIngest{utils.PlayerProfileFromClashy(*player)})
+		if err != nil {
+			return writes, err
+		}
+		writes += affected
+		seasonID := int64(player.PreviousLeagueSeasonID)
+		groupTag := clashy.CorrectTag(player.PreviousLeagueGroupTag)
+		if seasonID <= 0 || groupTag == "" || groupTag == "#0" {
+			continue
+		}
+		key := strconv.FormatInt(seasonID, 10) + "\x00" + groupTag
+		if _, seen := seenGroups[key]; seen {
+			continue
+		}
+		leagueHistory, found, err := d.matchingLeagueHistory(ctx, app, player.Tag, seasonID)
+		if err != nil {
+			return writes, err
+		}
+		if !found {
+			continue
+		}
+		members, err := d.fetchRankedGroupMembers(ctx, app, player.Tag, groupTag, seasonID, leagueHistory.LeagueTierID, leagueHistory.MaxBattles)
+		if err != nil {
+			return writes, err
+		}
+		seenGroups[key] = struct{}{}
+		seasons[seasonID] = struct{}{}
+		affected, err = d.store.StoreRankedLeagueGroup(ctx, members)
+		if err != nil {
+			return writes, err
+		}
+		writes += affected
+	}
+	seasonIDs := make([]int64, 0, len(seasons))
+	for seasonID := range seasons {
+		seasonIDs = append(seasonIDs, seasonID)
+	}
+	sort.Slice(seasonIDs, func(i, j int) bool { return seasonIDs[i] < seasonIDs[j] })
+	for _, seasonID := range seasonIDs {
+		missingWrites, err := d.fetchAndStoreMissingRankedPlayers(ctx, app, seasonID, time.Time{})
+		if err != nil {
+			return writes, err
+		}
+		writes += missingWrites
+		finalized, err := d.store.FinalizeRankedTournament(ctx, seasonID)
+		if err != nil {
+			return writes, err
+		}
+		writes += finalized
+	}
+	return writes, nil
+}
+
+func (d *scheduledDomain) fetchRankedSeedPlayer(ctx context.Context, app *platform.App, tag string) (*clashy.Player, bool, error) {
+	player, err := retryLimitedClashFetch(ctx, app, d.limiter, func(fetchCtx context.Context) (*clashy.Player, error) {
+		start := time.Now()
+		player, err := app.Clash.GetPlayer(fetchCtx, tag)
+		app.Stats.RecordRequest(scheduledDomainName, time.Since(start), err)
+		return player, err
+	})
+	if isClashNotFound(err) {
+		if err := d.store.DeletePlayers(ctx, []string{tag}); err != nil {
+			return nil, false, err
+		}
+		return nil, false, nil
+	}
+	if err != nil {
+		return nil, false, err
+	}
+	return player, true, nil
+}
+
+func (d *scheduledDomain) matchingLeagueHistory(ctx context.Context, app *platform.App, tag string, seasonID int64) (clashy.LeagueHistoryEntry, bool, error) {
+	entries, err := retryLimitedClashFetch(ctx, app, d.limiter, func(fetchCtx context.Context) ([]clashy.LeagueHistoryEntry, error) {
+		start := time.Now()
+		entries, err := app.Clash.GetPlayerLeagueHistory(fetchCtx, tag)
+		app.Stats.RecordRequest(scheduledDomainName, time.Since(start), err)
+		return entries, err
+	})
+	if err != nil {
+		return clashy.LeagueHistoryEntry{}, false, err
+	}
+	for _, entry := range entries {
+		if int64(entry.LeagueSeasonID) == seasonID && entry.LeagueTierID > 0 && entry.MaxBattles > 0 {
+			return entry, true, nil
+		}
+	}
+	return clashy.LeagueHistoryEntry{}, false, nil
+}
+
+func (d *scheduledDomain) fetchRankedGroupMembers(ctx context.Context, app *platform.App, seedTag, groupTag string, seasonID int64, leagueTierID, maximumBattles int) ([]models.RankedLeagueGroupMemberRow, error) {
+	group, err := retryLimitedClashFetch(ctx, app, d.limiter, func(fetchCtx context.Context) (*clashy.LeagueTierGroup, error) {
+		start := time.Now()
+		group, err := app.Clash.GetPlayerLeagueGroup(fetchCtx, seedTag, groupTag, strconv.FormatInt(seasonID, 10))
+		app.Stats.RecordRequest(scheduledDomainName, time.Since(start), err)
+		return group, err
+	})
+	if err != nil {
+		return nil, err
+	}
+	return rankedGroupMemberRows(groupTag, seasonID, leagueTierID, maximumBattles, group)
+}
+
+func rankedGroupMemberRows(groupTag string, seasonID int64, leagueTierID, maximumBattles int, group *clashy.LeagueTierGroup) ([]models.RankedLeagueGroupMemberRow, error) {
+	if group == nil {
+		return nil, nil
+	}
+	rows := make([]models.RankedLeagueGroupMemberRow, 0, len(group.Members))
+	for i, member := range group.Members {
+		if member.PlayerTag == "" {
+			continue
+		}
+		playerTag := clashy.CorrectTag(member.PlayerTag)
+		if playerTag == "" {
+			continue
+		}
+		rows = append(rows, models.RankedLeagueGroupMemberRow{
+			SeasonID:           seasonID,
+			GroupTag:           groupTag,
+			LeagueTierID:       leagueTierID,
+			PlayerTag:          playerTag,
+			PlayerName:         member.PlayerName,
+			Placement:          i + 1,
+			LeagueTrophies:     member.LeagueTrophies,
+			MaximumBattleCount: maximumBattles,
+			AttackWinCount:     member.AttackWinCount,
+			AttackLossCount:    member.AttackLoseCount,
+			DefenseWinCount:    member.DefenseWinCount,
+			DefenseLossCount:   member.DefenseLoseCount,
+		})
+	}
+	return rows, nil
+}
+
+func (d *scheduledDomain) fetchAndStoreMissingRankedPlayers(ctx context.Context, app *platform.App, seasonID int64, _ time.Time) (int, error) {
+	tags, err := d.store.MissingRankedGroupPlayers(ctx, seasonID)
+	if err != nil {
+		return 0, err
+	}
+	writes := 0
+	profiles := make([]models.PlayerProfileIngest, 0, 500)
+	flush := func() error {
+		if len(profiles) == 0 {
+			return nil
+		}
+		affected, err := d.store.StorePlayerProfiles(ctx, profiles)
+		if err != nil {
+			return err
+		}
+		writes += affected
+		profiles = profiles[:0]
+		return nil
+	}
+	for _, tag := range tags {
+		player, ok, err := d.fetchRankedSeedPlayer(ctx, app, tag)
+		if err != nil {
+			return writes, err
+		}
+		if !ok {
+			continue
+		}
+		profiles = append(profiles, utils.PlayerProfileFromClashy(*player))
+		if len(profiles) >= 500 {
+			if err := flush(); err != nil {
+				return writes, err
+			}
+		}
+	}
+	return writes, flush()
+}
+
+func (d *scheduledDomain) loadLeaderboardLocationIDs(
+	ctx context.Context,
+	app *platform.App,
+) ([]string, error) {
+	locations, err := retryLimitedClashFetch(ctx, app, d.limiter, func(fetchCtx context.Context) ([]clashy.Location, error) {
+		start := time.Now()
+		locations, err := app.Clash.SearchLocations(fetchCtx, clashy.PageOptions{})
+		app.Stats.RecordRequest(scheduledDomainName, time.Since(start), err)
+		return locations, err
+	})
+	if err != nil {
+		return nil, err
+	}
+	return leaderboardLocationIDs(locations), nil
+}
+
+func (d *scheduledDomain) doLeaderboardHistory(
+	ctx context.Context,
+	app *platform.App,
+	locationIDs []string,
+	now time.Time,
+) ([]leaderboardHistoryGroup, error) {
+	date := dayStart(now)
+	groups := make([]leaderboardHistoryGroup, 0, len(leaderboardHistoryPaths)*len(locationIDs))
+	var groupErrors []error
+	for _, locationID := range locationIDs {
+		for _, path := range leaderboardHistoryPaths {
+			if !shouldStoreLeaderboardHistoryKind(path.Kind, now) {
+				continue
+			}
+			payload, err := retryLimitedClashFetch(ctx, app, d.limiter, func(fetchCtx context.Context) (any, error) {
+				start := time.Now()
+				payload, err := path.Load(fetchCtx, app.Clash, locationID)
+				app.Stats.RecordRequest(scheduledDomainName, time.Since(start), err)
+				return payload, err
+			})
+			if err != nil {
+				groupErrors = append(
+					groupErrors,
+					fmt.Errorf("fetch %s leaderboard history for %s: %w", path.Kind, locationID, err),
+				)
+				continue
+			}
+			group, err := leaderboardHistoryGroupFromResponse(path.Kind, locationID, date, payload)
+			if err != nil {
+				groupErrors = append(groupErrors, err)
+				continue
+			}
+			groups = append(groups, group)
+		}
+	}
+	return groups, errors.Join(groupErrors...)
+}
+
+func shouldStoreLeaderboardHistoryKind(kind string, now time.Time) bool {
+	if kind != leaderboardHistoryClanCapitalPoints {
+		return true
+	}
+	return now.UTC().Weekday() == time.Tuesday
+}
+
+func (d *scheduledDomain) doLegendHistory(
+	ctx context.Context,
+	app *platform.App,
+	now time.Time,
+) (int, error) {
+	completed, err := d.store.CompletedLegendSeasons(ctx)
+	if err != nil {
+		return 0, err
+	}
+	loadSeasons := d.loadLegendSeasons
+	var officialSeasons []string
+	if loadSeasons == nil {
+		officialSeasons, err = loadOfficialLegendSeasons(ctx, app, d.limiter)
+	} else {
+		officialSeasons, err = loadSeasons(ctx, app)
+	}
+	if err != nil {
+		return 0, err
+	}
+	missing, err := missingCompletedLegendSeasons(officialSeasons, completed, now)
+	if err != nil {
+		return 0, err
+	}
+	loadRankings := d.loadLegendRankings
+	writes := 0
+	var seasonErrors []error
+	for _, season := range missing {
+		var rankings []legendRankingItem
+		if loadRankings == nil {
+			rankings, err = loadOfficialLegendSeasonRankings(ctx, app, d.limiter, season)
+		} else {
+			rankings, err = loadRankings(ctx, app, season)
+		}
+		if err != nil {
+			seasonErrors = append(seasonErrors, fmt.Errorf("fetch legend season %s: %w", season, err))
+			continue
+		}
+		rows, err := legendHistoryRows(season, rankings)
+		if err != nil {
+			seasonErrors = append(seasonErrors, err)
+			continue
+		}
+		affected, err := d.store.ReplaceLegendSeason(ctx, season, rows)
+		if err != nil {
+			seasonErrors = append(seasonErrors, fmt.Errorf("store legend season %s: %w", season, err))
+			continue
+		}
+		writes += affected
+	}
+	return writes, errors.Join(seasonErrors...)
+}
+
+func loadOfficialLegendSeasons(ctx context.Context, app *platform.App, limiter *clashy.Limiter) ([]string, error) {
+	return retryLimitedClashFetch(ctx, app, limiter, func(fetchCtx context.Context) ([]string, error) {
+		start := time.Now()
+		seasons, err := app.Clash.GetSeasons(fetchCtx, legendLeagueID)
+		app.Stats.RecordRequest(scheduledDomainName, time.Since(start), err)
+		return seasons, err
+	})
+}
+
+func loadOfficialLegendSeasonRankings(
+	ctx context.Context,
+	app *platform.App,
+	limiter *clashy.Limiter,
+	season string,
+) ([]legendRankingItem, error) {
+	return fetchAllLegendSeasonRankingPages(ctx, app, limiter, season)
+}
+
+func fetchAllLegendSeasonRankingPages(
+	ctx context.Context,
+	app *platform.App,
+	limiter *clashy.Limiter,
+	season string,
+) ([]legendRankingItem, error) {
+	if _, err := officialLegendSeasonWindow(season); err != nil {
+		return nil, err
+	}
+	cfg := clashy.DefaultClientConfig()
+	cfg.BaseURL = strings.TrimRight(app.Config.ProxyURL, "/")
+	cfg.LookupCache = false
+	cfg.UpdateCache = false
+	httpClient := clashy.NewHTTPClient(cfg)
+	defer httpClient.CloseIdleConnections()
+
+	return collectLegendSeasonRankingPages(season, func(after string) ([]legendRankingItem, string, error) {
+		endpoint := legendSeasonRankingPageURL(cfg.BaseURL, season, after)
+		start := time.Now()
+		body, err := retryLimitedClashFetch(ctx, app, limiter, func(fetchCtx context.Context) ([]byte, error) {
+			response, err := httpClient.Do(fetchCtx, http.MethodGet, endpoint, nil, clashy.RequestOptions{SkipAuth: true})
+			if err != nil {
+				return nil, err
+			}
+			return response.Body, nil
+		})
+		app.Stats.RecordRequest(scheduledDomainName, time.Since(start), err)
+		if err != nil {
+			return nil, "", err
+		}
+		var page struct {
+			Items  []clashy.RankedPlayer `json:"items"`
+			Paging struct {
+				Cursors struct {
+					After string `json:"after"`
+				} `json:"cursors"`
+			} `json:"paging"`
+		}
+		if err := json.Unmarshal(body, &page); err != nil {
+			return nil, "", err
+		}
+		items := make([]legendRankingItem, 0, len(page.Items))
+		for _, player := range page.Items {
+			items = append(items, legendRankingItem{Player: player})
+		}
+		return items, page.Paging.Cursors.After, nil
+	})
+}
+
+func collectLegendSeasonRankingPages(
+	season string,
+	fetch func(after string) ([]legendRankingItem, string, error),
+) ([]legendRankingItem, error) {
+	rankings := make([]legendRankingItem, 0, legendSeasonPageSize)
+	after := ""
+	seenCursors := make(map[string]struct{})
+	for {
+		items, next, err := fetch(after)
+		if err != nil {
+			return nil, err
+		}
+		rankings = append(rankings, items...)
+		if next == "" {
+			return rankings, nil
+		}
+		if len(items) == 0 {
+			return nil, fmt.Errorf("legend season %s returned an empty page with continuation cursor", season)
+		}
+		if _, duplicate := seenCursors[next]; duplicate {
+			return nil, fmt.Errorf("legend season %s repeated pagination cursor %q", season, next)
+		}
+		seenCursors[next] = struct{}{}
+		after = next
+	}
+}
+
+func legendSeasonRankingPageURL(baseURL, season, after string) string {
+	query := url.Values{}
+	query.Set("limit", strconv.Itoa(legendSeasonPageSize))
+	if after != "" {
+		query.Set("after", after)
+	}
+	return fmt.Sprintf(
+		"%s/leagues/%d/seasons/%s?%s",
+		strings.TrimRight(baseURL, "/"),
+		legendLeagueID,
+		url.PathEscape(season),
+		query.Encode(),
+	)
+}
+
+func missingCompletedLegendSeasons(
+	official []string,
+	completed map[string]struct{},
+	now time.Time,
+) ([]string, error) {
+	now = now.UTC()
+	missing := make([]string, 0, len(official))
+	seen := make(map[string]struct{}, len(official))
+	for _, season := range official {
+		window, err := officialLegendSeasonWindow(season)
+		if err != nil {
+			return nil, err
+		}
+		if _, duplicate := seen[season]; duplicate {
+			continue
+		}
+		seen[season] = struct{}{}
+		if window.EndTime.After(now) {
+			continue
+		}
+		if _, exists := completed[season]; !exists {
+			missing = append(missing, season)
+		}
+	}
+	return missing, nil
+}
+
+func officialLegendSeasonWindow(season string) (clashy.SeasonWindow, error) {
+	if strings.HasPrefix(season, legendSeasonV2Prefix) {
+		rawEnd := strings.TrimPrefix(season, legendSeasonV2Prefix)
+		end, err := time.Parse(time.RFC3339, rawEnd)
+		if err != nil || end.Format(time.RFC3339) != rawEnd {
+			return clashy.SeasonWindow{}, fmt.Errorf("invalid official legend season %q", season)
+		}
+		end = end.UTC()
+		return clashy.SeasonWindow{
+			SeasonID:  season,
+			StartTime: end.Add(-legendSeasonV2Length),
+			EndTime:   end,
+		}, nil
+	}
+	if len(season) != len("2006-01") {
+		return clashy.SeasonWindow{}, fmt.Errorf("invalid official legend season %q", season)
+	}
+	parsed, err := time.Parse("2006-01", season)
+	if err != nil || parsed.Format("2006-01") != season {
+		return clashy.SeasonWindow{}, fmt.Errorf("invalid official legend season %q", season)
+	}
+	window, err := clashy.GetSeasonByID(season)
+	if err != nil {
+		return clashy.SeasonWindow{}, fmt.Errorf("invalid official legend season %q: %w", season, err)
+	}
+	return window, nil
+}
+
+func legendHistoryRows(season string, rankings []legendRankingItem) ([]models.LegendHistoryRow, error) {
+	if _, err := officialLegendSeasonWindow(season); err != nil {
+		return nil, err
+	}
+	if len(rankings) == 0 {
+		return nil, fmt.Errorf("legend season %s returned no final rankings", season)
+	}
+	rows := make([]models.LegendHistoryRow, 0, len(rankings))
+	seenTags := make(map[string]struct{}, len(rankings))
+	seenRanks := make(map[int]struct{}, len(rankings))
+	for _, item := range rankings {
+		ranking := item.Player
+		if ranking.Tag == "" ||
+			strings.TrimSpace(ranking.Name) == "" ||
+			ranking.ExpLevel < 0 ||
+			ranking.Rank <= 0 ||
+			ranking.Trophies < 0 ||
+			ranking.AttackWins < 0 ||
+			ranking.DefenseWins < 0 {
+			return nil, fmt.Errorf(
+				"invalid legend season %s row: tag %q name %q rank %d trophies %d",
+				season,
+				ranking.Tag,
+				ranking.Name,
+				ranking.Rank,
+				ranking.Trophies,
+			)
+		}
+		if _, duplicate := seenTags[ranking.Tag]; duplicate {
+			return nil, fmt.Errorf("duplicate legend season %s player %s", season, ranking.Tag)
+		}
+		if _, duplicate := seenRanks[ranking.Rank]; duplicate {
+			return nil, fmt.Errorf("duplicate legend season %s rank %d", season, ranking.Rank)
+		}
+		row := models.LegendHistoryRow{
+			Season:       season,
+			PlayerTag:    ranking.Tag,
+			PlayerName:   ranking.Name,
+			ExpLevel:     ranking.ExpLevel,
+			Trophies:     ranking.Trophies,
+			AttackWins:   ranking.AttackWins,
+			DefenseWins:  ranking.DefenseWins,
+			Rank:         ranking.Rank,
+			LeagueTierID: nil,
+		}
+		if ranking.Clan != nil {
+			token := badgeToken(ranking.Clan.Badge)
+			if strings.TrimSpace(ranking.Clan.Tag) == "" ||
+				strings.TrimSpace(ranking.Clan.Name) == "" ||
+				token == "" {
+				return nil, fmt.Errorf(
+					"invalid legend season %s player %s clan snapshot",
+					season,
+					ranking.Tag,
+				)
+			}
+			clanTag := ranking.Clan.Tag
+			clanName := ranking.Clan.Name
+			row.ClanTag = &clanTag
+			row.ClanName = &clanName
+			row.ClanBadgeToken = &token
+		}
+		if ranking.LeagueTier.ID > 0 {
+			leagueTierID := ranking.LeagueTier.ID
+			row.LeagueTierID = &leagueTierID
+		} else if ranking.LeagueTier.ID < 0 {
+			return nil, fmt.Errorf(
+				"invalid legend season %s player %s league tier %d",
+				season,
+				ranking.Tag,
+				ranking.LeagueTier.ID,
+			)
+		}
+		seenTags[ranking.Tag] = struct{}{}
+		seenRanks[ranking.Rank] = struct{}{}
+		rows = append(rows, row)
+	}
+	for rank := 1; rank <= len(rows); rank++ {
+		if _, exists := seenRanks[rank]; !exists {
+			return nil, fmt.Errorf("incomplete legend season %s rankings: missing rank %d", season, rank)
+		}
+	}
+	return rows, nil
+}
+
+func (d *scheduledDomain) doCurrentClanRankings(
+	ctx context.Context,
+	app *platform.App,
+	locationIDs []string,
+	updatedAt time.Time,
+) (int, error) {
+	writes := 0
+	var groupErrors []error
+	for _, locationID := range locationIDs {
+		for _, path := range currentClanRankingPaths {
+			rankings, err := retryLimitedClashFetch(ctx, app, d.limiter, func(fetchCtx context.Context) ([]clashy.RankedClan, error) {
+				start := time.Now()
+				rankings, err := path.Load(fetchCtx, app.Clash, locationID, clashy.PageOptions{Limit: currentClanRankingLimit})
+				app.Stats.RecordRequest(scheduledDomainName, time.Since(start), err)
+				return rankings, err
+			})
+			if err != nil {
+				groupErrors = append(groupErrors, fmt.Errorf("fetch %s clan rankings for %s: %w", path.RankingType, locationID, err))
+				continue
+			}
+			group, err := currentClanRankingGroupFromResponse(
+				path.RankingType,
+				locationID,
+				rankings,
+				path.Points,
+				updatedAt,
+			)
+			if err != nil {
+				groupErrors = append(groupErrors, err)
+				continue
+			}
+			count, err := d.store.ReplaceCurrentClanRankingGroup(ctx, group)
+			if err != nil {
+				groupErrors = append(groupErrors, fmt.Errorf("replace %s clan rankings for %s: %w", path.RankingType, locationID, err))
+				continue
+			}
+			writes += count
+		}
+	}
+	return writes, errors.Join(groupErrors...)
+}
+
+func currentClanRankingGroupFromResponse(
+	rankingType string,
+	locationID string,
+	rankings []clashy.RankedClan,
+	points func(clashy.RankedClan) int,
+	updatedAt time.Time,
+) (currentClanRankingGroup, error) {
+	group := currentClanRankingGroup{
+		RankingType: rankingType,
+		LocationID:  locationID,
+		Rows:        make([]currentClanRankingRow, 0, len(rankings)),
+	}
+	if !validCurrentClanRankingType(rankingType) {
+		return currentClanRankingGroup{}, fmt.Errorf("unsupported clan ranking type %q", rankingType)
+	}
+	if locationID != "global" {
+		if _, err := strconv.Atoi(locationID); err != nil {
+			return currentClanRankingGroup{}, fmt.Errorf("invalid clan ranking location %q", locationID)
+		}
+	}
+	if len(rankings) > currentClanRankingLimit {
+		return currentClanRankingGroup{}, fmt.Errorf(
+			"oversized %s clan rankings for %s: got %d rows, limit %d",
+			rankingType,
+			locationID,
+			len(rankings),
+			currentClanRankingLimit,
+		)
+	}
+	seenTags := make(map[string]struct{}, len(rankings))
+	seenRanks := make(map[int]struct{}, len(rankings))
+	for _, ranking := range rankings {
+		score := points(ranking)
+		if ranking.Tag == "" || ranking.Rank < 1 || ranking.Rank > currentClanRankingLimit || score < 0 {
+			return currentClanRankingGroup{}, fmt.Errorf(
+				"incomplete %s clan ranking row for %s: tag %q rank %d points %d",
+				rankingType,
+				locationID,
+				ranking.Tag,
+				ranking.Rank,
+				score,
+			)
+		}
+		if _, ok := seenTags[ranking.Tag]; ok {
+			return currentClanRankingGroup{}, fmt.Errorf("duplicate clan %s in %s rankings for %s", ranking.Tag, rankingType, locationID)
+		}
+		if _, ok := seenRanks[ranking.Rank]; ok {
+			return currentClanRankingGroup{}, fmt.Errorf("duplicate rank %d in %s rankings for %s", ranking.Rank, rankingType, locationID)
+		}
+		seenTags[ranking.Tag] = struct{}{}
+		seenRanks[ranking.Rank] = struct{}{}
+		group.Rows = append(group.Rows, currentClanRankingRow{
+			ClanTag:   ranking.Tag,
+			Rank:      ranking.Rank,
+			Points:    score,
+			UpdatedAt: updatedAt.UTC(),
+		})
+	}
+	return group, nil
+}
+
+func validCurrentClanRankingType(value string) bool {
+	switch value {
+	case "home", "builder_base", "capital":
+		return true
+	default:
+		return false
+	}
+}
+
+func dayStart(value time.Time) time.Time {
+	return time.Date(value.Year(), value.Month(), value.Day(), 0, 0, 0, 0, time.UTC)
+}
+
+func leaderboardLocationIDs(locations []clashy.Location) []string {
+	out := make([]string, 0, len(locations)+1)
+	seen := make(map[int]struct{}, len(locations))
+	for _, location := range locations {
+		if location.ID == 0 {
+			continue
+		}
+		if _, ok := seen[location.ID]; ok {
+			continue
+		}
+		seen[location.ID] = struct{}{}
+		out = append(out, strconv.Itoa(location.ID))
+	}
+	return append(out, "global")
+}
+
+func leaderboardHistoryGroupFromResponse(
+	kind string,
+	locationID string,
+	date time.Time,
+	payload any,
+) (leaderboardHistoryGroup, error) {
+	group := leaderboardHistoryGroup{
+		Kind:       kind,
+		LocationID: locationID,
+		Date:       dayStart(date),
+	}
+	if !validLeaderboardHistoryKind(kind) {
+		return leaderboardHistoryGroup{}, fmt.Errorf("unsupported leaderboard history kind %q", kind)
+	}
+	if locationID != "global" {
+		location, err := strconv.Atoi(locationID)
+		if err != nil || location <= 0 {
+			return leaderboardHistoryGroup{}, fmt.Errorf("invalid leaderboard history location %q", locationID)
+		}
+	}
+
+	switch kind {
+	case leaderboardHistoryPlayerHomeTrophies:
+		items, ok := payload.([]clashy.RankedPlayer)
+		if !ok {
+			return leaderboardHistoryGroup{}, fmt.Errorf("player leaderboard history kind %q returned %T", kind, payload)
+		}
+		rows := make([]models.PlayerTrophyHistoryRow, 0, len(items))
+		for _, item := range items {
+			row, err := playerTrophyHistoryRow(locationID, group.Date, item)
+			if err != nil {
+				return leaderboardHistoryGroup{}, err
+			}
+			rows = append(rows, row)
+		}
+		group.Rows = rows
+	case leaderboardHistoryPlayerBuilderBaseTrophies:
+		items, ok := payload.([]clashy.RankedPlayer)
+		if !ok {
+			return leaderboardHistoryGroup{}, fmt.Errorf("player leaderboard history kind %q returned %T", kind, payload)
+		}
+		rows := make([]models.PlayerBuilderBaseTrophyHistoryRow, 0, len(items))
+		for _, item := range items {
+			row, err := playerBuilderBaseTrophyHistoryRow(locationID, group.Date, item)
+			if err != nil {
+				return leaderboardHistoryGroup{}, err
+			}
+			rows = append(rows, row)
+		}
+		group.Rows = rows
+	case leaderboardHistoryClanHomePoints:
+		items, ok := payload.([]clashy.RankedClan)
+		if !ok {
+			return leaderboardHistoryGroup{}, fmt.Errorf("clan leaderboard history kind %q returned %T", kind, payload)
+		}
+		rows := make([]models.ClanTrophyHistoryRow, 0, len(items))
+		for _, item := range items {
+			row, err := clanTrophyHistoryRow(locationID, group.Date, item)
+			if err != nil {
+				return leaderboardHistoryGroup{}, err
+			}
+			rows = append(rows, row)
+		}
+		group.Rows = rows
+	case leaderboardHistoryClanBuilderBasePoints:
+		items, ok := payload.([]clashy.RankedClan)
+		if !ok {
+			return leaderboardHistoryGroup{}, fmt.Errorf("clan leaderboard history kind %q returned %T", kind, payload)
+		}
+		rows := make([]models.ClanBuilderBaseTrophyHistoryRow, 0, len(items))
+		for _, item := range items {
+			row, err := clanBuilderBaseTrophyHistoryRow(locationID, group.Date, item)
+			if err != nil {
+				return leaderboardHistoryGroup{}, err
+			}
+			rows = append(rows, row)
+		}
+		group.Rows = rows
+	case leaderboardHistoryClanCapitalPoints:
+		items, ok := payload.([]clashy.RankedClan)
+		if !ok {
+			return leaderboardHistoryGroup{}, fmt.Errorf("clan leaderboard history kind %q returned %T", kind, payload)
+		}
+		rows := make([]models.ClanCapitalHistoryRow, 0, len(items))
+		for _, item := range items {
+			row, err := clanCapitalHistoryRow(locationID, group.Date, item)
+			if err != nil {
+				return leaderboardHistoryGroup{}, err
+			}
+			rows = append(rows, row)
+		}
+		group.Rows = rows
+	}
+	return group, nil
+}
+
+func playerTrophyHistoryRow(
+	locationID string,
+	date time.Time,
+	item clashy.RankedPlayer,
+) (models.PlayerTrophyHistoryRow, error) {
+	clanTag, clanName, clanBadgeToken, err := leaderboardPlayerClan(item.Clan)
+	if err != nil {
+		return models.PlayerTrophyHistoryRow{}, fmt.Errorf("player trophy history %s: %w", item.Tag, err)
+	}
+	previousRank, err := optionalHistoryPositiveInt(item.PreviousRank)
+	if err != nil {
+		return models.PlayerTrophyHistoryRow{}, fmt.Errorf("player trophy history %s previous rank: %w", item.Tag, err)
+	}
+	leagueIDValue := item.LeagueTier.ID
+	if leagueIDValue <= 0 {
+		leagueIDValue = item.League.ID
+	}
+	leagueID, err := optionalHistoryPositiveInt(leagueIDValue)
+	if err != nil {
+		return models.PlayerTrophyHistoryRow{}, fmt.Errorf("player trophy history %s league: %w", item.Tag, err)
+	}
+	row := models.PlayerTrophyHistoryRow{
+		LocationID:     locationID,
+		Date:           date,
+		PlayerTag:      item.Tag,
+		PlayerName:     item.Name,
+		ExpLevel:       item.ExpLevel,
+		Trophies:       item.Trophies,
+		AttackWins:     item.AttackWins,
+		DefenseWins:    item.DefenseWins,
+		Rank:           item.Rank,
+		PreviousRank:   previousRank,
+		ClanTag:        clanTag,
+		ClanName:       clanName,
+		ClanBadgeToken: clanBadgeToken,
+		LeagueID:       leagueID,
+	}
+	if err := validatePlayerTrophyHistoryRow(row); err != nil {
+		return models.PlayerTrophyHistoryRow{}, err
+	}
+	return row, nil
+}
+
+func playerBuilderBaseTrophyHistoryRow(
+	locationID string,
+	date time.Time,
+	item clashy.RankedPlayer,
+) (models.PlayerBuilderBaseTrophyHistoryRow, error) {
+	clanTag, clanName, clanBadgeToken, err := leaderboardPlayerClan(item.Clan)
+	if err != nil {
+		return models.PlayerBuilderBaseTrophyHistoryRow{}, fmt.Errorf("builder base trophy history %s: %w", item.Tag, err)
+	}
+	previousRank, err := optionalHistoryPositiveInt(item.PreviousRank)
+	if err != nil {
+		return models.PlayerBuilderBaseTrophyHistoryRow{}, fmt.Errorf("builder base trophy history %s previous rank: %w", item.Tag, err)
+	}
+	var leagueID *int
+	if item.BuilderBaseLeague != nil {
+		leagueID, err = optionalHistoryPositiveInt(item.BuilderBaseLeague.ID)
+		if err != nil {
+			return models.PlayerBuilderBaseTrophyHistoryRow{}, fmt.Errorf("builder base trophy history %s league: %w", item.Tag, err)
+		}
+	}
+	builderBaseTrophies := item.BuilderBaseTrophies
+	if builderBaseTrophies == 0 && item.VersusTrophies > 0 {
+		builderBaseTrophies = item.VersusTrophies
+	}
+	builderBaseBattleWins, err := optionalHistoryPositiveInt(item.VersusAttackWins)
+	if err != nil {
+		return models.PlayerBuilderBaseTrophyHistoryRow{}, fmt.Errorf("builder base trophy history %s battle wins: %w", item.Tag, err)
+	}
+	row := models.PlayerBuilderBaseTrophyHistoryRow{
+		LocationID:            locationID,
+		Date:                  date,
+		PlayerTag:             item.Tag,
+		PlayerName:            item.Name,
+		ExpLevel:              item.ExpLevel,
+		BuilderBaseTrophies:   builderBaseTrophies,
+		BuilderBaseBattleWins: builderBaseBattleWins,
+		Rank:                  item.Rank,
+		PreviousRank:          previousRank,
+		ClanTag:               clanTag,
+		ClanName:              clanName,
+		ClanBadgeToken:        clanBadgeToken,
+		LeagueID:              leagueID,
+	}
+	if err := validatePlayerBuilderBaseTrophyHistoryRow(row); err != nil {
+		return models.PlayerBuilderBaseTrophyHistoryRow{}, err
+	}
+	return row, nil
+}
+
+func clanTrophyHistoryRow(
+	locationID string,
+	date time.Time,
+	item clashy.RankedClan,
+) (models.ClanTrophyHistoryRow, error) {
+	common, err := leaderboardClanHistoryValues(locationID, date, item)
+	if err != nil {
+		return models.ClanTrophyHistoryRow{}, err
+	}
+	row := models.ClanTrophyHistoryRow{
+		LocationID:     common.LocationID,
+		Date:           common.Date,
+		ClanTag:        common.ClanTag,
+		ClanName:       common.ClanName,
+		ClanBadgeToken: common.ClanBadgeToken,
+		ClanLevel:      common.ClanLevel,
+		ClanPoints:     item.Points,
+		Members:        common.Members,
+		ClanLocationID: common.ClanLocationID,
+		Rank:           common.Rank,
+		PreviousRank:   common.PreviousRank,
+	}
+	if err := validateClanTrophyHistoryRow(row); err != nil {
+		return models.ClanTrophyHistoryRow{}, err
+	}
+	return row, nil
+}
+
+func clanBuilderBaseTrophyHistoryRow(
+	locationID string,
+	date time.Time,
+	item clashy.RankedClan,
+) (models.ClanBuilderBaseTrophyHistoryRow, error) {
+	common, err := leaderboardClanHistoryValues(locationID, date, item)
+	if err != nil {
+		return models.ClanBuilderBaseTrophyHistoryRow{}, err
+	}
+	row := models.ClanBuilderBaseTrophyHistoryRow{
+		LocationID:        common.LocationID,
+		Date:              common.Date,
+		ClanTag:           common.ClanTag,
+		ClanName:          common.ClanName,
+		ClanBadgeToken:    common.ClanBadgeToken,
+		ClanLevel:         common.ClanLevel,
+		BuilderBasePoints: item.BuilderBasePoints,
+		Members:           common.Members,
+		ClanLocationID:    common.ClanLocationID,
+		Rank:              common.Rank,
+		PreviousRank:      common.PreviousRank,
+	}
+	if err := validateClanBuilderBaseTrophyHistoryRow(row); err != nil {
+		return models.ClanBuilderBaseTrophyHistoryRow{}, err
+	}
+	return row, nil
+}
+
+func clanCapitalHistoryRow(
+	locationID string,
+	date time.Time,
+	item clashy.RankedClan,
+) (models.ClanCapitalHistoryRow, error) {
+	common, err := leaderboardClanHistoryValues(locationID, date, item)
+	if err != nil {
+		return models.ClanCapitalHistoryRow{}, err
+	}
+	row := models.ClanCapitalHistoryRow{
+		LocationID:     common.LocationID,
+		Date:           common.Date,
+		ClanTag:        common.ClanTag,
+		ClanName:       common.ClanName,
+		ClanBadgeToken: common.ClanBadgeToken,
+		ClanLevel:      common.ClanLevel,
+		CapitalPoints:  item.CapitalPoints,
+		Members:        common.Members,
+		ClanLocationID: common.ClanLocationID,
+		Rank:           common.Rank,
+		PreviousRank:   common.PreviousRank,
+	}
+	if err := validateClanCapitalHistoryRow(row); err != nil {
+		return models.ClanCapitalHistoryRow{}, err
+	}
+	return row, nil
+}
+
+type leaderboardClanHistoryCommon struct {
+	LocationID     string
+	Date           time.Time
+	ClanTag        string
+	ClanName       string
+	ClanBadgeToken string
+	ClanLevel      int
+	Members        int
+	ClanLocationID *int
+	Rank           int
+	PreviousRank   *int
+}
+
+func leaderboardClanHistoryValues(
+	locationID string,
+	date time.Time,
+	item clashy.RankedClan,
+) (leaderboardClanHistoryCommon, error) {
+	token := badgeToken(item.Badge)
+	previousRank, err := optionalHistoryPositiveInt(item.PreviousRank)
+	if err != nil {
+		return leaderboardClanHistoryCommon{}, fmt.Errorf("clan history %s previous rank: %w", item.Tag, err)
+	}
+	var clanLocationID *int
+	if item.Location != nil {
+		clanLocationID, err = optionalHistoryPositiveInt(item.Location.ID)
+		if err != nil {
+			return leaderboardClanHistoryCommon{}, fmt.Errorf("clan history %s location: %w", item.Tag, err)
+		}
+	}
+	common := leaderboardClanHistoryCommon{
+		LocationID:     locationID,
+		Date:           date,
+		ClanTag:        item.Tag,
+		ClanName:       item.Name,
+		ClanBadgeToken: token,
+		ClanLevel:      item.Level,
+		Members:        item.MemberCount,
+		ClanLocationID: clanLocationID,
+		Rank:           item.Rank,
+		PreviousRank:   previousRank,
+	}
+	if strings.TrimSpace(common.ClanTag) == "" ||
+		strings.TrimSpace(common.ClanName) == "" ||
+		common.ClanBadgeToken == "" ||
+		common.ClanLevel <= 0 ||
+		common.Members < 0 ||
+		common.Members > 50 ||
+		common.Rank <= 0 {
+		return leaderboardClanHistoryCommon{}, fmt.Errorf("invalid clan history row for %s", item.Tag)
+	}
+	return common, nil
+}
+
+func leaderboardPlayerClan(
+	clan *clashy.PlayerClan,
+) (*string, *string, *string, error) {
+	if clan == nil {
+		return nil, nil, nil, nil
+	}
+	token := badgeToken(clan.Badge)
+	if strings.TrimSpace(clan.Tag) == "" ||
+		strings.TrimSpace(clan.Name) == "" ||
+		token == "" {
+		return nil, nil, nil, fmt.Errorf("invalid clan snapshot")
+	}
+	tag := clan.Tag
+	name := clan.Name
+	return &tag, &name, &token, nil
+}
+
+func optionalHistoryPositiveInt(value int) (*int, error) {
+	if value < 0 {
+		return nil, fmt.Errorf("negative value %d", value)
+	}
+	if value == 0 {
+		return nil, nil
+	}
+	result := value
+	return &result, nil
+}
+
+func validatePlayerTrophyHistoryRow(row models.PlayerTrophyHistoryRow) error {
+	if !validLeaderboardHistoryLocation(row.LocationID) ||
+		row.Date.IsZero() ||
+		!row.Date.Equal(dayStart(row.Date)) ||
+		strings.TrimSpace(row.PlayerTag) == "" ||
+		strings.TrimSpace(row.PlayerName) == "" ||
+		row.ExpLevel < 0 ||
+		row.Trophies < 0 ||
+		row.AttackWins < 0 ||
+		row.DefenseWins < 0 ||
+		row.Rank <= 0 ||
+		!validOptionalPositiveHistoryInt(row.PreviousRank) ||
+		!validOptionalPositiveHistoryInt(row.LeagueID) ||
+		!validLeaderboardPlayerClan(row.ClanTag, row.ClanName, row.ClanBadgeToken) {
+		return fmt.Errorf("invalid player trophy history row for %s", row.PlayerTag)
+	}
+	return nil
+}
+
+func validatePlayerBuilderBaseTrophyHistoryRow(row models.PlayerBuilderBaseTrophyHistoryRow) error {
+	if !validLeaderboardHistoryLocation(row.LocationID) ||
+		row.Date.IsZero() ||
+		!row.Date.Equal(dayStart(row.Date)) ||
+		strings.TrimSpace(row.PlayerTag) == "" ||
+		strings.TrimSpace(row.PlayerName) == "" ||
+		row.ExpLevel < 0 ||
+		row.BuilderBaseTrophies < 0 ||
+		(row.BuilderBaseBattleWins != nil && *row.BuilderBaseBattleWins < 0) ||
+		row.Rank <= 0 ||
+		!validOptionalPositiveHistoryInt(row.PreviousRank) ||
+		!validOptionalPositiveHistoryInt(row.LeagueID) ||
+		!validLeaderboardPlayerClan(row.ClanTag, row.ClanName, row.ClanBadgeToken) {
+		return fmt.Errorf("invalid builder base trophy history row for %s", row.PlayerTag)
+	}
+	return nil
+}
+
+func validateClanTrophyHistoryRow(row models.ClanTrophyHistoryRow) error {
+	if !validLeaderboardClanHistoryValues(
+		row.LocationID,
+		row.Date,
+		row.ClanTag,
+		row.ClanName,
+		row.ClanBadgeToken,
+		row.ClanLevel,
+		row.ClanPoints,
+		row.Members,
+		row.ClanLocationID,
+		row.Rank,
+		row.PreviousRank,
+	) {
+		return fmt.Errorf("invalid clan trophy history row for %s", row.ClanTag)
+	}
+	return nil
+}
+
+func validateClanBuilderBaseTrophyHistoryRow(row models.ClanBuilderBaseTrophyHistoryRow) error {
+	if !validLeaderboardClanHistoryValues(
+		row.LocationID,
+		row.Date,
+		row.ClanTag,
+		row.ClanName,
+		row.ClanBadgeToken,
+		row.ClanLevel,
+		row.BuilderBasePoints,
+		row.Members,
+		row.ClanLocationID,
+		row.Rank,
+		row.PreviousRank,
+	) {
+		return fmt.Errorf("invalid clan builder base trophy history row for %s", row.ClanTag)
+	}
+	return nil
+}
+
+func validateClanCapitalHistoryRow(row models.ClanCapitalHistoryRow) error {
+	if !validLeaderboardClanHistoryValues(
+		row.LocationID,
+		row.Date,
+		row.ClanTag,
+		row.ClanName,
+		row.ClanBadgeToken,
+		row.ClanLevel,
+		row.CapitalPoints,
+		row.Members,
+		row.ClanLocationID,
+		row.Rank,
+		row.PreviousRank,
+	) {
+		return fmt.Errorf("invalid clan capital history row for %s", row.ClanTag)
+	}
+	return nil
+}
+
+func validLeaderboardClanHistoryValues(
+	locationID string,
+	date time.Time,
+	tag string,
+	name string,
+	badgeToken string,
+	level int,
+	points int,
+	members int,
+	clanLocationID *int,
+	rank int,
+	previousRank *int,
+) bool {
+	return validLeaderboardHistoryLocation(locationID) &&
+		!date.IsZero() &&
+		date.Equal(dayStart(date)) &&
+		strings.TrimSpace(tag) != "" &&
+		strings.TrimSpace(name) != "" &&
+		strings.TrimSpace(badgeToken) != "" &&
+		level > 0 &&
+		points >= 0 &&
+		members >= 0 &&
+		members <= 50 &&
+		validOptionalPositiveHistoryInt(clanLocationID) &&
+		rank > 0 &&
+		validOptionalPositiveHistoryInt(previousRank)
+}
+
+func validLeaderboardPlayerClan(tag, name, token *string) bool {
+	if tag == nil && name == nil && token == nil {
+		return true
+	}
+	return tag != nil &&
+		name != nil &&
+		token != nil &&
+		strings.TrimSpace(*tag) != "" &&
+		strings.TrimSpace(*name) != "" &&
+		strings.TrimSpace(*token) != ""
+}
+
+func validOptionalPositiveHistoryInt(value *int) bool {
+	return value == nil || *value > 0
+}
+
+func validLeaderboardHistoryLocation(locationID string) bool {
+	if locationID == "global" {
+		return true
+	}
+	location, err := strconv.Atoi(locationID)
+	return err == nil && location > 0
+}
+
+func validLeaderboardHistoryKind(kind string) bool {
+	return isPlayerLeaderboardHistoryKind(kind) || isClanLeaderboardHistoryKind(kind)
+}
+
+func isPlayerLeaderboardHistoryKind(kind string) bool {
+	switch kind {
+	case leaderboardHistoryPlayerHomeTrophies, leaderboardHistoryPlayerBuilderBaseTrophies:
+		return true
+	default:
+		return false
+	}
+}
+
+func isClanLeaderboardHistoryKind(kind string) bool {
+	switch kind {
+	case leaderboardHistoryClanHomePoints,
+		leaderboardHistoryClanBuilderBasePoints,
+		leaderboardHistoryClanCapitalPoints:
+		return true
+	default:
+		return false
+	}
+}
+
+type timescaleScheduledStore struct {
+	pool *pgxpool.Pool
+}
+
+func newTimescaleScheduledStore(ctx context.Context, dsn string) (*timescaleScheduledStore, error) {
+	pool, err := pgxpool.New(ctx, dsn)
+	if err != nil {
+		return nil, err
+	}
+	return &timescaleScheduledStore{pool: pool}, nil
+}
+
+func (s *timescaleScheduledStore) Close() {
+	if s.pool != nil {
+		s.pool.Close()
+	}
+}
+
+func (s *timescaleScheduledStore) ReconcileCWLSeasonStatistics(ctx context.Context, seasons []string) error {
+	return cwlstats.Reconcile(ctx, s.pool, seasons)
+}
+
+func (s *timescaleScheduledStore) FinalizeLegendDay(ctx context.Context, day time.Time) (int, error) {
+	day = dayStart(day)
+	tx, err := s.pool.Begin(ctx)
+	if err != nil {
+		return 0, err
+	}
+	defer tx.Rollback(ctx)
+	if _, err := tx.Exec(ctx, `DELETE FROM league_hitrate_stats WHERE period_kind='legend_day' AND period_start=$1`, day); err != nil {
+		return 0, err
+	}
+	if _, err := tx.Exec(ctx, `DELETE FROM legend_daily_stats WHERE day=$1::date`, day); err != nil {
+		return 0, err
+	}
+	if _, err := tx.Exec(ctx, `
+		WITH attacks AS MATERIALIZED (
+			SELECT battle.*, player.league_id AS league_tier_id FROM battles_ranked battle
+			JOIN basic_player player ON player.tag=battle.player_tag
+			WHERE battle.direction='attack' AND battle.battle_mode='legend' AND battle.battle_time >= $1 AND battle.battle_time < $1 + interval '1 day' AND player.league_id > 0
+		)
+		INSERT INTO league_hitrate_stats (period_kind,period_start,league_tier_id,town_hall,attack_count,zero_star_count,one_star_count,two_star_count,three_star_count,refreshed_at)
+		SELECT 'legend_day',$1,league_tier_id,player_town_hall,count(*),count(*) FILTER (WHERE stars=0),count(*) FILTER (WHERE stars=1),count(*) FILTER (WHERE stars=2),count(*) FILTER (WHERE stars=3),now()
+		FROM attacks WHERE player_town_hall=opponent_town_hall GROUP BY league_tier_id,player_town_hall
+	`, day); err != nil {
+		return 0, err
+	}
+	inserted, err := tx.Exec(ctx, `
+		WITH attacks AS MATERIALIZED (
+			SELECT battle.*, player.league_id AS league_tier_id FROM battles_ranked battle
+			JOIN basic_player player ON player.tag=battle.player_tag
+			WHERE battle.direction='attack' AND battle.battle_mode='legend' AND battle.battle_time >= $1 AND battle.battle_time < $1 + interval '1 day' AND player.league_id > 0
+		), groups AS (
+			SELECT league_tier_id,player_town_hall AS town_hall,count(*) AS attack_count,count(DISTINCT player_tag) AS distinct_player_count,
+				count(*) FILTER (WHERE stars=0) AS zero_star_count,count(*) FILTER (WHERE stars=1) AS one_star_count,
+				count(*) FILTER (WHERE stars=2) AS two_star_count,count(*) FILTER (WHERE stars=3) AS three_star_count,
+				sum(destruction_percentage) AS destruction_percentage_sum,sum(coalesce(duration_seconds,0)) AS duration_seconds_sum
+			FROM attacks GROUP BY league_tier_id,player_town_hall
+		), perfect AS (
+			SELECT league_tier_id,player_town_hall AS town_hall,count(*) AS player_count FROM (
+				SELECT league_tier_id,player_town_hall,player_tag FROM attacks GROUP BY league_tier_id,player_town_hall,player_tag
+				HAVING count(*)=8 AND count(*) FILTER (WHERE stars=3)=8
+			) players GROUP BY league_tier_id,player_town_hall
+		), heroes AS (
+			SELECT league_tier_id,player_town_hall AS town_hall,hero_id,count(*) AS uses,count(*) FILTER (WHERE stars=3) AS triples
+			FROM attacks JOIN army_compositions composition USING (army_hash) CROSS JOIN LATERAL unnest(composition.heroes) hero_id
+			GROUP BY league_tier_id,player_town_hall,hero_id
+		), hero_json AS (
+			SELECT league_tier_id,town_hall,jsonb_agg(jsonb_build_object('id',hero_id,'uses',uses,'triples',triples) ORDER BY hero_id) AS value FROM heroes GROUP BY league_tier_id,town_hall
+		), pets AS (
+			SELECT league_tier_id,player_town_hall AS town_hall,(pet->>'petId')::integer AS pet_id,count(*) AS uses,count(*) FILTER (WHERE stars=3) AS triples
+			FROM attacks JOIN army_compositions composition USING (army_hash) CROSS JOIN LATERAL jsonb_array_elements(composition.pet_assignments) pet
+			GROUP BY league_tier_id,player_town_hall,(pet->>'petId')::integer
+		), pet_json AS (
+			SELECT league_tier_id,town_hall,jsonb_agg(jsonb_build_object('id',pet_id,'uses',uses,'triples',triples) ORDER BY pet_id) AS value FROM pets GROUP BY league_tier_id,town_hall
+		), equipment AS (
+			SELECT league_tier_id,player_town_hall AS town_hall,(item->>'equipmentId')::integer AS equipment_id,count(*) AS uses,count(*) FILTER (WHERE stars=3) AS triples
+			FROM attacks JOIN army_compositions composition USING (army_hash) CROSS JOIN LATERAL jsonb_array_elements(composition.equipment) item
+			GROUP BY league_tier_id,player_town_hall,(item->>'equipmentId')::integer
+		), equipment_json AS (
+			SELECT league_tier_id,town_hall,jsonb_agg(jsonb_build_object('id',equipment_id,'uses',uses,'triples',triples) ORDER BY equipment_id) AS value FROM equipment GROUP BY league_tier_id,town_hall
+		), assignments AS (
+			SELECT league_tier_id,player_town_hall AS town_hall,(item->>'petId')::integer AS pet_id,(item->>'heroId')::integer AS hero_id,
+				count(*) AS uses,count(*) FILTER (WHERE stars=3) AS triples
+			FROM attacks JOIN army_compositions composition USING (army_hash) CROSS JOIN LATERAL jsonb_array_elements(composition.pet_assignments) item
+			GROUP BY league_tier_id,player_town_hall,(item->>'petId')::integer,(item->>'heroId')::integer
+		), assignment_json AS (
+			SELECT league_tier_id,town_hall,jsonb_agg(jsonb_build_object('petId',pet_id,'heroId',hero_id,'uses',uses,'triples',triples) ORDER BY pet_id,hero_id) AS value FROM assignments GROUP BY league_tier_id,town_hall
+		)
+		INSERT INTO legend_daily_stats (day,league_tier_id,town_hall,attack_count,distinct_player_count,perfect_320_player_count,
+			zero_star_count,one_star_count,two_star_count,three_star_count,destruction_percentage_sum,duration_seconds_sum,
+			hero_stats,pet_stats,equipment_stats,pet_hero_assignments,refreshed_at)
+		SELECT $1::date,g.league_tier_id,g.town_hall,g.attack_count,g.distinct_player_count,coalesce(p.player_count,0),
+			g.zero_star_count,g.one_star_count,g.two_star_count,g.three_star_count,g.destruction_percentage_sum,g.duration_seconds_sum,
+			coalesce(h.value,'[]'),coalesce(pt.value,'[]'),coalesce(e.value,'[]'),coalesce(a.value,'[]'),now()
+		FROM groups g LEFT JOIN perfect p USING (league_tier_id,town_hall) LEFT JOIN hero_json h USING (league_tier_id,town_hall)
+		LEFT JOIN pet_json pt USING (league_tier_id,town_hall) LEFT JOIN equipment_json e USING (league_tier_id,town_hall)
+		LEFT JOIN assignment_json a USING (league_tier_id,town_hall)
+	`, day)
+	if err != nil {
+		return 0, err
+	}
+	if err := tx.Commit(ctx); err != nil {
+		return 0, err
+	}
+	return int(inserted.RowsAffected()), nil
+}
+
+func (s *timescaleScheduledStore) ReplaceLeaderboardHistory(
+	ctx context.Context,
+	groups []leaderboardHistoryGroup,
+) (int, error) {
+	if len(groups) == 0 {
+		return 0, nil
+	}
+	batch, err := validateAndFlattenLeaderboardHistoryGroups(groups)
+	if err != nil {
+		return 0, err
+	}
+	tx, err := s.pool.Begin(ctx)
+	if err != nil {
+		return 0, err
+	}
+	defer tx.Rollback(ctx)
+	affected := 0
+	for _, spec := range typedLeaderboardHistorySpecs {
+		count, err := storeTypedLeaderboardHistoryBatch(ctx, tx, spec, batch)
+		if err != nil {
+			return 0, err
+		}
+		affected += count
+	}
+	if err := tx.Commit(ctx); err != nil {
+		return 0, err
+	}
+	return affected, nil
+}
+
+func validateAndFlattenLeaderboardHistoryGroups(
+	groups []leaderboardHistoryGroup,
+) (typedLeaderboardHistoryBatch, error) {
+	batch := typedLeaderboardHistoryBatch{
+		Scopes: make(map[string][]leaderboardHistoryScope, len(typedLeaderboardHistorySpecs)),
+		Rows:   make(map[string][][]any, len(typedLeaderboardHistorySpecs)),
+	}
+	groupKeys := make(map[string]struct{}, len(groups))
+	for _, group := range groups {
+		if !validLeaderboardHistoryKind(group.Kind) {
+			return typedLeaderboardHistoryBatch{}, fmt.Errorf("unsupported leaderboard history category %q", group.Kind)
+		}
+		if group.LocationID != "global" {
+			location, err := strconv.Atoi(group.LocationID)
+			if err != nil || location <= 0 {
+				return typedLeaderboardHistoryBatch{}, fmt.Errorf("invalid leaderboard history location %q", group.LocationID)
+			}
+		}
+		groupDate := dayStart(group.Date)
+		key := leaderboardHistoryGroupKey(group.Kind, group.LocationID, groupDate)
+		if _, exists := groupKeys[key]; exists {
+			return typedLeaderboardHistoryBatch{}, fmt.Errorf(
+				"duplicate leaderboard history group %s/%s/%s",
+				group.Kind,
+				group.LocationID,
+				groupDate.Format(time.DateOnly),
+			)
+		}
+		groupKeys[key] = struct{}{}
+		rows, identities, err := typedLeaderboardHistoryRows(group, groupDate)
+		if err != nil {
+			return typedLeaderboardHistoryBatch{}, err
+		}
+		tags := make(map[string]struct{}, len(identities))
+		ranks := make(map[int]struct{}, len(identities))
+		for _, identity := range identities {
+			if _, exists := tags[identity.Tag]; exists {
+				return typedLeaderboardHistoryBatch{}, fmt.Errorf(
+					"duplicate leaderboard history tag %s for %s/%s/%s",
+					identity.Tag,
+					group.Kind,
+					group.LocationID,
+					groupDate.Format(time.DateOnly),
+				)
+			}
+			if _, exists := ranks[identity.Rank]; exists {
+				return typedLeaderboardHistoryBatch{}, fmt.Errorf(
+					"duplicate leaderboard history rank %d for %s/%s/%s",
+					identity.Rank,
+					group.Kind,
+					group.LocationID,
+					groupDate.Format(time.DateOnly),
+				)
+			}
+			tags[identity.Tag] = struct{}{}
+			ranks[identity.Rank] = struct{}{}
+		}
+		batch.Scopes[group.Kind] = append(batch.Scopes[group.Kind], leaderboardHistoryScope{
+			LocationID: group.LocationID,
+			Date:       groupDate,
+		})
+		batch.Rows[group.Kind] = append(batch.Rows[group.Kind], rows...)
+	}
+	return batch, nil
+}
+
+func leaderboardHistoryGroupKey(kind, locationID string, date time.Time) string {
+	return kind + "\x00" + locationID + "\x00" + dayStart(date).Format(time.DateOnly)
+}
+
+type leaderboardHistoryRowIdentity struct {
+	Tag  string
+	Rank int
+}
+
+func typedLeaderboardHistoryRows(
+	group leaderboardHistoryGroup,
+	groupDate time.Time,
+) ([][]any, []leaderboardHistoryRowIdentity, error) {
+	switch group.Kind {
+	case leaderboardHistoryPlayerHomeTrophies:
+		items, ok := group.Rows.([]models.PlayerTrophyHistoryRow)
+		if !ok {
+			return nil, nil, fmt.Errorf("player trophy history group has row type %T", group.Rows)
+		}
+		rows := make([][]any, 0, len(items))
+		identities := make([]leaderboardHistoryRowIdentity, 0, len(items))
+		for _, item := range items {
+			if item.LocationID != group.LocationID || !dayStart(item.Date).Equal(groupDate) {
+				return nil, nil, fmt.Errorf("player trophy history row is outside its group")
+			}
+			if err := validatePlayerTrophyHistoryRow(item); err != nil {
+				return nil, nil, err
+			}
+			rows = append(rows, []any{
+				item.LocationID, groupDate, item.PlayerTag, item.PlayerName, item.ExpLevel,
+				item.Trophies, item.AttackWins, item.DefenseWins, item.Rank, item.PreviousRank,
+				item.ClanTag, item.ClanName, item.ClanBadgeToken, item.LeagueID,
+			})
+			identities = append(identities, leaderboardHistoryRowIdentity{Tag: item.PlayerTag, Rank: item.Rank})
+		}
+		return rows, identities, nil
+	case leaderboardHistoryPlayerBuilderBaseTrophies:
+		items, ok := group.Rows.([]models.PlayerBuilderBaseTrophyHistoryRow)
+		if !ok {
+			return nil, nil, fmt.Errorf("builder base trophy history group has row type %T", group.Rows)
+		}
+		rows := make([][]any, 0, len(items))
+		identities := make([]leaderboardHistoryRowIdentity, 0, len(items))
+		for _, item := range items {
+			if item.LocationID != group.LocationID || !dayStart(item.Date).Equal(groupDate) {
+				return nil, nil, fmt.Errorf("builder base trophy history row is outside its group")
+			}
+			if err := validatePlayerBuilderBaseTrophyHistoryRow(item); err != nil {
+				return nil, nil, err
+			}
+			rows = append(rows, []any{
+				item.LocationID, groupDate, item.PlayerTag, item.PlayerName, item.ExpLevel,
+				item.BuilderBaseTrophies, item.BuilderBaseBattleWins, item.Rank, item.PreviousRank,
+				item.ClanTag, item.ClanName, item.ClanBadgeToken, item.LeagueID,
+			})
+			identities = append(identities, leaderboardHistoryRowIdentity{Tag: item.PlayerTag, Rank: item.Rank})
+		}
+		return rows, identities, nil
+	case leaderboardHistoryClanHomePoints:
+		items, ok := group.Rows.([]models.ClanTrophyHistoryRow)
+		if !ok {
+			return nil, nil, fmt.Errorf("clan trophy history group has row type %T", group.Rows)
+		}
+		rows := make([][]any, 0, len(items))
+		identities := make([]leaderboardHistoryRowIdentity, 0, len(items))
+		for _, item := range items {
+			if item.LocationID != group.LocationID || !dayStart(item.Date).Equal(groupDate) {
+				return nil, nil, fmt.Errorf("clan trophy history row is outside its group")
+			}
+			if err := validateClanTrophyHistoryRow(item); err != nil {
+				return nil, nil, err
+			}
+			rows = append(rows, []any{
+				item.LocationID, groupDate, item.ClanTag, item.ClanName, item.ClanBadgeToken,
+				item.ClanLevel, item.ClanPoints, item.Members, item.ClanLocationID, item.Rank, item.PreviousRank,
+			})
+			identities = append(identities, leaderboardHistoryRowIdentity{Tag: item.ClanTag, Rank: item.Rank})
+		}
+		return rows, identities, nil
+	case leaderboardHistoryClanBuilderBasePoints:
+		items, ok := group.Rows.([]models.ClanBuilderBaseTrophyHistoryRow)
+		if !ok {
+			return nil, nil, fmt.Errorf("clan builder base trophy history group has row type %T", group.Rows)
+		}
+		rows := make([][]any, 0, len(items))
+		identities := make([]leaderboardHistoryRowIdentity, 0, len(items))
+		for _, item := range items {
+			if item.LocationID != group.LocationID || !dayStart(item.Date).Equal(groupDate) {
+				return nil, nil, fmt.Errorf("clan builder base trophy history row is outside its group")
+			}
+			if err := validateClanBuilderBaseTrophyHistoryRow(item); err != nil {
+				return nil, nil, err
+			}
+			rows = append(rows, []any{
+				item.LocationID, groupDate, item.ClanTag, item.ClanName, item.ClanBadgeToken,
+				item.ClanLevel, item.BuilderBasePoints, item.Members, item.ClanLocationID, item.Rank, item.PreviousRank,
+			})
+			identities = append(identities, leaderboardHistoryRowIdentity{Tag: item.ClanTag, Rank: item.Rank})
+		}
+		return rows, identities, nil
+	case leaderboardHistoryClanCapitalPoints:
+		items, ok := group.Rows.([]models.ClanCapitalHistoryRow)
+		if !ok {
+			return nil, nil, fmt.Errorf("clan capital history group has row type %T", group.Rows)
+		}
+		rows := make([][]any, 0, len(items))
+		identities := make([]leaderboardHistoryRowIdentity, 0, len(items))
+		for _, item := range items {
+			if item.LocationID != group.LocationID || !dayStart(item.Date).Equal(groupDate) {
+				return nil, nil, fmt.Errorf("clan capital history row is outside its group")
+			}
+			if err := validateClanCapitalHistoryRow(item); err != nil {
+				return nil, nil, err
+			}
+			rows = append(rows, []any{
+				item.LocationID, groupDate, item.ClanTag, item.ClanName, item.ClanBadgeToken,
+				item.ClanLevel, item.CapitalPoints, item.Members, item.ClanLocationID, item.Rank, item.PreviousRank,
+			})
+			identities = append(identities, leaderboardHistoryRowIdentity{Tag: item.ClanTag, Rank: item.Rank})
+		}
+		return rows, identities, nil
+	default:
+		return nil, nil, fmt.Errorf("unsupported leaderboard history category %q", group.Kind)
+	}
+}
+
+func storeTypedLeaderboardHistoryBatch(
+	ctx context.Context,
+	tx pgx.Tx,
+	spec typedLeaderboardHistorySpec,
+	batch typedLeaderboardHistoryBatch,
+) (int, error) {
+	scopes := batch.Scopes[spec.Kind]
+	if len(scopes) == 0 {
+		return 0, nil
+	}
+	stageTable := spec.Table + "_stage"
+	groupsTable := spec.Table + "_groups_stage"
+	if _, err := tx.Exec(ctx, fmt.Sprintf(`
+		CREATE TEMP TABLE %s
+		(LIKE %s)
+		ON COMMIT DROP
+	`, quoteHistoryIdentifier(stageTable), quoteHistoryIdentifier(spec.Table))); err != nil {
+		return 0, err
+	}
+	if _, err := tx.Exec(ctx, fmt.Sprintf(`
+		CREATE TEMP TABLE %s (
+			location_id text NOT NULL,
+			date date NOT NULL,
+			PRIMARY KEY (location_id, date)
+		)
+		ON COMMIT DROP
+	`, quoteHistoryIdentifier(groupsTable))); err != nil {
+		return 0, err
+	}
+	if _, err := tx.CopyFrom(
+		ctx,
+		pgx.Identifier{groupsTable},
+		[]string{"location_id", "date"},
+		pgx.CopyFromSlice(len(scopes), func(index int) ([]any, error) {
+			scope := scopes[index]
+			return []any{scope.LocationID, scope.Date}, nil
+		}),
+	); err != nil {
+		return 0, err
+	}
+	rows := batch.Rows[spec.Kind]
+	if len(rows) > 0 {
+		if _, err := tx.CopyFrom(
+			ctx,
+			pgx.Identifier{stageTable},
+			spec.Columns,
+			pgx.CopyFromRows(rows),
+		); err != nil {
+			return 0, err
+		}
+	}
+	upserted, err := tx.Exec(ctx, typedLeaderboardHistoryUpsertSQL(spec))
+	if err != nil {
+		return 0, err
+	}
+	deleted, err := tx.Exec(ctx, typedLeaderboardHistoryDeleteSQL(spec))
+	if err != nil {
+		return 0, err
+	}
+	return int(upserted.RowsAffected() + deleted.RowsAffected()), nil
+}
+
+func typedLeaderboardHistoryUpsertSQL(spec typedLeaderboardHistorySpec) string {
+	columns := quoteHistoryIdentifiers(spec.Columns)
+	assignments := make([]string, 0, len(spec.UpdateCols))
+	changes := make([]string, 0, len(spec.UpdateCols))
+	target := quoteHistoryIdentifier(spec.Table)
+	for _, column := range spec.UpdateCols {
+		quoted := quoteHistoryIdentifier(column)
+		assignments = append(assignments, quoted+" = EXCLUDED."+quoted)
+		changes = append(changes, target+"."+quoted+" IS DISTINCT FROM EXCLUDED."+quoted)
+	}
+	return fmt.Sprintf(`
+		INSERT INTO %s (%s)
+		SELECT %s FROM %s
+		ON CONFLICT (location_id, date, %s) DO UPDATE SET
+			%s
+		WHERE %s
+	`,
+		target,
+		strings.Join(columns, ", "),
+		strings.Join(columns, ", "),
+		quoteHistoryIdentifier(spec.Table+"_stage"),
+		quoteHistoryIdentifier(spec.TagColumn),
+		strings.Join(assignments, ", "),
+		strings.Join(changes, " OR "),
+	)
+}
+
+func typedLeaderboardHistoryDeleteSQL(spec typedLeaderboardHistorySpec) string {
+	target := quoteHistoryIdentifier(spec.Table)
+	stage := quoteHistoryIdentifier(spec.Table + "_stage")
+	groups := quoteHistoryIdentifier(spec.Table + "_groups_stage")
+	tag := quoteHistoryIdentifier(spec.TagColumn)
+	return fmt.Sprintf(`
+		DELETE FROM %s AS current
+		USING %s AS groups
+		WHERE current.location_id = groups.location_id
+		  AND current.date = groups.date
+		  AND NOT EXISTS (
+			SELECT 1
+			FROM %s AS stage
+			WHERE stage.location_id = current.location_id
+			  AND stage.date = current.date
+			  AND stage.%s = current.%s
+		  )
+	`, target, groups, stage, tag, tag)
+}
+
+func quoteHistoryIdentifier(value string) string {
+	return pgx.Identifier{value}.Sanitize()
+}
+
+func quoteHistoryIdentifiers(values []string) []string {
+	out := make([]string, 0, len(values))
+	for _, value := range values {
+		out = append(out, quoteHistoryIdentifier(value))
+	}
+	return out
+}
+
+var legendHistoryColumns = []string{
+	"season",
+	"player_tag",
+	"player_name",
+	"exp_level",
+	"trophies",
+	"attack_wins",
+	"defense_wins",
+	"rank",
+	"clan_tag",
+	"clan_name",
+	"clan_badge_token",
+	"league_tier_id",
+}
+
+const upsertLegendHistorySQL = `
+	INSERT INTO legend_history (
+		season, player_tag, player_name, exp_level, trophies,
+		attack_wins, defense_wins, rank, clan_tag, clan_name,
+		clan_badge_token, league_tier_id
+	)
+	SELECT
+		season, player_tag, player_name, exp_level, trophies,
+		attack_wins, defense_wins, rank, clan_tag, clan_name,
+		clan_badge_token, league_tier_id
+	FROM legend_history_stage
+	ON CONFLICT (season, player_tag) DO UPDATE SET
+		player_name = EXCLUDED.player_name,
+		exp_level = EXCLUDED.exp_level,
+		trophies = EXCLUDED.trophies,
+		attack_wins = EXCLUDED.attack_wins,
+		defense_wins = EXCLUDED.defense_wins,
+		rank = EXCLUDED.rank,
+		clan_tag = EXCLUDED.clan_tag,
+		clan_name = EXCLUDED.clan_name,
+		clan_badge_token = EXCLUDED.clan_badge_token,
+		league_tier_id = EXCLUDED.league_tier_id
+	WHERE
+		legend_history.player_name IS DISTINCT FROM EXCLUDED.player_name OR
+		legend_history.exp_level IS DISTINCT FROM EXCLUDED.exp_level OR
+		legend_history.trophies IS DISTINCT FROM EXCLUDED.trophies OR
+		legend_history.attack_wins IS DISTINCT FROM EXCLUDED.attack_wins OR
+		legend_history.defense_wins IS DISTINCT FROM EXCLUDED.defense_wins OR
+		legend_history.rank IS DISTINCT FROM EXCLUDED.rank OR
+		legend_history.clan_tag IS DISTINCT FROM EXCLUDED.clan_tag OR
+		legend_history.clan_name IS DISTINCT FROM EXCLUDED.clan_name OR
+		legend_history.clan_badge_token IS DISTINCT FROM EXCLUDED.clan_badge_token OR
+		legend_history.league_tier_id IS DISTINCT FROM EXCLUDED.league_tier_id
+`
+
+const deleteStaleLegendHistorySQL = `
+	DELETE FROM legend_history AS current
+	WHERE current.season = $1
+	  AND NOT EXISTS (
+		SELECT 1
+		FROM legend_history_stage AS stage
+		WHERE stage.season = current.season
+		  AND stage.player_tag = current.player_tag
+	  )
+`
+
+func (s *timescaleScheduledStore) CompletedLegendSeasons(ctx context.Context) (map[string]struct{}, error) {
+	rows, err := s.pool.Query(ctx, `
+		SELECT season
+		FROM legend_history
+		GROUP BY season
+		HAVING count(*) > 0
+		   AND min(rank) = 1
+		   AND max(rank)::bigint = count(*)
+		   AND count(DISTINCT rank) = count(*)
+	`)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	completed := make(map[string]struct{})
+	for rows.Next() {
+		var season string
+		if err := rows.Scan(&season); err != nil {
+			return nil, err
+		}
+		completed[season] = struct{}{}
+	}
+	return completed, rows.Err()
+}
+
+func (s *timescaleScheduledStore) ReplaceLegendSeason(
+	ctx context.Context,
+	season string,
+	rows []models.LegendHistoryRow,
+) (int, error) {
+	if err := validateLegendHistoryRows(season, rows); err != nil {
+		return 0, err
+	}
+	tx, err := s.pool.Begin(ctx)
+	if err != nil {
+		return 0, err
+	}
+	defer tx.Rollback(ctx)
+	if _, err := tx.Exec(ctx, `
+		CREATE TEMP TABLE legend_history_stage
+		(LIKE legend_history)
+		ON COMMIT DROP
+	`); err != nil {
+		return 0, err
+	}
+	if _, err := tx.CopyFrom(
+		ctx,
+		pgx.Identifier{"legend_history_stage"},
+		legendHistoryColumns,
+		pgx.CopyFromSlice(len(rows), func(index int) ([]any, error) {
+			row := rows[index]
+			return []any{
+				row.Season,
+				row.PlayerTag,
+				row.PlayerName,
+				row.ExpLevel,
+				row.Trophies,
+				row.AttackWins,
+				row.DefenseWins,
+				row.Rank,
+				row.ClanTag,
+				row.ClanName,
+				row.ClanBadgeToken,
+				row.LeagueTierID,
+			}, nil
+		}),
+	); err != nil {
+		return 0, err
+	}
+	upserted, err := tx.Exec(ctx, upsertLegendHistorySQL)
+	if err != nil {
+		return 0, err
+	}
+	deleted, err := tx.Exec(ctx, deleteStaleLegendHistorySQL, season)
+	if err != nil {
+		return 0, err
+	}
+	if err := tx.Commit(ctx); err != nil {
+		return 0, err
+	}
+	return int(upserted.RowsAffected() + deleted.RowsAffected()), nil
+}
+
+func validateLegendHistoryRows(season string, rows []models.LegendHistoryRow) error {
+	if _, err := officialLegendSeasonWindow(season); err != nil {
+		return err
+	}
+	if len(rows) == 0 {
+		return fmt.Errorf("refusing empty legend season %s replacement", season)
+	}
+	seenTags := make(map[string]struct{}, len(rows))
+	seenRanks := make(map[int]struct{}, len(rows))
+	for _, row := range rows {
+		if row.Season != season ||
+			row.PlayerTag == "" ||
+			strings.TrimSpace(row.PlayerName) == "" ||
+			row.ExpLevel < 0 ||
+			row.Trophies < 0 ||
+			row.AttackWins < 0 ||
+			row.DefenseWins < 0 ||
+			row.Rank <= 0 ||
+			!validLegendHistoryClan(row) ||
+			(row.LeagueTierID != nil && *row.LeagueTierID <= 0) {
+			return fmt.Errorf(
+				"invalid legend history row for season %s: player %q name %q rank %d trophies %d",
+				season,
+				row.PlayerTag,
+				row.PlayerName,
+				row.Rank,
+				row.Trophies,
+			)
+		}
+		if _, duplicate := seenTags[row.PlayerTag]; duplicate {
+			return fmt.Errorf("duplicate legend season %s player %s", season, row.PlayerTag)
+		}
+		if _, duplicate := seenRanks[row.Rank]; duplicate {
+			return fmt.Errorf("duplicate legend season %s rank %d", season, row.Rank)
+		}
+		seenTags[row.PlayerTag] = struct{}{}
+		seenRanks[row.Rank] = struct{}{}
+	}
+	for rank := 1; rank <= len(rows); rank++ {
+		if _, exists := seenRanks[rank]; !exists {
+			return fmt.Errorf("incomplete legend season %s rows: missing rank %d", season, rank)
+		}
+	}
+	return nil
+}
+
+func validLegendHistoryClan(row models.LegendHistoryRow) bool {
+	if row.ClanTag == nil && row.ClanName == nil && row.ClanBadgeToken == nil {
+		return true
+	}
+	return row.ClanTag != nil &&
+		row.ClanName != nil &&
+		row.ClanBadgeToken != nil &&
+		strings.TrimSpace(*row.ClanTag) != "" &&
+		strings.TrimSpace(*row.ClanName) != "" &&
+		strings.TrimSpace(*row.ClanBadgeToken) != ""
+}
+
+const replaceCurrentClanRankingGroupSQL = `
+	INSERT INTO clan_rankings_current (
+		clan_tag, ranking_type, location_id, rank, points, updated_at
+	)
+	SELECT clan_tag, $1, $2, rank, points, updated_at
+	FROM clan_rankings_current_stage
+	ON CONFLICT (clan_tag, ranking_type, location_id) DO UPDATE SET
+		rank = EXCLUDED.rank,
+		points = EXCLUDED.points,
+		updated_at = EXCLUDED.updated_at
+`
+
+const deleteStaleCurrentClanRankingGroupSQL = `
+	DELETE FROM clan_rankings_current AS current
+	WHERE current.ranking_type = $1
+	  AND current.location_id = $2
+	  AND NOT EXISTS (
+		SELECT 1
+		FROM clan_rankings_current_stage AS stage
+		WHERE stage.clan_tag = current.clan_tag
+	  )
+`
+
+func (s *timescaleScheduledStore) ReplaceCurrentClanRankingGroup(
+	ctx context.Context,
+	group currentClanRankingGroup,
+) (int, error) {
+	if len(group.Rows) > currentClanRankingLimit {
+		return 0, fmt.Errorf(
+			"refusing oversized %s clan ranking replacement for %s: got %d rows, limit %d",
+			group.RankingType,
+			group.LocationID,
+			len(group.Rows),
+			currentClanRankingLimit,
+		)
+	}
+	tx, err := s.pool.Begin(ctx)
+	if err != nil {
+		return 0, err
+	}
+	defer tx.Rollback(ctx)
+	if _, err := tx.Exec(ctx, `
+		CREATE TEMP TABLE clan_rankings_current_stage (
+			clan_tag text NOT NULL,
+			rank integer NOT NULL,
+			points integer NOT NULL,
+			updated_at timestamp with time zone NOT NULL
+		) ON COMMIT DROP
+	`); err != nil {
+		return 0, err
+	}
+	if len(group.Rows) > 0 {
+		if _, err := tx.CopyFrom(
+			ctx,
+			pgx.Identifier{"clan_rankings_current_stage"},
+			[]string{"clan_tag", "rank", "points", "updated_at"},
+			pgx.CopyFromSlice(len(group.Rows), func(index int) ([]any, error) {
+				row := group.Rows[index]
+				return []any{row.ClanTag, row.Rank, row.Points, row.UpdatedAt}, nil
+			}),
+		); err != nil {
+			return 0, err
+		}
+	}
+	if _, err := tx.Exec(ctx, replaceCurrentClanRankingGroupSQL, group.RankingType, group.LocationID); err != nil {
+		return 0, err
+	}
+	commandTag, err := tx.Exec(ctx, deleteStaleCurrentClanRankingGroupSQL, group.RankingType, group.LocationID)
+	if err != nil {
+		return 0, err
+	}
+	if err := tx.Commit(ctx); err != nil {
+		return 0, err
+	}
+	return len(group.Rows) + int(commandTag.RowsAffected()), nil
+}
+
+func (s *timescaleScheduledStore) ListRankedGroupTargets(ctx context.Context, _ int64) ([]string, error) {
+	rows, err := s.pool.Query(ctx, `
+		SELECT player.tag FROM basic_player player
+		WHERE player.tag <> '' AND player.trophies > 0
+		  AND player.league_id IS NOT NULL AND player.league_id NOT IN (105000000,105000036)
+		ORDER BY player.tag
+	`)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	tags := []string{}
+	for rows.Next() {
+		var tag string
+		if err := rows.Scan(&tag); err != nil {
+			return nil, err
+		}
+		tags = append(tags, tag)
+	}
+	return tags, rows.Err()
+}
+
+func (s *timescaleScheduledStore) StorePlayerProfiles(ctx context.Context, profiles []models.PlayerProfileIngest) (int, error) {
+	if len(profiles) == 0 {
+		return 0, nil
+	}
+	tx, err := s.pool.Begin(ctx)
+	if err != nil {
+		return 0, err
+	}
+	defer tx.Rollback(ctx)
+	affected, err := utils.UpsertPlayerProfiles(ctx, tx, profiles, scheduledDomainName)
+	if err != nil {
+		return affected, err
+	}
+	if err := tx.Commit(ctx); err != nil {
+		return affected, err
+	}
+	return affected, nil
+}
+
+func (s *timescaleScheduledStore) DeletePlayers(ctx context.Context, tags []string) error {
+	if len(tags) == 0 {
+		return nil
+	}
+	tx, err := s.pool.Begin(ctx)
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback(ctx)
+	if err := utils.DeletePlayers(ctx, tx, tags); err != nil {
+		return err
+	}
+	return tx.Commit(ctx)
+}
+
+func (s *timescaleScheduledStore) StoreRankedLeagueGroup(ctx context.Context, rows []models.RankedLeagueGroupMemberRow) (int, error) {
+	if len(rows) == 0 {
+		return 0, nil
+	}
+	tx, err := s.pool.Begin(ctx)
+	if err != nil {
+		return 0, err
+	}
+	defer tx.Rollback(ctx)
+	batch := &pgx.Batch{}
+	for _, row := range rows {
+		batch.Queue(`
+			INSERT INTO ranked_league_group_members(
+				season_id,group_tag,league_tier_id,player_tag,player_name,town_hall,placement,league_trophies,maximum_battle_count,
+				attack_win_count,attack_loss_count,attack_star_count,defense_win_count,defense_loss_count,defense_star_count
+			) VALUES($1,$2,$3,$4,$5,NULLIF($6,0),$7,$8,$9,$10,$11,$12,$13,$14,$15)
+			ON CONFLICT (season_id,player_tag) DO UPDATE SET
+				group_tag=EXCLUDED.group_tag,league_tier_id=EXCLUDED.league_tier_id,player_name=EXCLUDED.player_name,
+				town_hall=coalesce(EXCLUDED.town_hall,ranked_league_group_members.town_hall),placement=EXCLUDED.placement,
+				league_trophies=EXCLUDED.league_trophies,maximum_battle_count=EXCLUDED.maximum_battle_count,
+				attack_win_count=EXCLUDED.attack_win_count,attack_loss_count=EXCLUDED.attack_loss_count,attack_star_count=EXCLUDED.attack_star_count,
+				defense_win_count=EXCLUDED.defense_win_count,defense_loss_count=EXCLUDED.defense_loss_count,defense_star_count=EXCLUDED.defense_star_count
+		`, row.SeasonID, row.GroupTag, row.LeagueTierID, row.PlayerTag, row.PlayerName, row.TownHall, row.Placement, row.LeagueTrophies, row.MaximumBattleCount,
+			row.AttackWinCount, row.AttackLossCount, row.AttackStarCount, row.DefenseWinCount, row.DefenseLossCount, row.DefenseStarCount)
+	}
+	affected, err := utils.SendBatchCount(ctx, tx, batch)
+	if err != nil {
+		return affected, err
+	}
+	if err = tx.Commit(ctx); err != nil {
+		return affected, err
+	}
+	return affected, nil
+}
+
+func (s *timescaleScheduledStore) MissingRankedGroupPlayers(ctx context.Context, seasonID int64) ([]string, error) {
+	rows, err := s.pool.Query(ctx, `
+		SELECT DISTINCT m.player_tag
+		FROM ranked_league_group_members m
+		LEFT JOIN basic_player p ON p.tag = m.player_tag
+		WHERE m.season_id = $1
+		  AND p.tag IS NULL
+		ORDER BY 1
+	`, seasonID)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	tags := make([]string, 0)
+	for rows.Next() {
+		var tag string
+		if err := rows.Scan(&tag); err != nil {
+			return nil, err
+		}
+		if tag != "" {
+			tags = append(tags, tag)
+		}
+	}
+	return tags, rows.Err()
+}
+
+func (s *timescaleScheduledStore) FinalizeRankedTournament(ctx context.Context, seasonID int64) (int, error) {
+	if seasonID <= 0 {
+		return 0, errors.New("ranked season ID must be positive")
+	}
+	tx, err := s.pool.Begin(ctx)
+	if err != nil {
+		return 0, err
+	}
+	defer tx.Rollback(ctx)
+	if _, err = tx.Exec(ctx, `
+		UPDATE ranked_league_group_members member SET town_hall=player.townhall_level
+		FROM basic_player player WHERE member.season_id=$1 AND player.tag=member.player_tag AND player.townhall_level BETWEEN 1 AND 20
+	`, seasonID); err != nil {
+		return 0, err
+	}
+	periodStart := time.Unix(seasonID, 0).UTC()
+	if _, err = tx.Exec(ctx, `DELETE FROM league_hitrate_stats WHERE period_kind='ranked_season' AND period_start=$1`, periodStart); err != nil {
+		return 0, err
+	}
+	hitrate, err := tx.Exec(ctx, `
+		INSERT INTO league_hitrate_stats(period_kind,period_start,league_tier_id,town_hall,attack_count,zero_star_count,one_star_count,two_star_count,three_star_count,refreshed_at)
+		SELECT 'ranked_season',$2,member.league_tier_id,battle.player_town_hall,count(*),count(*) FILTER(WHERE stars=0),count(*) FILTER(WHERE stars=1),
+			count(*) FILTER(WHERE stars=2),count(*) FILTER(WHERE stars=3),now()
+		FROM battles_ranked battle JOIN ranked_league_group_members member ON member.season_id=$1 AND member.player_tag=battle.player_tag
+		WHERE battle.direction='attack' AND battle.battle_mode='ranked' AND battle.battle_time >= $2 AND battle.battle_time < $2 + interval '7 days'
+		  AND battle.player_town_hall=battle.opponent_town_hall
+		GROUP BY member.league_tier_id,battle.player_town_hall
+	`, seasonID, periodStart)
+	if err != nil {
+		return 0, err
+	}
+	if _, err = tx.Exec(ctx, `DELETE FROM ranked_league_tier_stats WHERE season_id=$1`, seasonID); err != nil {
+		return 0, err
+	}
+	tierStats, err := tx.Exec(ctx, `
+		WITH members AS MATERIALIZED (SELECT * FROM ranked_league_group_members WHERE season_id=$1),
+		group_values AS (
+			SELECT league_tier_id,group_tag,max(league_trophies)-min(league_trophies) AS first_last_range,
+				max(league_trophies) FILTER(WHERE placement=1)-max(league_trophies) FILTER(WHERE placement=2) AS first_second_gap
+			FROM members GROUP BY league_tier_id,group_tag
+		), town_halls AS (
+			SELECT league_tier_id,town_hall,count(*) AS count FROM members WHERE town_hall IS NOT NULL GROUP BY league_tier_id,town_hall
+		), town_hall_json AS (
+			SELECT league_tier_id,jsonb_agg(jsonb_build_object('level',town_hall,'count',count) ORDER BY town_hall DESC) AS value
+			FROM town_halls GROUP BY league_tier_id
+		), aggregate_values AS (
+			SELECT league_tier_id,count(DISTINCT group_tag) AS group_count,count(DISTINCT player_tag) AS distinct_player_count,
+				count(DISTINCT player_tag) FILTER(WHERE attack_win_count+attack_loss_count>0) AS participating_player_count,
+				percentile_disc(.10) WITHIN GROUP(ORDER BY league_trophies) AS trophy_p10,
+				percentile_disc(.25) WITHIN GROUP(ORDER BY league_trophies) AS trophy_p25,
+				percentile_disc(.50) WITHIN GROUP(ORDER BY league_trophies) AS trophy_p50,
+				percentile_disc(.75) WITHIN GROUP(ORDER BY league_trophies) AS trophy_p75,
+				percentile_disc(.90) WITHIN GROUP(ORDER BY league_trophies) AS trophy_p90
+			FROM members GROUP BY league_tier_id
+		), group_averages AS (
+			SELECT league_tier_id,avg(first_last_range) AS range_average,avg(first_second_gap) FILTER(WHERE first_second_gap IS NOT NULL) AS gap_average
+			FROM group_values GROUP BY league_tier_id
+		)
+		INSERT INTO ranked_league_tier_stats(season_id,league_tier_id,group_count,distinct_player_count,participating_player_count,
+			trophy_p10,trophy_p25,trophy_p50,trophy_p75,trophy_p90,town_halls,average_group_first_last_trophy_range,average_first_second_trophy_gap,refreshed_at)
+		SELECT $1,a.league_tier_id,a.group_count,a.distinct_player_count,a.participating_player_count,
+			a.trophy_p10,a.trophy_p25,a.trophy_p50,a.trophy_p75,a.trophy_p90,coalesce(t.value,'[]'),g.range_average,g.gap_average,now()
+		FROM aggregate_values a LEFT JOIN town_hall_json t USING(league_tier_id) LEFT JOIN group_averages g USING(league_tier_id)
+	`, seasonID)
+	if err != nil {
+		return 0, err
+	}
+	if err = tx.Commit(ctx); err != nil {
+		return 0, err
+	}
+	return int(hitrate.RowsAffected() + tierStats.RowsAffected()), nil
+}
+
+type memoryScheduledStore struct {
+	currentClanRankings map[string]map[string]currentClanRankingRow
+	leaderboardHistory  map[string]map[string]any
+	legendHistory       map[string]map[string]models.LegendHistoryRow
+}
+
+func newMemoryScheduledStore() *memoryScheduledStore {
+	return &memoryScheduledStore{
+		currentClanRankings: make(map[string]map[string]currentClanRankingRow),
+		leaderboardHistory:  make(map[string]map[string]any),
+		legendHistory:       make(map[string]map[string]models.LegendHistoryRow),
+	}
+}
+
+func (*memoryScheduledStore) Close() {}
+
+func (*memoryScheduledStore) ReconcileCWLSeasonStatistics(context.Context, []string) error {
+	return nil
+}
+
+func (*memoryScheduledStore) FinalizeLegendDay(context.Context, time.Time) (int, error) {
+	return 0, nil
+}
+
+func (*memoryScheduledStore) FinalizeArmyFamilies(context.Context, time.Time, platform.Config) (int, error) {
+	return 0, nil
+}
+
+func (s *memoryScheduledStore) ReplaceLeaderboardHistory(
+	_ context.Context,
+	groups []leaderboardHistoryGroup,
+) (int, error) {
+	if _, err := validateAndFlattenLeaderboardHistoryGroups(groups); err != nil {
+		return 0, err
+	}
+	affected := 0
+	for _, group := range groups {
+		key := leaderboardHistoryGroupKey(group.Kind, group.LocationID, group.Date)
+		replacement, err := memoryLeaderboardHistoryReplacement(group)
+		if err != nil {
+			return 0, err
+		}
+		for tag := range s.leaderboardHistory[key] {
+			if _, exists := replacement[tag]; !exists {
+				affected++
+			}
+		}
+		affected += len(replacement)
+		s.leaderboardHistory[key] = replacement
+	}
+	return affected, nil
+}
+
+func memoryLeaderboardHistoryReplacement(group leaderboardHistoryGroup) (map[string]any, error) {
+	replacement := make(map[string]any)
+	switch rows := group.Rows.(type) {
+	case []models.PlayerTrophyHistoryRow:
+		for _, row := range rows {
+			replacement[row.PlayerTag] = row
+		}
+	case []models.PlayerBuilderBaseTrophyHistoryRow:
+		for _, row := range rows {
+			replacement[row.PlayerTag] = row
+		}
+	case []models.ClanTrophyHistoryRow:
+		for _, row := range rows {
+			replacement[row.ClanTag] = row
+		}
+	case []models.ClanBuilderBaseTrophyHistoryRow:
+		for _, row := range rows {
+			replacement[row.ClanTag] = row
+		}
+	case []models.ClanCapitalHistoryRow:
+		for _, row := range rows {
+			replacement[row.ClanTag] = row
+		}
+	default:
+		return nil, fmt.Errorf("unsupported memory leaderboard history rows %T", group.Rows)
+	}
+	return replacement, nil
+}
+
+func (s *memoryScheduledStore) CompletedLegendSeasons(context.Context) (map[string]struct{}, error) {
+	completed := make(map[string]struct{})
+	for season, stored := range s.legendHistory {
+		rows := make([]models.LegendHistoryRow, 0, len(stored))
+		for _, row := range stored {
+			rows = append(rows, row)
+		}
+		if validateLegendHistoryRows(season, rows) == nil {
+			completed[season] = struct{}{}
+		}
+	}
+	return completed, nil
+}
+
+func (s *memoryScheduledStore) ReplaceLegendSeason(
+	_ context.Context,
+	season string,
+	rows []models.LegendHistoryRow,
+) (int, error) {
+	if err := validateLegendHistoryRows(season, rows); err != nil {
+		return 0, err
+	}
+	replacement := make(map[string]models.LegendHistoryRow, len(rows))
+	for _, row := range rows {
+		replacement[row.PlayerTag] = row
+	}
+	affected := len(replacement)
+	for playerTag := range s.legendHistory[season] {
+		if _, exists := replacement[playerTag]; !exists {
+			affected++
+		}
+	}
+	s.legendHistory[season] = replacement
+	return affected, nil
+}
+
+func (s *memoryScheduledStore) ReplaceCurrentClanRankingGroup(
+	_ context.Context,
+	group currentClanRankingGroup,
+) (int, error) {
+	key := group.RankingType + "\x00" + group.LocationID
+	replacement := make(map[string]currentClanRankingRow, len(group.Rows))
+	for _, row := range group.Rows {
+		replacement[row.ClanTag] = row
+	}
+	stale := 0
+	for clanTag := range s.currentClanRankings[key] {
+		if _, ok := replacement[clanTag]; !ok {
+			stale++
+		}
+	}
+	s.currentClanRankings[key] = replacement
+	return len(replacement) + stale, nil
+}
+
+func (*memoryScheduledStore) ListRankedGroupTargets(context.Context, int64) ([]string, error) {
+	return nil, nil
+}
+
+func (*memoryScheduledStore) StorePlayerProfiles(context.Context, []models.PlayerProfileIngest) (int, error) {
+	return 0, nil
+}
+
+func (*memoryScheduledStore) DeletePlayers(context.Context, []string) error {
+	return nil
+}
+
+func (*memoryScheduledStore) StoreRankedLeagueGroup(context.Context, []models.RankedLeagueGroupMemberRow) (int, error) {
+	return 0, nil
+}
+
+func (*memoryScheduledStore) MissingRankedGroupPlayers(context.Context, int64) ([]string, error) {
+	return nil, nil
+}
+
+func (*memoryScheduledStore) FinalizeRankedTournament(context.Context, int64) (int, error) {
+	return 0, nil
+}

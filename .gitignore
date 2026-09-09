@@ -4,3 +4,8 @@
 .idea/
 .venv/
 *__pycache__*
+.DS_Store
+.gocache/
+.t3/
+.work/
+t3.json
