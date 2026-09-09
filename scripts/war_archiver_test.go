@@ -1,6 +1,7 @@
 package scripts
 
 import (
+	"encoding/json"
 	"strings"
 	"testing"
 	"time"
@@ -8,53 +9,44 @@ import (
 	"clashking_tracking/internal/wararchive"
 )
 
-func TestArchiveStatsCountCWLFromPendingThroughUploadPayload(t *testing.T) {
+func TestArchiveStatsTreatCWLAsAnExistingWarTypeWithoutLeagueBreakdown(t *testing.T) {
 	stats := wararchive.NewPackStats()
-	stats.CWL = wararchive.NewCWLStats()
 	end := time.Date(2026, 9, 1, 12, 0, 0, 0, time.UTC)
 	wars := []pendingArchiveWar{
 		{ID: 1, WarType: "random", War: validArchiveStatsWar(end)},
-		{ID: 2, WarType: "cwl", CWLLeagueID: 48000001, War: validArchiveStatsWar(end)},
+		{ID: 2, WarType: "cwl", War: validArchiveStatsWar(end)},
 		{ID: 3, WarType: "cwl", War: validArchiveStatsWar(end.Add(time.Hour))},
 	}
 	for _, pending := range wars {
-		if err := addPendingArchiveWarStats(&stats, pending); err != nil {
-			t.Fatal(err)
-		}
+		stats.Add(pending.WarType, pending.War)
 	}
 
 	if got := stats.ByDay["2026-09-01"].WarsByType["cwl"]; got != 2 {
 		t.Fatalf("base pending CWL total = %d, want 2", got)
 	}
-	if got := stats.CWL.Coverage.WarCount; got != 2 {
-		t.Fatalf("uploaded CWL coverage total = %d, want 2", got)
+	payload, err := json.Marshal(stats)
+	if err != nil {
+		t.Fatal(err)
 	}
-	if stats.CWL.Coverage.LeagueComplete || stats.CWL.Coverage.UnknownLeagueWarCount != 1 {
-		t.Fatalf("unknown historic attribution was not retained: %+v", stats.CWL.Coverage)
+	var topLevel map[string]any
+	if err := json.Unmarshal(payload, &topLevel); err != nil {
+		t.Fatal(err)
 	}
-	if got := stats.CWL.ByDay["2026-09-01"].ByLeague["48000001"]["18:17"].Attacks; got != 1 {
-		t.Fatalf("known league attacks = %d, want 1", got)
-	}
-	if got := stats.CWL.ByDay["2026-09-01"].ByLeague["unknown"]["18:17"].Attacks; got != 1 {
-		t.Fatalf("unknown league attacks = %d, want 1", got)
+	if _, exists := topLevel["cwl"]; exists {
+		t.Fatalf("new CWL league statistics leaked into pack metadata: %s", payload)
 	}
 }
 
-func TestArchiveCWLLeagueAttributionUsesUniqueStoredGroup(t *testing.T) {
-	for _, fragment := range []string{
-		"count(DISTINCT groups.cwl_id) = 1",
-		"min(groups.cwl_league_id)",
-		"jsonb_array_elements(groups.rounds)",
-		"WHEN 'array' THEN round.value",
-		"WHEN 'object' THEN COALESCE(round.value -> 'warTags'",
-		"cwl_attribution.war_tag = wars.war_tag",
-	} {
+func TestArchivePackClaimDoesNotComputeNewCWLLeagueStatistics(t *testing.T) {
+	for _, fragment := range []string{"WHERE pending.pack_id = $1", "JOIN wars ON wars.war_id = pending.war_id"} {
 		if !strings.Contains(claimArchivePackWarsSQL, fragment) {
-			t.Fatalf("historic CWL attribution query missing %q", fragment)
+			t.Fatalf("archive pack query missing %q", fragment)
 		}
 	}
-	if strings.Contains(claimArchivePackWarsSQL, "basic_clan") {
-		t.Fatal("archive attribution must not use the clan's current league")
+	for _, excluded := range []string{"cwl_groups", "cwl_league_id", "jsonb_array_elements", "war_tag"} {
+		if strings.Contains(claimArchivePackWarsSQL, excluded) {
+			t.Fatalf("archive pack query must not compute CWL league statistics through %q", excluded)
+		}
 	}
 }
 

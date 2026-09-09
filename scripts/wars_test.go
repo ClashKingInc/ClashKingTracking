@@ -79,23 +79,26 @@ func TestWarTargetsSQLOnlyUsesPublicWarLogs(t *testing.T) {
 func TestCWLTargetsSkipKnownGroupSiblingsDuringDiscovery(t *testing.T) {
 	for _, required := range []string{
 		"EXTRACT(DAY FROM now() AT TIME ZONE 'UTC') BETWEEN 1 AND 15",
-		"FROM cwl_group_clans known_clan",
-		"left(known_group.season, 7) = to_char(now() AT TIME ZONE 'UTC', 'YYYY-MM')",
-		"SELECT min(candidate.clan_tag)",
-		"active_cwl_war.end_time - INTERVAL '24 hours' <= now()",
-		"next_cwl_war.end_time > active_cwl_war.end_time",
+		"WITH current_clans AS MATERIALIZED",
+		"JOIN cwl_group_clans known_clan",
+		"known_group.season >= to_char(now() AT TIME ZONE 'UTC', 'YYYY-MM')",
 	} {
-		if !strings.Contains(cwlTargetsSQL, required) {
-			t.Fatalf("CWL target query is missing group-deduplication rule %q: %s", required, cwlTargetsSQL)
+		if !strings.Contains(cwlDiscoveryTargetsSQL, required) {
+			t.Fatalf("CWL discovery query is missing rule %q: %s", required, cwlDiscoveryTargetsSQL)
 		}
 	}
 	for _, excluded := range []string{"public_war_log", "cwl_league_id IS NOT NULL", "last_active", "last_war_at"} {
-		if strings.Contains(cwlTargetPredicateSQL, excluded) {
-			t.Fatalf("CWL target query must not restrict candidates by %q: %s", excluded, cwlTargetPredicateSQL)
+		if strings.Contains(cwlDiscoveryTargetsSQL, excluded) {
+			t.Fatalf("CWL discovery query must not restrict candidates by %q: %s", excluded, cwlDiscoveryTargetsSQL)
 		}
 	}
-	if !strings.Contains(cwlTargetsSQL, "COALESCE(cwl_league_id, 0)") {
-		t.Fatalf("CWL target query must scan null cached leagues safely: %s", cwlTargetsSQL)
+	if !strings.Contains(cwlDiscoveryTargetsSQL, "COALESCE(cwl_league_id, 0)") {
+		t.Fatalf("CWL discovery query must scan null cached leagues safely: %s", cwlDiscoveryTargetsSQL)
+	}
+	for _, required := range []string{"WITH current_groups AS MATERIALIZED", "min(group_clan.clan_tag)", "JOIN basic_clan candidate_clan", "group_wars AS MATERIALIZED", "next_war.end_time > active_war.end_time"} {
+		if !strings.Contains(cwlRefreshTargetsSQL, required) {
+			t.Fatalf("CWL refresh query is missing rule %q: %s", required, cwlRefreshTargetsSQL)
+		}
 	}
 }
 
@@ -122,15 +125,16 @@ func TestCWLGroupLeaguePrefersRankedSiblingConsensus(t *testing.T) {
 
 func TestMemoryWarTargetSourceCountsFinitePools(t *testing.T) {
 	source := newMemoryWarTargetSource([]models.BasicClanRow{{Tag: "#A"}, {Tag: "#B"}})
-	for _, kind := range []warTargetKind{activeWarTargets, cwlTargets} {
-		count, err := source.CountTargets(t.Context(), kind)
-		if err != nil || count != 2 {
-			t.Fatalf("CountTargets(%q) = %d, %v; want 2", kind, count, err)
-		}
+	count, err := source.CountTargets(t.Context(), activeWarTargets)
+	if err != nil || count != 2 {
+		t.Fatalf("CountTargets(active) = %d, %v; want 2", count, err)
 	}
-	count, err := source.CountTargets(t.Context(), dormantWarTargets)
+	count, err = source.CountTargets(t.Context(), dormantWarTargets)
 	if err != nil || count != 0 {
 		t.Fatalf("CountTargets(dormant) = %d, %v; want 0", count, err)
+	}
+	if _, err := source.CountTargets(t.Context(), cwlTargets); err == nil {
+		t.Fatal("CWL source should not run an exact target count")
 	}
 }
 
@@ -475,9 +479,9 @@ func TestCWLSeasonMonthPreservesDatedProviderSeason(t *testing.T) {
 	if got := cwlSeasonMonth("2026"); got != "" {
 		t.Fatalf("short season month = %q", got)
 	}
-	for _, query := range []string{cwlTargetPredicateSQL, cwlTargetCountSQL} {
-		if strings.Contains(query, "group.season = to_char") || !strings.Contains(query, "left(") {
-			t.Fatal("CWL target query does not compare the month portion of exact stored seasons")
+	for _, query := range []string{cwlDiscoveryTargetsSQL, cwlRefreshTargetsSQL} {
+		if strings.Contains(query, "left(") || !strings.Contains(query, "season >= to_char") || !strings.Contains(query, "season < to_char") {
+			t.Fatal("CWL target query does not use an indexable range that includes exact and dated stored seasons")
 		}
 	}
 }
@@ -571,7 +575,7 @@ func TestGlobalCWLSyncSchedulesOverlappingBattleAndPreparationOnce(t *testing.T)
 		t.Fatal(err)
 	}
 	progress := app.Stats.Domain("cwl.groups")
-	if progress.TargetCount != 1 || progress.TargetCycle != 2 || progress.TargetProcessed != 0 {
+	if progress.TargetCount != 0 || progress.TargetCycle != 1 || progress.TargetProcessed != 1 {
 		t.Fatalf("CWL progress = %#v", progress)
 	}
 	if len(store.schedules) != 2 {

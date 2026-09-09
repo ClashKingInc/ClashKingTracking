@@ -28,11 +28,10 @@ const (
 type warArchiverDomain struct{}
 
 type pendingArchiveWar struct {
-	ID          int32
-	EndTime     time.Time
-	WarType     string
-	CWLLeagueID int
-	War         wararchive.War
+	ID      int32
+	EndTime time.Time
+	WarType string
+	War     wararchive.War
 }
 
 func NewWarArchiverDomain() platform.Domain { return &warArchiverDomain{} }
@@ -122,7 +121,6 @@ func (d *warArchiverDomain) archiveOne(ctx context.Context, app *platform.App, p
 	}
 	defer builder.Close()
 	stats := wararchive.NewPackStats()
-	stats.CWL = wararchive.NewCWLStats()
 	var rawBytes int64
 	firstEnd, lastEnd := wars[0].EndTime, wars[0].EndTime
 	for _, pending := range wars {
@@ -131,9 +129,7 @@ func (d *warArchiverDomain) archiveOne(ctx context.Context, app *platform.App, p
 			return 0, err
 		}
 		rawBytes += int64(locator.RawBytes)
-		if err := addPendingArchiveWarStats(&stats, pending); err != nil {
-			app.Logger.Error("CWL archive statistics frame invalid", "war_id", pending.ID, "error", err)
-		}
+		stats.Add(pending.WarType, pending.War)
 		if pending.EndTime.Before(firstEnd) {
 			firstEnd = pending.EndTime
 		}
@@ -157,17 +153,6 @@ func (d *warArchiverDomain) archiveOne(ctx context.Context, app *platform.App, p
 	}
 	app.Logger.Info("war archive pack uploaded", "pack_id", packID, "wars", len(wars), "bytes", len(builder.Bytes()))
 	return len(wars), nil
-}
-
-func addPendingArchiveWarStats(stats *wararchive.PackStats, pending pendingArchiveWar) error {
-	stats.Add(pending.WarType, pending.War)
-	if pending.WarType != "cwl" {
-		return nil
-	}
-	if stats.CWL == nil {
-		stats.CWL = wararchive.NewCWLStats()
-	}
-	return stats.CWL.AddWar(pending.War, pending.CWLLeagueID)
 }
 
 func primeWarArchiveCache(ctx context.Context, origin, key string) error {
@@ -251,12 +236,8 @@ func claimArchivePack(ctx context.Context, pool *pgxpool.Pool, packSize int) (in
 	for rows.Next() {
 		var pending pendingArchiveWar
 		var payload []byte
-		var cwlLeagueID *int
-		if err := rows.Scan(&pending.ID, &pending.EndTime, &pending.WarType, &payload, &cwlLeagueID); err != nil {
+		if err := rows.Scan(&pending.ID, &pending.EndTime, &pending.WarType, &payload); err != nil {
 			return 0, nil, err
-		}
-		if cwlLeagueID != nil {
-			pending.CWLLeagueID = *cwlLeagueID
 		}
 		pending.War, err = wararchive.Unmarshal(payload)
 		if err != nil {
@@ -273,33 +254,10 @@ func claimArchivePack(ctx context.Context, pool *pgxpool.Pool, packSize int) (in
 	return packID, claimed, nil
 }
 
-// A war tag belongs to exactly one stored CWL group. Ambiguous or missing group
-// matches remain unknown; the archiver never substitutes a clan's current league.
 const claimArchivePackWarsSQL = `
-		WITH cwl_attribution AS (
-			SELECT tag.value AS war_tag,
-			CASE
-				WHEN count(DISTINCT groups.cwl_id) = 1 THEN min(groups.cwl_league_id)
-				ELSE NULL
-			END AS cwl_league_id
-			FROM cwl_groups AS groups
-			CROSS JOIN LATERAL jsonb_array_elements(groups.rounds) AS round(value)
-			CROSS JOIN LATERAL jsonb_array_elements_text(
-				CASE jsonb_typeof(round.value)
-					WHEN 'array' THEN round.value
-					WHEN 'object' THEN COALESCE(round.value -> 'warTags', '[]'::jsonb)
-					ELSE '[]'::jsonb
-				END
-			) AS tag(value)
-			GROUP BY tag.value
-		)
-		SELECT pending.war_id, pending.end_time, wars.war_type, pending.payload,
-			cwl_attribution.cwl_league_id
+		SELECT pending.war_id, pending.end_time, wars.war_type, pending.payload
 		FROM war_archive_pending AS pending
 		JOIN wars ON wars.war_id = pending.war_id AND wars.end_time = pending.end_time
-		LEFT JOIN cwl_attribution
-		  ON wars.war_type = 'cwl'
-		 AND cwl_attribution.war_tag = wars.war_tag
 		WHERE pending.pack_id = $1
 		ORDER BY pending.created_at, pending.war_id
 	`

@@ -77,6 +77,7 @@ type Config struct {
 	DiscordBotToken                        string
 	DiscordAPIURL                          string
 	DiscordGatewayQueueSize                int
+	DiscordGatewayMemberChunkConcurrency   int
 	DiscordMessageCreateEnabled            bool
 	DiscordDeliveryBatchSize               int
 	WarArchiveEndpoint                     string
@@ -240,8 +241,9 @@ type jsonRosterAutomationConfig struct {
 }
 
 type jsonDiscordGatewayConfig struct {
-	QueueSize            int  `json:"queue_size"`
-	MessageCreateEnabled bool `json:"message_create_enabled"`
+	QueueSize              int  `json:"queue_size"`
+	MemberChunkConcurrency int  `json:"member_chunk_concurrency"`
+	MessageCreateEnabled   bool `json:"message_create_enabled"`
 }
 
 type jsonDiscordDeliveryConfig struct {
@@ -307,6 +309,7 @@ func loadConfigFile(path string) (Config, error) {
 		RosterAutomationScanSeconds:            file.RosterAutomations.ScanSeconds,
 		RosterAutomationBatchSize:              file.RosterAutomations.BatchSize,
 		DiscordGatewayQueueSize:                file.DiscordGateway.QueueSize,
+		DiscordGatewayMemberChunkConcurrency:   file.DiscordGateway.MemberChunkConcurrency,
 		DiscordMessageCreateEnabled:            file.DiscordGateway.MessageCreateEnabled,
 		DiscordDeliveryBatchSize:               file.DiscordDelivery.BatchSize,
 	}, nil
@@ -431,6 +434,9 @@ func deriveConfig(cfg *Config) {
 	}
 	if cfg.DiscordGatewayQueueSize == 0 {
 		cfg.DiscordGatewayQueueSize = 4096
+	}
+	if cfg.DiscordGatewayMemberChunkConcurrency == 0 {
+		cfg.DiscordGatewayMemberChunkConcurrency = 2
 	}
 	if cfg.DiscordDeliveryBatchSize == 0 {
 		cfg.DiscordDeliveryBatchSize = 50

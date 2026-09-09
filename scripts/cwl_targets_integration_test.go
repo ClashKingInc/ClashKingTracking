@@ -24,16 +24,34 @@ func TestCWLTargetsMidSeasonDatabase(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer tx.Rollback(t.Context())
-	_, err = tx.Exec(t.Context(), `INSERT INTO basic_clan(tag,name,public_war_log,war_wins,member_count,badge_token,troops_donated,troops_received,cwl_league_id) VALUES ('#LOCAL_A','local',true,0,15,'',0,0,48000012),('#LOCAL_B','local',true,0,15,'',0,0,48000012),('#LOCAL_PRIVATE','local',false,0,0,'',0,0,NULL)`)
+	_, err = tx.Exec(t.Context(), `INSERT INTO basic_clan(tag,name,public_war_log,war_wins,member_count,badge_token,troops_donated,troops_received,cwl_league_id) VALUES ('#LOCAL_A','local',true,0,15,'',0,0,48000012),('#LOCAL_B','local',true,0,15,'',0,0,48000012),('#LOCAL_PRIVATE','local',false,0,0,'',0,0,48000000)`)
 	if err != nil {
 		t.Fatal(err)
 	}
 	count := func(day string, want int) {
 		t.Helper()
-		q := strings.ReplaceAll(cwlTargetPredicateSQL, "now()", "TIMESTAMPTZ '2026-09-"+day+" 12:00:00+00'")
-		var got int
-		if err := tx.QueryRow(t.Context(), "SELECT count(*) FROM basic_clan WHERE tag IN ('#LOCAL_A','#LOCAL_B','#LOCAL_PRIVATE') AND "+q).Scan(&got); err != nil {
-			t.Fatal(err)
+		got := 0
+		for _, sourceQuery := range []string{cwlRefreshTargetsSQL, cwlDiscoveryTargetsSQL} {
+			q := strings.ReplaceAll(sourceQuery, "now()", "TIMESTAMPTZ '2026-09-"+day+" 12:00:00+00'")
+			rows, queryErr := tx.Query(t.Context(), q, "", 100)
+			if queryErr != nil {
+				t.Fatal(queryErr)
+			}
+			for rows.Next() {
+				var tag, name string
+				var leagueID int
+				if scanErr := rows.Scan(&tag, &name, &leagueID); scanErr != nil {
+					rows.Close()
+					t.Fatal(scanErr)
+				}
+				if strings.HasPrefix(tag, "#LOCAL_") {
+					got++
+				}
+			}
+			if rows.Err() != nil {
+				t.Fatal(rows.Err())
+			}
+			rows.Close()
 		}
 		if got != want {
 			t.Fatalf("day %s: targets %d, want %d", day, got, want)
