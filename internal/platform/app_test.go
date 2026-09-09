@@ -19,7 +19,7 @@ func (d runTestDomain) Run(ctx context.Context, _ *App) error { return d.run(ctx
 
 func TestRunCancelsSiblingDomainsAfterFailure(t *testing.T) {
 	stopped := make(chan struct{})
-	app := &App{Scheduler: NewScheduler()}
+	app := &App{}
 	err := Run(t.Context(), app, []Domain{
 		runTestDomain{name: "failed", run: func(context.Context) error {
 			return errors.New("failed")
@@ -68,7 +68,7 @@ func TestProxyConnectionLimitUsesLargestRequestRate(t *testing.T) {
 		GlobalClanPriorityRequestsPerSecond:    950,
 		GlobalClanNonPriorityRequestsPerSecond: 50,
 		BattlelogRequestsPerSecond:             10,
-		WarRequestsPerSecond:                   950,
+		WarDiscoveryActiveRequestsPerSecond:    950,
 		TrackedClanRequestsPerSecond:           950,
 		TrackedPlayerRequestsPerSecond:         950,
 	}

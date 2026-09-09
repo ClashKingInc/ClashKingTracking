@@ -58,7 +58,7 @@ Reads:
 
 Writes:
 
-- `basic_clan`: current profile, public-war-log flag, members, activity fields, and known Clash IDs.
+- `basic_clan`: current profile, public-war-log flag, members, activity fields, known Clash IDs, and the clan's cumulative Capital Gold deposits.
 - `clan_records`: best clan points and war streak records.
 - `basic_player`: inexpensive member facts learned from the clan response.
 - `join_leave_history`: durable join and leave rows.
@@ -98,6 +98,8 @@ flowchart LR
 - `target_page_multiplier`
 - Timescale/PostgreSQL connection settings
 - Proxy origin and credentials shared by all Clash callers
+
+Operational request and progress metrics are split into `globalclans.priority` and `globalclans.non_priority`. Each pool therefore shows its own observed RPS, errors, latency, target count, loop progress, and completion estimate instead of combining both configured rates into one opaque number.
 
 ## Outages and restarts
 

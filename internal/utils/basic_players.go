@@ -10,19 +10,23 @@ import (
 
 const UpsertBasicPlayerSQL = `
 	INSERT INTO basic_player (
-		tag, name, league_id, clan_tag, townhall_level, trophies
+		tag, name, league_id, league_group_tag, league_season_id, clan_tag, townhall_level, trophies
 	)
-	VALUES ($1, $2, NULLIF($3, 0), $4, $5, $6)
+	VALUES ($1, $2, NULLIF($3, 0), NULLIF($4, ''), NULLIF($5, 0), $6, $7, $8)
 	ON CONFLICT (tag) DO UPDATE SET
 		name = EXCLUDED.name,
 		league_id = COALESCE(EXCLUDED.league_id, basic_player.league_id),
-		clan_tag = CASE WHEN $7 THEN EXCLUDED.clan_tag ELSE basic_player.clan_tag END,
+		league_group_tag = CASE WHEN $9 THEN EXCLUDED.league_group_tag ELSE basic_player.league_group_tag END,
+		league_season_id = CASE WHEN $9 THEN EXCLUDED.league_season_id ELSE basic_player.league_season_id END,
+		clan_tag = CASE WHEN $10 THEN EXCLUDED.clan_tag ELSE basic_player.clan_tag END,
 		townhall_level = EXCLUDED.townhall_level,
 		trophies = CASE WHEN EXCLUDED.trophies > 0 THEN EXCLUDED.trophies ELSE basic_player.trophies END
 	WHERE
 		basic_player.name IS DISTINCT FROM EXCLUDED.name OR
 		basic_player.league_id IS DISTINCT FROM COALESCE(EXCLUDED.league_id, basic_player.league_id) OR
-		($7 AND basic_player.clan_tag IS DISTINCT FROM EXCLUDED.clan_tag) OR
+		($9 AND basic_player.league_group_tag IS DISTINCT FROM EXCLUDED.league_group_tag) OR
+		($9 AND basic_player.league_season_id IS DISTINCT FROM EXCLUDED.league_season_id) OR
+		($10 AND basic_player.clan_tag IS DISTINCT FROM EXCLUDED.clan_tag) OR
 		basic_player.townhall_level IS DISTINCT FROM EXCLUDED.townhall_level OR
 		(EXCLUDED.trophies > 0 AND basic_player.trophies IS DISTINCT FROM EXCLUDED.trophies)
 `
@@ -51,9 +55,12 @@ func UpsertBasicPlayersCount(ctx context.Context, tx pgx.Tx, players []models.Ba
 			player.Tag,
 			player.Name,
 			player.LeagueID,
+			player.LeagueGroupID,
+			player.LeagueSeasonID,
 			clanTagValue(player.ClanTag, clanTagKnown),
 			player.TownHall,
 			player.Trophies,
+			player.LeagueGroupKnown,
 			clanTagKnown,
 		)
 	}

@@ -29,7 +29,7 @@ func TestBuildLeaderboardCacheRanksFreshPlayersAndExcludesUnrankedLeague(t *test
 	players := []leaderboardPlayerRow{
 		{BasicPlayerRow: models.BasicPlayerRow{Tag: "#B", Name: "B", LeagueID: unrankedPlayerLeagueID, TownHall: 16, Trophies: 7000}},
 		{
-			BasicPlayerRow: models.BasicPlayerRow{Tag: "#A", Name: "A", LeagueID: 29000022, ClanTag: "#CLAN", TownHall: 16, Trophies: 6500},
+			BasicPlayerRow: models.BasicPlayerRow{Tag: "#A", Name: "A", LeagueID: 29000022, LeagueGroupID: "#GROUP", ClanTag: "#CLAN", TownHall: 16, Trophies: 6500},
 			League:         leaderboardLeaguePayload{ID: 29000022, Name: "Legend League", Badge: "legend.png"},
 		},
 		{
@@ -69,6 +69,9 @@ func TestBuildLeaderboardCacheRanksFreshPlayersAndExcludesUnrankedLeague(t *test
 	if board.Items[1].League.ID != 29000022 || board.Items[1].League.Name != "Legend League" || board.Items[1].League.Badge != "legend.png" {
 		t.Fatalf("expected nested league metadata: %#v", board.Items[1].League)
 	}
+	if board.Items[1].LeagueGroupID != "#GROUP" {
+		t.Fatalf("league group ID = %q, want #GROUP", board.Items[1].LeagueGroupID)
+	}
 	townhallBoard := findLeaderboardBoard(t, cache.Boards, "townhall", "16")
 	if len(townhallBoard.Items) != 3 {
 		t.Fatalf("townhall board items = %d, want 3", len(townhallBoard.Items))
@@ -81,6 +84,9 @@ func TestBuildLeaderboardCacheRanksFreshPlayersAndExcludesUnrankedLeague(t *test
 		t.Fatalf("marshal board: %v", err)
 	}
 	payload := string(raw)
+	if !strings.Contains(payload, `"leagueGroupId":"#GROUP"`) || strings.Contains(payload, "league_group_id") {
+		t.Fatalf("leaderboard group field must use the API contract name: %s", payload)
+	}
 	if strings.Contains(payload, `"type"`) || strings.Contains(payload, `"key"`) || !strings.Contains(payload, `"items"`) {
 		t.Fatalf("unexpected board payload shape: %s", payload)
 	}
@@ -122,11 +128,16 @@ func TestLeaguePayloadForPlayerUsesLeagueTierMetadata(t *testing.T) {
 }
 
 func TestLeaderboardMaterializedViewRefreshSet(t *testing.T) {
+	if leaderboardMaterializedViewRefreshSeconds != 30*60 {
+		t.Fatalf("materialized view refresh cadence = %d seconds, want 30 minutes", leaderboardMaterializedViewRefreshSeconds)
+	}
 	got := strings.Join(leaderboardMaterializedViewRefreshQueries[:], "\n")
 	want := strings.Join([]string{
 		`REFRESH MATERIALIZED VIEW CONCURRENTLY clan_leaderboards`,
 		`REFRESH MATERIALIZED VIEW war_league_counts`,
 		`REFRESH MATERIALIZED VIEW CONCURRENTLY townhall_counts`,
+		`REFRESH MATERIALIZED VIEW CONCURRENTLY api_global_counts`,
+		`REFRESH MATERIALIZED VIEW CONCURRENTLY api_league_tier_counts`,
 	}, "\n")
 
 	if got != want {
@@ -150,6 +161,35 @@ func TestLeaderboardMaterializedViewRefreshSet(t *testing.T) {
 		if strings.Contains(query, "CONCURRENTLY") {
 			t.Fatalf("bootstrap query %d uses CONCURRENTLY: %s", i, query)
 		}
+	}
+}
+
+func TestLeaderboardMaterializedViewRefreshPreventsOverlap(t *testing.T) {
+	started := make(chan struct{})
+	release := make(chan struct{})
+	attempts := 0
+	domain := &leaderboardsDomain{refreshMaterializedViews: func(context.Context) error {
+		attempts++
+		close(started)
+		<-release
+		return nil
+	}}
+	app := &platform.App{
+		Logger: slog.New(slog.NewTextHandler(io.Discard, nil)),
+		Stats:  platform.NewTracker(),
+	}
+	done := make(chan error, 1)
+	go func() { done <- domain.refreshMaterializedViewsIfDue(t.Context(), app, time.Now().UTC()) }()
+	<-started
+	if err := domain.refreshMaterializedViewsIfDue(t.Context(), app, time.Now().UTC()); err != nil {
+		t.Fatalf("overlapping refresh check: %v", err)
+	}
+	close(release)
+	if err := <-done; err != nil {
+		t.Fatalf("initial refresh: %v", err)
+	}
+	if attempts != 1 {
+		t.Fatalf("refresh attempts = %d, want one while first refresh is running", attempts)
 	}
 }
 

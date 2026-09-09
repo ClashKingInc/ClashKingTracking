@@ -2,18 +2,19 @@ package models
 
 import (
 	"time"
-
-	"github.com/google/uuid"
 )
 
 type BasicPlayerRow struct {
-	Tag          string
-	Name         string
-	LeagueID     int
-	ClanTag      string
-	ClanTagKnown bool
-	TownHall     int
-	Trophies     int
+	Tag              string
+	Name             string
+	LeagueID         int
+	LeagueGroupID    string
+	LeagueSeasonID   int64
+	LeagueGroupKnown bool
+	ClanTag          string
+	ClanTagKnown     bool
+	TownHall         int
+	Trophies         int
 }
 
 type BattlelogCheckpoint struct {
@@ -27,11 +28,10 @@ type BattlelogIngest struct {
 }
 
 type BattlelogRow struct {
-	BattleID              uuid.UUID
 	ArmyShareCode         string
+	ArmyHash              [32]byte
 	PlayerTag             string
 	OpponentTag           string
-	OpponentName          string
 	OpponentTH            uint8
 	BattleType            string
 	Attack                bool

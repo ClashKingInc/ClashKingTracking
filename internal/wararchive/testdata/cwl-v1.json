@@ -1,0 +1,26 @@
+{
+  "version": 1,
+  "coverage": {"complete": true, "warCount": 1, "unknownLeagueWarCount": 0, "leagueComplete": true},
+  "byDay": {
+    "2026-09-01": {
+      "byLeague": {
+        "48000001": {
+          "18:17": {
+            "attacks": 2,
+            "zeroStars": {"attacks": 1, "destructionPercent": 40, "durationSeconds": 60},
+            "oneStars": {"attacks": 1, "destructionPercent": 60, "durationSeconds": 90},
+            "twoStars": {"attacks": 0, "destructionPercent": 0, "durationSeconds": 0},
+            "threeStars": {"attacks": 0, "durationSeconds": 0}
+          },
+          "17:18": {
+            "attacks": 2,
+            "zeroStars": {"attacks": 0, "destructionPercent": 0, "durationSeconds": 0},
+            "oneStars": {"attacks": 0, "destructionPercent": 0, "durationSeconds": 0},
+            "twoStars": {"attacks": 1, "destructionPercent": 80, "durationSeconds": 120},
+            "threeStars": {"attacks": 1, "durationSeconds": 150}
+          }
+        }
+      }
+    }
+  }
+}

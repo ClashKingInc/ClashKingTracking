@@ -7,10 +7,12 @@ import (
 	"fmt"
 	"net/http"
 	"net/url"
+	"sort"
 	"strconv"
 	"strings"
 	"time"
 
+	"clashking_tracking/internal/cwlstats"
 	"clashking_tracking/internal/platform"
 	"clashking_tracking/internal/utils"
 	"clashking_tracking/models"
@@ -34,7 +36,8 @@ const (
 	legendSeasonV2Prefix = "v2-"
 	legendSeasonV2Length = 28 * 24 * time.Hour
 
-	currentClanRankingLimit = 200
+	currentClanRankingLimit     = 200
+	cwlSeasonStatisticsInterval = 7 * 24 * time.Hour
 )
 
 type leaderboardLoader func(context.Context, *clashy.Client, string) (any, error)
@@ -204,10 +207,10 @@ type legendRankingItem struct {
 }
 
 type scheduledDomain struct {
-	store                   scheduledStore
-	lastRankedGroupSeasonID int64
-	loadLegendSeasons       legendSeasonsLoader
-	loadLegendRankings      legendSeasonRankingsLoader
+	store              scheduledStore
+	limiter            *clashy.Limiter
+	loadLegendSeasons  legendSeasonsLoader
+	loadLegendRankings legendSeasonRankingsLoader
 }
 
 type scheduledStore interface {
@@ -216,11 +219,15 @@ type scheduledStore interface {
 	CompletedLegendSeasons(context.Context) (map[string]struct{}, error)
 	ReplaceLegendSeason(context.Context, string, []models.LegendHistoryRow) (int, error)
 	ReplaceCurrentClanRankingGroup(context.Context, currentClanRankingGroup) (int, error)
-	ListRankedGroupTargets(context.Context) ([]string, error)
+	ListRankedGroupTargets(context.Context, int64) ([]string, error)
 	StorePlayerProfiles(context.Context, []models.PlayerProfileIngest) (int, error)
 	DeletePlayers(context.Context, []string) error
-	StoreRankedLeagueGroupMembers(context.Context, []models.RankedLeagueGroupMemberRow) (int, error)
+	StoreRankedLeagueGroup(context.Context, []models.RankedLeagueGroupMemberRow) (int, error)
 	MissingRankedGroupPlayers(context.Context, int64) ([]string, error)
+	FinalizeRankedTournament(context.Context, int64) (int, error)
+	ReconcileCWLSeasonStatistics(context.Context, []string) error
+	FinalizeLegendDay(context.Context, time.Time) (int, error)
+	FinalizeArmyFamilies(context.Context, time.Time, platform.Config) (int, error)
 }
 
 func NewScheduledDomain() platform.Domain { return &scheduledDomain{} }
@@ -231,6 +238,11 @@ func (d *scheduledDomain) Run(ctx context.Context, app *platform.App) error {
 	if err := validateScheduledConfig(app.Config); err != nil {
 		return err
 	}
+	limiter, err := newTrackingLimiter(app.Config.ScheduledRequestsPerSecond)
+	if err != nil {
+		return err
+	}
+	d.limiter = limiter
 	store, err := newScheduledStore(ctx, app)
 	if err != nil {
 		return err
@@ -243,11 +255,17 @@ func (d *scheduledDomain) Run(ctx context.Context, app *platform.App) error {
 	leaderboardCtx, stopLeaderboards := context.WithCancel(ctx)
 	leaderboardDone := make(chan error, 1)
 	go func() {
-		leaderboardDone <- (&leaderboardsDomain{}).Run(leaderboardCtx, app)
+		leaderboardDone <- (&leaderboardsDomain{limiter: limiter}).Run(leaderboardCtx, app)
 	}()
+	cwlStatisticsDone := make(chan error, 1)
+	go func() { cwlStatisticsDone <- d.runCWLSeasonStatisticsLoop(leaderboardCtx, app) }()
+	leagueCloseoutDone := make(chan error, 1)
+	go func() { leagueCloseoutDone <- d.runLeagueCloseoutLoop(leaderboardCtx, app) }()
 	defer func() {
 		stopLeaderboards()
 		<-leaderboardDone
+		<-cwlStatisticsDone
+		<-leagueCloseoutDone
 	}()
 
 	interval := time.Duration(app.Config.ScheduledIntervalSeconds) * time.Second
@@ -267,6 +285,74 @@ func (d *scheduledDomain) Run(ctx context.Context, app *platform.App) error {
 			stopLeaderboards()
 			leaderboardDone <- err
 			return fmt.Errorf("scheduled leaderboard refresh stopped: %w", err)
+		case err := <-cwlStatisticsDone:
+			if !timer.Stop() {
+				<-timer.C
+			}
+			stopLeaderboards()
+			cwlStatisticsDone <- err
+			return fmt.Errorf("scheduled CWL season statistics refresh stopped: %w", err)
+		case err := <-leagueCloseoutDone:
+			if !timer.Stop() {
+				<-timer.C
+			}
+			stopLeaderboards()
+			leagueCloseoutDone <- err
+			return fmt.Errorf("scheduled league closeout stopped: %w", err)
+		case <-ctx.Done():
+			if !timer.Stop() {
+				<-timer.C
+			}
+			return ctx.Err()
+		case <-timer.C:
+		}
+	}
+}
+
+func (d *scheduledDomain) runCWLSeasonStatisticsLoop(ctx context.Context, app *platform.App) error {
+	for {
+		started := time.Now()
+		if err := d.store.ReconcileCWLSeasonStatistics(ctx, cwlstats.CurrentAndPreviousUTC(started)); err != nil {
+			return err
+		}
+		app.Stats.RecordProcess(trackingProgressName(scheduledDomainName, "cwl-season-statistics"), time.Since(started))
+		timer := time.NewTimer(cwlSeasonStatisticsInterval)
+		select {
+		case <-ctx.Done():
+			if !timer.Stop() {
+				<-timer.C
+			}
+			return ctx.Err()
+		case <-timer.C:
+		}
+	}
+}
+
+func (d *scheduledDomain) runLeagueCloseoutLoop(ctx context.Context, app *platform.App) error {
+	for {
+		now := time.Now().UTC()
+		day := latestEligibleLegendDay(now)
+		started := time.Now()
+		writes, err := d.store.FinalizeLegendDay(ctx, day)
+		if err != nil {
+			return err
+		}
+		familyWrites, err := d.store.FinalizeArmyFamilies(ctx, day, app.Config)
+		if err != nil {
+			return err
+		}
+		app.Stats.RecordWrite(trackingProgressName(scheduledDomainName, "legend-closeout"), writes)
+		app.Stats.RecordWrite(trackingProgressName(scheduledDomainName, "army-family-closeout"), familyWrites)
+		app.Stats.RecordProcess(trackingProgressName(scheduledDomainName, "league-closeout"), time.Since(started))
+		if rankedCloseoutDue(now) {
+			rankedWrites, err := d.doRankedGroupDiscovery(ctx, app, now)
+			if err != nil {
+				return err
+			}
+			app.Stats.RecordWrite(trackingProgressName(scheduledDomainName, "ranked-closeout"), rankedWrites)
+		}
+		timer := time.NewTimer(time.Until(nextLeagueCloseout(now)))
+		select {
 		case <-ctx.Done():
 			if !timer.Stop() {
 				<-timer.C
@@ -278,6 +364,9 @@ func (d *scheduledDomain) Run(ctx context.Context, app *platform.App) error {
 }
 
 func validateScheduledConfig(cfg platform.Config) error {
+	if cfg.ScheduledRequestsPerSecond <= 0 {
+		return errors.New("scheduled.requests_per_second must be greater than zero")
+	}
 	if cfg.ScheduledIntervalSeconds <= 0 {
 		return errors.New("scheduled.interval_seconds must be greater than zero")
 	}
@@ -320,11 +409,6 @@ func (d *scheduledDomain) runCycle(ctx context.Context, app *platform.App) error
 	if err != nil {
 		cycleErrors = append(cycleErrors, err)
 	}
-	groupWrites, err := d.doRankedGroupDiscovery(ctx, app, now)
-	if err != nil {
-		cycleErrors = append(cycleErrors, err)
-	}
-	app.Stats.RecordWrite(scheduledDomainName, groupWrites)
 	if err := errors.Join(cycleErrors...); err != nil {
 		return err
 	}
@@ -332,27 +416,38 @@ func (d *scheduledDomain) runCycle(ctx context.Context, app *platform.App) error
 	return nil
 }
 
-func (d *scheduledDomain) doRankedGroupDiscovery(ctx context.Context, app *platform.App, now time.Time) (int, error) {
-	seasonID, ok := previousRankedSeasonID(now)
-	if !ok {
-		return 0, nil
+func latestEligibleLegendDay(now time.Time) time.Time {
+	now = now.UTC()
+	today := time.Date(now.Year(), now.Month(), now.Day(), 0, 0, 0, 0, time.UTC)
+	if now.Before(today.Add(5*time.Hour + 10*time.Minute)) {
+		return today.AddDate(0, 0, -2)
 	}
-	if d.lastRankedGroupSeasonID == seasonID {
-		return 0, nil
+	return today.AddDate(0, 0, -1)
+}
+
+func nextLeagueCloseout(now time.Time) time.Time {
+	now = now.UTC()
+	next := time.Date(now.Year(), now.Month(), now.Day(), 5, 10, 0, 0, time.UTC)
+	if !next.After(now) {
+		next = next.AddDate(0, 0, 1)
 	}
-	targets, err := d.store.ListRankedGroupTargets(ctx)
+	return next
+}
+
+func rankedCloseoutDue(now time.Time) bool {
+	now = now.UTC()
+	return now.Weekday() == time.Monday && !now.Before(time.Date(now.Year(), now.Month(), now.Day(), 5, 10, 0, 0, time.UTC))
+}
+
+func (d *scheduledDomain) doRankedGroupDiscovery(ctx context.Context, app *platform.App, _ time.Time) (int, error) {
+	targets, err := d.store.ListRankedGroupTargets(ctx, 0)
 	if err != nil {
 		return 0, err
 	}
-	pending := make(map[string]struct{}, len(targets))
-	for _, tag := range targets {
-		if tag != "" {
-			pending[tag] = struct{}{}
-		}
-	}
 	writes := 0
-	for tag := range pending {
-		delete(pending, tag)
+	seenGroups := make(map[string]struct{})
+	seasons := make(map[int64]struct{})
+	for _, tag := range targets {
 		player, ok, err := d.fetchRankedSeedPlayer(ctx, app, tag)
 		if err != nil {
 			return writes, err
@@ -365,41 +460,56 @@ func (d *scheduledDomain) doRankedGroupDiscovery(ctx context.Context, app *platf
 			return writes, err
 		}
 		writes += affected
-		if player.PreviousLeagueSeasonID == 0 || int64(player.PreviousLeagueSeasonID) != seasonID || player.PreviousLeagueGroupTag == "" || player.PreviousLeagueGroupTag == "#0" {
+		seasonID := int64(player.PreviousLeagueSeasonID)
+		groupTag := clashy.CorrectTag(player.PreviousLeagueGroupTag)
+		if seasonID <= 0 || groupTag == "" || groupTag == "#0" {
 			continue
 		}
-		leagueTierID, found, err := d.previousLeagueTierID(ctx, app, player.Tag, seasonID)
+		key := strconv.FormatInt(seasonID, 10) + "\x00" + groupTag
+		if _, seen := seenGroups[key]; seen {
+			continue
+		}
+		leagueHistory, found, err := d.matchingLeagueHistory(ctx, app, player.Tag, seasonID)
 		if err != nil {
 			return writes, err
 		}
 		if !found {
-			app.Logger.Info("ranked group skipped without matching league history", "tag", player.Tag, "season_id", seasonID, "group_tag", player.PreviousLeagueGroupTag)
 			continue
 		}
-		members, err := d.fetchRankedGroupMembers(ctx, app, player.Tag, player.PreviousLeagueGroupTag, seasonID, leagueTierID)
+		members, err := d.fetchRankedGroupMembers(ctx, app, player.Tag, groupTag, seasonID, leagueHistory.LeagueTierID, leagueHistory.MaxBattles)
 		if err != nil {
 			return writes, err
 		}
-		affected, err = d.store.StoreRankedLeagueGroupMembers(ctx, members)
+		seenGroups[key] = struct{}{}
+		seasons[seasonID] = struct{}{}
+		affected, err = d.store.StoreRankedLeagueGroup(ctx, members)
 		if err != nil {
 			return writes, err
 		}
 		writes += affected
-		for _, member := range members {
-			delete(pending, member.PlayerTag)
+	}
+	seasonIDs := make([]int64, 0, len(seasons))
+	for seasonID := range seasons {
+		seasonIDs = append(seasonIDs, seasonID)
+	}
+	sort.Slice(seasonIDs, func(i, j int) bool { return seasonIDs[i] < seasonIDs[j] })
+	for _, seasonID := range seasonIDs {
+		missingWrites, err := d.fetchAndStoreMissingRankedPlayers(ctx, app, seasonID, time.Time{})
+		if err != nil {
+			return writes, err
 		}
+		writes += missingWrites
+		finalized, err := d.store.FinalizeRankedTournament(ctx, seasonID)
+		if err != nil {
+			return writes, err
+		}
+		writes += finalized
 	}
-	missingWrites, err := d.fetchAndStoreMissingRankedPlayers(ctx, app, seasonID, now)
-	if err != nil {
-		return writes, err
-	}
-	writes += missingWrites
-	d.lastRankedGroupSeasonID = seasonID
 	return writes, nil
 }
 
 func (d *scheduledDomain) fetchRankedSeedPlayer(ctx context.Context, app *platform.App, tag string) (*clashy.Player, bool, error) {
-	player, err := platform.RetryClashFetch(ctx, app.Availability, func(fetchCtx context.Context) (*clashy.Player, error) {
+	player, err := retryLimitedClashFetch(ctx, app, d.limiter, func(fetchCtx context.Context) (*clashy.Player, error) {
 		start := time.Now()
 		player, err := app.Clash.GetPlayer(fetchCtx, tag)
 		app.Stats.RecordRequest(scheduledDomainName, time.Since(start), err)
@@ -417,26 +527,26 @@ func (d *scheduledDomain) fetchRankedSeedPlayer(ctx context.Context, app *platfo
 	return player, true, nil
 }
 
-func (d *scheduledDomain) previousLeagueTierID(ctx context.Context, app *platform.App, tag string, seasonID int64) (int, bool, error) {
-	entries, err := platform.RetryClashFetch(ctx, app.Availability, func(fetchCtx context.Context) ([]clashy.LeagueHistoryEntry, error) {
+func (d *scheduledDomain) matchingLeagueHistory(ctx context.Context, app *platform.App, tag string, seasonID int64) (clashy.LeagueHistoryEntry, bool, error) {
+	entries, err := retryLimitedClashFetch(ctx, app, d.limiter, func(fetchCtx context.Context) ([]clashy.LeagueHistoryEntry, error) {
 		start := time.Now()
 		entries, err := app.Clash.GetPlayerLeagueHistory(fetchCtx, tag)
 		app.Stats.RecordRequest(scheduledDomainName, time.Since(start), err)
 		return entries, err
 	})
 	if err != nil {
-		return 0, false, err
+		return clashy.LeagueHistoryEntry{}, false, err
 	}
 	for _, entry := range entries {
-		if int64(entry.LeagueSeasonID) == seasonID && entry.LeagueTierID > 0 {
-			return entry.LeagueTierID, true, nil
+		if int64(entry.LeagueSeasonID) == seasonID && entry.LeagueTierID > 0 && entry.MaxBattles > 0 {
+			return entry, true, nil
 		}
 	}
-	return 0, false, nil
+	return clashy.LeagueHistoryEntry{}, false, nil
 }
 
-func (d *scheduledDomain) fetchRankedGroupMembers(ctx context.Context, app *platform.App, seedTag, groupTag string, seasonID int64, leagueTierID int) ([]models.RankedLeagueGroupMemberRow, error) {
-	group, err := platform.RetryClashFetch(ctx, app.Availability, func(fetchCtx context.Context) (*clashy.LeagueTierGroup, error) {
+func (d *scheduledDomain) fetchRankedGroupMembers(ctx context.Context, app *platform.App, seedTag, groupTag string, seasonID int64, leagueTierID, maximumBattles int) ([]models.RankedLeagueGroupMemberRow, error) {
+	group, err := retryLimitedClashFetch(ctx, app, d.limiter, func(fetchCtx context.Context) (*clashy.LeagueTierGroup, error) {
 		start := time.Now()
 		group, err := app.Clash.GetPlayerLeagueGroup(fetchCtx, seedTag, groupTag, strconv.FormatInt(seasonID, 10))
 		app.Stats.RecordRequest(scheduledDomainName, time.Since(start), err)
@@ -445,35 +555,38 @@ func (d *scheduledDomain) fetchRankedGroupMembers(ctx context.Context, app *plat
 	if err != nil {
 		return nil, err
 	}
-	return rankedGroupMemberRows(groupTag, seasonID, leagueTierID, group), nil
+	return rankedGroupMemberRows(groupTag, seasonID, leagueTierID, maximumBattles, group)
 }
 
-func rankedGroupMemberRows(groupTag string, seasonID int64, leagueTierID int, group *clashy.LeagueTierGroup) []models.RankedLeagueGroupMemberRow {
+func rankedGroupMemberRows(groupTag string, seasonID int64, leagueTierID, maximumBattles int, group *clashy.LeagueTierGroup) ([]models.RankedLeagueGroupMemberRow, error) {
 	if group == nil {
-		return nil
+		return nil, nil
 	}
 	rows := make([]models.RankedLeagueGroupMemberRow, 0, len(group.Members))
 	for i, member := range group.Members {
 		if member.PlayerTag == "" {
 			continue
 		}
+		playerTag := clashy.CorrectTag(member.PlayerTag)
+		if playerTag == "" {
+			continue
+		}
 		rows = append(rows, models.RankedLeagueGroupMemberRow{
-			SeasonID:         seasonID,
-			GroupTag:         groupTag,
-			LeagueTierID:     leagueTierID,
-			PlayerTag:        member.PlayerTag,
-			PlayerName:       member.PlayerName,
-			ClanTag:          member.ClanTag,
-			ClanName:         member.ClanName,
-			Placement:        i + 1,
-			LeagueTrophies:   member.LeagueTrophies,
-			AttackWinCount:   member.AttackWinCount,
-			AttackLoseCount:  member.AttackLoseCount,
-			DefenseWinCount:  member.DefenseWinCount,
-			DefenseLoseCount: member.DefenseLoseCount,
+			SeasonID:           seasonID,
+			GroupTag:           groupTag,
+			LeagueTierID:       leagueTierID,
+			PlayerTag:          playerTag,
+			PlayerName:         member.PlayerName,
+			Placement:          i + 1,
+			LeagueTrophies:     member.LeagueTrophies,
+			MaximumBattleCount: maximumBattles,
+			AttackWinCount:     member.AttackWinCount,
+			AttackLossCount:    member.AttackLoseCount,
+			DefenseWinCount:    member.DefenseWinCount,
+			DefenseLossCount:   member.DefenseLoseCount,
 		})
 	}
-	return rows
+	return rows, nil
 }
 
 func (d *scheduledDomain) fetchAndStoreMissingRankedPlayers(ctx context.Context, app *platform.App, seasonID int64, _ time.Time) (int, error) {
@@ -513,21 +626,11 @@ func (d *scheduledDomain) fetchAndStoreMissingRankedPlayers(ctx context.Context,
 	return writes, flush()
 }
 
-func previousRankedSeasonID(now time.Time) (int64, bool) {
-	now = now.UTC()
-	weekdayOffset := (int(now.Weekday()) + 6) % 7
-	currentSeasonStart := time.Date(now.Year(), now.Month(), now.Day(), 5, 0, 0, 0, time.UTC).AddDate(0, 0, -weekdayOffset)
-	if now.Before(currentSeasonStart.Add(7 * time.Hour)) {
-		return 0, false
-	}
-	return currentSeasonStart.AddDate(0, 0, -7).Unix(), true
-}
-
 func (d *scheduledDomain) loadLeaderboardLocationIDs(
 	ctx context.Context,
 	app *platform.App,
 ) ([]string, error) {
-	locations, err := platform.RetryClashFetch(ctx, app.Availability, func(fetchCtx context.Context) ([]clashy.Location, error) {
+	locations, err := retryLimitedClashFetch(ctx, app, d.limiter, func(fetchCtx context.Context) ([]clashy.Location, error) {
 		start := time.Now()
 		locations, err := app.Clash.SearchLocations(fetchCtx, clashy.PageOptions{})
 		app.Stats.RecordRequest(scheduledDomainName, time.Since(start), err)
@@ -553,7 +656,7 @@ func (d *scheduledDomain) doLeaderboardHistory(
 			if !shouldStoreLeaderboardHistoryKind(path.Kind, now) {
 				continue
 			}
-			payload, err := platform.RetryClashFetch(ctx, app.Availability, func(fetchCtx context.Context) (any, error) {
+			payload, err := retryLimitedClashFetch(ctx, app, d.limiter, func(fetchCtx context.Context) (any, error) {
 				start := time.Now()
 				payload, err := path.Load(fetchCtx, app.Clash, locationID)
 				app.Stats.RecordRequest(scheduledDomainName, time.Since(start), err)
@@ -594,10 +697,12 @@ func (d *scheduledDomain) doLegendHistory(
 		return 0, err
 	}
 	loadSeasons := d.loadLegendSeasons
+	var officialSeasons []string
 	if loadSeasons == nil {
-		loadSeasons = loadOfficialLegendSeasons
+		officialSeasons, err = loadOfficialLegendSeasons(ctx, app, d.limiter)
+	} else {
+		officialSeasons, err = loadSeasons(ctx, app)
 	}
-	officialSeasons, err := loadSeasons(ctx, app)
 	if err != nil {
 		return 0, err
 	}
@@ -606,13 +711,15 @@ func (d *scheduledDomain) doLegendHistory(
 		return 0, err
 	}
 	loadRankings := d.loadLegendRankings
-	if loadRankings == nil {
-		loadRankings = loadOfficialLegendSeasonRankings
-	}
 	writes := 0
 	var seasonErrors []error
 	for _, season := range missing {
-		rankings, err := loadRankings(ctx, app, season)
+		var rankings []legendRankingItem
+		if loadRankings == nil {
+			rankings, err = loadOfficialLegendSeasonRankings(ctx, app, d.limiter, season)
+		} else {
+			rankings, err = loadRankings(ctx, app, season)
+		}
 		if err != nil {
 			seasonErrors = append(seasonErrors, fmt.Errorf("fetch legend season %s: %w", season, err))
 			continue
@@ -632,8 +739,8 @@ func (d *scheduledDomain) doLegendHistory(
 	return writes, errors.Join(seasonErrors...)
 }
 
-func loadOfficialLegendSeasons(ctx context.Context, app *platform.App) ([]string, error) {
-	return platform.RetryClashFetch(ctx, app.Availability, func(fetchCtx context.Context) ([]string, error) {
+func loadOfficialLegendSeasons(ctx context.Context, app *platform.App, limiter *clashy.Limiter) ([]string, error) {
+	return retryLimitedClashFetch(ctx, app, limiter, func(fetchCtx context.Context) ([]string, error) {
 		start := time.Now()
 		seasons, err := app.Clash.GetSeasons(fetchCtx, legendLeagueID)
 		app.Stats.RecordRequest(scheduledDomainName, time.Since(start), err)
@@ -644,16 +751,16 @@ func loadOfficialLegendSeasons(ctx context.Context, app *platform.App) ([]string
 func loadOfficialLegendSeasonRankings(
 	ctx context.Context,
 	app *platform.App,
+	limiter *clashy.Limiter,
 	season string,
 ) ([]legendRankingItem, error) {
-	return platform.RetryClashFetch(ctx, app.Availability, func(fetchCtx context.Context) ([]legendRankingItem, error) {
-		return fetchAllLegendSeasonRankingPages(fetchCtx, app, season)
-	})
+	return fetchAllLegendSeasonRankingPages(ctx, app, limiter, season)
 }
 
 func fetchAllLegendSeasonRankingPages(
 	ctx context.Context,
 	app *platform.App,
+	limiter *clashy.Limiter,
 	season string,
 ) ([]legendRankingItem, error) {
 	if _, err := officialLegendSeasonWindow(season); err != nil {
@@ -669,13 +776,13 @@ func fetchAllLegendSeasonRankingPages(
 	return collectLegendSeasonRankingPages(season, func(after string) ([]legendRankingItem, string, error) {
 		endpoint := legendSeasonRankingPageURL(cfg.BaseURL, season, after)
 		start := time.Now()
-		response, err := httpClient.Do(
-			ctx,
-			http.MethodGet,
-			endpoint,
-			nil,
-			clashy.RequestOptions{SkipAuth: true},
-		)
+		body, err := retryLimitedClashFetch(ctx, app, limiter, func(fetchCtx context.Context) ([]byte, error) {
+			response, err := httpClient.Do(fetchCtx, http.MethodGet, endpoint, nil, clashy.RequestOptions{SkipAuth: true})
+			if err != nil {
+				return nil, err
+			}
+			return response.Body, nil
+		})
 		app.Stats.RecordRequest(scheduledDomainName, time.Since(start), err)
 		if err != nil {
 			return nil, "", err
@@ -688,7 +795,7 @@ func fetchAllLegendSeasonRankingPages(
 				} `json:"cursors"`
 			} `json:"paging"`
 		}
-		if err := json.Unmarshal(response.Body, &page); err != nil {
+		if err := json.Unmarshal(body, &page); err != nil {
 			return nil, "", err
 		}
 		items := make([]legendRankingItem, 0, len(page.Items))
@@ -891,7 +998,7 @@ func (d *scheduledDomain) doCurrentClanRankings(
 	var groupErrors []error
 	for _, locationID := range locationIDs {
 		for _, path := range currentClanRankingPaths {
-			rankings, err := platform.RetryClashFetch(ctx, app.Availability, func(fetchCtx context.Context) ([]clashy.RankedClan, error) {
+			rankings, err := retryLimitedClashFetch(ctx, app, d.limiter, func(fetchCtx context.Context) ([]clashy.RankedClan, error) {
 				start := time.Now()
 				rankings, err := path.Load(fetchCtx, app.Clash, locationID, clashy.PageOptions{Limit: currentClanRankingLimit})
 				app.Stats.RecordRequest(scheduledDomainName, time.Since(start), err)
@@ -1555,6 +1662,96 @@ func (s *timescaleScheduledStore) Close() {
 	}
 }
 
+func (s *timescaleScheduledStore) ReconcileCWLSeasonStatistics(ctx context.Context, seasons []string) error {
+	return cwlstats.Reconcile(ctx, s.pool, seasons)
+}
+
+func (s *timescaleScheduledStore) FinalizeLegendDay(ctx context.Context, day time.Time) (int, error) {
+	day = dayStart(day)
+	tx, err := s.pool.Begin(ctx)
+	if err != nil {
+		return 0, err
+	}
+	defer tx.Rollback(ctx)
+	if _, err := tx.Exec(ctx, `DELETE FROM league_hitrate_stats WHERE period_kind='legend_day' AND period_start=$1`, day); err != nil {
+		return 0, err
+	}
+	if _, err := tx.Exec(ctx, `DELETE FROM legend_daily_stats WHERE day=$1::date`, day); err != nil {
+		return 0, err
+	}
+	if _, err := tx.Exec(ctx, `
+		WITH attacks AS MATERIALIZED (
+			SELECT battle.*, player.league_id AS league_tier_id FROM battles_ranked battle
+			JOIN basic_player player ON player.tag=battle.player_tag
+			WHERE battle.direction='attack' AND battle.battle_mode='legend' AND battle.battle_time >= $1 AND battle.battle_time < $1 + interval '1 day' AND player.league_id > 0
+		)
+		INSERT INTO league_hitrate_stats (period_kind,period_start,league_tier_id,town_hall,attack_count,zero_star_count,one_star_count,two_star_count,three_star_count,refreshed_at)
+		SELECT 'legend_day',$1,league_tier_id,player_town_hall,count(*),count(*) FILTER (WHERE stars=0),count(*) FILTER (WHERE stars=1),count(*) FILTER (WHERE stars=2),count(*) FILTER (WHERE stars=3),now()
+		FROM attacks WHERE player_town_hall=opponent_town_hall GROUP BY league_tier_id,player_town_hall
+	`, day); err != nil {
+		return 0, err
+	}
+	inserted, err := tx.Exec(ctx, `
+		WITH attacks AS MATERIALIZED (
+			SELECT battle.*, player.league_id AS league_tier_id FROM battles_ranked battle
+			JOIN basic_player player ON player.tag=battle.player_tag
+			WHERE battle.direction='attack' AND battle.battle_mode='legend' AND battle.battle_time >= $1 AND battle.battle_time < $1 + interval '1 day' AND player.league_id > 0
+		), groups AS (
+			SELECT league_tier_id,player_town_hall AS town_hall,count(*) AS attack_count,count(DISTINCT player_tag) AS distinct_player_count,
+				count(*) FILTER (WHERE stars=0) AS zero_star_count,count(*) FILTER (WHERE stars=1) AS one_star_count,
+				count(*) FILTER (WHERE stars=2) AS two_star_count,count(*) FILTER (WHERE stars=3) AS three_star_count,
+				sum(destruction_percentage) AS destruction_percentage_sum,sum(coalesce(duration_seconds,0)) AS duration_seconds_sum
+			FROM attacks GROUP BY league_tier_id,player_town_hall
+		), perfect AS (
+			SELECT league_tier_id,player_town_hall AS town_hall,count(*) AS player_count FROM (
+				SELECT league_tier_id,player_town_hall,player_tag FROM attacks GROUP BY league_tier_id,player_town_hall,player_tag
+				HAVING count(*)=8 AND count(*) FILTER (WHERE stars=3)=8
+			) players GROUP BY league_tier_id,player_town_hall
+		), heroes AS (
+			SELECT league_tier_id,player_town_hall AS town_hall,hero_id,count(*) AS uses,count(*) FILTER (WHERE stars=3) AS triples
+			FROM attacks JOIN army_compositions composition USING (army_hash) CROSS JOIN LATERAL unnest(composition.heroes) hero_id
+			GROUP BY league_tier_id,player_town_hall,hero_id
+		), hero_json AS (
+			SELECT league_tier_id,town_hall,jsonb_agg(jsonb_build_object('id',hero_id,'uses',uses,'triples',triples) ORDER BY hero_id) AS value FROM heroes GROUP BY league_tier_id,town_hall
+		), pets AS (
+			SELECT league_tier_id,player_town_hall AS town_hall,(pet->>'petId')::integer AS pet_id,count(*) AS uses,count(*) FILTER (WHERE stars=3) AS triples
+			FROM attacks JOIN army_compositions composition USING (army_hash) CROSS JOIN LATERAL jsonb_array_elements(composition.pet_assignments) pet
+			GROUP BY league_tier_id,player_town_hall,(pet->>'petId')::integer
+		), pet_json AS (
+			SELECT league_tier_id,town_hall,jsonb_agg(jsonb_build_object('id',pet_id,'uses',uses,'triples',triples) ORDER BY pet_id) AS value FROM pets GROUP BY league_tier_id,town_hall
+		), equipment AS (
+			SELECT league_tier_id,player_town_hall AS town_hall,(item->>'equipmentId')::integer AS equipment_id,count(*) AS uses,count(*) FILTER (WHERE stars=3) AS triples
+			FROM attacks JOIN army_compositions composition USING (army_hash) CROSS JOIN LATERAL jsonb_array_elements(composition.equipment) item
+			GROUP BY league_tier_id,player_town_hall,(item->>'equipmentId')::integer
+		), equipment_json AS (
+			SELECT league_tier_id,town_hall,jsonb_agg(jsonb_build_object('id',equipment_id,'uses',uses,'triples',triples) ORDER BY equipment_id) AS value FROM equipment GROUP BY league_tier_id,town_hall
+		), assignments AS (
+			SELECT league_tier_id,player_town_hall AS town_hall,(item->>'petId')::integer AS pet_id,(item->>'heroId')::integer AS hero_id,
+				count(*) AS uses,count(*) FILTER (WHERE stars=3) AS triples
+			FROM attacks JOIN army_compositions composition USING (army_hash) CROSS JOIN LATERAL jsonb_array_elements(composition.pet_assignments) item
+			GROUP BY league_tier_id,player_town_hall,(item->>'petId')::integer,(item->>'heroId')::integer
+		), assignment_json AS (
+			SELECT league_tier_id,town_hall,jsonb_agg(jsonb_build_object('petId',pet_id,'heroId',hero_id,'uses',uses,'triples',triples) ORDER BY pet_id,hero_id) AS value FROM assignments GROUP BY league_tier_id,town_hall
+		)
+		INSERT INTO legend_daily_stats (day,league_tier_id,town_hall,attack_count,distinct_player_count,perfect_320_player_count,
+			zero_star_count,one_star_count,two_star_count,three_star_count,destruction_percentage_sum,duration_seconds_sum,
+			hero_stats,pet_stats,equipment_stats,pet_hero_assignments,refreshed_at)
+		SELECT $1::date,g.league_tier_id,g.town_hall,g.attack_count,g.distinct_player_count,coalesce(p.player_count,0),
+			g.zero_star_count,g.one_star_count,g.two_star_count,g.three_star_count,g.destruction_percentage_sum,g.duration_seconds_sum,
+			coalesce(h.value,'[]'),coalesce(pt.value,'[]'),coalesce(e.value,'[]'),coalesce(a.value,'[]'),now()
+		FROM groups g LEFT JOIN perfect p USING (league_tier_id,town_hall) LEFT JOIN hero_json h USING (league_tier_id,town_hall)
+		LEFT JOIN pet_json pt USING (league_tier_id,town_hall) LEFT JOIN equipment_json e USING (league_tier_id,town_hall)
+		LEFT JOIN assignment_json a USING (league_tier_id,town_hall)
+	`, day)
+	if err != nil {
+		return 0, err
+	}
+	if err := tx.Commit(ctx); err != nil {
+		return 0, err
+	}
+	return int(inserted.RowsAffected()), nil
+}
+
 func (s *timescaleScheduledStore) ReplaceLeaderboardHistory(
 	ctx context.Context,
 	groups []leaderboardHistoryGroup,
@@ -2177,26 +2374,24 @@ func (s *timescaleScheduledStore) ReplaceCurrentClanRankingGroup(
 	return len(group.Rows) + int(commandTag.RowsAffected()), nil
 }
 
-func (s *timescaleScheduledStore) ListRankedGroupTargets(ctx context.Context) ([]string, error) {
+func (s *timescaleScheduledStore) ListRankedGroupTargets(ctx context.Context, _ int64) ([]string, error) {
 	rows, err := s.pool.Query(ctx, `
-		SELECT tag
-		FROM basic_player
-		WHERE tag <> ''
-		ORDER BY tag
+		SELECT player.tag FROM basic_player player
+		WHERE player.tag <> '' AND player.trophies > 0
+		  AND player.league_id IS NOT NULL AND player.league_id NOT IN (105000000,105000036)
+		ORDER BY player.tag
 	`)
 	if err != nil {
 		return nil, err
 	}
 	defer rows.Close()
-	tags := make([]string, 0)
+	tags := []string{}
 	for rows.Next() {
 		var tag string
 		if err := rows.Scan(&tag); err != nil {
 			return nil, err
 		}
-		if tag != "" {
-			tags = append(tags, tag)
-		}
+		tags = append(tags, tag)
 	}
 	return tags, rows.Err()
 }
@@ -2235,67 +2430,36 @@ func (s *timescaleScheduledStore) DeletePlayers(ctx context.Context, tags []stri
 	return tx.Commit(ctx)
 }
 
-func (s *timescaleScheduledStore) StoreRankedLeagueGroupMembers(ctx context.Context, rows []models.RankedLeagueGroupMemberRow) (int, error) {
+func (s *timescaleScheduledStore) StoreRankedLeagueGroup(ctx context.Context, rows []models.RankedLeagueGroupMemberRow) (int, error) {
 	if len(rows) == 0 {
 		return 0, nil
-	}
-	batch := &pgx.Batch{}
-	for _, row := range rows {
-		batch.Queue(`
-			INSERT INTO ranked_league_group_members (
-				season_id, group_tag, league_tier_id,
-				player_tag, player_name, clan_tag, clan_name,
-				placement, league_trophies,
-				attack_win_count, attack_lose_count,
-				defense_win_count, defense_lose_count
-			)
-			VALUES (
-				$1, $2, $3,
-				$4, $5, NULLIF($6, ''), NULLIF($7, ''),
-				$8, $9,
-				$10, $11,
-				$12, $13
-			)
-			ON CONFLICT (season_id, group_tag, player_tag) DO UPDATE SET
-				league_tier_id = EXCLUDED.league_tier_id,
-				player_name = EXCLUDED.player_name,
-				clan_tag = EXCLUDED.clan_tag,
-				clan_name = EXCLUDED.clan_name,
-				placement = EXCLUDED.placement,
-				league_trophies = EXCLUDED.league_trophies,
-				attack_win_count = EXCLUDED.attack_win_count,
-				attack_lose_count = EXCLUDED.attack_lose_count,
-				defense_win_count = EXCLUDED.defense_win_count,
-				defense_lose_count = EXCLUDED.defense_lose_count
-			WHERE
-				ranked_league_group_members.league_tier_id IS DISTINCT FROM EXCLUDED.league_tier_id OR
-				ranked_league_group_members.player_name IS DISTINCT FROM EXCLUDED.player_name OR
-				ranked_league_group_members.clan_tag IS DISTINCT FROM EXCLUDED.clan_tag OR
-				ranked_league_group_members.clan_name IS DISTINCT FROM EXCLUDED.clan_name OR
-				ranked_league_group_members.placement IS DISTINCT FROM EXCLUDED.placement OR
-				ranked_league_group_members.league_trophies IS DISTINCT FROM EXCLUDED.league_trophies OR
-				ranked_league_group_members.attack_win_count IS DISTINCT FROM EXCLUDED.attack_win_count OR
-				ranked_league_group_members.attack_lose_count IS DISTINCT FROM EXCLUDED.attack_lose_count OR
-				ranked_league_group_members.defense_win_count IS DISTINCT FROM EXCLUDED.defense_win_count OR
-				ranked_league_group_members.defense_lose_count IS DISTINCT FROM EXCLUDED.defense_lose_count
-		`,
-			row.SeasonID, row.GroupTag, row.LeagueTierID,
-			row.PlayerTag, row.PlayerName, row.ClanTag, row.ClanName,
-			row.Placement, row.LeagueTrophies,
-			row.AttackWinCount, row.AttackLoseCount,
-			row.DefenseWinCount, row.DefenseLoseCount,
-		)
 	}
 	tx, err := s.pool.Begin(ctx)
 	if err != nil {
 		return 0, err
 	}
 	defer tx.Rollback(ctx)
+	batch := &pgx.Batch{}
+	for _, row := range rows {
+		batch.Queue(`
+			INSERT INTO ranked_league_group_members(
+				season_id,group_tag,league_tier_id,player_tag,player_name,town_hall,placement,league_trophies,maximum_battle_count,
+				attack_win_count,attack_loss_count,attack_star_count,defense_win_count,defense_loss_count,defense_star_count
+			) VALUES($1,$2,$3,$4,$5,NULLIF($6,0),$7,$8,$9,$10,$11,$12,$13,$14,$15)
+			ON CONFLICT (season_id,player_tag) DO UPDATE SET
+				group_tag=EXCLUDED.group_tag,league_tier_id=EXCLUDED.league_tier_id,player_name=EXCLUDED.player_name,
+				town_hall=coalesce(EXCLUDED.town_hall,ranked_league_group_members.town_hall),placement=EXCLUDED.placement,
+				league_trophies=EXCLUDED.league_trophies,maximum_battle_count=EXCLUDED.maximum_battle_count,
+				attack_win_count=EXCLUDED.attack_win_count,attack_loss_count=EXCLUDED.attack_loss_count,attack_star_count=EXCLUDED.attack_star_count,
+				defense_win_count=EXCLUDED.defense_win_count,defense_loss_count=EXCLUDED.defense_loss_count,defense_star_count=EXCLUDED.defense_star_count
+		`, row.SeasonID, row.GroupTag, row.LeagueTierID, row.PlayerTag, row.PlayerName, row.TownHall, row.Placement, row.LeagueTrophies, row.MaximumBattleCount,
+			row.AttackWinCount, row.AttackLossCount, row.AttackStarCount, row.DefenseWinCount, row.DefenseLossCount, row.DefenseStarCount)
+	}
 	affected, err := utils.SendBatchCount(ctx, tx, batch)
 	if err != nil {
 		return affected, err
 	}
-	if err := tx.Commit(ctx); err != nil {
+	if err = tx.Commit(ctx); err != nil {
 		return affected, err
 	}
 	return affected, nil
@@ -2308,7 +2472,7 @@ func (s *timescaleScheduledStore) MissingRankedGroupPlayers(ctx context.Context,
 		LEFT JOIN basic_player p ON p.tag = m.player_tag
 		WHERE m.season_id = $1
 		  AND p.tag IS NULL
-		ORDER BY m.player_tag
+		ORDER BY 1
 	`, seasonID)
 	if err != nil {
 		return nil, err
@@ -2327,6 +2491,79 @@ func (s *timescaleScheduledStore) MissingRankedGroupPlayers(ctx context.Context,
 	return tags, rows.Err()
 }
 
+func (s *timescaleScheduledStore) FinalizeRankedTournament(ctx context.Context, seasonID int64) (int, error) {
+	if seasonID <= 0 {
+		return 0, errors.New("ranked season ID must be positive")
+	}
+	tx, err := s.pool.Begin(ctx)
+	if err != nil {
+		return 0, err
+	}
+	defer tx.Rollback(ctx)
+	if _, err = tx.Exec(ctx, `
+		UPDATE ranked_league_group_members member SET town_hall=player.townhall_level
+		FROM basic_player player WHERE member.season_id=$1 AND player.tag=member.player_tag AND player.townhall_level BETWEEN 1 AND 20
+	`, seasonID); err != nil {
+		return 0, err
+	}
+	periodStart := time.Unix(seasonID, 0).UTC()
+	if _, err = tx.Exec(ctx, `DELETE FROM league_hitrate_stats WHERE period_kind='ranked_season' AND period_start=$1`, periodStart); err != nil {
+		return 0, err
+	}
+	hitrate, err := tx.Exec(ctx, `
+		INSERT INTO league_hitrate_stats(period_kind,period_start,league_tier_id,town_hall,attack_count,zero_star_count,one_star_count,two_star_count,three_star_count,refreshed_at)
+		SELECT 'ranked_season',$2,member.league_tier_id,battle.player_town_hall,count(*),count(*) FILTER(WHERE stars=0),count(*) FILTER(WHERE stars=1),
+			count(*) FILTER(WHERE stars=2),count(*) FILTER(WHERE stars=3),now()
+		FROM battles_ranked battle JOIN ranked_league_group_members member ON member.season_id=$1 AND member.player_tag=battle.player_tag
+		WHERE battle.direction='attack' AND battle.battle_mode='ranked' AND battle.battle_time >= $2 AND battle.battle_time < $2 + interval '7 days'
+		  AND battle.player_town_hall=battle.opponent_town_hall
+		GROUP BY member.league_tier_id,battle.player_town_hall
+	`, seasonID, periodStart)
+	if err != nil {
+		return 0, err
+	}
+	if _, err = tx.Exec(ctx, `DELETE FROM ranked_league_tier_stats WHERE season_id=$1`, seasonID); err != nil {
+		return 0, err
+	}
+	tierStats, err := tx.Exec(ctx, `
+		WITH members AS MATERIALIZED (SELECT * FROM ranked_league_group_members WHERE season_id=$1),
+		group_values AS (
+			SELECT league_tier_id,group_tag,max(league_trophies)-min(league_trophies) AS first_last_range,
+				max(league_trophies) FILTER(WHERE placement=1)-max(league_trophies) FILTER(WHERE placement=2) AS first_second_gap
+			FROM members GROUP BY league_tier_id,group_tag
+		), town_halls AS (
+			SELECT league_tier_id,town_hall,count(*) AS count FROM members WHERE town_hall IS NOT NULL GROUP BY league_tier_id,town_hall
+		), town_hall_json AS (
+			SELECT league_tier_id,jsonb_agg(jsonb_build_object('level',town_hall,'count',count) ORDER BY town_hall DESC) AS value
+			FROM town_halls GROUP BY league_tier_id
+		), aggregate_values AS (
+			SELECT league_tier_id,count(DISTINCT group_tag) AS group_count,count(DISTINCT player_tag) AS distinct_player_count,
+				count(DISTINCT player_tag) FILTER(WHERE attack_win_count+attack_loss_count>0) AS participating_player_count,
+				percentile_disc(.10) WITHIN GROUP(ORDER BY league_trophies) AS trophy_p10,
+				percentile_disc(.25) WITHIN GROUP(ORDER BY league_trophies) AS trophy_p25,
+				percentile_disc(.50) WITHIN GROUP(ORDER BY league_trophies) AS trophy_p50,
+				percentile_disc(.75) WITHIN GROUP(ORDER BY league_trophies) AS trophy_p75,
+				percentile_disc(.90) WITHIN GROUP(ORDER BY league_trophies) AS trophy_p90
+			FROM members GROUP BY league_tier_id
+		), group_averages AS (
+			SELECT league_tier_id,avg(first_last_range) AS range_average,avg(first_second_gap) FILTER(WHERE first_second_gap IS NOT NULL) AS gap_average
+			FROM group_values GROUP BY league_tier_id
+		)
+		INSERT INTO ranked_league_tier_stats(season_id,league_tier_id,group_count,distinct_player_count,participating_player_count,
+			trophy_p10,trophy_p25,trophy_p50,trophy_p75,trophy_p90,town_halls,average_group_first_last_trophy_range,average_first_second_trophy_gap,refreshed_at)
+		SELECT $1,a.league_tier_id,a.group_count,a.distinct_player_count,a.participating_player_count,
+			a.trophy_p10,a.trophy_p25,a.trophy_p50,a.trophy_p75,a.trophy_p90,coalesce(t.value,'[]'),g.range_average,g.gap_average,now()
+		FROM aggregate_values a LEFT JOIN town_hall_json t USING(league_tier_id) LEFT JOIN group_averages g USING(league_tier_id)
+	`, seasonID)
+	if err != nil {
+		return 0, err
+	}
+	if err = tx.Commit(ctx); err != nil {
+		return 0, err
+	}
+	return int(hitrate.RowsAffected() + tierStats.RowsAffected()), nil
+}
+
 type memoryScheduledStore struct {
 	currentClanRankings map[string]map[string]currentClanRankingRow
 	leaderboardHistory  map[string]map[string]any
@@ -2342,6 +2579,18 @@ func newMemoryScheduledStore() *memoryScheduledStore {
 }
 
 func (*memoryScheduledStore) Close() {}
+
+func (*memoryScheduledStore) ReconcileCWLSeasonStatistics(context.Context, []string) error {
+	return nil
+}
+
+func (*memoryScheduledStore) FinalizeLegendDay(context.Context, time.Time) (int, error) {
+	return 0, nil
+}
+
+func (*memoryScheduledStore) FinalizeArmyFamilies(context.Context, time.Time, platform.Config) (int, error) {
+	return 0, nil
+}
 
 func (s *memoryScheduledStore) ReplaceLeaderboardHistory(
 	_ context.Context,
@@ -2452,7 +2701,7 @@ func (s *memoryScheduledStore) ReplaceCurrentClanRankingGroup(
 	return len(replacement) + stale, nil
 }
 
-func (*memoryScheduledStore) ListRankedGroupTargets(context.Context) ([]string, error) {
+func (*memoryScheduledStore) ListRankedGroupTargets(context.Context, int64) ([]string, error) {
 	return nil, nil
 }
 
@@ -2464,10 +2713,14 @@ func (*memoryScheduledStore) DeletePlayers(context.Context, []string) error {
 	return nil
 }
 
-func (*memoryScheduledStore) StoreRankedLeagueGroupMembers(context.Context, []models.RankedLeagueGroupMemberRow) (int, error) {
+func (*memoryScheduledStore) StoreRankedLeagueGroup(context.Context, []models.RankedLeagueGroupMemberRow) (int, error) {
 	return 0, nil
 }
 
 func (*memoryScheduledStore) MissingRankedGroupPlayers(context.Context, int64) ([]string, error) {
 	return nil, nil
+}
+
+func (*memoryScheduledStore) FinalizeRankedTournament(context.Context, int64) (int, error) {
+	return 0, nil
 }

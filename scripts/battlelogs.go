@@ -2,6 +2,7 @@ package scripts
 
 import (
 	"context"
+	"crypto/sha256"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -17,7 +18,6 @@ import (
 	"clashking_tracking/models"
 
 	"github.com/clashkinginc/clashy.go"
-	"github.com/google/uuid"
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgxpool"
 	"github.com/valkey-io/valkey-go"
@@ -30,14 +30,16 @@ const (
 	// queued value is much larger than a normal profile update. Keep both the
 	// SQL batch and the pending queue deliberately small; backpressure is safer
 	// than retaining thousands of decoded battle logs while Postgres catches up.
-	battlelogAsyncWriteBatchSize     = 100
-	battlelogAsyncWriteQueueSize     = 200
+	battlelogAsyncWriteBatchSize     = 250
+	battlelogAsyncWriteQueueSize     = 500
 	battlelogAsyncWriteFlushInterval = 500 * time.Millisecond
 	// Target tags and checkpoint timestamps are small. A larger page amortizes
 	// SQL/MGET work and, more importantly, avoids waiting at a page barrier for
 	// a handful of retrying 504s every few seconds. Decoded response memory is
 	// bounded independently by battlelogRequestConcurrency and the write queue.
 	battlelogTargetPageSize = 20000
+	// Ranked attacks that begin before the weekly reset can complete a few
+	// minutes afterward. Keep that narrow completion tail in the prior season.
 )
 
 // Battlelog army columns use a compact prefix+ID shape. The prefix keeps the
@@ -53,7 +55,6 @@ type battlelogsDomain struct {
 
 type battlelogStore interface {
 	LoadTargets(context.Context, string) ([]string, error)
-	FilterStandardTargets(context.Context, []string) ([]string, error)
 	Store(context.Context, models.BattlelogIngest) (int, error)
 	Close() error
 }
@@ -265,17 +266,6 @@ func (d *battlelogsDomain) runTracker(
 		if err != nil {
 			return err
 		}
-		if group == "standard" {
-			verified, err := activeVerifiedPlayerTags(ctx, app.Valkey)
-			if err != nil {
-				return err
-			}
-			verified, err = d.sink.FilterStandardTargets(ctx, verified)
-			if err != nil {
-				return err
-			}
-			tags = mergeUniqueTags(tags, verified)
-		}
 		app.Stats.SetTrackingTargets(statsName, len(tags))
 		for start := 0; start < len(tags); start += battlelogTargetPageSize {
 			end := min(start+battlelogTargetPageSize, len(tags))
@@ -289,34 +279,16 @@ func (d *battlelogsDomain) runTracker(
 	}
 }
 
-func mergeUniqueTags(groups ...[]string) []string {
-	seen := make(map[string]struct{})
-	for _, group := range groups {
-		for _, tag := range group {
-			if tag != "" {
-				seen[tag] = struct{}{}
-			}
-		}
-	}
-	tags := make([]string, 0, len(seen))
-	for tag := range seen {
-		tags = append(tags, tag)
-	}
-	sort.Strings(tags)
-	return tags
-}
-
 func battlelogRequestConcurrency(requestsPerSecond int) int {
 	if requestsPerSecond <= 0 {
 		return 0
 	}
 	// Battle-log responses are much larger than clan/player summaries. A worker
-	// blocked on SQL backpressure retains its decoded response, so the generic
-	// three-seconds-of-RPS concurrency would allow thousands of full logs to
-	// remain live at once. At most one second of the configured request budget,
-	// capped at 1000 per target pool, covers the observed upstream latency while
-	// keeping retained responses bounded when Postgres becomes the slower side.
-	return min(requestsPerSecond, 1000)
+	// blocked on SQL backpressure retains its decoded response, so keep the hard
+	// cap. Within that bound, allow the same three seconds of latency headroom as
+	// the other trackers. A five-second experiment improved full-population
+	// throughput by only two percent while increasing peak allocation by half.
+	return min(platform.RequestConcurrency(requestsPerSecond), 1000)
 }
 
 func mergeBattlelogIngests(values []models.BattlelogIngest) models.BattlelogIngest {
@@ -367,8 +339,10 @@ func (d *battlelogsDomain) do(
 	if err != nil {
 		return models.BattlelogIngest{}, err
 	}
+	return battlelogIngestFromEntries(entries, playerTag, checkpoint, time.Now().UTC(), app.Config.BattlelogFirstSeenLookbackDays)
+}
 
-	now := time.Now().UTC()
+func battlelogIngestFromEntries(entries []clashy.BattleLogEntry, playerTag string, checkpoint models.BattlelogCheckpoint, now time.Time, firstSeenLookbackDays int) (models.BattlelogIngest, error) {
 	if len(entries) == 0 {
 		return models.BattlelogIngest{}, nil
 	}
@@ -377,7 +351,7 @@ func (d *battlelogsDomain) do(
 	if after.IsZero() {
 		// First-seen players only backfill a bounded window so old accounts do not fan out
 		// into unbounded historical ingestion on their first poll.
-		after = now.Add(-time.Duration(app.Config.BattlelogFirstSeenLookbackDays) * 24 * time.Hour)
+		after = now.Add(-time.Duration(firstSeenLookbackDays) * 24 * time.Hour)
 	}
 	newEntries := entriesAfterTimestamp(entries, after)
 	if len(newEntries) == 0 {
@@ -396,26 +370,45 @@ func (d *battlelogsDomain) do(
 	var checkpointTime time.Time
 	for _, entry := range newEntries {
 		timestamp := battlelogEntryTimestamp(entry)
-		if timestamp.IsZero() || entry.OpponentPlayerTag == "" || entry.OpponentName == "" || entry.OpponentTownHallLevel < 0 {
+		if timestamp.IsZero() {
 			// Do not checkpoint past incomplete rows; later polls can retry after
-			// the API returns the required battle timestamp and opponent metadata.
+			// the API returns the required battle timestamp.
 			break
 		}
-		rows = append(rows, battlelogRowFromEntry(playerTag, entry))
+		include := false
+		switch battlelogStorageMode(entry.BattleType) {
+		case "farming":
+			// Farming history is intentionally attack-only and omits all opponent
+			// metadata. Home-village defenses can safely advance the checkpoint.
+			include = entry.Attack
+		case "ranked", "legend":
+			if entry.OpponentPlayerTag == "" || entry.OpponentTownHallLevel <= 0 {
+				// A real battle needs both perspectives, so retry incomplete rows.
+				return models.BattlelogIngest{}, nil
+			}
+			include = true
+		default:
+			// Unknown modes are outside this persistence contract.
+		}
+		if include {
+			row := battlelogRowFromEntry(playerTag, entry)
+			if row.ArmyShareCode == "" {
+				return models.BattlelogIngest{}, nil
+			}
+			rows = append(rows, row)
+		}
 		if timestamp.After(checkpointTime) {
 			checkpointTime = timestamp.UTC()
 		}
 	}
-	if len(rows) == 0 {
+	if checkpointTime.IsZero() {
 		return models.BattlelogIngest{}, nil
 	}
 
 	ingest := models.BattlelogIngest{
 		Rows: rows,
 	}
-	if !checkpointTime.IsZero() {
-		ingest.Checkpoints = []models.BattlelogCheckpoint{{Tag: playerTag, Timestamp: checkpointTime}}
-	}
+	ingest.Checkpoints = []models.BattlelogCheckpoint{{Tag: playerTag, Timestamp: checkpointTime}}
 	return ingest, nil
 }
 
@@ -503,34 +496,8 @@ func (s *timescaleBattlelogStore) LoadTargets(ctx context.Context, group string)
 	return tags, nil
 }
 
-func (s *timescaleBattlelogStore) FilterStandardTargets(ctx context.Context, tags []string) ([]string, error) {
-	if len(tags) == 0 {
-		return nil, nil
-	}
-	rows, err := s.pool.Query(ctx, `
-		SELECT tag
-		FROM basic_player
-		WHERE tag = ANY($1)
-		  AND league_id IS DISTINCT FROM 105000036
-		ORDER BY tag
-	`, tags)
-	if err != nil {
-		return nil, err
-	}
-	defer rows.Close()
-	filtered := make([]string, 0, len(tags))
-	for rows.Next() {
-		var tag string
-		if err := rows.Scan(&tag); err != nil {
-			return nil, err
-		}
-		filtered = append(filtered, tag)
-	}
-	return filtered, rows.Err()
-}
-
 func (s *timescaleBattlelogStore) Store(ctx context.Context, ingest models.BattlelogIngest) (int, error) {
-	if len(ingest.Rows) == 0 && len(ingest.Checkpoints) == 0 {
+	if len(ingest.Rows) == 0 {
 		return 0, nil
 	}
 	tx, err := s.pool.Begin(ctx)
@@ -554,115 +521,311 @@ func (s *timescaleBattlelogStore) insertBattlelogRows(ctx context.Context, tx pg
 		return 0, nil
 	}
 	if _, err := tx.Exec(ctx, `
-		CREATE TEMP TABLE battlelog_ingest_stage (
-			battle_id uuid NOT NULL,
-			army_share_code text NOT NULL,
-			player_tag text NOT NULL,
+		CREATE TEMP TABLE IF NOT EXISTS battlelog_ingest_stage (
+			requested_tag text NOT NULL,
 			opponent_tag text NOT NULL,
-			opponent_name text NOT NULL,
 			opponent_th smallint NOT NULL,
-			battle_type text NOT NULL,
-			attack boolean NOT NULL,
+			mode text NOT NULL,
+			requested_attack boolean NOT NULL,
 			stars smallint NOT NULL,
 			destruction_percentage smallint NOT NULL,
-			gold integer NOT NULL,
-			elixir integer NOT NULL,
-			dark_elixir integer NOT NULL,
-			duration integer NOT NULL,
+			looted_resources jsonb NOT NULL,
+			duration_seconds integer NOT NULL,
 			battle_time timestamp with time zone NOT NULL,
-			army_items text[] NOT NULL,
-			army_counts text NOT NULL
-	) ON COMMIT DROP
+			army_hash bytea NOT NULL,
+			army_share_code text NOT NULL
+		) ON COMMIT DELETE ROWS
 	`); err != nil {
 		return 0, err
 	}
 
 	copyRows := make([][]any, 0, len(rows))
+	compositions := make(map[[sha256.Size]byte]models.BattlelogRow)
 	for _, row := range rows {
-		armyItems, armyCounts, err := armyItemsAndCounts(row.ArmyColumns)
+		playerTag := clashy.CorrectTag(row.PlayerTag)
+		if playerTag == "" {
+			return 0, errors.New("battlelog player tag is empty")
+		}
+		opponentTag := clashy.CorrectTag(row.OpponentTag)
+		if opponentTag == "" {
+			opponentTag = "#0"
+		}
+		mode := battlelogStorageMode(clashy.BattleType(row.BattleType))
+		if mode == "" {
+			return 0, fmt.Errorf("unsupported battle type %q", row.BattleType)
+		}
+		loot, err := json.Marshal(map[string]uint32{
+			"gold": row.Gold, "elixir": row.Elixir, "darkElixir": row.DarkElixir,
+		})
 		if err != nil {
 			return 0, err
 		}
 		copyRows = append(copyRows, []any{
-			row.BattleID, row.ArmyShareCode, row.PlayerTag,
-			row.OpponentTag, row.OpponentName, int16(row.OpponentTH),
-			row.BattleType, row.Attack,
-			int16(row.Stars), int16(row.DestructionPercentage), int32(row.Gold),
-			int32(row.Elixir), int32(row.DarkElixir), int32(row.Duration), row.Timestamp,
-			armyItems, armyCounts,
+			playerTag, opponentTag, int16(row.OpponentTH), mode, row.Attack,
+			int16(row.Stars), int16(row.DestructionPercentage), loot,
+			int32(row.Duration), row.Timestamp, row.ArmyHash[:], row.ArmyShareCode,
 		})
+		if mode != "farming" {
+			compositions[row.ArmyHash] = row
+		}
 	}
-	_, err := tx.CopyFrom(ctx, pgx.Identifier{"battlelog_ingest_stage"}, []string{
-		"battle_id",
-		"army_share_code",
-		"player_tag",
-		"opponent_tag",
-		"opponent_name",
-		"opponent_th",
-		"battle_type",
-		"attack",
-		"stars",
-		"destruction_percentage",
-		"gold",
-		"elixir",
-		"dark_elixir",
-		"duration",
-		"battle_time",
-		"army_items",
-		"army_counts",
-	}, pgx.CopyFromRows(copyRows))
+	if _, err := tx.CopyFrom(ctx, pgx.Identifier{"battlelog_ingest_stage"}, []string{
+		"requested_tag", "opponent_tag", "opponent_th", "mode", "requested_attack",
+		"stars", "destruction_percentage", "looted_resources", "duration_seconds",
+		"battle_time", "army_hash", "army_share_code",
+	}, pgx.CopyFromRows(copyRows)); err != nil {
+		return 0, err
+	}
+	if err := insertArmyCompositions(ctx, tx, compositions); err != nil {
+		return 0, err
+	}
+
+	farmingTag, err := tx.Exec(ctx, `
+		INSERT INTO battles_farming (
+			player_tag, battle_time, stars, destruction_percentage, duration_seconds,
+			looted_resources, share_code
+		)
+		SELECT requested_tag, battle_time, stars, destruction_percentage,
+			NULLIF(duration_seconds, 0), looted_resources, NULLIF(army_share_code, '')
+		FROM battlelog_ingest_stage
+		WHERE mode = 'farming' AND requested_attack
+		ON CONFLICT (player_tag, battle_time) DO NOTHING
+	`)
 	if err != nil {
 		return 0, err
 	}
 
-	tag, err := tx.Exec(ctx, `
-		INSERT INTO battlelogs (
-			battle_id, army_share_code, player_tag, player_name, player_th,
-			opponent_tag, opponent_name, opponent_th, battle_type, attack,
-			stars, destruction_percentage, gold, elixir, dark_elixir, duration, timestamp,
-			army_items, army_counts
+	var rankedInserted int
+	err = tx.QueryRow(ctx, `
+		WITH observations AS (
+			SELECT stage.*, requested.townhall_level AS requested_th
+			FROM battlelog_ingest_stage stage
+			JOIN basic_player requested ON requested.tag = stage.requested_tag
+			WHERE stage.mode IN ('ranked', 'legend')
+			  AND requested.townhall_level BETWEEN 1 AND 20
+		), battles AS (
+			SELECT observations.*,
+				CASE WHEN requested_attack THEN requested_tag ELSE opponent_tag END AS attacker_tag,
+				CASE WHEN requested_attack THEN opponent_tag ELSE requested_tag END AS defender_tag,
+				CASE WHEN requested_attack THEN requested_th ELSE opponent_th END AS attacker_th,
+				CASE WHEN requested_attack THEN opponent_th ELSE requested_th END AS defender_th
+			FROM observations
+		), perspectives AS (
+			SELECT perspective.player_tag, perspective.opponent_tag, perspective.direction,
+				perspective.player_th, perspective.opponent_th, battles.battle_time,
+				battles.mode, battles.army_hash, battles.stars, battles.destruction_percentage,
+				battles.duration_seconds, battles.looted_resources, battles.army_share_code
+			FROM battles
+			CROSS JOIN LATERAL (VALUES
+				(attacker_tag, defender_tag, 'attack'::text, attacker_th, defender_th),
+				(defender_tag, attacker_tag, 'defense'::text, defender_th, attacker_th)
+			) perspective(player_tag, opponent_tag, direction, player_th, opponent_th)
+		), inserted AS (
+			INSERT INTO battles_ranked (
+				player_tag, battle_time, direction, opponent_tag, battle_mode,
+				player_town_hall, opponent_town_hall, stars, destruction_percentage,
+				duration_seconds, looted_resources, share_code, army_hash
+			)
+			SELECT player_tag, battle_time, direction, opponent_tag, mode,
+				player_th, opponent_th, stars, destruction_percentage,
+				NULLIF(duration_seconds, 0), looted_resources,
+				NULLIF(army_share_code, ''), army_hash
+			FROM perspectives
+			ON CONFLICT (player_tag, battle_time, battle_mode, direction, opponent_tag) DO NOTHING
+			RETURNING 1
 		)
-		SELECT
-			stage.battle_id,
-			stage.army_share_code,
-			stage.player_tag,
-			basic_player.name,
-			basic_player.townhall_level,
-			stage.opponent_tag,
-			stage.opponent_name,
-			stage.opponent_th,
-			stage.battle_type,
-			stage.attack,
-			stage.stars,
-			stage.destruction_percentage,
-			stage.gold,
-			stage.elixir,
-			stage.dark_elixir,
-			stage.duration,
-			stage.battle_time,
-			stage.army_items,
-			stage.army_counts::jsonb
-		FROM battlelog_ingest_stage AS stage
-		JOIN basic_player ON basic_player.tag = stage.player_tag
-		ON CONFLICT (battle_id, timestamp) DO NOTHING
-	`)
-	inserted := int(tag.RowsAffected())
-	return inserted, err
+		SELECT count(*)::integer FROM inserted
+	`).Scan(&rankedInserted)
+	if err != nil {
+		return 0, err
+	}
+	return int(farmingTag.RowsAffected()) + rankedInserted, nil
 }
 
-func armyItemsAndCounts(columns map[string]uint16) ([]string, string, error) {
-	// Derive both stored army representations from the same sorted key list so
-	// row inserts are deterministic even though maps iterate randomly.
-	items := sortedArmyColumnKeys(columns)
-	counts := make(map[string]uint16, len(items))
-	for _, item := range items {
-		counts[item] = columns[item]
+type armyQuantity struct {
+	ID       int `json:"id"`
+	Quantity int `json:"quantity"`
+}
+
+type armySpellQuantity struct {
+	ID         int  `json:"id"`
+	Quantity   int  `json:"quantity"`
+	ClanCastle bool `json:"clanCastle"`
+}
+
+type armyHeroEquipment struct {
+	HeroID      int `json:"heroId"`
+	EquipmentID int `json:"equipmentId"`
+}
+
+type armyPetAssignment struct {
+	HeroID int `json:"heroId"`
+	PetID  int `json:"petId"`
+}
+
+type armyCompositionRecord struct {
+	MainTroops       []armyQuantity
+	ClanCastleTroops []armyQuantity
+	Spells           []armySpellQuantity
+	Heroes           []int32
+	Equipment        []armyHeroEquipment
+	PetAssignments   []armyPetAssignment
+	SiegeMachineID   *int32
+}
+
+func insertArmyCompositions(ctx context.Context, tx pgx.Tx, compositions map[[sha256.Size]byte]models.BattlelogRow) error {
+	if len(compositions) == 0 {
+		return nil
 	}
-	raw, err := json.Marshal(counts)
+	if _, err := tx.Exec(ctx, `
+		CREATE TEMP TABLE IF NOT EXISTS battlelog_army_composition_stage (
+			army_hash bytea NOT NULL,
+			normalized_share_code text NOT NULL,
+			main_troops jsonb NOT NULL,
+			clan_castle_troops jsonb NOT NULL,
+			spells jsonb NOT NULL,
+			heroes integer[] NOT NULL,
+			equipment jsonb NOT NULL,
+			pet_assignments jsonb NOT NULL,
+			siege_machine_id integer
+		) ON COMMIT DELETE ROWS
+	`); err != nil {
+		return err
+	}
+
+	hashes := make([][sha256.Size]byte, 0, len(compositions))
+	shareCodeHashes := make(map[string][sha256.Size]byte, len(compositions))
+	for hash, row := range compositions {
+		if existing, ok := shareCodeHashes[row.ArmyShareCode]; ok && existing != hash {
+			return fmt.Errorf("normalized army share code maps to multiple composition hashes: %q (%x, %x)", row.ArmyShareCode, existing, hash)
+		}
+		shareCodeHashes[row.ArmyShareCode] = hash
+		hashes = append(hashes, hash)
+	}
+	sort.Slice(hashes, func(i, j int) bool { return strings.Compare(string(hashes[i][:]), string(hashes[j][:])) < 0 })
+	static, err := clashy.LoadStaticData()
 	if err != nil {
-		return nil, "", err
+		return fmt.Errorf("load static data for army composition: %w", err)
 	}
-	return items, string(raw), nil
+	compositionRows := make([][]any, 0, len(hashes))
+	for _, hash := range hashes {
+		row := compositions[hash]
+		record := armyCompositionFromColumns(static, row.ArmyShareCode, row.ArmyColumns)
+		mainTroops, _ := json.Marshal(record.MainTroops)
+		clanCastleTroops, _ := json.Marshal(record.ClanCastleTroops)
+		spells, _ := json.Marshal(record.Spells)
+		equipment, _ := json.Marshal(record.Equipment)
+		petAssignments, _ := json.Marshal(record.PetAssignments)
+		compositionRows = append(compositionRows, []any{
+			hash[:], row.ArmyShareCode, json.RawMessage(mainTroops), json.RawMessage(clanCastleTroops),
+			json.RawMessage(spells), record.Heroes, json.RawMessage(equipment),
+			json.RawMessage(petAssignments), record.SiegeMachineID,
+		})
+	}
+	columns := []string{
+		"army_hash", "normalized_share_code", "main_troops", "clan_castle_troops",
+		"spells", "heroes", "equipment", "pet_assignments", "siege_machine_id",
+	}
+	if _, err := tx.CopyFrom(ctx, pgx.Identifier{"battlelog_army_composition_stage"}, columns, pgx.CopyFromRows(compositionRows)); err != nil {
+		return err
+	}
+	if _, err := tx.Exec(ctx, `
+		INSERT INTO army_compositions (
+			army_hash, normalized_share_code, main_troops, clan_castle_troops,
+			spells, heroes, equipment, pet_assignments, siege_machine_id
+		)
+		SELECT army_hash, normalized_share_code, main_troops, clan_castle_troops,
+			spells, heroes, equipment, pet_assignments, siege_machine_id
+		FROM battlelog_army_composition_stage
+		ON CONFLICT (army_hash) DO NOTHING
+	`); err != nil {
+		return err
+	}
+	var mismatchCount int
+	if err := tx.QueryRow(ctx, `
+		SELECT count(*)::integer
+		FROM battlelog_army_composition_stage staged
+		JOIN army_compositions stored USING (army_hash)
+		WHERE staged.normalized_share_code <> stored.normalized_share_code
+		   OR staged.main_troops <> stored.main_troops
+		   OR staged.clan_castle_troops <> stored.clan_castle_troops
+		   OR staged.spells <> stored.spells
+		   OR staged.heroes <> stored.heroes
+		   OR staged.equipment <> stored.equipment
+		   OR staged.pet_assignments <> stored.pet_assignments
+		   OR staged.siege_machine_id IS DISTINCT FROM stored.siege_machine_id
+	`).Scan(&mismatchCount); err != nil {
+		return err
+	}
+	if mismatchCount > 0 {
+		return fmt.Errorf("%d canonical army hashes conflict with immutable compositions", mismatchCount)
+	}
+	return nil
+}
+
+func armyCompositionFromColumns(static *clashy.StaticData, shareCode string, columns map[string]uint16) armyCompositionRecord {
+	record := armyCompositionRecord{
+		MainTroops: []armyQuantity{}, ClanCastleTroops: []armyQuantity{},
+		Spells: []armySpellQuantity{}, Heroes: []int32{},
+		Equipment: []armyHeroEquipment{}, PetAssignments: []armyPetAssignment{},
+	}
+	for _, key := range sortedArmyColumnKeys(columns) {
+		section, localID := splitArmyColumn(key)
+		quantity := int(columns[key])
+		switch section {
+		case "u":
+			id := clashy.TroopBaseID + localID
+			if data := static.LookupByID(id); data != nil && data["production_building"] == "Workshop" {
+				value := int32(id)
+				record.SiegeMachineID = &value
+			} else {
+				record.MainTroops = append(record.MainTroops, armyQuantity{ID: id, Quantity: quantity})
+			}
+		case "i":
+			record.ClanCastleTroops = append(record.ClanCastleTroops, armyQuantity{ID: clashy.TroopBaseID + localID, Quantity: quantity})
+		case "s":
+			record.Spells = append(record.Spells, armySpellQuantity{ID: clashy.SpellBaseID + localID, Quantity: quantity})
+		case "d":
+			record.Spells = append(record.Spells, armySpellQuantity{ID: clashy.SpellBaseID + localID, Quantity: quantity, ClanCastle: true})
+		case "h":
+			record.Heroes = append(record.Heroes, int32(clashy.HeroBaseID+localID))
+		}
+	}
+	for _, section := range splitArmyShareSections(extractArmySharePayload(shareCode)) {
+		if len(section) == 0 || section[0] != 'h' {
+			continue
+		}
+		for _, loadout := range parseArmyHeroLoadouts(section[1:]) {
+			heroID := clashy.HeroBaseID + loadout.HeroID
+			if loadout.PetID >= 0 {
+				record.PetAssignments = append(record.PetAssignments, armyPetAssignment{HeroID: heroID, PetID: clashy.PetBaseID + loadout.PetID})
+			}
+			for _, equipmentID := range loadout.Equipment {
+				record.Equipment = append(record.Equipment, armyHeroEquipment{HeroID: heroID, EquipmentID: clashy.EquipmentBaseID + equipmentID})
+			}
+		}
+	}
+	sort.Slice(record.MainTroops, func(i, j int) bool { return record.MainTroops[i].ID < record.MainTroops[j].ID })
+	sort.Slice(record.ClanCastleTroops, func(i, j int) bool { return record.ClanCastleTroops[i].ID < record.ClanCastleTroops[j].ID })
+	sort.Slice(record.Spells, func(i, j int) bool {
+		if record.Spells[i].ID != record.Spells[j].ID {
+			return record.Spells[i].ID < record.Spells[j].ID
+		}
+		return !record.Spells[i].ClanCastle && record.Spells[j].ClanCastle
+	})
+	sort.Slice(record.Equipment, func(i, j int) bool {
+		if record.Equipment[i].EquipmentID != record.Equipment[j].EquipmentID {
+			return record.Equipment[i].EquipmentID < record.Equipment[j].EquipmentID
+		}
+		return record.Equipment[i].HeroID < record.Equipment[j].HeroID
+	})
+	sort.Slice(record.PetAssignments, func(i, j int) bool {
+		if record.PetAssignments[i].PetID != record.PetAssignments[j].PetID {
+			return record.PetAssignments[i].PetID < record.PetAssignments[j].PetID
+		}
+		return record.PetAssignments[i].HeroID < record.PetAssignments[j].HeroID
+	})
+	return record
 }
 
 func sortedArmyColumnKeys(columns map[string]uint16) []string {
@@ -783,17 +946,6 @@ func entriesAfterTimestamp(entries []clashy.BattleLogEntry, after time.Time) []c
 	return out
 }
 
-func latestBattlelogTimestamp(entries []clashy.BattleLogEntry) time.Time {
-	var latest time.Time
-	for _, entry := range entries {
-		timestamp := battlelogEntryTimestamp(entry)
-		if timestamp.After(latest) {
-			latest = timestamp
-		}
-	}
-	return latest.UTC()
-}
-
 func battlelogEntryTimestamp(entry clashy.BattleLogEntry) time.Time {
 	if entry.Timestamp == "" {
 		return time.Time{}
@@ -808,15 +960,15 @@ func battlelogEntryTimestamp(entry clashy.BattleLogEntry) time.Time {
 func battlelogRowFromEntry(playerTag string, entry clashy.BattleLogEntry) models.BattlelogRow {
 	gold, elixir, darkElixir := lootedResourceColumns(entry.LootedResources)
 	armyColumns := parseArmyColumns(entry.ArmyShareCode)
+	armyShareCode := normalizeArmyShareCode(entry.ArmyShareCode)
 	timestamp := battlelogEntryTimestamp(entry)
 	return models.BattlelogRow{
-		BattleID:              battlelogBattleID(playerTag, entry),
-		ArmyShareCode:         normalizeArmyShareCode(entry.ArmyShareCode),
+		ArmyShareCode:         armyShareCode,
+		ArmyHash:              canonicalArmyHash(armyShareCode),
 		PlayerTag:             playerTag,
 		OpponentTag:           entry.OpponentPlayerTag,
-		OpponentName:          entry.OpponentName,
-		OpponentTH:            uint8(entry.OpponentTownHallLevel + 1),
-		BattleType:            string(entry.BattleType),
+		OpponentTH:            uint8(entry.OpponentTownHallLevel),
+		BattleType:            battlelogStorageMode(entry.BattleType),
 		Attack:                entry.Attack,
 		Stars:                 uint8(entry.Stars),
 		DestructionPercentage: uint8(entry.DestructionPercentage),
@@ -829,22 +981,30 @@ func battlelogRowFromEntry(playerTag string, entry clashy.BattleLogEntry) models
 	}
 }
 
-func battlelogBattleID(playerTag string, entry clashy.BattleLogEntry) uuid.UUID {
-	leftTag, rightTag := orderedBattlelogTags(playerTag, entry.OpponentPlayerTag)
-	timestamp := battlelogEntryTimestamp(entry)
-	key := strings.Join([]string{
-		leftTag,
-		rightTag,
-		timestamp.Format(time.RFC3339Nano),
-	}, "|")
-	return uuid.NewSHA1(uuid.NameSpaceOID, []byte(key))
+func battlelogStorageMode(value clashy.BattleType) string {
+	normalized := strings.ToLower(strings.NewReplacer("_", "", "-", "", " ", "").Replace(string(value)))
+	switch normalized {
+	case "homevillage", "farming":
+		return "farming"
+	case "ranked":
+		return "ranked"
+	case "legend":
+		return "legend"
+	default:
+		return ""
+	}
 }
 
-func orderedBattlelogTags(left, right string) (string, string) {
-	if right < left {
-		return right, left
-	}
-	return left, right
+func canonicalArmyHash(normalizedShareCode string) [sha256.Size]byte {
+	// The canonical share code sorts sections, heroes, pets, equipment, and item
+	// IDs. Hash the complete normalized loadout so equal item counts with
+	// different hero assignments cannot collapse into one composition.
+	hash := sha256.New()
+	hash.Write([]byte{2})
+	hash.Write([]byte(normalizedShareCode))
+	var out [sha256.Size]byte
+	copy(out[:], hash.Sum(nil))
+	return out
 }
 
 func lootedResourceColumns(resources []clashy.Resource) (gold, elixir, darkElixir int) {
@@ -1035,7 +1195,7 @@ func parseArmyHeroLoadouts(payload string) []armyHeroLoadout {
 		if heroID < 0 {
 			continue
 		}
-		loadout := armyHeroLoadout{HeroID: heroID}
+		loadout := armyHeroLoadout{HeroID: heroID, PetID: -1}
 		for rest != "" {
 			marker := rest[0]
 			if marker != 'p' && marker != 'e' {
@@ -1087,7 +1247,7 @@ func encodeArmyHeroSection(heroes []armyHeroLoadout) string {
 	parts := make([]string, 0, len(heroes))
 	for _, hero := range heroes {
 		part := strconv.Itoa(hero.HeroID)
-		if hero.PetID > 0 {
+		if hero.PetID >= 0 {
 			part += "p" + strconv.Itoa(hero.PetID)
 		}
 		if len(hero.Equipment) > 0 {
@@ -1154,11 +1314,4 @@ func splitArmyColumn(column string) (string, int) {
 	section, idText, _ := strings.Cut(column, "_")
 	id, _ := strconv.Atoi(idText)
 	return section, id
-}
-
-func maxInt(a, b int) int {
-	if a > b {
-		return a
-	}
-	return b
 }

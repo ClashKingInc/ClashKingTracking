@@ -168,23 +168,8 @@ func (d *trackedPlayersDomain) Run(ctx context.Context, app *platform.App) error
 			return nil
 		})
 	}
-	loadVerifiedTargets := func() ([]models.TrackedPlayerTarget, error) {
-		verifiedTags, err := activeVerifiedPlayerTags(ctx, app.Valkey)
-		if err != nil {
-			return nil, err
-		}
-		verified := make([]models.TrackedPlayerTarget, 0, len(verifiedTags))
-		for _, tag := range verifiedTags {
-			verified = append(verified, models.TrackedPlayerTarget{Tag: tag, Verified: true})
-		}
-		return verified, nil
-	}
 	finishCycle := func() error {
-		verified, err := loadVerifiedTargets()
-		if err != nil {
-			return err
-		}
-		cycle = append(cycle, verified...)
+		app.Stats.SetTrackingTargets(trackedPlayersDomainName, len(cycle))
 		if err := processTargets(cycle); err != nil {
 			return err
 		}
@@ -949,7 +934,7 @@ func (s *timescaleTrackedPlayerStore) NextTargetPage(
 	var targets []models.TrackedPlayerTarget
 	for rows.Next() {
 		var target models.TrackedPlayerTarget
-		if err := rows.Scan(&target.Tag); err != nil {
+		if err := rows.Scan(&target.Tag, &target.Verified); err != nil {
 			return trackedPlayerTargetPage{}, err
 		}
 		targets = append(targets, target)
@@ -1020,7 +1005,9 @@ func (s *timescaleTrackedPlayerStore) StoreIngest(
 }
 
 const trackedPlayerTargetSetSQL = `
-		SELECT member->>'tag' AS tag
+	SELECT tag, bool_or(verified) AS verified
+	FROM (
+		SELECT member->>'tag' AS tag, false AS verified
 		FROM server_clans tracked_clan
 		JOIN servers server ON server.id = tracked_clan.server_id
 		JOIN basic_clan ON basic_clan.tag = tracked_clan.tag
@@ -1028,10 +1015,17 @@ const trackedPlayerTargetSetSQL = `
 		WHERE server.last_command_at >= now() - interval '90 days'
 		  AND member->>'tag' <> ''
 		  AND COALESCE(NULLIF(member->>'town_hall', ''), '0')::integer >= 9
+		UNION ALL
+		SELECT tag, true AS verified
+		FROM player_links
+		WHERE is_verified = true
+		  AND last_login >= now() - interval '7 days'
+	) sources
+	GROUP BY tag
 `
 
 const trackedPlayerTargetsSQL = `
-	SELECT tag
+	SELECT tag, verified
 	FROM (` + trackedPlayerTargetSetSQL + `) targets
 	WHERE tag > $1
 	ORDER BY tag

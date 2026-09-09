@@ -16,7 +16,7 @@ Each child runs in its own goroutine. If one returns an unexpected error, the co
 
 ## Data, endpoints, and events
 
-Reddit calls the configured Reddit API credentials. Giveaways and rosters primarily use PostgreSQL. All bot-facing work is published through the shared event transport; this tracking repository does not send Discord messages.
+Reddit calls the configured Reddit API credentials. Giveaways and rosters primarily use PostgreSQL. All bot-facing work is published through the shared event transport. The separate `discord-delivery` process sends it, so these automation loops do not hold Discord state or make Discord requests themselves.
 
 ## Why one runtime
 

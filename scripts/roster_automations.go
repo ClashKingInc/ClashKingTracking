@@ -3,7 +3,6 @@ package scripts
 import (
 	"context"
 	"errors"
-	"fmt"
 	"time"
 
 	"clashking_tracking/internal/platform"
@@ -303,8 +302,4 @@ func (s *memoryRosterAutomationStore) MarkDispatched(_ context.Context, executio
 func (s *memoryRosterAutomationStore) MarkRetry(_ context.Context, execution models.RosterAutomationExecution, _ time.Time, _ string) error {
 	s.retried = append(s.retried, execution.ExecutionID)
 	return nil
-}
-
-func rosterAutomationExecutionID(automationID, rosterID string, scheduledAt time.Time) string {
-	return fmt.Sprintf("%s:%s:%d", automationID, rosterID, scheduledAt.UTC().Unix())
 }

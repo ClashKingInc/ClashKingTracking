@@ -4,10 +4,7 @@ package scripts
 
 import (
 	"context"
-	"encoding/json"
-	"os"
 	"reflect"
-	"strings"
 	"testing"
 	"time"
 
@@ -60,6 +57,17 @@ func TestNormalizeArmyShareCodeFromLink(t *testing.T) {
 	}
 }
 
+func TestNormalizeArmyShareCodePreservesZeroBasedPetID(t *testing.T) {
+	withFirstPet := normalizeArmyShareCode("h0p0e1_8u1x5")
+	withoutPet := normalizeArmyShareCode("h0e1_8u1x5")
+	if withFirstPet != "h0p0e1_8u1x5" {
+		t.Fatalf("zero-based pet was dropped: %q", withFirstPet)
+	}
+	if withFirstPet == withoutPet {
+		t.Fatalf("armies with and without pet ID 0 normalized identically: %q", withFirstPet)
+	}
+}
+
 func TestParseArmyColumnsAggregatesDuplicates(t *testing.T) {
 	got := parseArmyColumns("u1x0-2x0-3x1s1x35-2x35")
 	if got["u_0"] != 3 {
@@ -73,29 +81,23 @@ func TestParseArmyColumnsAggregatesDuplicates(t *testing.T) {
 	}
 }
 
-func TestArmyItemsAndCounts(t *testing.T) {
-	items, rawCounts, err := armyItemsAndCounts(map[string]uint16{
-		"u_5":  7,
-		"s_2":  2,
-		"h_1":  1,
-		"noop": 9,
-		"e_10": 0,
-	})
-	if err != nil {
-		t.Fatal(err)
+func TestCanonicalArmyHashIgnoresLinkAndMapOrder(t *testing.T) {
+	left := normalizeArmyShareCode("u10x0-2x1s4x35i3x53d1x70h0p4e8_14")
+	right := normalizeArmyShareCode("h0p4e14_8d1x70i3x53s4x35u2x1-10x0")
+	if canonicalArmyHash(left) != canonicalArmyHash(right) {
+		t.Fatal("equivalent armies should have the same canonical hash")
 	}
-	wantItems := []string{"h_1", "s_2", "u_5"}
-	if !reflect.DeepEqual(items, wantItems) {
-		t.Fatalf("items = %#v, want %#v", items, wantItems)
+	changedQuantity := normalizeArmyShareCode("h0p4e14_8d1x70i3x53s4x35u3x1-10x0")
+	if canonicalArmyHash(left) == canonicalArmyHash(changedQuantity) {
+		t.Fatal("changing an army quantity should change the canonical hash")
 	}
-
-	var counts map[string]uint16
-	if err := json.Unmarshal([]byte(rawCounts), &counts); err != nil {
-		t.Fatal(err)
+	differentAssignment := normalizeArmyShareCode("h0p4e8_14-1p9e39")
+	sameItemsDifferentAssignment := normalizeArmyShareCode("h0p9e14_8-1p4e39")
+	if reflect.DeepEqual(parseArmyColumns(differentAssignment), parseArmyColumns(sameItemsDifferentAssignment)) == false {
+		t.Fatal("assignment regression requires equal flat item counts")
 	}
-	wantCounts := map[string]uint16{"h_1": 1, "s_2": 2, "u_5": 7}
-	if !reflect.DeepEqual(counts, wantCounts) {
-		t.Fatalf("counts = %#v, want %#v", counts, wantCounts)
+	if canonicalArmyHash(differentAssignment) == canonicalArmyHash(sameItemsDifferentAssignment) {
+		t.Fatal("different hero loadout assignments should change the canonical hash")
 	}
 }
 
@@ -124,8 +126,41 @@ func TestEntriesAfterTimestamp(t *testing.T) {
 	if len(got) != 1 || got[0].OpponentPlayerTag != "#AAA" {
 		t.Fatalf("unexpected entries after timestamp: %#v", got)
 	}
-	if latest := latestBattlelogTimestamp(entries); !latest.Equal(old.Add(3 * time.Hour)) {
-		t.Fatalf("latest timestamp = %s", latest)
+}
+
+func TestBattlelogCheckpointTracksCompleteBattleDataInsteadOfPollTime(t *testing.T) {
+	now := time.Date(2026, 9, 8, 5, 0, 0, 0, time.UTC)
+	checkpoint := models.BattlelogCheckpoint{Tag: "#PLAYER", Timestamp: now.Add(-2 * time.Hour)}
+	lateBattleTime := now.Add(-time.Hour)
+	incomplete := clashy.BattleLogEntry{
+		BattleType: clashy.BattleTypeRanked,
+		Attack:     true,
+		Timestamp:  clashTimestamp(lateBattleTime),
+	}
+
+	for name, entries := range map[string][]clashy.BattleLogEntry{
+		"empty":      nil,
+		"incomplete": {incomplete},
+	} {
+		ingest, err := battlelogIngestFromEntries(entries, "#PLAYER", checkpoint, now, 14)
+		if err != nil {
+			t.Fatalf("%s response: %v", name, err)
+		}
+		if len(ingest.Rows) != 0 || len(ingest.Checkpoints) != 0 {
+			t.Fatalf("%s response advanced durable state: %#v", name, ingest)
+		}
+	}
+
+	complete := incomplete
+	complete.OpponentPlayerTag = "#OPPONENT"
+	complete.OpponentTownHallLevel = 17
+	complete.ArmyShareCode = "u1x0"
+	ingest, err := battlelogIngestFromEntries([]clashy.BattleLogEntry{complete}, "#PLAYER", checkpoint, now.Add(time.Minute), 14)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(ingest.Rows) != 1 || len(ingest.Checkpoints) != 1 || !ingest.Checkpoints[0].Timestamp.Equal(lateBattleTime) {
+		t.Fatalf("completed late battle was not recovered: %#v", ingest)
 	}
 }
 
@@ -135,8 +170,8 @@ func TestBattlelogRequestConcurrencyIsMemoryBounded(t *testing.T) {
 		want int
 	}{
 		{rps: 0, want: 0},
-		{rps: 100, want: 100},
-		{rps: 900, want: 900},
+		{rps: 100, want: 300},
+		{rps: 900, want: 1000},
 		{rps: 4000, want: 1000},
 	}
 	for _, test := range tests {
@@ -146,7 +181,7 @@ func TestBattlelogRequestConcurrencyIsMemoryBounded(t *testing.T) {
 	}
 }
 
-func TestBattlelogRowFromEntryStoresPlayerAndOpponentNames(t *testing.T) {
+func TestBattlelogRowFromEntryUsesExactOpponentTownHall(t *testing.T) {
 	entry := clashy.BattleLogEntry{
 		OpponentPlayerTag:     "#OPP",
 		OpponentName:          "Opponent Name",
@@ -156,59 +191,30 @@ func TestBattlelogRowFromEntryStoresPlayerAndOpponentNames(t *testing.T) {
 	}
 
 	row := battlelogRowFromEntry("#PLAYER", entry)
-	if row.OpponentName != "Opponent Name" {
-		t.Fatalf("opponent name = %q, want %q", row.OpponentName, "Opponent Name")
-	}
 	if row.Duration != 173 {
 		t.Fatalf("duration = %d, want 173", row.Duration)
 	}
-	if row.OpponentTH != 17 {
-		t.Fatalf("opponent th = %d, want 17", row.OpponentTH)
+	if row.OpponentTH != 16 {
+		t.Fatalf("opponent th = %d, want 16", row.OpponentTH)
 	}
 	if row.ArmyShareCode != "" {
 		t.Fatalf("army share code = %q, want empty", row.ArmyShareCode)
 	}
 }
 
-func TestBattlelogBattleIDDedupesSwappedTagsAndAttackFlag(t *testing.T) {
-	timestamp := clashTimestamp(time.Date(2026, 5, 20, 10, 0, 0, 0, time.UTC))
-	attackEntry := clashy.BattleLogEntry{
-		BattleType:        clashy.BattleTypeRanked,
-		Attack:            true,
-		OpponentPlayerTag: "#DEFENDER",
-		Timestamp:         timestamp,
+func TestBattlelogStorageModeAcceptsWireAndConstantValues(t *testing.T) {
+	tests := map[clashy.BattleType]string{
+		clashy.BattleTypeHomeVillage:     "farming",
+		clashy.BattleTypeRanked:          "ranked",
+		clashy.BattleTypeLegend:          "legend",
+		clashy.BattleType("homeVillage"): "farming",
+		clashy.BattleType("ranked"):      "ranked",
+		clashy.BattleType("legend"):      "legend",
 	}
-	defenseEntry := clashy.BattleLogEntry{
-		BattleType:        clashy.BattleTypeRanked,
-		Attack:            false,
-		OpponentPlayerTag: "#ATTACKER",
-		Timestamp:         timestamp,
-	}
-
-	left := battlelogBattleID("#ATTACKER", attackEntry)
-	right := battlelogBattleID("#DEFENDER", defenseEntry)
-	if left != right {
-		t.Fatalf("swapped player/opponent perspectives should share battle id: %s != %s", left, right)
-	}
-}
-
-func TestBattlelogBattleIDUsesOnlyTagsAndTimestamp(t *testing.T) {
-	base := clashy.BattleLogEntry{
-		BattleType:        clashy.BattleTypeRanked,
-		OpponentPlayerTag: "#DEFENDER",
-		Timestamp:         clashTimestamp(time.Date(2026, 5, 20, 10, 0, 0, 0, time.UTC)),
-	}
-	differentTimestamp := base
-	differentTimestamp.Timestamp = clashTimestamp(time.Date(2026, 5, 20, 10, 0, 1, 0, time.UTC))
-	differentType := base
-	differentType.BattleType = clashy.BattleTypeLegend
-
-	baseID := battlelogBattleID("#ATTACKER", base)
-	if baseID == battlelogBattleID("#ATTACKER", differentTimestamp) {
-		t.Fatalf("battle id should change when timestamp changes")
-	}
-	if baseID != battlelogBattleID("#ATTACKER", differentType) {
-		t.Fatalf("battle id should ignore battle type")
+	for input, want := range tests {
+		if got := battlelogStorageMode(input); got != want {
+			t.Errorf("battlelogStorageMode(%q) = %q, want %q", input, got, want)
+		}
 	}
 }
 
@@ -219,18 +225,6 @@ type fakeBattlelogStore struct {
 
 func (s *fakeBattlelogStore) LoadTargets(context.Context, string) ([]string, error) {
 	return nil, nil
-}
-
-func (s *fakeBattlelogStore) FilterStandardTargets(_ context.Context, tags []string) ([]string, error) {
-	return tags, nil
-}
-
-func TestMergeUniqueBattlelogTargets(t *testing.T) {
-	got := mergeUniqueTags([]string{"#B", "#A", "#B"}, []string{"#C", "#A", ""})
-	want := []string{"#A", "#B", "#C"}
-	if !reflect.DeepEqual(got, want) {
-		t.Fatalf("mergeUniqueTags() = %#v, want %#v", got, want)
-	}
 }
 
 func (s *fakeBattlelogStore) Store(_ context.Context, ingest models.BattlelogIngest) (int, error) {
@@ -289,72 +283,6 @@ func TestMergeBattlelogIngestsKeepsLatestCheckpoint(t *testing.T) {
 	}
 	if got.Checkpoints[1].Tag != "#B" || !got.Checkpoints[1].Timestamp.Equal(older) {
 		t.Fatalf("unexpected #B checkpoint: %#v", got.Checkpoints)
-	}
-}
-
-func TestTimescaleBattlelogStoreCopiesRowsThroughStage(t *testing.T) {
-	dsn := os.Getenv("TRACKING_INTEGRATION_TIMESCALE_URL")
-	if dsn == "" {
-		t.Skip("TRACKING_INTEGRATION_TIMESCALE_URL is not set")
-	}
-	ctx := context.Background()
-	store, err := newTimescaleBattlelogStore(ctx, dsn)
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer store.Close()
-
-	now := time.Now().UTC().Truncate(time.Millisecond)
-	entry := clashy.BattleLogEntry{
-		ArmyShareCode:         "u1x8",
-		OpponentPlayerTag:     "#CODEXOPP",
-		OpponentName:          "Smoke Opponent",
-		OpponentTownHallLevel: 16,
-		BattleType:            clashy.BattleTypeRanked,
-		Attack:                true,
-		Stars:                 3,
-		DestructionPercentage: 100,
-		Duration:              180,
-		Timestamp:             clashTimestamp(now),
-	}
-	row := battlelogRowFromEntry("#CODEXSMOKE", entry)
-	t.Cleanup(func() {
-		_, _ = store.pool.Exec(context.Background(), `DELETE FROM battlelogs WHERE battle_id = $1 AND timestamp = $2`, row.BattleID, row.Timestamp)
-		_, _ = store.pool.Exec(context.Background(), `DELETE FROM basic_player WHERE tag = '#CODEXSMOKE'`)
-	})
-	if _, err := store.pool.Exec(ctx, `
-		INSERT INTO basic_player (tag, name, league_id, clan_tag, townhall_level, trophies)
-		VALUES ('#CODEXSMOKE', 'Smoke Player', 105000035, NULL, 17, 5000)
-		ON CONFLICT (tag) DO UPDATE SET
-			name = EXCLUDED.name,
-			league_id = EXCLUDED.league_id,
-			townhall_level = EXCLUDED.townhall_level,
-			trophies = EXCLUDED.trophies
-	`); err != nil {
-		t.Fatal(err)
-	}
-	inserted, err := store.Store(ctx, models.BattlelogIngest{Rows: []models.BattlelogRow{row}})
-	if err != nil {
-		t.Fatal(err)
-	}
-	if inserted != 1 {
-		t.Fatalf("inserted rows = %d, want 1", inserted)
-	}
-	var playerName string
-	var playerTH int
-	var armyCounts string
-	if err := store.pool.QueryRow(ctx, `
-		SELECT player_name, player_th, army_counts::text
-		FROM battlelogs
-		WHERE battle_id = $1 AND timestamp = $2
-	`, row.BattleID, row.Timestamp).Scan(&playerName, &playerTH, &armyCounts); err != nil {
-		t.Fatal(err)
-	}
-	if playerName != "Smoke Player" || playerTH != 17 {
-		t.Fatalf("joined player = %q TH%d, want Smoke Player TH17", playerName, playerTH)
-	}
-	if !strings.Contains(armyCounts, `"u_8": 1`) {
-		t.Fatalf("army_counts = %s, want u_8 count", armyCounts)
 	}
 }
 

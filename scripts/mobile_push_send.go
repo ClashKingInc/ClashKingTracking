@@ -119,7 +119,14 @@ func sendFCM(ctx context.Context, app *platform.App, token string, msg pushMessa
 	if err != nil {
 		return err
 	}
-	url := fmt.Sprintf("https://fcm.googleapis.com/v1/projects/%s/messages:send", app.Config.MobilePushFCMProjectID)
+	origin := "https://fcm.googleapis.com"
+	if app.Config.MobilePushFCMAPIOrigin != "" {
+		if err := platform.ValidateLoopbackProviderURL(app.Config.MobilePushFCMAPIOrigin); err != nil {
+			return fmt.Errorf("invalid CLASHKING_LOCAL_FCM_API_ORIGIN: %w", err)
+		}
+		origin = app.Config.MobilePushFCMAPIOrigin
+	}
+	url := fmt.Sprintf("%s/v1/projects/%s/messages:send", origin, app.Config.MobilePushFCMProjectID)
 	req, err := http.NewRequestWithContext(ctx, http.MethodPost, url, bytes.NewReader(body))
 	if err != nil {
 		return err

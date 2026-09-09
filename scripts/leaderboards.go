@@ -28,8 +28,8 @@ const (
 	leaderboardLeagueKeyPrefix                = "leaderboards:league:"
 	leaderboardTHKeyPrefix                    = "leaderboards:townhall:"
 	leaderboardUpdateRetries                  = 3
-	leaderboardMaterializedViewRefreshSeconds = 3600
-	leaderboardMaterializedViewCount          = 3
+	leaderboardMaterializedViewRefreshSeconds = 1800
+	leaderboardMaterializedViewCount          = 5
 )
 
 var leaderboardCacheScript = valkey.NewLuaScript(`
@@ -43,12 +43,16 @@ var leaderboardMaterializedViewRefreshQueries = [...]string{
 	`REFRESH MATERIALIZED VIEW CONCURRENTLY clan_leaderboards`,
 	`REFRESH MATERIALIZED VIEW war_league_counts`,
 	`REFRESH MATERIALIZED VIEW CONCURRENTLY townhall_counts`,
+	`REFRESH MATERIALIZED VIEW CONCURRENTLY api_global_counts`,
+	`REFRESH MATERIALIZED VIEW CONCURRENTLY api_league_tier_counts`,
 }
 
 var leaderboardMaterializedViewBootstrapQueries = [...]string{
 	`REFRESH MATERIALIZED VIEW clan_leaderboards`,
 	`REFRESH MATERIALIZED VIEW war_league_counts`,
 	`REFRESH MATERIALIZED VIEW townhall_counts`,
+	`REFRESH MATERIALIZED VIEW api_global_counts`,
+	`REFRESH MATERIALIZED VIEW api_league_tier_counts`,
 }
 
 const leaderboardCandidateSQL = `
@@ -103,8 +107,11 @@ const leaderboardCandidateSQL = `
 
 type leaderboardsDomain struct {
 	store                       *timescaleLeaderboardStore
+	limiter                     *clashy.Limiter
 	limit                       int
 	nullAssetURL                string
+	materializedViewRefreshMu   sync.Mutex
+	materializedViewRefreshRun  bool
 	nextMaterializedViewRefresh time.Time
 	refreshMaterializedViews    func(context.Context) error
 }
@@ -135,13 +142,14 @@ type leaderboardBoardPayload struct {
 }
 
 type leaderboardPlayerPayload struct {
-	Rank     int                      `json:"rank"`
-	Tag      string                   `json:"tag"`
-	Name     string                   `json:"name"`
-	Clan     *leaderboardClanPayload  `json:"clan"`
-	League   leaderboardLeaguePayload `json:"league"`
-	TownHall int                      `json:"townhall_level"`
-	Trophies int                      `json:"trophies"`
+	Rank          int                      `json:"rank"`
+	Tag           string                   `json:"tag"`
+	Name          string                   `json:"name"`
+	Clan          *leaderboardClanPayload  `json:"clan"`
+	League        leaderboardLeaguePayload `json:"league"`
+	LeagueGroupID string                   `json:"leagueGroupId"`
+	TownHall      int                      `json:"townhall_level"`
+	Trophies      int                      `json:"trophies"`
 }
 
 type leaderboardLeaguePayload struct {
@@ -205,8 +213,8 @@ func (d *leaderboardsDomain) Run(ctx context.Context, app *platform.App) error {
 }
 
 func validateLeaderboardsConfig(cfg platform.Config) error {
-	if cfg.LeaderboardRequestsPerSecond <= 0 {
-		return errors.New("leaderboards.requests_per_second must be greater than zero")
+	if cfg.ScheduledRequestsPerSecond <= 0 {
+		return errors.New("scheduled.requests_per_second must be greater than zero")
 	}
 	if cfg.LeaderboardIntervalSeconds <= 0 {
 		return errors.New("leaderboards.interval_seconds must be greater than zero")
@@ -235,9 +243,8 @@ func (d *leaderboardsDomain) openStore(ctx context.Context, app *platform.App) (
 }
 
 func (d *leaderboardsDomain) runCycle(ctx context.Context, app *platform.App) error {
-	limiter, err := newTrackingLimiter(app.Config.LeaderboardRequestsPerSecond)
-	if err != nil {
-		return err
+	if d.limiter == nil {
+		return errors.New("scheduled shared request limiter is required for leaderboards")
 	}
 	candidates, err := d.store.LoadCandidates(ctx, d.limit)
 	if err != nil {
@@ -248,11 +255,11 @@ func (d *leaderboardsDomain) runCycle(ctx context.Context, app *platform.App) er
 		cache := buildLeaderboardCache(candidates, nil, nil, time.Now().UTC(), d.limit, d.nullAssetURL)
 		return d.store.CacheBoards(ctx, cache)
 	}
-	leagues, err := d.fetchLeagues(ctx, app, limiter)
+	leagues, err := d.fetchLeagues(ctx, app, d.limiter)
 	if err != nil {
 		return err
 	}
-	players, deletedTags, err := d.fetchPlayers(ctx, app, limiter, tags, leagues)
+	players, deletedTags, err := d.fetchPlayers(ctx, app, d.limiter, tags, leagues)
 	if err != nil {
 		return err
 	}
@@ -277,15 +284,30 @@ func (d *leaderboardsDomain) runCycle(ctx context.Context, app *platform.App) er
 }
 
 func (d *leaderboardsDomain) refreshMaterializedViewsIfDue(ctx context.Context, app *platform.App, now time.Time) error {
+	d.materializedViewRefreshMu.Lock()
 	if !d.nextMaterializedViewRefresh.IsZero() && now.Before(d.nextMaterializedViewRefresh) {
+		d.materializedViewRefreshMu.Unlock()
 		return nil
 	}
+	if d.materializedViewRefreshRun {
+		d.materializedViewRefreshMu.Unlock()
+		return nil
+	}
+	d.materializedViewRefreshRun = true
+	d.materializedViewRefreshMu.Unlock()
+	defer func() {
+		d.materializedViewRefreshMu.Lock()
+		d.materializedViewRefreshRun = false
+		d.materializedViewRefreshMu.Unlock()
+	}()
 	start := time.Now()
 	if err := d.refreshMaterializedViews(ctx); err != nil {
 		return fmt.Errorf("refresh leaderboard materialized views: %w", err)
 	}
 	duration := time.Since(start)
+	d.materializedViewRefreshMu.Lock()
 	d.nextMaterializedViewRefresh = now.Add(time.Duration(leaderboardMaterializedViewRefreshSeconds) * time.Second)
+	d.materializedViewRefreshMu.Unlock()
 	app.Logger.Info("leaderboards materialized views refreshed", "duration", duration)
 	app.Stats.RecordStore(
 		leaderboardsDomainName,
@@ -319,7 +341,7 @@ func (d *leaderboardsDomain) fetchPlayers(ctx context.Context, app *platform.App
 	deleteTags := make([]string, 0)
 	skipped := 0
 	notFound := 0
-	err := runBounded(ctx, platform.RequestConcurrency(app.Config.LeaderboardRequestsPerSecond), tags, func(workerCtx context.Context, tag string) error {
+	err := runBounded(ctx, platform.RequestConcurrency(app.Config.ScheduledRequestsPerSecond), tags, func(workerCtx context.Context, tag string) error {
 		player, err := retryLimitedClashFetch(workerCtx, app, limiter, func(fetchCtx context.Context) (*clashy.Player, error) {
 			start := time.Now()
 			player, err := app.Clash.GetPlayer(fetchCtx, tag)
@@ -370,13 +392,16 @@ func basicPlayerRowFromPlayer(player *clashy.Player, leagues map[int]leaderboard
 	}
 	return leaderboardPlayerRow{
 		BasicPlayerRow: models.BasicPlayerRow{
-			Tag:          player.Tag,
-			Name:         player.Name,
-			LeagueID:     player.LeagueTier.ID,
-			ClanTag:      clanTag,
-			ClanTagKnown: true,
-			TownHall:     player.TownHall,
-			Trophies:     player.Trophies,
+			Tag:              player.Tag,
+			Name:             player.Name,
+			LeagueID:         player.LeagueTier.ID,
+			LeagueGroupID:    player.CurrentLeagueGroupTag,
+			LeagueSeasonID:   int64(player.CurrentLeagueSeasonID),
+			LeagueGroupKnown: true,
+			ClanTag:          clanTag,
+			ClanTagKnown:     true,
+			TownHall:         player.TownHall,
+			Trophies:         player.Trophies,
 		},
 		League: leaguePayloadForPlayer(player.LeagueTier, leagues),
 	}, true
@@ -507,13 +532,14 @@ func leaderboardBoard(kind, key string, players []leaderboardPlayerRow, clans ma
 	}
 	for i, player := range players {
 		payload.Items = append(payload.Items, leaderboardPlayerPayload{
-			Rank:     i + 1,
-			Tag:      player.Tag,
-			Name:     player.Name,
-			Clan:     leaderboardClanPayloadForPlayer(player.ClanTag, clans, nullAssetURL),
-			League:   player.League,
-			TownHall: player.TownHall,
-			Trophies: player.Trophies,
+			Rank:          i + 1,
+			Tag:           player.Tag,
+			Name:          player.Name,
+			Clan:          leaderboardClanPayloadForPlayer(player.ClanTag, clans, nullAssetURL),
+			League:        player.League,
+			LeagueGroupID: player.LeagueGroupID,
+			TownHall:      player.TownHall,
+			Trophies:      player.Trophies,
 		})
 	}
 	return payload

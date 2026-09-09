@@ -45,6 +45,7 @@ type mobileWarEvent struct {
 }
 
 func (d *mobileEventsDomain) Run(ctx context.Context, app *platform.App) error {
+	statsName := trackingProgressName(mobileEventsDomainName, "events")
 	if err := validateMobileEventsConfig(app.Config, app.Valkey); err != nil {
 		return err
 	}
@@ -81,9 +82,14 @@ func (d *mobileEventsDomain) Run(ctx context.Context, app *platform.App) error {
 			}
 			return err
 		}
+		app.Stats.SetQueueDepth(statsName, len(entries))
+		started := time.Now()
 		if err := worker.processEntries(ctx, entries); err != nil {
 			return err
 		}
+		app.Stats.SetQueueDepth(statsName, 0)
+		app.Stats.RecordProcess(statsName, time.Since(started))
+		app.Stats.SetReady(statsName, true, "")
 	}
 }
 

@@ -2,7 +2,7 @@
 
 FROM golang:1.26.4-bookworm AS build
 
-WORKDIR /src/PycharmProjects/clashking_tracking
+WORKDIR /src
 
 COPY go.mod go.sum ./
 RUN --mount=type=cache,target=/go/pkg/mod \

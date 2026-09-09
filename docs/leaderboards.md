@@ -6,7 +6,7 @@ Leaderboards fetch current global/location rankings and maintain the typed curre
 
 ## When it runs
 
-The current leaderboard loop runs every `leaderboards.interval_seconds` at `leaderboards.requests_per_second`. Historical/season jobs run when the scheduled calendar says a season can be completed.
+The current leaderboard loop runs every `leaderboards.interval_seconds`. Its Clash requests share `scheduled.requests_per_second` with the other work in the scheduled process, so concurrent scheduled jobs cannot each consume a full independent request budget.
 
 ## Targets and endpoints
 
@@ -38,7 +38,7 @@ Leaderboard writes to `basic_player` are accepted because volume is bounded and 
 
 ## Configuration
 
-- `leaderboards.requests_per_second`
+- `scheduled.requests_per_second`
 - `leaderboards.interval_seconds`
 - `leaderboards.limit`
 - `leaderboards.null_asset_url`

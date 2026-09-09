@@ -6,13 +6,13 @@ The CWL process discovers league groups, stores group membership and league meta
 
 ## When it runs
 
-It is a separate `cwl` script. It wakes every `wars.cwl_sync_seconds`. New group discovery runs from the 1st through the 3rd UTC because clans cannot sign up later; current-season groups already found keep syncing through the 15th or until their stored state becomes `ended`.
+It is a separate `cwl` script. It wakes every `cwl.sync_seconds`. New group discovery and current-season refreshes run from the 1st through the 15th UTC. Discovery stays open after signup closes so a new or restarted tracker can recover groups first observed mid-season. Stored groups stop refreshing when their state becomes `ended`.
 
 ## How a clan becomes a target
 
-Targets are known clans with public war logs and a stored CWL league ID. They are paged independently from the active/dormant regular-war cursors. During the 1st–3rd discovery window, clans with no current-season group are checked individually because their group is not known yet. As soon as one response stores all group members, those known siblings leave the discovery pool and SQL keeps only one eligible representative for that active group. An eight-clan group therefore uses one group refresh after discovery rather than eight.
+Every clan in `basic_clan` is eligible for CWL discovery, including clans with private war logs and no cached CWL league. CWL targets are paged independently from the active/dormant regular-war cursors, whose public-log and recent-war rules remain unchanged. During the 1st–15th discovery window, clans with no current-season group are checked individually because their group is not known yet. As soon as one response stores all group members, those known siblings leave the discovery pool and SQL keeps one representative for that active group.
 
-The page is processed with bounded concurrent workers behind the shared 500-request/second limiter. Normal network latency therefore does not turn the global CWL crawl into a sequential 20–30 request/second loop.
+The page is processed with bounded concurrent workers behind the configured discovery limiter, currently 250 requests per second. Once the current battle and following preparation war are both known, that group sleeps until the current battle ends. It then becomes eligible once, discovers the next preparation war, and sleeps again. If the following preparation war is not known yet, the group remains eligible so a late matchup is not missed.
 
 ## Decision flow
 
@@ -21,6 +21,7 @@ Load CWL target page
   -> GET target's current league group
   -> wrong season/no group? skip
   -> derive stable group identity and deduplicate
+  -> reuse the group's persisted league, or resolve it once if absent
   -> store group clans and members
   -> ask SQL which round war tags are already scheduled or permanent
   -> GET only previously unseen league wars by tag
@@ -34,7 +35,7 @@ Pseudocode:
 if current time is CWL:
   for target in page:
     group = GET /clans/{tag}/currentwar/leaguegroup
-    if group season != current season: continue
+    if the first seven characters of the exact group season != current UTC month: continue
     if group already seen: continue
     known = SQL war tags already in war_schedule or wars
     for unseen war_tag in group.rounds:
@@ -46,6 +47,7 @@ if current time is CWL:
 ## Clash API used
 
 - Current league group for a clan.
+- Clan profile for the first discovery of an unresolved group when `cwl.resolve_league_from_clan_profile` is enabled.
 - League war by war tag.
 
 Both calls go through the configured proxy and availability gate.
@@ -54,7 +56,11 @@ Both calls go through the configured proxy and availability gate.
 
 Reads CWL candidate clans and any stored league ID. Writes CWL group, group-clan, and group-member tables plus canonical `war_schedule` and `player_timers`. Final CWL attacks and permanent war data are stored later by the `war-discovery` due-schedule finalizer.
 
-The group retains both `cwl_league_id` and observed `war_size`; neither has to be reconstructed from attack rows later. When a live configured-clan tracker scheduled the war first, this process derives the size from its participant timers instead of refetching the same tagged war. A later group response with no new tags preserves the already known size rather than replacing it with null.
+The group retains both `cwl_league_id` and observed `war_size`; neither has to be reconstructed from attack rows later. With profile resolution enabled, the first discovery of an unresolved group fetches one representative clan profile and persists its current `warLeague`. Later refreshes and process restarts reuse that stored value, so the other group members and each refresh do not cause profile lookups. The profile field is a current observation rather than historical proof; persisting the first ranked observation prevents a later season's league from rewriting the stored group. A failed or unranked profile lookup leaves the league unresolved, still stores the group and retrievable wars, and retries on a later refresh. With the switch disabled, resolution uses the existing ranked consensus from `basic_clan`.
+
+When a live configured-clan tracker scheduled the war first, this process derives the size from its participant timers instead of refetching the same tagged war. A later group response with no new tags preserves the already known size rather than replacing it with null.
+
+The `scheduled` process derives `cwl_season_statistics` from these PostgreSQL group tables once a week for the current and previous UTC month. The aggregate is intentionally partial and has no finalized marker; an all-season run-once command can reconcile every retained season without reading R2 or changing any war producer.
 
 ## Events and interaction
 
@@ -72,10 +78,14 @@ flowchart LR
 
 ## Configuration
 
-- `wars.cwl_sync_seconds`
-- `wars.requests_per_second`
+- `cwl.sync_seconds`
+- `cwl.requests_per_second` for league-group discovery
+- `cwl.resolve_league_from_clan_profile` enables the one-time profile resolution for groups without a persisted league; it defaults to `false`, while the checked deployment config enables it for the initial stale-cache rollout
+- `cwl.war_requests_per_second` for war-tag hydration; when omitted, it inherits the group rate
 - `target_page_multiplier`
 - SQL, event stream, and proxy settings
+
+Operational metrics use `cwl.groups` for the finite candidate pass. The eligible target total is recounted every 15 minutes, every attempted candidate advances progress, and group and optional profile requests share the configured 250-request/second limiter and its metrics. Previously unseen league-war requests use the separate configured 1,000-request/second budget. Outside the CWL calendar window the process remains idle rather than reporting fake target progress.
 
 ## Outages and restarts
 

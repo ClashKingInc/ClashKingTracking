@@ -17,7 +17,7 @@ import (
 func TestRosterAutomationCyclePublishesExactTimeExecution(t *testing.T) {
 	scheduledAt := time.Date(2026, 9, 8, 18, 0, 0, 0, time.UTC)
 	store := &memoryRosterAutomationStore{due: []models.RosterAutomationExecution{{
-		ExecutionID:      rosterAutomationExecutionID("auto", "roster", scheduledAt),
+		ExecutionID:      "auto:roster:1788890400",
 		AutomationID:     "auto",
 		ServerID:         "123",
 		RosterID:         "roster",

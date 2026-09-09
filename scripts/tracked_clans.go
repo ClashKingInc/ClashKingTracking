@@ -30,53 +30,8 @@ type TrackedItem[T any] struct {
 
 const (
 	trackedClansDomainName = "trackedclans"
-	capitalRaidCacheGrace  = 10 * time.Minute
 	cwlGroupRefreshPeriod  = 15 * time.Minute
 )
-
-var replaceCapitalRaidCacheScript = valkey.NewLuaScript(`
-	local clan_tag = ARGV[2]
-	local expires_at_ms = ARGV[3]
-	local member_key_prefix = ARGV[4]
-	local previous_members = redis.call('SMEMBERS', KEYS[2])
-
-	for _, player_tag in ipairs(previous_members) do
-		local member_key = member_key_prefix .. player_tag
-		if redis.call('GET', member_key) == clan_tag then
-			redis.call('DEL', member_key)
-		end
-	end
-
-	redis.call('DEL', KEYS[1], KEYS[2])
-	redis.call('SET', KEYS[1], ARGV[1], 'PXAT', expires_at_ms)
-
-	for index = 5, #ARGV do
-		local player_tag = ARGV[index]
-		redis.call('SADD', KEYS[2], player_tag)
-		redis.call('SET', member_key_prefix .. player_tag, clan_tag, 'PXAT', expires_at_ms)
-	end
-
-	if #ARGV >= 5 then
-		redis.call('PEXPIREAT', KEYS[2], expires_at_ms)
-	end
-
-	return #ARGV - 4
-`)
-
-var deleteCapitalRaidCacheScript = valkey.NewLuaScript(`
-	local clan_tag = ARGV[1]
-	local member_key_prefix = ARGV[2]
-	local previous_members = redis.call('SMEMBERS', KEYS[2])
-
-	for _, player_tag in ipairs(previous_members) do
-		local member_key = member_key_prefix .. player_tag
-		if redis.call('GET', member_key) == clan_tag then
-			redis.call('DEL', member_key)
-		end
-	end
-
-	return redis.call('DEL', KEYS[1], KEYS[2])
-`)
 
 type trackedClansDomain struct {
 	targetsMu        sync.RWMutex
@@ -87,7 +42,6 @@ type trackedClansDomain struct {
 	snapshotPrefix   string
 	cwlStateSnapshot string
 	store            trackedClanStore
-	capitalRaids     capitalRaidCache
 }
 
 type trackedClanTarget struct {
@@ -103,7 +57,6 @@ func NewTrackedClansDomain() platform.Domain {
 		snapshots: &memoryTrackedClanSnapshotStore{
 			values: make(map[string][]byte),
 		},
-		capitalRaids: newMemoryCapitalRaidCache("trackedclans:snapshot:", time.Now),
 	}
 }
 
@@ -127,7 +80,6 @@ func (d *trackedClansDomain) Run(ctx context.Context, app *platform.App) error {
 	d.snapshots = newTrackedClanSnapshotStore(app)
 	d.snapshotPrefix = app.Config.TrackedClanSnapshotPrefix
 	d.cwlStateSnapshot = app.Config.TrackedClanCWLStateSnapshot
-	d.capitalRaids = newCapitalRaidCache(app, d.snapshotPrefix)
 
 	rateLimit := app.Config.TrackedClanRequestsPerSecond
 	limiter, err := newTrackingLimiter(rateLimit)
@@ -185,6 +137,7 @@ type raidReminder struct {
 	ServerID         string
 	ClanTag          string
 	ChannelID        string
+	ThreadID         string
 	TriggerTime      string
 	MinutesRemaining int
 	CustomText       string
@@ -201,6 +154,7 @@ func (r raidReminder) eventData() map[string]any {
 		"type_name":         "Clan Capital",
 		"clan_tag":          r.ClanTag,
 		"channel_id":        r.ChannelID,
+		"thread_id":         r.ThreadID,
 		"trigger_time":      r.TriggerTime,
 		"minutes_remaining": r.MinutesRemaining,
 		"custom_text":       r.CustomText,
@@ -239,7 +193,7 @@ func (s *timescaleTrackedClanStore) Close() {
 }
 
 func (s *timescaleTrackedClanStore) UpsertCurrentWar(ctx context.Context, sourceTag string, war clashy.ClanWar, warTag string) (string, error) {
-	ingest, err := buildWarIngest(war, sourceTag, false, warTag, "", "")
+	ingest, err := buildWarIngest(war, sourceTag, false, warTag, "", 0)
 	if err != nil || len(ingest.Schedules) == 0 {
 		return "", err
 	}
@@ -316,7 +270,7 @@ func (s memoryTrackedClanStore) ListTargets(context.Context) ([]trackedClanTarge
 }
 
 func (memoryTrackedClanStore) UpsertCurrentWar(_ context.Context, sourceTag string, war clashy.ClanWar, warTag string) (string, error) {
-	ingest, err := buildWarIngest(war, sourceTag, false, warTag, "", "")
+	ingest, err := buildWarIngest(war, sourceTag, false, warTag, "", 0)
 	if err != nil || len(ingest.Schedules) == 0 {
 		return "", err
 	}
@@ -487,20 +441,6 @@ func closedWarLogResponse(err error) bool {
 	return errors.As(err, &notFound)
 }
 
-func fetchRaid(app *platform.App) trackedClanFetchFunc[clashy.RaidLogEntry] {
-	return func(ctx context.Context, tag string) (*clashy.RaidLogEntry, error) {
-		raids, err := app.Clash.GetRaidLog(ctx, tag, clashy.PageOptions{Limit: 1})
-		if err != nil {
-			return nil, err
-		}
-		if len(raids) == 0 {
-			return &clashy.RaidLogEntry{}, nil
-		}
-		raid := raids[0]
-		return &raid, nil
-	}
-}
-
 func (d *trackedClansDomain) handleClanChange(ctx context.Context, app *platform.App, item TrackedItem[clashy.Clan]) error {
 	if item.Current == nil {
 		return nil
@@ -626,293 +566,6 @@ func (d *trackedClansDomain) handleWarChange(ctx context.Context, app *platform.
 		}
 	}
 	return d.snapshots.StoreRaw(ctx, trackedClanSnapshotKey(d.snapshotPrefix, "war", item.Tag), raw)
-}
-
-func (d *trackedClansDomain) handleRaidChange(ctx context.Context, app *platform.App, item TrackedItem[clashy.RaidLogEntry]) error {
-	if item.Current == nil {
-		return nil
-	}
-	expiresAt, ok := capitalRaidCacheExpiry(*item.Current, time.Now().UTC())
-	if !ok {
-		return d.capitalRaids.Delete(ctx, item.Tag)
-	}
-	previous, raw, hasPrevious, changed, err := loadCapitalRaidCacheChange(ctx, d.capitalRaids, item.Tag, *item.Current, item.Raw)
-	if err != nil {
-		return err
-	}
-	if !changed {
-		return d.capitalRaids.Replace(ctx, item.Tag, capitalRaidParticipantTags(*item.Current), raw, expiresAt)
-	}
-	if hasPrevious {
-		app.Stats.RecordWrite(trackedClansDomainName, 1)
-		app.Stats.SetReady(trackedClansDomainName, true, "")
-		if previous != nil {
-			if err := d.publishRaidDiffEvents(ctx, app, item.Tag, *previous, *item.Current, raw); err != nil {
-				return err
-			}
-		}
-	}
-	return d.capitalRaids.Replace(ctx, item.Tag, capitalRaidParticipantTags(*item.Current), raw, expiresAt)
-}
-
-type capitalRaidCache interface {
-	LoadRaw(context.Context, string) ([]byte, bool, error)
-	Replace(context.Context, string, []string, []byte, time.Time) error
-	Delete(context.Context, string) error
-}
-
-type valkeyCapitalRaidCache struct {
-	client valkey.Client
-	prefix string
-}
-
-type memoryCapitalRaidCacheEntry struct {
-	compressed []byte
-	expiresAt  time.Time
-	members    map[string]struct{}
-}
-
-type memoryCapitalRaidMemberMapping struct {
-	clanTag   string
-	expiresAt time.Time
-}
-
-type memoryCapitalRaidCache struct {
-	mu       sync.Mutex
-	prefix   string
-	now      func() time.Time
-	entries  map[string]memoryCapitalRaidCacheEntry
-	mappings map[string]memoryCapitalRaidMemberMapping
-}
-
-func newCapitalRaidCache(app *platform.App, prefix string) capitalRaidCache {
-	if app.Valkey != nil {
-		return valkeyCapitalRaidCache{client: app.Valkey, prefix: prefix}
-	}
-	return newMemoryCapitalRaidCache(prefix, time.Now)
-}
-
-func newMemoryCapitalRaidCache(prefix string, now func() time.Time) *memoryCapitalRaidCache {
-	return &memoryCapitalRaidCache{
-		prefix:   prefix,
-		now:      now,
-		entries:  make(map[string]memoryCapitalRaidCacheEntry),
-		mappings: make(map[string]memoryCapitalRaidMemberMapping),
-	}
-}
-
-func (s valkeyCapitalRaidCache) LoadRaw(ctx context.Context, clanTag string) ([]byte, bool, error) {
-	value, err := s.client.Do(ctx, s.client.B().Get().Key(capitalRaidPayloadKey(s.prefix, clanTag)).Build()).ToString()
-	if err != nil {
-		if valkey.IsValkeyNil(err) {
-			return nil, false, nil
-		}
-		return nil, false, err
-	}
-	raw, err := utils.Decompress([]byte(value))
-	if err != nil {
-		return nil, false, err
-	}
-	return raw, true, nil
-}
-
-func (s valkeyCapitalRaidCache) Replace(
-	ctx context.Context,
-	clanTag string,
-	participantTags []string,
-	raw []byte,
-	expiresAt time.Time,
-) error {
-	if !expiresAt.After(time.Now()) {
-		return errors.New("capital raid cache expiry must be in the future")
-	}
-	args := []string{
-		string(utils.Compress(raw)),
-		clanTag,
-		strconv.FormatInt(expiresAt.UTC().UnixMilli(), 10),
-		capitalRaidMemberKeyPrefix(s.prefix),
-	}
-	args = append(args, participantTags...)
-	return replaceCapitalRaidCacheScript.Exec(
-		ctx,
-		s.client,
-		[]string{
-			capitalRaidPayloadKey(s.prefix, clanTag),
-			capitalRaidParticipantSetKey(s.prefix, clanTag),
-		},
-		args,
-	).Error()
-}
-
-func (s valkeyCapitalRaidCache) Delete(ctx context.Context, clanTag string) error {
-	return deleteCapitalRaidCacheScript.Exec(
-		ctx,
-		s.client,
-		[]string{
-			capitalRaidPayloadKey(s.prefix, clanTag),
-			capitalRaidParticipantSetKey(s.prefix, clanTag),
-		},
-		[]string{clanTag, capitalRaidMemberKeyPrefix(s.prefix)},
-	).Error()
-}
-
-func (s *memoryCapitalRaidCache) LoadRaw(_ context.Context, clanTag string) ([]byte, bool, error) {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	s.removeExpiredLocked(s.now().UTC())
-	entry, ok := s.entries[clanTag]
-	if !ok {
-		return nil, false, nil
-	}
-	raw, err := utils.Decompress(entry.compressed)
-	if err != nil {
-		return nil, false, err
-	}
-	return raw, true, nil
-}
-
-func (s *memoryCapitalRaidCache) Replace(
-	_ context.Context,
-	clanTag string,
-	participantTags []string,
-	raw []byte,
-	expiresAt time.Time,
-) error {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	now := s.now().UTC()
-	expiresAt = expiresAt.UTC()
-	s.removeExpiredLocked(now)
-	if !expiresAt.After(now) {
-		return errors.New("capital raid cache expiry must be in the future")
-	}
-	if previous, ok := s.entries[clanTag]; ok {
-		for playerTag := range previous.members {
-			if mapping, exists := s.mappings[playerTag]; exists && mapping.clanTag == clanTag {
-				delete(s.mappings, playerTag)
-			}
-		}
-	}
-	members := make(map[string]struct{}, len(participantTags))
-	for _, playerTag := range participantTags {
-		members[playerTag] = struct{}{}
-		s.mappings[playerTag] = memoryCapitalRaidMemberMapping{
-			clanTag:   clanTag,
-			expiresAt: expiresAt,
-		}
-	}
-	s.entries[clanTag] = memoryCapitalRaidCacheEntry{
-		compressed: utils.Compress(raw),
-		expiresAt:  expiresAt,
-		members:    members,
-	}
-	return nil
-}
-
-func (s *memoryCapitalRaidCache) Delete(_ context.Context, clanTag string) error {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	s.removeExpiredLocked(s.now().UTC())
-	entry, ok := s.entries[clanTag]
-	if !ok {
-		return nil
-	}
-	delete(s.entries, clanTag)
-	for playerTag := range entry.members {
-		if mapping, exists := s.mappings[playerTag]; exists && mapping.clanTag == clanTag {
-			delete(s.mappings, playerTag)
-		}
-	}
-	return nil
-}
-
-func (s *memoryCapitalRaidCache) removeExpiredLocked(now time.Time) {
-	for clanTag, entry := range s.entries {
-		if entry.expiresAt.After(now) {
-			continue
-		}
-		delete(s.entries, clanTag)
-		for playerTag := range entry.members {
-			if mapping, ok := s.mappings[playerTag]; ok && mapping.clanTag == clanTag {
-				delete(s.mappings, playerTag)
-			}
-		}
-	}
-	for playerTag, mapping := range s.mappings {
-		if !mapping.expiresAt.After(now) {
-			delete(s.mappings, playerTag)
-		}
-	}
-}
-
-func capitalRaidPayloadKey(prefix, clanTag string) string {
-	return trackedClanSnapshotKey(prefix, "raid", clanTag)
-}
-
-func capitalRaidParticipantSetKey(prefix, clanTag string) string {
-	return prefix + "raid-members:" + clanTag
-}
-
-func capitalRaidMemberKeyPrefix(prefix string) string {
-	return prefix + "raid-member:"
-}
-
-func capitalRaidMemberKey(prefix, playerTag string) string {
-	return capitalRaidMemberKeyPrefix(prefix) + playerTag
-}
-
-func capitalRaidCacheExpiry(raid clashy.RaidLogEntry, now time.Time) (time.Time, bool) {
-	if raid.EndTime == nil || raid.EndTime.Time.IsZero() {
-		return time.Time{}, false
-	}
-	expiresAt := raid.EndTime.Time.UTC().Add(capitalRaidCacheGrace)
-	if !expiresAt.After(now.UTC()) {
-		return time.Time{}, false
-	}
-	return expiresAt, true
-}
-
-func capitalRaidParticipantTags(raid clashy.RaidLogEntry) []string {
-	seen := make(map[string]struct{}, len(raid.Members))
-	tags := make([]string, 0, len(raid.Members))
-	for _, member := range raid.Members {
-		if member.Tag == "" {
-			continue
-		}
-		if _, ok := seen[member.Tag]; ok {
-			continue
-		}
-		seen[member.Tag] = struct{}{}
-		tags = append(tags, member.Tag)
-	}
-	return tags
-}
-
-func loadCapitalRaidCacheChange(
-	ctx context.Context,
-	cache capitalRaidCache,
-	clanTag string,
-	current clashy.RaidLogEntry,
-	raw []byte,
-) (*clashy.RaidLogEntry, []byte, bool, bool, error) {
-	if len(raw) == 0 {
-		raw = jsonBytes(current)
-	}
-	previousRaw, hasPrevious, err := cache.LoadRaw(ctx, clanTag)
-	if err != nil {
-		return nil, raw, false, false, err
-	}
-	if hasPrevious && bytes.Equal(previousRaw, raw) {
-		return nil, raw, true, false, nil
-	}
-	var previous *clashy.RaidLogEntry
-	if hasPrevious {
-		var decoded clashy.RaidLogEntry
-		if err := json.Unmarshal(previousRaw, &decoded); err == nil {
-			previous = &decoded
-		}
-	}
-	return previous, raw, hasPrevious, true, nil
 }
 
 type trackedClanSnapshotStore interface {
@@ -1058,40 +711,6 @@ func warAttackKey(attack clashy.WarAttack) string {
 	return attack.AttackerTag + ":" + attack.DefenderTag + ":" + strconv.Itoa(attack.Order)
 }
 
-func (d *trackedClansDomain) publishRaidDiffEvents(ctx context.Context, app *platform.App, clanTag string, previous, current clashy.RaidLogEntry, raw []byte) error {
-	if previous.State != current.State {
-		if err := app.PublishEvent(ctx, platform.Event{
-			Topic:   "capital",
-			ClanTag: clanTag,
-			Value:   map[string]any{"type": "raid_state", "previous_raid": previous, "raid": json.RawMessage(raw), "clan_tag": clanTag},
-		}); err != nil {
-			return err
-		}
-	}
-	if attacked := changedRaidMemberAttacks(previous, current); len(attacked) > 0 {
-		return app.PublishEvent(ctx, platform.Event{
-			Topic:   "capital",
-			ClanTag: clanTag,
-			Value:   map[string]any{"type": "raid_attacks", "attacked": attacked, "raid": json.RawMessage(raw), "previous_raid": previous, "clan_tag": clanTag},
-		})
-	}
-	return nil
-}
-
-func changedRaidMemberAttacks(previous, current clashy.RaidLogEntry) []string {
-	previousMembers := make(map[string]int)
-	for _, member := range previous.Members {
-		previousMembers[member.Tag] = member.AttackCount
-	}
-	var out []string
-	for _, member := range current.Members {
-		if previousMembers[member.Tag] != member.AttackCount {
-			out = append(out, member.Tag)
-		}
-	}
-	return out
-}
-
 func raidMissingMembers(clan clashy.Clan, raid clashy.RaidLogEntry, reminder raidReminder) []map[string]any {
 	threshold := reminder.AttackThreshold
 	roles := reminder.Roles
@@ -1193,7 +812,7 @@ func (c *cwlCycleWarCache) fetch(ctx context.Context, warTag string, fetch func(
 }
 
 func (d *trackedClansDomain) runCWLLoop(ctx context.Context, app *platform.App, limiter *clashy.Limiter) error {
-	interval := time.Duration(app.Config.WarCWLSyncSeconds) * time.Second
+	interval := time.Duration(app.Config.CWLSyncSeconds) * time.Second
 	if interval <= 0 {
 		interval = 3 * time.Minute
 	}
@@ -1495,22 +1114,6 @@ func (d *trackedClansDomain) fetchCWLWar(ctx context.Context, app *platform.App,
 	return &wars[0], jsonBytes(wars[0]), nil
 }
 
-func (d *trackedClansDomain) findClanCWLWar(ctx context.Context, app *platform.App, limiter *clashy.Limiter, clanTag string, warTags []string) (string, *clashy.ClanWar, []byte, error) {
-	for _, warTag := range warTags {
-		war, raw, err := d.fetchCWLWar(ctx, app, limiter, warTag)
-		if err != nil {
-			return "", nil, nil, err
-		}
-		if war == nil {
-			continue
-		}
-		if warContainsClan(*war, clanTag) {
-			return warTag, war, raw, nil
-		}
-	}
-	return "", nil, nil, nil
-}
-
 type cwlWarRole string
 
 const (
@@ -1668,25 +1271,7 @@ func groupNotInThisSeason(group *clashy.ClanWarLeagueGroup, now time.Time) bool 
 	if group.State == "notInWar" || group.State == "groupNotFound" {
 		return true
 	}
-	return group.Season != "" && group.Season != utils.CurrentSeason(now)
-}
-
-func latestCWLWarTags(group *clashy.ClanWarLeagueGroup) ([]string, string) {
-	if group == nil {
-		return nil, ""
-	}
-	for i := len(group.Rounds) - 1; i >= 0; i-- {
-		var tags []string
-		for _, tag := range group.Rounds[i].WarTags {
-			if tag != "" && tag != "#0" {
-				tags = append(tags, tag)
-			}
-		}
-		if len(tags) > 0 {
-			return tags, strings.Join(tags, ",")
-		}
-	}
-	return nil, ""
+	return group.Season != "" && cwlSeasonMonth(group.Season) != utils.CurrentSeason(now)
 }
 
 func warContainsClan(war clashy.ClanWar, clanTag string) bool {
@@ -1694,13 +1279,6 @@ func warContainsClan(war clashy.ClanWar, clanTag string) bool {
 		return true
 	}
 	return war.Opponent != nil && war.Opponent.Tag == clanTag
-}
-
-func rawCWLGroup(group *clashy.ClanWarLeagueGroup) string {
-	if group == nil {
-		return ""
-	}
-	return string(jsonBytes(group))
 }
 
 func cwlLineupChanges(previous, current clashy.ClanWar) map[string]any {

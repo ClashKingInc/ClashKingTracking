@@ -6,16 +6,16 @@ Priority player tracking keeps a smaller useful set of players fresh, detects me
 
 ## When it runs
 
-It runs continuously as `trackedplayers` at `trackedplayers.requests_per_second`. SQL targets are paged into one small in-memory cycle, active verified-app targets from Valkey are appended, and the complete cycle is fed through one bounded worker pool. This prevents one slow retry at a page boundary from idling the remaining request budget.
+It runs continuously as `trackedplayers` at `trackedplayers.requests_per_second`. SQL targets are paged into one small in-memory cycle and fed through one bounded worker pool. This prevents one slow retry at a page boundary from idling the remaining request budget.
 
 ## How a player becomes a target
 
 The target union is:
 
 1. Town Hall 9 or higher members stored on server clans whose server used ClashKing within 90 days.
-2. Verified app accounts in the `tracking:verified_players` sorted set whose seven-day expiry has not passed. These are accepted without a Town Hall filter because their current profile is not known until it is fetched.
+2. Verified app accounts whose `player_links.last_login` is within seven days. These are accepted without a Town Hall filter because their current profile is not known until it is fetched.
 
-The SQL source is deduplicated by its query. The verified-account pass is independent, so a verified account that is also in the SQL set can receive one extra poll per full cycle. That avoids a database membership check for every verified account. Bookmarked players are not targets merely because they are bookmarked.
+The SQL source groups duplicate tags and marks a target verified when any current `player_links` row qualifies, so an account that is also in a configured clan is polled once per cycle while still updating its verified player-to-clan mapping. Bookmarked players are not targets merely because they are bookmarked.
 
 ## Decision flow
 
@@ -77,7 +77,6 @@ Valkey state:
 
 - Player snapshot keys for comparisons have a 30-day TTL. Reading an active snapshot refreshes its TTL only after it falls below 23 days, in the same Valkey operation and without uploading the payload again.
 - `tracking:tracked_player_snapshot_targets` remembers the last completed target union. After a complete pass, snapshots removed from the union are shortened to a one-day TTL. A target returning during that day is restored to 30 days on its next read.
-- `tracking:verified_players`: seven-day verified-account target expiry.
 - The verified player-to-current-clan hash used by Capital tracking and Raid reminders.
 
 The clan mapping is written only when the clan changes. Leaving a clan removes the mapping.
@@ -107,6 +106,8 @@ flowchart LR
 - `trackedplayers.target_refresh_seconds` controls how often the in-memory player-event interest registry reloads.
 - `target_page_multiplier`
 - Valkey, Timescale/PostgreSQL, event stream, and proxy settings
+
+Each completed target refresh sets the operational target total to the combined SQL and verified-player cycle before workers begin. Processed-target progress therefore represents the actual current pass instead of an unbounded counter.
 
 ## Outages and restarts
 

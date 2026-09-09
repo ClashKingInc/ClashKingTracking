@@ -222,6 +222,15 @@ func TestGlobalClanOnlyDefersGatewayTimeout(t *testing.T) {
 	}
 }
 
+func TestPersistedGlobalClanNotFoundIsAnUpstreamAnomaly(t *testing.T) {
+	if !isClashNotFound(&clashy.NotFound{}) {
+		t.Fatal("a clan 404 must be recognized without treating zero members as deletion")
+	}
+	if isDeferredBulkFetch(&clashy.NotFound{}) {
+		t.Fatal("the shared bulk-fetch policy must not silently redefine 404s for other domains")
+	}
+}
+
 func TestBasicClanRowUsesUnrankedWarLeagueWhenMissing(t *testing.T) {
 	got := basicClanRow(clashy.Clan{
 		Tag:               "#CLAN",
@@ -229,17 +238,18 @@ func TestBasicClanRowUsesUnrankedWarLeagueWhenMissing(t *testing.T) {
 		Points:            50000,
 		BuilderBasePoints: 42000,
 		CapitalPoints:     3100,
+		ClanCapital:       clashy.ClanCapital{ClanGoldSinkTotal: 9876543210},
 	})
 	if got.LocationID != nil || got.CWLLeagueID != unrankedWarLeagueID || got.CapitalLeagueID != nil {
 		t.Fatalf("optional ids/war league mismatch when missing: %#v", got)
 	}
-	if got.ClanPoints != 50000 || got.BuilderBasePoints != 42000 || got.CapitalPoints != 3100 {
+	if got.ClanPoints != 50000 || got.BuilderBasePoints != 42000 || got.CapitalPoints != 3100 || got.CapitalGoldTotal != 9876543210 {
 		t.Fatalf("typed clan points were not preserved: %#v", got)
 	}
 }
 
 func TestBasicClanUpsertStoresAllTypedPointFields(t *testing.T) {
-	for _, field := range []string{"clan_points", "builder_base_points", "capital_points"} {
+	for _, field := range []string{"clan_points", "builder_base_points", "capital_points", "capital_gold_total"} {
 		if !strings.Contains(upsertBasicClanSQL, field+" = EXCLUDED."+field) {
 			t.Fatalf("basic clan upsert does not update %s: %s", field, upsertBasicClanSQL)
 		}

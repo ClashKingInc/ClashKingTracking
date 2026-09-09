@@ -19,13 +19,16 @@ func PlayerProfileFromClashy(player clashy.Player) models.PlayerProfileIngest {
 	}
 	ingest := models.PlayerProfileIngest{
 		Player: models.BasicPlayerRow{
-			Tag:          player.Tag,
-			Name:         player.Name,
-			LeagueID:     player.LeagueTier.ID,
-			ClanTag:      clanTag,
-			ClanTagKnown: clanTagKnown,
-			TownHall:     player.TownHall,
-			Trophies:     player.Trophies,
+			Tag:              player.Tag,
+			Name:             player.Name,
+			LeagueID:         player.LeagueTier.ID,
+			LeagueGroupID:    player.CurrentLeagueGroupTag,
+			LeagueSeasonID:   int64(player.CurrentLeagueSeasonID),
+			LeagueGroupKnown: true,
+			ClanTag:          clanTag,
+			ClanTagKnown:     clanTagKnown,
+			TownHall:         player.TownHall,
+			Trophies:         player.Trophies,
 		},
 		Heroes:       make([]models.PlayerHeroRow, 0, len(player.Heroes)),
 		Equipment:    make([]models.PlayerEquipmentRow, 0, len(player.HeroEquipment)),

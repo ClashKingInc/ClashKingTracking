@@ -15,7 +15,7 @@ Each group has its own progress statistics. Its target tags are loaded once per 
 
 ## How a player becomes a target
 
-Legend targets are players whose stored league is Legend League. Standard SQL targets are Town Hall 9 or higher members of recently active configured server clans, matching `trackedplayers`. Active verified app accounts are loaded from the seven-day Valkey target set on each pass without a Town Hall filter and use the same standard request budget. Verified players already in Legend League are removed from the standard pool so the two workers cannot publish the same newly observed battle twice.
+Legend targets are players whose stored league is Legend League. Standard SQL targets are Town Hall 9 or higher members of recently active configured server clans, matching `trackedplayers`. Active verified app accounts are selected from `player_links` when `last_login` is within seven days, without a Town Hall filter, and use the same standard request budget. Verified players already in Legend League are removed from the standard pool so the two workers cannot publish the same newly observed battle twice.
 
 Bookmarks and war participation do not create battle-log targets. There is no `battlelogs_tracking_ttl`.
 
@@ -27,7 +27,7 @@ Load and deduplicate the current target set once
   -> load each batch's checkpoints with one Valkey MGET
   -> stream player jobs through the fixed worker pool
   -> GET the player's battle log
-  -> identify stable battle identities not seen before
+  -> keep entries newer than the durable timestamp checkpoint
   -> reject newly discovered rows older than the first-seen lookback
   -> insert new battles in SQL
   -> advance the checkpoint only after storage succeeds
@@ -36,16 +36,16 @@ Load and deduplicate the current target set once
 Pseudocode:
 
 ```text
-targets = SQL target set UNION active verified accounts
+targets = configured-clan members UNION recently active verified player_links
 for target_batch in targets:
   checkpoints = Valkey MGET for target_batch
   stream targets through bounded workers:
   log = GET /players/{tag}/battlelog
   checkpoint = checkpoints[target]
   for battle in log:
-    if battle identity is already checkpointed: skip
+    if battle time is at or before the checkpoint: skip
     if no checkpoint and battle time is older than 14 days: skip
-    normalize armies, result, trophies, town halls, and opponent
+    keep farming attacks slim; normalize Ranked/Legend armies and both players
     queue SQL insert
   commit inserts
   save new checkpoint with its TTL
@@ -59,9 +59,15 @@ Checkpoint batches feed one long-lived pool rather than waiting for every retry 
 
 ## Data read and written
 
-Reads target tables and `basic_player.league_id`. Writes normalized rows to `battlelogs`. A row includes the player/opponent identity, attack direction, battle type, result, trophy change, destruction, stars, town halls, armies, and the API battle time.
+Reads target tables and the requested player's current Town Hall from `basic_player`. Farming attacks go to `battles_farming` with the player, time, result, duration, loot object, and share code; farming defenses and opponent metadata are discarded. Ranked and Legend battles go to `battles_ranked` as attack and defense perspectives. Aggregate readers use only `direction='attack'`, so each physical battle is counted once.
+
+Every Ranked or Legend row references an immutable exact army in `army_compositions`. The identity is a deterministic 32-byte hash of the normalized share code. Its structured columns preserve main troops, clan-castle troops, spells with clan-castle ownership, heroes, hero-equipment assignments, pet-hero assignments, and the siege machine. The hot writer performs no daily aggregation, group mutation, item-mask allocation, prefix rebuild, or tier enrichment.
+
+The scheduled closeout rebuilds completed Legend-day and Ranked-season aggregates from raw attack perspectives. It groups newly observed Legend armies into immutable direct-anchor families and writes daily family outcomes. Farming and Ranked/Legend raw rows retain one year.
 
 Valkey checkpoint keys remember the newest battle time seen for each player. `battlelogs.checkpoint_ttl_days` controls their lifetime. The checkpoint is comparison state, not target membership.
+
+Every target is fetched on every pass whether it has a checkpoint or not, so an empty or unchanged response does not cause an extra HTTP request on the next pass. Empty logs and logs with no entry newer than the current watermark emit no checkpoint. An incomplete newly observed Ranked or Legend entry also emits no checkpoint, because advancing a poll-time watermark could skip that battle if the API later returns the same battle timestamp with its missing opponent or army data filled in. Checkpoints therefore record the newest complete battle timestamp that was durably processed; they never record the time of the poll.
 
 ## Events and interaction
 
@@ -74,7 +80,7 @@ flowchart LR
   V[verified target cache] --> B
   B --> API[Battle-log endpoint]
   B --> C[Valkey checkpoints]
-  B --> SQL[(battlelogs)]
+  B --> SQL[(farming and ranked battles)]
   SQL --> Stats[API analytics]
 ```
 
@@ -94,5 +100,6 @@ Requests pause at the availability gate. A checkpoint is stored only after SQL s
 
 - No bookmarked-player or Legend mobile notifications.
 - No writes to general `basic_player` targeting state.
+- No stored trophy deltas or synthetic automatic defenses; API responses derive them from real results.
 - No war-derived TTL.
 - No search through every player's bookmarked accounts per attack.

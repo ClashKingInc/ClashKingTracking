@@ -17,7 +17,8 @@ import (
 const remindersDomainName = "reminders"
 
 type remindersDomain struct {
-	pool *pgxpool.Pool
+	pool    *pgxpool.Pool
+	limiter *clashy.Limiter
 }
 
 const discordReminderPayloadSQL = `jsonb_build_object(
@@ -26,6 +27,7 @@ const discordReminderPayloadSQL = `jsonb_build_object(
 	'type_name', reminder.type_name,
 	'clan_tag', reminder.clan_tag,
 	'channel_id', COALESCE(reminder.channel_id, ''),
+	'thread_id', COALESCE(reminder.thread_id, ''),
 	'trigger_time', COALESCE(reminder.trigger_time, ''),
 	'minutes_remaining', reminder.minutes_remaining,
 	'custom_text', reminder.custom_text,
@@ -42,6 +44,14 @@ func (d *remindersDomain) Run(ctx context.Context, app *platform.App) error {
 	if app.Config.TimescaleURL == "" || app.Valkey == nil || app.Clash == nil {
 		return errors.New("reminders requires Timescale, Valkey, and the Clash API")
 	}
+	if app.Config.ReminderRequestsPerSecond <= 0 {
+		return errors.New("reminders.requests_per_second must be greater than zero")
+	}
+	limiter, err := newTrackingLimiter(app.Config.ReminderRequestsPerSecond)
+	if err != nil {
+		return err
+	}
+	d.limiter = limiter
 	pool, err := pgxpool.New(ctx, app.Config.TimescaleURL)
 	if err != nil {
 		return err
@@ -52,9 +62,10 @@ func (d *remindersDomain) Run(ctx context.Context, app *platform.App) error {
 		return err
 	}
 	var wg sync.WaitGroup
-	errCh := make(chan error, 5)
+	errCh := make(chan error, 6)
 	for _, run := range []func(context.Context, *platform.App) error{
 		d.runEventLoop,
+		d.runPostgresWakeLoop,
 		d.runDueWarJobs,
 		d.runMobileWarReconciliation,
 		d.runRaidReminderClock,
@@ -75,6 +86,7 @@ func (d *remindersDomain) Run(ctx context.Context, app *platform.App) error {
 }
 
 func (d *remindersDomain) runFixedDiscordReminderClock(ctx context.Context, app *platform.App) error {
+	statsName := trackingProgressName(remindersDomainName, "fixed")
 	for {
 		now := time.Now().UTC()
 		next := now.Truncate(15 * time.Minute).Add(15 * time.Minute)
@@ -82,11 +94,20 @@ func (d *remindersDomain) runFixedDiscordReminderClock(ctx context.Context, app 
 			return err
 		}
 		now = time.Now().UTC()
-		if err := d.sendClanGamesReminderInterval(ctx, app, now); err != nil {
-			app.Logger.Error("clan games reminder interval failed", "err", err)
+		started := time.Now()
+		clanGamesErr := d.sendClanGamesReminderInterval(ctx, app, now)
+		if clanGamesErr != nil {
+			app.Logger.Error("clan games reminder interval failed", "err", clanGamesErr)
 		}
-		if err := d.sendInactivityReminderInterval(ctx, app, now); err != nil {
-			app.Logger.Error("inactivity reminder interval failed", "err", err)
+		inactivityErr := d.sendInactivityReminderInterval(ctx, app, now)
+		if inactivityErr != nil {
+			app.Logger.Error("inactivity reminder interval failed", "err", inactivityErr)
+		}
+		app.Stats.RecordProcess(statsName, time.Since(started))
+		if err := errors.Join(clanGamesErr, inactivityErr); err != nil {
+			app.Stats.SetReady(statsName, false, err.Error())
+		} else {
+			app.Stats.SetReady(statsName, true, "")
 		}
 	}
 }
@@ -114,7 +135,7 @@ func (d *remindersDomain) sendClanGamesReminderInterval(ctx context.Context, app
 			WHERE change.player_tag = member->>'tag' AND change.stat_type = 'clan_games'
 			  AND change.event_time >= $2
 		) points ON true
-		WHERE reminder.type_name = 'Clan Games' AND reminder.minutes_remaining = $1
+		WHERE reminder.disabled = false AND reminder.type_name = 'Clan Games' AND reminder.minutes_remaining = $1
 		  AND COALESCE(points.value, 0) <= COALESCE(reminder.trigger_threshold, 0)
 		GROUP BY reminder.id, reminder.clan_tag
 	`, minutes, start)
@@ -148,7 +169,7 @@ const inactivityReminderRowsSQL = `
 			SELECT max(event.seen_at) AS last_seen
 			FROM player_online_events event WHERE event.tag = member->>'tag'
 		) online ON true
-		WHERE lower(reminder.type_name) = 'inactivity'
+		WHERE reminder.disabled = false AND lower(reminder.type_name) = 'inactivity'
 		  AND online.last_seen >= $1::timestamptz - make_interval(mins => reminder.minutes_remaining + 15)
 		  AND online.last_seen <  $1::timestamptz - make_interval(mins => reminder.minutes_remaining)
 		GROUP BY reminder.id, reminder.clan_tag
@@ -172,7 +193,7 @@ func (d *remindersDomain) publishFixedReminderRows(ctx context.Context, app *pla
 		if json.Unmarshal(reminderRaw, &reminderData) != nil || json.Unmarshal(missingRaw, &missing) != nil || len(missing) == 0 {
 			continue
 		}
-		clan, err := platform.RetryClashFetch(ctx, app.Availability, func(fetchCtx context.Context) (*clashy.Clan, error) {
+		clan, err := retryLimitedClashFetch(ctx, app, d.limiter, func(fetchCtx context.Context) (*clashy.Clan, error) {
 			return app.Clash.GetClan(fetchCtx, clanTag)
 		})
 		if err != nil || clan == nil {
@@ -262,7 +283,8 @@ func (d *remindersDomain) reconcileWar(ctx context.Context, scheduleKey string) 
 			SELECT DISTINCT reminder.minutes_remaining
 			FROM schedule
 			JOIN reminders reminder
-			  ON reminder.type_name = 'War'
+			  ON reminder.disabled = false
+			 AND reminder.type_name = 'War'
 			 AND reminder.clan_tag IN (schedule.source_clan_tag, schedule.opponent_tag)
 			WHERE reminder.minutes_remaining > 0
 			  AND (cardinality(reminder.war_type_names) = 0 OR schedule.war_type = ANY(reminder.war_type_names))
@@ -292,7 +314,8 @@ func (d *remindersDomain) reconcileWar(ctx context.Context, scheduleKey string) 
 		  AND NOT EXISTS (
 			SELECT 1 FROM reminders reminder
 			JOIN war_schedule schedule ON schedule.schedule_key = job.schedule_key
-			WHERE reminder.type_name = 'War'
+			WHERE reminder.disabled = false
+			  AND reminder.type_name = 'War'
 			  AND reminder.clan_tag IN (schedule.source_clan_tag, schedule.opponent_tag)
 			  AND reminder.minutes_remaining = job.minutes_remaining
 			  AND (cardinality(reminder.war_type_names) = 0 OR schedule.war_type = ANY(reminder.war_type_names))
@@ -313,7 +336,8 @@ func (d *remindersDomain) reconcileWar(ctx context.Context, scheduleKey string) 
 	return tx.Commit(ctx)
 }
 
-func (d *remindersDomain) runMobileWarReconciliation(ctx context.Context, _ *platform.App) error {
+func (d *remindersDomain) runMobileWarReconciliation(ctx context.Context, app *platform.App) error {
+	statsName := trackingProgressName(remindersDomainName, "mobile-reconciliation")
 	ticker := time.NewTicker(5 * time.Minute)
 	defer ticker.Stop()
 	for {
@@ -321,37 +345,64 @@ func (d *remindersDomain) runMobileWarReconciliation(ctx context.Context, _ *pla
 		case <-ctx.Done():
 			return ctx.Err()
 		case <-ticker.C:
-			rows, err := d.pool.Query(ctx, `
-				SELECT DISTINCT timer.event_key
-				FROM player_timers timer
-				JOIN mobile_notification_accounts account ON account.player_tag = timer.player_tag AND account.active = true AND account.source = 'verified'
-				JOIN mobile_push_devices device ON device.user_id = account.user_id
-				WHERE timer.event_type = 'war' AND timer.expires_at > now()
-				  AND device.enabled = true AND device.provider = 'fcm' AND device.war_reminders_enabled = true
-			`)
-			if err != nil {
+			started := time.Now()
+			if err := d.reconcileMobileWars(ctx, ""); err != nil {
 				return err
 			}
-			var keys []string
-			for rows.Next() {
-				var key string
-				if err := rows.Scan(&key); err != nil {
-					rows.Close()
-					return err
-				}
-				keys = append(keys, key)
-			}
-			rows.Close()
-			for _, key := range keys {
-				if err := d.reconcileWar(ctx, key); err != nil {
-					return err
-				}
-			}
+			app.Stats.RecordProcess(statsName, time.Since(started))
+			app.Stats.SetReady(statsName, true, "")
 		}
 	}
 }
 
+func (d *remindersDomain) runPostgresWakeLoop(ctx context.Context, app *platform.App) error {
+	return runTrackingWakeListener(ctx, app, func(wakeCtx context.Context, event trackingWakeEvent) error {
+		switch event.Kind {
+		case "reminder_config":
+			return d.handleReconciliationEvent(wakeCtx, "reminder_config", event.ClanTag, map[string]any{"type": event.ReminderType})
+		case "mobile_reminder_config":
+			return d.reconcileMobileWars(wakeCtx, event.UserID)
+		default:
+			return nil
+		}
+	})
+}
+
+func (d *remindersDomain) reconcileMobileWars(ctx context.Context, userID string) error {
+	rows, err := d.pool.Query(ctx, `
+		SELECT DISTINCT timer.event_key
+		FROM player_timers timer
+		JOIN mobile_notification_accounts account ON account.player_tag = timer.player_tag AND account.active = true AND account.source = 'verified'
+		JOIN mobile_push_devices device ON device.user_id = account.user_id
+		WHERE timer.event_type = 'war' AND timer.expires_at > now()
+		  AND device.enabled = true AND device.provider = 'fcm' AND device.war_reminders_enabled = true
+		  AND ($1 = '' OR account.user_id::text = $1)
+	`, userID)
+	if err != nil {
+		return err
+	}
+	defer rows.Close()
+	var keys []string
+	for rows.Next() {
+		var key string
+		if err := rows.Scan(&key); err != nil {
+			return err
+		}
+		keys = append(keys, key)
+	}
+	if err := rows.Err(); err != nil {
+		return err
+	}
+	for _, key := range keys {
+		if err := d.reconcileWar(ctx, key); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
 func (d *remindersDomain) runEventLoop(ctx context.Context, app *platform.App) error {
+	statsName := trackingProgressName(remindersDomainName, "events")
 	group := "reminders"
 	err := app.Valkey.Do(ctx, app.Valkey.B().XgroupCreate().Key(app.Config.EventStreamName).Group(group).Id("0").Mkstream().Build()).Error()
 	if err != nil && !strings.Contains(err.Error(), "BUSYGROUP") {
@@ -367,7 +418,10 @@ func (d *remindersDomain) runEventLoop(ctx context.Context, app *platform.App) e
 			}
 			return err
 		}
-		for _, entry := range result[app.Config.EventStreamName] {
+		entries := result[app.Config.EventStreamName]
+		app.Stats.SetQueueDepth(statsName, len(entries))
+		started := time.Now()
+		for _, entry := range entries {
 			topic := entry.FieldValues["topic"]
 			clanTag := entry.FieldValues["clan_tag"]
 			var value map[string]any
@@ -381,6 +435,9 @@ func (d *remindersDomain) runEventLoop(ctx context.Context, app *platform.App) e
 				return err
 			}
 		}
+		app.Stats.SetQueueDepth(statsName, 0)
+		app.Stats.RecordProcess(statsName, time.Since(started))
+		app.Stats.SetReady(statsName, true, "")
 	}
 }
 
@@ -427,6 +484,7 @@ func (d *remindersDomain) handleReconciliationEvent(ctx context.Context, topic, 
 }
 
 func (d *remindersDomain) runDueWarJobs(ctx context.Context, app *platform.App) error {
+	statsName := trackingProgressName(remindersDomainName, "war-jobs")
 	ticker := time.NewTicker(15 * time.Second)
 	defer ticker.Stop()
 	for {
@@ -462,6 +520,8 @@ func (d *remindersDomain) runDueWarJobs(ctx context.Context, app *platform.App) 
 			jobs = append(jobs, job)
 		}
 		rows.Close()
+		app.Stats.SetQueueDepth(statsName, len(jobs))
+		started := time.Now()
 		for _, job := range jobs {
 			if err := app.Availability.Wait(ctx); err != nil {
 				return err
@@ -480,14 +540,14 @@ func (d *remindersDomain) runDueWarJobs(ctx context.Context, app *platform.App) 
 			}
 			var war *clashy.ClanWar
 			if job.warTag != "" {
-				wars, fetchErr := platform.RetryClashFetch(ctx, app.Availability, func(fetchCtx context.Context) ([]clashy.ClanWar, error) {
+				wars, fetchErr := retryLimitedClashFetch(ctx, app, d.limiter, func(fetchCtx context.Context) ([]clashy.ClanWar, error) {
 					return app.Clash.GetLeagueWars(fetchCtx, []string{job.warTag})
 				})
 				if fetchErr == nil && len(wars) > 0 {
 					war = &wars[0]
 				}
 			} else {
-				war, _ = platform.RetryClashFetch(ctx, app.Availability, func(fetchCtx context.Context) (*clashy.ClanWar, error) {
+				war, _ = retryLimitedClashFetch(ctx, app, d.limiter, func(fetchCtx context.Context) (*clashy.ClanWar, error) {
 					return app.Clash.GetClanWar(fetchCtx, job.clanTag)
 				})
 			}
@@ -500,10 +560,14 @@ func (d *remindersDomain) runDueWarJobs(ctx context.Context, app *platform.App) 
 			}
 			_, _ = d.pool.Exec(ctx, `DELETE FROM war_reminder_jobs WHERE schedule_key = $1 AND minutes_remaining = $2`, job.key, job.minutes)
 		}
+		app.Stats.SetQueueDepth(statsName, 0)
+		app.Stats.RecordProcess(statsName, time.Since(started))
+		app.Stats.SetReady(statsName, true, "")
 	}
 }
 
 func (d *remindersDomain) runRaidReminderClock(ctx context.Context, app *platform.App) error {
+	statsName := trackingProgressName(remindersDomainName, "raid")
 	for {
 		now := time.Now().UTC()
 		next := now.Truncate(15 * time.Minute).Add(15 * time.Minute)
@@ -513,8 +577,14 @@ func (d *remindersDomain) runRaidReminderClock(ctx context.Context, app *platfor
 		if !capitalWeekendActive(time.Now().UTC()) {
 			continue
 		}
+		started := time.Now()
 		if err := d.sendRaidReminderInterval(ctx, app, time.Now().UTC()); err != nil {
 			app.Logger.Error("raid reminder interval failed", "err", err)
+			app.Stats.RecordProcess(statsName, time.Since(started))
+			app.Stats.SetReady(statsName, false, err.Error())
+		} else {
+			app.Stats.RecordProcess(statsName, time.Since(started))
+			app.Stats.SetReady(statsName, true, "")
 		}
 	}
 }
@@ -583,7 +653,7 @@ func (d *remindersDomain) sendRaidReminderInterval(ctx context.Context, app *pla
 		raid, ok := loadCachedRaid(ctx, app, group.clanTag)
 		if !ok {
 			var fetchErr error
-			raid, ok, fetchErr = fetchReminderRaid(ctx, app, group.clanTag)
+			raid, ok, fetchErr = fetchReminderRaid(ctx, app, d.limiter, group.clanTag)
 			if fetchErr != nil || !ok {
 				continue
 			}
@@ -624,12 +694,12 @@ func remainingRaidAttacks(tags []string, members map[string]clashy.RaidMember) i
 
 func (d *remindersDomain) sendDiscordRaidReminders(ctx context.Context, app *platform.App, minutes int) error {
 	rows, err := d.pool.Query(ctx, `
-		SELECT id::text, server_id, clan_tag, COALESCE(channel_id, ''),
+		SELECT id::text, server_id, clan_tag, COALESCE(channel_id, ''), COALESCE(thread_id, ''),
 		       COALESCE(trigger_time, ''), minutes_remaining, custom_text,
 		       COALESCE(townhalls, '{}'::integer[]), roles, war_type_names,
 		       COALESCE(trigger_threshold, 1)
 		FROM reminders
-		WHERE type_name = 'Clan Capital' AND minutes_remaining = $1
+		WHERE disabled = false AND type_name = 'Clan Capital' AND minutes_remaining = $1
 		ORDER BY clan_tag, id
 	`, minutes)
 	if err != nil {
@@ -639,7 +709,7 @@ func (d *remindersDomain) sendDiscordRaidReminders(ctx context.Context, app *pla
 	byClan := make(map[string][]raidReminder)
 	for rows.Next() {
 		var reminder raidReminder
-		if err := rows.Scan(&reminder.ID, &reminder.ServerID, &reminder.ClanTag, &reminder.ChannelID,
+		if err := rows.Scan(&reminder.ID, &reminder.ServerID, &reminder.ClanTag, &reminder.ChannelID, &reminder.ThreadID,
 			&reminder.TriggerTime, &reminder.MinutesRemaining, &reminder.CustomText, &reminder.TownHalls,
 			&reminder.Roles, &reminder.WarTypes, &reminder.AttackThreshold); err != nil {
 			return err
@@ -653,12 +723,12 @@ func (d *remindersDomain) sendDiscordRaidReminders(ctx context.Context, app *pla
 		raid, ok := loadCachedRaid(ctx, app, clanTag)
 		if !ok {
 			var fetchErr error
-			raid, ok, fetchErr = fetchReminderRaid(ctx, app, clanTag)
+			raid, ok, fetchErr = fetchReminderRaid(ctx, app, d.limiter, clanTag)
 			if fetchErr != nil || !ok {
 				continue
 			}
 		}
-		clan, fetchErr := fetchReminderClan(ctx, app, clanTag)
+		clan, fetchErr := fetchReminderClan(ctx, app, d.limiter, clanTag)
 		if fetchErr != nil || clan == nil {
 			continue
 		}
@@ -678,8 +748,8 @@ func (d *remindersDomain) sendDiscordRaidReminders(ctx context.Context, app *pla
 	return nil
 }
 
-func fetchReminderRaid(ctx context.Context, app *platform.App, clanTag string) (clashy.RaidLogEntry, bool, error) {
-	entries, err := platform.RetryClashFetch(ctx, app.Availability, func(fetchCtx context.Context) ([]clashy.RaidLogEntry, error) {
+func fetchReminderRaid(ctx context.Context, app *platform.App, limiter *clashy.Limiter, clanTag string) (clashy.RaidLogEntry, bool, error) {
+	entries, err := retryLimitedClashFetch(ctx, app, limiter, func(fetchCtx context.Context) ([]clashy.RaidLogEntry, error) {
 		start := time.Now()
 		entries, fetchErr := app.Clash.GetRaidLog(fetchCtx, clanTag, clashy.PageOptions{Limit: 1})
 		app.Stats.RecordRequest(remindersDomainName, time.Since(start), fetchErr)
@@ -691,8 +761,8 @@ func fetchReminderRaid(ctx context.Context, app *platform.App, clanTag string) (
 	return entries[0], true, nil
 }
 
-func fetchReminderClan(ctx context.Context, app *platform.App, clanTag string) (*clashy.Clan, error) {
-	return platform.RetryClashFetch(ctx, app.Availability, func(fetchCtx context.Context) (*clashy.Clan, error) {
+func fetchReminderClan(ctx context.Context, app *platform.App, limiter *clashy.Limiter, clanTag string) (*clashy.Clan, error) {
+	return retryLimitedClashFetch(ctx, app, limiter, func(fetchCtx context.Context) (*clashy.Clan, error) {
 		start := time.Now()
 		clan, err := app.Clash.GetClan(fetchCtx, clanTag)
 		app.Stats.RecordRequest(remindersDomainName, time.Since(start), err)

@@ -212,7 +212,7 @@ func TestUnchangedPlayerDoesNotRewriteSnapshot(t *testing.T) {
 	}
 }
 
-func TestTrackedPlayerTargetsAreTH9ConfiguredClanMembers(t *testing.T) {
+func TestTrackedPlayerTargetsIncludeActiveVerifiedAppPlayers(t *testing.T) {
 	if strings.Contains(trackedPlayerTargetSetSQL, "tracked_player_targets") {
 		t.Fatalf("obsolete explicit target table remains in query: %s", trackedPlayerTargetSetSQL)
 	}
@@ -220,6 +220,9 @@ func TestTrackedPlayerTargetsAreTH9ConfiguredClanMembers(t *testing.T) {
 		"server.last_command_at >= now() - interval '90 days'",
 		"member->>'town_hall'",
 		">= 9",
+		"FROM player_links",
+		"is_verified = true",
+		"last_login >= now() - interval '7 days'",
 	} {
 		if !strings.Contains(trackedPlayerTargetSetSQL, fragment) {
 			t.Fatalf("tracked player target query omits %q: %s", fragment, trackedPlayerTargetSetSQL)

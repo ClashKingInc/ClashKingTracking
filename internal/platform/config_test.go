@@ -13,17 +13,14 @@ func TestLoadWithArgsReadsConfigJSON(t *testing.T) {
 	t.Setenv("VALKEY_HOST", "valkey-env")
 	t.Setenv("VALKEY_PORT", "6380")
 	writeConfig(t, `{
-		"grpc_addr": ":9191",
 		"target_page_multiplier": 9,
 		"stats": {
 			"timescale_flush_seconds": 22
 		},
 		"events": {
 			"stream": "tracking:events",
-			"group": "events-group",
 			"consumer": "events-1",
 			"retention_seconds": 300,
-			"batch_size": 50,
 			"reclaim_idle_seconds": 30
 		},
 		"globalclans": {
@@ -37,9 +34,19 @@ func TestLoadWithArgsReadsConfigJSON(t *testing.T) {
 			"checkpoint_ttl_days": 34,
 			"first_seen_lookback_days": 56
 		},
-		"wars": {
-			"requests_per_second": 99,
-			"cwl_sync_seconds": 22
+		"war_discovery": {
+			"active_requests_per_second": 99,
+			"dormant_requests_per_second": 12
+		},
+		"cwl": {
+			"requests_per_second": 44,
+			"war_requests_per_second": 88,
+			"sync_seconds": 22,
+			"resolve_league_from_clan_profile": true
+		},
+		"war_archiver": {
+			"scan_seconds": 31,
+			"pack_size": 9999
 		},
 		"trackedclans": {
 			"requests_per_second": 77,
@@ -55,13 +62,16 @@ func TestLoadWithArgsReadsConfigJSON(t *testing.T) {
 			"requests_per_second": 30
 		},
 		"leaderboards": {
-			"requests_per_second": 66,
 			"interval_seconds": 600,
 			"limit": 500,
 			"null_asset_url": "https://assets/null"
 		},
 		"scheduled": {
+			"requests_per_second": 66,
 			"interval_seconds": 900
+		},
+		"reminders": {
+			"requests_per_second": 7
 		},
 		"giveaways": {
 			"scan_seconds": 60
@@ -80,9 +90,6 @@ func TestLoadWithArgsReadsConfigJSON(t *testing.T) {
 	if cfg.Script != "" {
 		t.Fatalf("script = %q, want empty because config JSON cannot select scripts", cfg.Script)
 	}
-	if cfg.Enabled("wars") {
-		t.Fatalf("script should not be enabled without --script")
-	}
 	if cfg.ProxyURL != "http://proxy-env/v1" || cfg.ValkeyAddr != "valkey-env:6380" {
 		t.Fatalf("environment endpoint config was not applied: %+v", cfg)
 	}
@@ -98,21 +105,24 @@ func TestLoadWithArgsReadsConfigJSON(t *testing.T) {
 		cfg.BattlelogCheckpointTTLDays != 34 || cfg.BattlelogFirstSeenLookbackDays != 56 {
 		t.Fatalf("battlelogs config was not applied: %+v", cfg)
 	}
-	if cfg.WarCWLSyncSeconds != 22 {
-		t.Fatalf("wars config was not applied: %+v", cfg)
+	if cfg.WarDiscoveryActiveRequestsPerSecond != 99 || cfg.WarDiscoveryDormantRequestsPerSecond != 12 ||
+		cfg.CWLRequestsPerSecond != 44 || cfg.CWLWarRequestsPerSecond != 88 || cfg.CWLSyncSeconds != 22 ||
+		!cfg.CWLResolveLeagueFromClanProfile ||
+		cfg.WarArchiveScanSeconds != 31 || cfg.WarArchivePackSize != 9999 {
+		t.Fatalf("war runtime config was not applied: %+v", cfg)
 	}
 	if cfg.TrackedClanRequestsPerSecond != 77 || cfg.TrackedClanTargetRefreshSeconds != 3800 ||
 		cfg.TrackedClanSnapshotPrefix != "trackedclans:test:" ||
 		cfg.TrackedClanCWLStateSnapshot != "test-cwlstate" {
 		t.Fatalf("trackedclans config was not applied: %+v", cfg)
 	}
-	if cfg.EventStreamName != "tracking:events" || cfg.EventStreamBatchSize != 50 ||
+	if cfg.EventStreamName != "tracking:events" ||
 		cfg.EventStreamRetentionSeconds != 300 || cfg.EventStreamReclaimIdleSeconds != 30 {
 		t.Fatalf("events config was not applied: %+v", cfg)
 	}
 	if cfg.TrackedPlayerRequestsPerSecond != 88 || cfg.TrackedPlayerTargetRefreshSeconds != 3900 ||
 		cfg.BasicPlayerRequestsPerSecond != 30 ||
-		cfg.LeaderboardRequestsPerSecond != 66 ||
+		cfg.ScheduledRequestsPerSecond != 66 || cfg.ReminderRequestsPerSecond != 7 ||
 		cfg.LeaderboardIntervalSeconds != 600 || cfg.ScheduledIntervalSeconds != 900 ||
 		cfg.LeaderboardLimit != 500 || cfg.LeaderboardNullAssetURL != "https://assets/null" ||
 		cfg.GiveawayScanSeconds != 60 || cfg.RedditPollSeconds != 120 ||
@@ -124,7 +134,6 @@ func TestLoadWithArgsReadsConfigJSON(t *testing.T) {
 func TestLoadWithArgsOnlyScriptComesFromCLI(t *testing.T) {
 	clearConfigEnv(t)
 	writeConfig(t, `{
-		"grpc_addr": ":9191",
 		"dry_run": true,
 		"mock_db": true,
 		"target_page_multiplier": 9,
@@ -137,9 +146,13 @@ func TestLoadWithArgsOnlyScriptComesFromCLI(t *testing.T) {
 			"checkpoint_ttl_days": 15,
 			"first_seen_lookback_days": 14
 		},
-		"wars": {
-			"requests_per_second": 50,
-			"cwl_sync_seconds": 10
+		"war_discovery": {
+			"active_requests_per_second": 50,
+			"dormant_requests_per_second": 5
+		},
+		"cwl": {
+			"requests_per_second": 25,
+			"sync_seconds": 10
 		}
 	}`)
 	t.Setenv("TARGET_PAGE_MULTIPLIER", "3")
@@ -157,15 +170,14 @@ func TestLoadWithArgsOnlyScriptComesFromCLI(t *testing.T) {
 		cfg.ProxyURL != "http://canonical-proxy/v1" || !cfg.DryRun {
 		t.Fatalf("operational env knobs or canonical connectivity were not handled correctly: %+v", cfg)
 	}
-	if cfg.WarMaxInFlight != RequestConcurrency(cfg.WarRequestsPerSecond) {
-		t.Fatalf("war max in-flight = %d, want concurrency %d", cfg.WarMaxInFlight, RequestConcurrency(cfg.WarRequestsPerSecond))
+	if cfg.WarDiscoveryMaxInFlight != RequestConcurrency(cfg.WarDiscoveryActiveRequestsPerSecond) {
+		t.Fatalf("war max in-flight = %d, want concurrency %d", cfg.WarDiscoveryMaxInFlight, RequestConcurrency(cfg.WarDiscoveryActiveRequestsPerSecond))
 	}
 }
 
 func TestLoadWithArgsReadsSecretsFromEnv(t *testing.T) {
 	clearConfigEnv(t)
 	writeConfig(t, `{
-		"grpc_addr": ":9191",
 		"target_page_multiplier": 9,
 		"globalclans": {
 			"priority_requests_per_second": 77,
@@ -176,9 +188,13 @@ func TestLoadWithArgsReadsSecretsFromEnv(t *testing.T) {
 			"checkpoint_ttl_days": 15,
 			"first_seen_lookback_days": 14
 		},
-		"wars": {
-			"requests_per_second": 50,
-			"cwl_sync_seconds": 10
+		"war_discovery": {
+			"active_requests_per_second": 50,
+			"dormant_requests_per_second": 5
+		},
+		"cwl": {
+			"requests_per_second": 25,
+			"sync_seconds": 10
 		}
 	}`)
 	t.Setenv("TIMESCALE_HOST", "timescale")
@@ -187,10 +203,23 @@ func TestLoadWithArgsReadsSecretsFromEnv(t *testing.T) {
 	t.Setenv("TIMESCALE_PASSWORD", "p@ss/word")
 	t.Setenv("TIMESCALE_DATABASE", "tracking data")
 	t.Setenv("TIMESCALE_SSLMODE", "require")
+	t.Setenv("CLASHKING_LOCAL_DISCORD_API_URL", "http://127.0.0.1:18080/v10/")
+	t.Setenv("CLASHKING_LOCAL_FCM_API_ORIGIN", "http://127.0.0.1:18081/")
+	t.Setenv("CLOUDFLARE_ACCOUNT_ID", "cf-account")
+	t.Setenv("CLOUDFLARE_AI_GATEWAY_ID", "tracking-test")
+	t.Setenv("CLOUDFLARE_AI_API_TOKEN", "cf-token")
+	t.Setenv("CLASHKING_LOCAL_CLOUDFLARE_AI_API_ORIGIN", "http://127.0.0.1:18082/")
 	cfg := LoadWithArgs([]string{"--script", "wars"})
 
 	if cfg.TimescaleURL != "postgres://tracking:p%40ss%2Fword@timescale:5432/tracking%20data?sslmode=require" {
 		t.Fatalf("secret env was not applied: %+v", cfg)
+	}
+	if cfg.DiscordAPIURL != "http://127.0.0.1:18080/v10" || cfg.MobilePushFCMAPIOrigin != "http://127.0.0.1:18081" {
+		t.Fatalf("local provider overrides were not normalized: %+v", cfg)
+	}
+	if cfg.CloudflareAccountID != "cf-account" || cfg.CloudflareAIGatewayID != "tracking-test" ||
+		cfg.CloudflareAIAPIToken != "cf-token" || cfg.CloudflareAIAPIOrigin != "http://127.0.0.1:18082" {
+		t.Fatalf("Cloudflare AI Gateway environment was not applied: %+v", cfg)
 	}
 }
 
@@ -206,13 +235,6 @@ func TestLoadWithArgsDoesNotAcceptLegacyConnectivityVariables(t *testing.T) {
 	cfg := LoadWithArgs(nil)
 	if cfg.TimescaleURL != "" || cfg.ProxyURL != "" || cfg.ValkeyAddr != "" || cfg.MobilePushTokenKey != "" {
 		t.Fatalf("legacy connectivity variables were accepted: %+v", cfg)
-	}
-}
-
-func TestEnabledUsesOnlySelectedScript(t *testing.T) {
-	cfg := Config{Script: "globalclans"}
-	if !cfg.Enabled("globalclans") || cfg.Enabled("wars") {
-		t.Fatalf("only the selected script should be enabled")
 	}
 }
 
@@ -250,6 +272,9 @@ func clearConfigEnv(t *testing.T) {
 		"VALKEY_ADDR",
 		"ENCRYPTION_KEY",
 		"CLASHKING_PROXY_INTERNAL_ORIGIN",
+		"CLASHKING_API_ORIGIN",
+		"CLASHKING_API_URL",
+		"CLASHKING_API_TOKEN",
 		"TIMESCALE_HOST",
 		"TIMESCALE_PORT",
 		"TIMESCALE_USERNAME",
@@ -266,6 +291,17 @@ func clearConfigEnv(t *testing.T) {
 		"DATA_ENCRYPTION_KEY",
 		"MOBILE_PUSH_FCM_PROJECT_ID",
 		"MOBILE_PUSH_FCM_SERVICE_ACCOUNT_JSON",
+		"CLASHKING_LOCAL_DISCORD_API_URL",
+		"CLASHKING_LOCAL_FCM_API_ORIGIN",
+		"R2_ACCOUNT_ID",
+		"R2_ACCESS_KEY_ID",
+		"R2_SECRET_ACCESS_KEY",
+		"WAR_ARCHIVE_S3_ENDPOINT",
+		"WAR_ARCHIVE_ORIGIN",
+		"WAR_ARCHIVE_BUCKET",
+		"R2_ENDPOINT",
+		"R2_ENDPOINT_URL",
+		"R2_WARS_BUCKET",
 	}
 	for _, key := range keys {
 		previous, ok := os.LookupEnv(key)

@@ -8,8 +8,8 @@ Global war discovery scans public war logs across the game, records an active wa
 
 Two continuous discovery loops and one finalizer run inside `war-discovery`:
 
-- Active clans: a war was found within 30 days, using `wars.requests_per_second`.
-- Dormant clans: no known war within 30 days, using `wars.dormant_requests_per_second`.
+- Active clans: a war was found within 30 days, using `war_discovery.active_requests_per_second`.
+- Dormant clans: no known war within 30 days, using `war_discovery.dormant_requests_per_second`.
 - Due schedules: every 15 seconds, load wars whose `next_run_at` has arrived.
 
 A periodic cleanup removes expired `player_timers`.
@@ -40,7 +40,7 @@ war_schedule.next_run_at is due
   -> fetch exact CWL war tag, or try both regular-war clan perspectives
   -> require canonical tags + preparation time to match this schedule
   -> API still says active? move next_run_at one minute forward
-  -> ended? store permanent war, members, attacks, and missed attacks
+  -> ended? store the searchable war row, pending archive JSON, and player mappings
   -> delete completed schedule and its reminder jobs
   -> still unavailable six hours after shifted end? remove the dead schedule
 ```
@@ -57,7 +57,9 @@ for schedule in due_schedules:
       remove dead schedule and its war timers
   else:
     transaction:
-      insert canonical war and attack data
+      insert canonical war metadata
+      insert the compact pending archive payload
+      append this integer war ID to every participant's history
       remove schedule
 ```
 
@@ -72,7 +74,9 @@ Reads `basic_clan`, `war_schedule`, and due player timers. Writes:
 
 - `war_schedule`: temporary durable active-war clock and opponent mapping.
 - `player_timers`: one `(player, war, schedule key)` participation row.
-- Permanent war index, member, attack, and missed-attack tables after completion.
+- `wars`: searchable metadata and, after archiving, the exact R2 byte locator.
+- `war_archive_pending`: the full compact war payload until a 10,000-war pack is uploaded.
+- `player_war_history`: one compact integer array per participant, including players who did not attack.
 - `basic_clan.last_war_at` when a war is observed.
 
 It never writes `basic_player`.
@@ -90,15 +94,20 @@ flowchart LR
   API --> S[(war_schedule)]
   S --> R[reminders]
   S --> F[durable finalizer]
-  F --> W[(permanent war tables)]
+  F --> W[(wars + pending archive)]
+  W --> H[(player war history)]
+  W --> A[war-archiver]
 ```
 
 ## Configuration
 
-- `wars.requests_per_second` (default supplied: 500)
-- `wars.dormant_requests_per_second` (default supplied: 50)
-- `wars.cwl_sync_seconds` is consumed by the separate CWL mode
+- `war_discovery.active_requests_per_second` (default supplied: 500)
+- `war_discovery.dormant_requests_per_second` (default supplied: 50)
 - `target_page_multiplier`, SQL, event stream, and proxy settings
+
+The active limiter is also used by due final-war fetches. CWL has its own process and its own `cwl.*` budget, so changing CWL throughput cannot consume the discovery allowance.
+
+Operational metrics expose `war-discovery.active` and `war-discovery.dormant` as separate finite target pools. Their target totals are recounted every 15 minutes and their processed counts advance with each attempted clan. `war-discovery.finalization` is queue-driven, so it reports queue depth, request rate, errors, and latency without presenting a misleading completion percentage.
 
 ## Outages and restarts
 

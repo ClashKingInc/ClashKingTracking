@@ -25,8 +25,8 @@ type App struct {
 	Clash        *clashy.Client
 	Stats        *Tracker
 	StatsWriter  *TimescaleStatsWriter
-	Scheduler    *Scheduler
 	Availability *AvailabilityGate
+	Errors       ErrorReporter
 }
 
 func New(ctx context.Context, cfg Config) (*App, error) {
@@ -77,6 +77,19 @@ func New(ctx context.Context, cfg Config) (*App, error) {
 			return nil, err
 		}
 	}
+	reporter, err := newErrorReporter(cfg)
+	if err != nil {
+		if valkeyClient != nil {
+			valkeyClient.Close()
+		}
+		if clashClient != nil {
+			_ = clashClient.Close()
+		}
+		if statsWriter != nil {
+			statsWriter.Close()
+		}
+		return nil, err
+	}
 	app := &App{
 		Config:       cfg,
 		Logger:       logger,
@@ -84,8 +97,8 @@ func New(ctx context.Context, cfg Config) (*App, error) {
 		Clash:        clashClient,
 		Stats:        stats,
 		StatsWriter:  statsWriter,
-		Scheduler:    NewScheduler(),
 		Availability: NewAvailabilityGate(valkeyClient),
+		Errors:       reporter,
 	}
 	return app, nil
 }
@@ -100,6 +113,9 @@ func (a *App) Close(ctx context.Context) error {
 	if a.StatsWriter != nil {
 		a.StatsWriter.Close()
 	}
+	if a.Errors != nil {
+		return a.Errors.Close(ctx)
+	}
 	return nil
 }
 
@@ -112,9 +128,6 @@ func Run(ctx context.Context, app *App, domains []Domain) error {
 	if app.Availability != nil {
 		go app.Availability.Run(runCtx)
 	}
-	// Legacy in-process timers remain available to old helper code, but all active
-	// war and reminder scheduling reads durable SQL rows instead.
-
 	var wg sync.WaitGroup
 	errCh := make(chan error, len(domains))
 	for _, domain := range domains {
@@ -123,7 +136,11 @@ func Run(ctx context.Context, app *App, domains []Domain) error {
 		go func() {
 			defer wg.Done()
 			if err := domain.Run(runCtx, app); err != nil && !errors.Is(err, context.Canceled) {
-				errCh <- fmt.Errorf("%s: %w", domain.Name(), err)
+				wrapped := fmt.Errorf("%s: %w", domain.Name(), err)
+				if app.Errors != nil {
+					app.Errors.Capture(wrapped, map[string]string{"script": app.Config.Script, "domain": domain.Name()})
+				}
+				errCh <- wrapped
 			}
 		}()
 	}
@@ -152,11 +169,13 @@ func proxyConnectionLimit(cfg Config) int {
 		cfg.GlobalClanPriorityRequestsPerSecond+cfg.GlobalClanNonPriorityRequestsPerSecond,
 		cfg.BattlelogRequestsPerSecond,
 		cfg.BattlelogPriorityRequestsPerSecond,
-		cfg.WarRequestsPerSecond+cfg.WarDormantRequestsPerSecond,
+		cfg.WarDiscoveryActiveRequestsPerSecond+cfg.WarDiscoveryDormantRequestsPerSecond,
+		cfg.CWLRequestsPerSecond+cfg.CWLWarRequestsPerSecond,
 		cfg.TrackedClanRequestsPerSecond,
 		cfg.TrackedPlayerRequestsPerSecond,
 		cfg.BasicPlayerRequestsPerSecond,
-		cfg.LeaderboardRequestsPerSecond,
+		cfg.ScheduledRequestsPerSecond,
+		cfg.ReminderRequestsPerSecond,
 	)
 	if rate <= 0 {
 		return 100

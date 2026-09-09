@@ -95,7 +95,9 @@ flowchart LR
 
 ## Configuration
 
-There is no generic job-framework config. War mobile reconciliation is five minutes; due-job and availability-sensitive clocks are hard-coded to 15 seconds; fixed event granularity is 15 minutes. It also uses event-stream, SQL, Valkey, proxy, and `capital.snapshot_prefix` settings.
+`reminders.requests_per_second` is one shared Clash request budget for due war jobs, Capital fallbacks, and clan enrichment. War mobile reconciliation is five minutes; due-job and availability-sensitive clocks are hard-coded to 15 seconds; fixed event granularity is 15 minutes. It also uses event-stream, SQL, Valkey, proxy, and `capital.snapshot_prefix` settings.
+
+Operational metrics split the process into `reminders.events`, `reminders.war-jobs`, `reminders.mobile-reconciliation`, `reminders.raid`, and `reminders.fixed`. Event and due-job workers report their active batch depth and run duration; clock-driven workers report each run and readiness. None presents a target completion percentage because these are queues and scheduled clocks, not finite crawls.
 
 ## Outages and restarts
 

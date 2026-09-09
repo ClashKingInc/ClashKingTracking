@@ -1,8 +1,8 @@
-# Event transport (`events`)
+# Valkey event transport
 
-## What this process is for
+## What this transport is for
 
-The event system carries requested live changes between independently running trackers and consumers. It is transport, not the durable source of game state.
+The Valkey stream carries requested live changes between independently running trackers and consumers. There is no gRPC event-server process; logs, reminders, Discord delivery, and mobile delivery read the stream directly in their own consumer groups. The stream is transport, not the durable source of game state.
 
 ## Event shape
 
@@ -42,10 +42,8 @@ If a change must survive stream trimming independently, it belongs in SQL first 
 ## Valkey configuration
 
 - `events.stream`
-- `events.group`
 - `events.consumer`
 - `events.retention_seconds`
-- `events.batch_size`
 - `events.reclaim_idle_seconds`
 
 ## Interaction diagram
