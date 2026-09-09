@@ -565,7 +565,9 @@ func (s *timescaleBattlelogStore) insertBattlelogRows(ctx context.Context, tx pg
 			int16(row.Stars), int16(row.DestructionPercentage), loot,
 			int32(row.Duration), row.Timestamp, row.ArmyHash[:], row.ArmyShareCode,
 		})
-		if mode != "farming" {
+		// Detailed army analytics cover Legend battles only. Keep the share code
+		// and hash in every raw battle without materializing Ranked compositions.
+		if mode == "legend" {
 			compositions[row.ArmyHash] = row
 		}
 	}
