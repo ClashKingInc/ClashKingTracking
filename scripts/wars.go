@@ -25,7 +25,7 @@ const (
 	cwlDomainName                = "cwl"
 	warFinalizationGrace         = 6 * time.Hour
 	warFinalizationFallbackRetry = time.Minute
-	cwlFinalizationDelay         = 15 * time.Minute
+	cwlFinalizationDelay         = 30 * time.Minute
 	cwlFinalizationRetry         = 5 * time.Minute
 	warTargetCountRefresh        = 15 * time.Minute
 )
@@ -120,30 +120,11 @@ const cwlRefreshTargetsSQL = `
 	  JOIN cwl_group_clans group_clan ON group_clan.cwl_id = current_group.cwl_id
 	  JOIN basic_clan candidate_clan ON candidate_clan.tag = group_clan.clan_tag
 	  GROUP BY current_group.cwl_id
-	), group_wars AS MATERIALIZED (
-	  SELECT DISTINCT current_group.cwl_id, schedule.end_time
-	  FROM current_groups current_group
-	  JOIN cwl_group_clans group_clan ON group_clan.cwl_id = current_group.cwl_id
-	  JOIN war_schedule schedule
-	    ON schedule.war_type = 'cwl'
-	   AND group_clan.clan_tag IN (schedule.source_clan_tag, schedule.opponent_tag)
-	   AND schedule.end_time > now()
 	)
 	SELECT clan.tag, clan.name, COALESCE(clan.cwl_league_id, 0)
 	FROM representatives representative
 	JOIN basic_clan clan ON clan.tag = representative.clan_tag
 	WHERE representative.clan_tag > $1
-	  AND NOT EXISTS (
-	    SELECT 1
-	    FROM group_wars active_war
-	    WHERE active_war.cwl_id = representative.cwl_id
-	      AND active_war.end_time - INTERVAL '24 hours' <= now()
-	      AND EXISTS (
-	        SELECT 1 FROM group_wars next_war
-	        WHERE next_war.cwl_id = active_war.cwl_id
-	          AND next_war.end_time > active_war.end_time
-	      )
-	  )
 	ORDER BY representative.clan_tag
 	LIMIT $2
 `
@@ -218,6 +199,7 @@ func (q *warQueue) Enqueue(req warFetchRequest) error {
 }
 
 type warStore interface {
+	LoadCWLWarTags(context.Context, string) ([]string, error)
 	LoadPendingSchedules(context.Context) ([]models.WarScheduleRow, error)
 	LoadDueSchedules(context.Context, int) ([]models.WarScheduleRow, error)
 	Reschedule(context.Context, string, time.Time, string, string) error
@@ -421,7 +403,7 @@ func (s *timescaleWarTargetSource) NextDormantTargetBatch(ctx context.Context, l
 func (s *timescaleWarTargetSource) NextCWLDiscoveryTargetBatch(ctx context.Context, limit int) ([]models.BasicClanRow, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	targets, cursor, err := s.nextTargetBatch(ctx, cwlDiscoveryTargetsSQL, limit, s.cwlDiscoveryCursor)
+	targets, cursor, err := s.nextCWLBatch(ctx, cwlDiscoveryTargetsSQL, limit, s.cwlDiscoveryCursor)
 	s.cwlDiscoveryCursor = cursor
 	return targets, err
 }
@@ -429,9 +411,34 @@ func (s *timescaleWarTargetSource) NextCWLDiscoveryTargetBatch(ctx context.Conte
 func (s *timescaleWarTargetSource) NextCWLRefreshTargetBatch(ctx context.Context, limit int) ([]models.BasicClanRow, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	targets, cursor, err := s.nextTargetBatch(ctx, cwlRefreshTargetsSQL, limit, s.cwlRefreshCursor)
+	targets, cursor, err := s.nextCWLBatch(ctx, cwlRefreshTargetsSQL, limit, s.cwlRefreshCursor)
 	s.cwlRefreshCursor = cursor
 	return targets, err
+}
+
+// CWL pages never wrap within a pass. An empty page marks completion and resets
+// the cursor for the next sweep, including when the final page is exactly full.
+func (s *timescaleWarTargetSource) nextCWLBatch(ctx context.Context, query string, limit int, cursor string) ([]models.BasicClanRow, string, error) {
+	rows, err := s.pool.Query(ctx, query, cursor, max(1, limit))
+	if err != nil {
+		return nil, cursor, err
+	}
+	defer rows.Close()
+	var out []models.BasicClanRow
+	for rows.Next() {
+		var row models.BasicClanRow
+		if err := rows.Scan(&row.Tag, &row.Name, &row.CWLLeagueID); err != nil {
+			return nil, cursor, err
+		}
+		out = append(out, row)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, cursor, err
+	}
+	if len(out) == 0 {
+		return nil, "", nil
+	}
+	return out, out[len(out)-1].Tag, nil
 }
 
 func (s *timescaleWarTargetSource) CountTargets(ctx context.Context, kind warTargetKind) (int, error) {
@@ -504,8 +511,13 @@ func (s *memoryWarTargetSource) NextTargetBatch(_ context.Context, limit int) ([
 func (s *memoryWarTargetSource) NextCWLDiscoveryTargetBatch(_ context.Context, limit int) ([]models.BasicClanRow, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	out, cursor := memoryWarTargetBatch(s.targets, s.cwlCursor, limit)
-	s.cwlCursor = cursor
+	if s.cwlCursor >= len(s.targets) {
+		s.cwlCursor = 0
+		return nil, nil
+	}
+	end := min(len(s.targets), s.cwlCursor+max(1, limit))
+	out := append([]models.BasicClanRow(nil), s.targets[s.cwlCursor:end]...)
+	s.cwlCursor = end
 	return out, nil
 }
 
@@ -1098,6 +1110,17 @@ func opponentTagForSource(source string, war clashy.ClanWar) string {
 }
 
 func (d *warsDomain) runCWLLoop(ctx context.Context, app *platform.App, groupLimiter, warLimiter *clashy.Limiter) {
+	var wg sync.WaitGroup
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		d.runCWLSweeps(ctx, app, groupLimiter, warLimiter, false)
+	}()
+	d.runCWLSweeps(ctx, app, groupLimiter, warLimiter, true)
+	wg.Wait()
+}
+
+func (d *warsDomain) runCWLSweeps(ctx context.Context, app *platform.App, groupLimiter, warLimiter *clashy.Limiter, refresh bool) {
 	statsName := trackingProgressName(d.name, string(cwlTargets))
 	timer := time.NewTimer(0)
 	defer timer.Stop()
@@ -1108,8 +1131,8 @@ func (d *warsDomain) runCWLLoop(ctx context.Context, app *platform.App, groupLim
 		case <-timer.C:
 		}
 		start := time.Now()
-		if utils.IsCWL(d.currentTime()) {
-			if err := d.syncCWLGroups(ctx, app, groupLimiter, warLimiter); err != nil {
+		if refresh || utils.IsCWL(d.currentTime()) {
+			if err := d.syncCWLSweep(ctx, app, groupLimiter, warLimiter, refresh); err != nil {
 				app.Logger.Error("cwl sync failed", "err", err)
 				app.Stats.RecordProcess(statsName, time.Since(start))
 				app.Stats.SetReady(statsName, false, err.Error())
@@ -1121,6 +1144,29 @@ func (d *warsDomain) runCWLLoop(ctx context.Context, app *platform.App, groupLim
 		app.Stats.SetReady(statsName, true, "")
 		timer.Reset(time.Duration(app.Config.CWLSyncSeconds) * time.Second)
 	}
+}
+
+func (d *warsDomain) syncCWLSweep(ctx context.Context, app *platform.App, groupLimiter, warLimiter *clashy.Limiter, refresh bool) error {
+	limit := max(1, app.Config.CWLRequestsPerSecond*app.Config.TargetPageMultiplier)
+	for ctx.Err() == nil {
+		var targets []models.BasicClanRow
+		var err error
+		if refresh {
+			targets, err = d.targets.NextCWLRefreshTargetBatch(ctx, limit)
+		} else {
+			targets, err = d.targets.NextCWLDiscoveryTargetBatch(ctx, limit)
+		}
+		if err != nil {
+			return err
+		}
+		if len(targets) == 0 {
+			return nil
+		}
+		if err := d.syncCWLTargets(ctx, app, groupLimiter, warLimiter, targets, false); err != nil {
+			return err
+		}
+	}
+	return ctx.Err()
 }
 
 func (d *warsDomain) syncCWLGroups(ctx context.Context, app *platform.App, groupLimiter, warLimiter *clashy.Limiter) error {
@@ -1169,12 +1215,14 @@ func (d *warsDomain) syncCWLTargets(ctx context.Context, app *platform.App, grou
 			return err
 		}
 		groupRow := cwlGroupRow(cwlID, group, leagueID)
-		warSize, err := d.scheduleCWLWars(workerCtx, app, warLimiter, group, strict)
+		previous, err := d.store.LoadCWLWarTags(workerCtx, cwlID)
 		if err != nil {
 			return err
 		}
-		if warSize > 0 {
-			groupRow.WarSize = intPtr(warSize)
+		// Enqueue before updating rounds, so a failed enqueue cannot make a new
+		// tag disappear from the next API-versus-database comparison.
+		if err := enqueueCWLWarTags(workerCtx, app, cwlID, newCWLWarTags(previous, warTags(group))); err != nil {
+			return err
 		}
 		if err := d.storeIngest(workerCtx, app, models.WarIngest{CWLGroups: []models.CWLGroupRow{groupRow}}); err != nil {
 			return err
@@ -1344,6 +1392,19 @@ func (d *warsDomain) scheduleCWLWars(ctx context.Context, app *platform.App, lim
 		ingest, err := buildWarIngest(wars[0], source, false, warTag, "", 0)
 		if err != nil {
 			return 0, err
+		}
+		if len(ingest.Schedules) == 0 {
+			return 0, errors.New("CWL war response is missing scheduling fields")
+		}
+		if wars[0].State == clashy.WarStateEnded {
+			// The store allocates the real ID from the schedule in the same
+			// transaction and rewrites this placeholder before persisting.
+			finished, err := buildWarIngest(wars[0], source, true, warTag, ingest.Schedules[0].ScheduleKey, 1)
+			if err != nil {
+				return 0, err
+			}
+			finished.Schedules = ingest.Schedules
+			ingest = finished
 		}
 		if wars[0].TeamSize > 0 {
 			warSize = wars[0].TeamSize

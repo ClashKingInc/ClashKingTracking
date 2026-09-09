@@ -29,7 +29,7 @@
   "cwl": {
     "requests_per_second": 250,
     "war_requests_per_second": 1000,
-    "sync_seconds": 180,
+    "sync_seconds": 1800,
     "resolve_league_from_clan_profile": true
   },
   "war_archiver": {

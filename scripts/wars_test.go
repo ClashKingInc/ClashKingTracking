@@ -98,10 +98,13 @@ func TestCWLTargetsSkipKnownGroupSiblingsDuringDiscovery(t *testing.T) {
 	if !strings.Contains(cwlDiscoveryTargetsSQL, "COALESCE(cwl_league_id, 0)") {
 		t.Fatalf("CWL discovery query must scan null cached leagues safely: %s", cwlDiscoveryTargetsSQL)
 	}
-	for _, required := range []string{"WITH current_groups AS MATERIALIZED", "min(group_clan.clan_tag)", "JOIN basic_clan candidate_clan", "group_wars AS MATERIALIZED", "next_war.end_time > active_war.end_time"} {
+	for _, required := range []string{"WITH current_groups AS MATERIALIZED", "min(group_clan.clan_tag)", "JOIN basic_clan candidate_clan", "state <> 'ended'"} {
 		if !strings.Contains(cwlRefreshTargetsSQL, required) {
 			t.Fatalf("CWL refresh query is missing rule %q: %s", required, cwlRefreshTargetsSQL)
 		}
+	}
+	if strings.Contains(cwlRefreshTargetsSQL, "war_schedule") {
+		t.Fatal("refresh eligibility must not depend on war schedules")
 	}
 }
 
@@ -951,6 +954,17 @@ func TestGlobalCWLSyncSchedulesOverlappingBattleAndPreparationOnce(t *testing.T)
 	progress := app.Stats.Domain("cwl.groups")
 	if progress.TargetCount != 0 || progress.TargetCycle != 1 || progress.TargetProcessed != 1 {
 		t.Fatalf("CWL progress = %#v", progress)
+	}
+	if len(store.schedules) != 0 || calls["#BATTLE"] != 0 || calls["#PREP"] != 0 {
+		t.Fatal("group discovery must not fetch or schedule war payloads")
+	}
+	for id, group := range store.cwlGroups {
+		size, err := domain.scheduleCWLWars(t.Context(), app, limiter, cwlGroupFromRounds(group.Rounds), true)
+		if err != nil {
+			t.Fatal(err)
+		}
+		group.WarSize = intPtr(size)
+		store.cwlGroups[id] = group
 	}
 	if len(store.schedules) != 2 {
 		t.Fatalf("overlapping schedules = %d, want battle and preparation", len(store.schedules))

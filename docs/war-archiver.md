@@ -8,6 +8,8 @@ The war archiver owns the durable end-time queue for regular and CWL wars, then 
 
 It checks due `war_schedule` rows every 15 seconds and archive candidates every 30 seconds. Packing does nothing until exactly 10,000 unclaimed completed wars are ready; there is no time-based partial flush. `run_once` performs one archive check and exits.
 
+It also consumes checker-produced CWL war-tag jobs from `tracking:cwl:war-tags` in Valkey every five seconds, sharing the finalization request budget. It never discovers tags by scanning group rounds. Already-ended payloads are stored from that first fetch; future CWL wars are scheduled at end time plus 30 minutes. See [CWL handoff](cwl.md) for comparison, deduplication, and retry behavior.
+
 ## Final-war decision flow
 
 ```text

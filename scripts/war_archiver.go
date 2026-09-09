@@ -73,7 +73,11 @@ func (d *warArchiverDomain) Run(ctx context.Context, app *platform.App) error {
 	runCtx, stopFinalizer := context.WithCancel(ctx)
 	var finalizerRun sync.WaitGroup
 	if !app.Config.RunOnce {
-		finalizerRun.Add(1)
+		finalizerRun.Add(2)
+		go func() {
+			defer finalizerRun.Done()
+			finalizer.runCWLHydrationLoop(runCtx, app, pool)
+		}()
 		go func() {
 			defer finalizerRun.Done()
 			finalizer.runDueWarScheduleLoop(runCtx, app)
