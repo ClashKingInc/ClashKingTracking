@@ -382,8 +382,8 @@ func battlelogIngestFromEntries(entries []clashy.BattleLogEntry, playerTag strin
 			// metadata. Home-village defenses can safely advance the checkpoint.
 			include = entry.Attack
 		case "ranked", "legend":
-			if entry.OpponentPlayerTag == "" || entry.OpponentTownHallLevel <= 0 {
-				// A real battle needs both perspectives, so retry incomplete rows.
+			if entry.OpponentPlayerTag == "" || entry.OpponentTownHallLevel < 0 || entry.OpponentTownHallLevel >= 20 {
+				// Persist only complete observations for the player that was requested.
 				return models.BattlelogIngest{}, nil
 			}
 			include = true
@@ -605,35 +605,19 @@ func (s *timescaleBattlelogStore) insertBattlelogRows(ctx context.Context, tx pg
 			JOIN basic_player requested ON requested.tag = stage.requested_tag
 			WHERE stage.mode IN ('ranked', 'legend')
 			  AND requested.townhall_level BETWEEN 1 AND 20
-		), battles AS (
-			SELECT observations.*,
-				CASE WHEN requested_attack THEN requested_tag ELSE opponent_tag END AS attacker_tag,
-				CASE WHEN requested_attack THEN opponent_tag ELSE requested_tag END AS defender_tag,
-				CASE WHEN requested_attack THEN requested_th ELSE opponent_th END AS attacker_th,
-				CASE WHEN requested_attack THEN opponent_th ELSE requested_th END AS defender_th
-			FROM observations
-		), perspectives AS (
-			SELECT perspective.player_tag, perspective.opponent_tag, perspective.direction,
-				perspective.player_th, perspective.opponent_th, battles.battle_time,
-				battles.mode, battles.army_hash, battles.stars, battles.destruction_percentage,
-				battles.duration_seconds, battles.looted_resources, battles.army_share_code
-			FROM battles
-			CROSS JOIN LATERAL (VALUES
-				(attacker_tag, defender_tag, 'attack'::text, attacker_th, defender_th),
-				(defender_tag, attacker_tag, 'defense'::text, defender_th, attacker_th)
-			) perspective(player_tag, opponent_tag, direction, player_th, opponent_th)
 		), inserted AS (
 			INSERT INTO battles_ranked (
 				player_tag, battle_time, direction, opponent_tag, battle_mode,
 				player_town_hall, opponent_town_hall, stars, destruction_percentage,
 				duration_seconds, looted_resources, share_code, army_hash
 			)
-			SELECT player_tag, battle_time, direction, opponent_tag, mode,
-				player_th, opponent_th, stars, destruction_percentage,
+			SELECT requested_tag, battle_time,
+				CASE WHEN requested_attack THEN 'attack' ELSE 'defense' END,
+				opponent_tag, mode, requested_th, opponent_th, stars, destruction_percentage,
 				NULLIF(duration_seconds, 0), looted_resources,
 				NULLIF(army_share_code, ''), army_hash
-			FROM perspectives
-			ON CONFLICT (player_tag, battle_time, battle_mode, direction, opponent_tag) DO NOTHING
+			FROM observations
+			ON CONFLICT (player_tag, battle_time) DO NOTHING
 			RETURNING 1
 		)
 		SELECT count(*)::integer FROM inserted
@@ -969,7 +953,7 @@ func battlelogRowFromEntry(playerTag string, entry clashy.BattleLogEntry) models
 		ArmyHash:              canonicalArmyHash(armyShareCode),
 		PlayerTag:             playerTag,
 		OpponentTag:           entry.OpponentPlayerTag,
-		OpponentTH:            uint8(entry.OpponentTownHallLevel),
+		OpponentTH:            uint8(entry.OpponentTownHallLevel + 1),
 		BattleType:            battlelogStorageMode(entry.BattleType),
 		Attack:                entry.Attack,
 		Stars:                 uint8(entry.Stars),
