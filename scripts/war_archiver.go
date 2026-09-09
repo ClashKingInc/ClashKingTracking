@@ -173,7 +173,9 @@ func (d *warsDomain) processDueWarSchedule(ctx context.Context, app *platform.Ap
 		ClanTag: schedule.SourceClanTag, OpponentTag: schedule.OpponentTag,
 		ScheduleKey: schedule.ScheduleKey, WarID: schedule.WarID,
 		PrepTime: schedule.PrepTime, EndTime: schedule.EndTime,
-		WarTag: schedule.WarTag, StoreOnly: true, StatsName: statsName,
+		WarTag: schedule.WarTag, StoreOnly: true,
+		InitialFinalization: schedule.WarTag == "" && schedule.NextRunAt.Equal(schedule.EndTime),
+		StatsName:           statsName,
 	}); err != nil {
 		app.Logger.Error("invalid due war schedule", "err", err)
 		return err
@@ -197,10 +199,7 @@ func (d *warsDomain) processDueWarSchedule(ctx context.Context, app *platform.Ap
 		if delay <= 0 {
 			delay = warFinalizationFallbackRetry
 		}
-		if delay > warFinalizationMaxCacheWait {
-			delay = warFinalizationMaxCacheWait
-		}
-		if rescheduleErr := d.store.Reschedule(ctx, schedule.ScheduleKey, now.Add(delay)); rescheduleErr != nil {
+		if rescheduleErr := d.store.Reschedule(ctx, schedule.ScheduleKey, now.Add(delay), pending.preferredClanTag, pending.opponentClanTag); rescheduleErr != nil {
 			return rescheduleErr
 		}
 		app.Logger.Warn("final war is still cached before completion; scheduled cache-expiry retry",
@@ -218,7 +217,7 @@ func (d *warsDomain) processDueWarSchedule(ctx context.Context, app *platform.Ap
 				"abandoned unavailable ended war after finalization grace", err)
 		} else {
 			app.Logger.Error("final war fetch failed; retrying in one minute", "schedule_key", schedule.ScheduleKey, "err", err)
-			if rescheduleErr := d.store.Reschedule(ctx, schedule.ScheduleKey, now.Add(time.Minute)); rescheduleErr != nil {
+			if rescheduleErr := d.store.Reschedule(ctx, schedule.ScheduleKey, now.Add(time.Minute), schedule.SourceClanTag, schedule.OpponentTag); rescheduleErr != nil {
 				return rescheduleErr
 			}
 		}
