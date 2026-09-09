@@ -6,6 +6,8 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"io"
+	"log/slog"
 	"net/http"
 	"net/http/httptest"
 	"path"
@@ -339,6 +341,153 @@ func TestScheduledWarIdentityAcceptsEitherPerspectiveAndRejectsNextWar(t *testin
 	war.PreparationStartTime = &clashy.Timestamp{Time: prep.Add(48 * time.Hour)}
 	if scheduledWarMatches(request, war) {
 		t.Fatal("a later war between the same clans must not finalize the old schedule")
+	}
+}
+
+func TestDueWarPrivateLogsTryBothClansThenAbandon(t *testing.T) {
+	var calls int
+	server := httptest.NewServer(http.HandlerFunc(func(response http.ResponseWriter, request *http.Request) {
+		calls++
+		response.Header().Set("Content-Type", "application/json")
+		response.WriteHeader(http.StatusForbidden)
+		_, _ = response.Write([]byte(`{"reason":"accessDenied","message":"Access denied"}`))
+	}))
+	defer server.Close()
+
+	domain, app, store := newDueWarTestDomain(t, server.URL)
+	schedule := dueWarTestSchedule(time.Date(2026, 9, 9, 9, 0, 0, 0, time.UTC))
+	if err := store.Store(t.Context(), models.WarIngest{Schedules: []models.WarScheduleRow{schedule}}); err != nil {
+		t.Fatal(err)
+	}
+	schedule = store.schedules[schedule.ScheduleKey]
+	if err := domain.processDueWarSchedule(t.Context(), app, "war-archiver.finalization", schedule); err != nil {
+		t.Fatal(err)
+	}
+	if calls != 2 {
+		t.Fatalf("private war fetches = %d, want source clan plus opponent", calls)
+	}
+	if _, exists := store.schedules[schedule.ScheduleKey]; exists {
+		t.Fatal("schedule with two private war logs was retained")
+	}
+}
+
+func TestDueWarPrivateSourceStoresFromPublicOpponent(t *testing.T) {
+	now := time.Date(2026, 9, 9, 9, 0, 0, 0, time.UTC)
+	schedule := dueWarTestSchedule(now)
+	var calls int
+	server := httptest.NewServer(http.HandlerFunc(func(response http.ResponseWriter, request *http.Request) {
+		calls++
+		response.Header().Set("Content-Type", "application/json")
+		if strings.Contains(request.URL.Path, "#AAA") {
+			response.WriteHeader(http.StatusForbidden)
+			_, _ = response.Write([]byte(`{"reason":"accessDenied","message":"Access denied"}`))
+			return
+		}
+		_ = json.NewEncoder(response).Encode(dueWarTestPayload(schedule, "warEnded"))
+	}))
+	defer server.Close()
+
+	domain, app, store := newDueWarTestDomain(t, server.URL)
+	if err := store.Store(t.Context(), models.WarIngest{Schedules: []models.WarScheduleRow{schedule}}); err != nil {
+		t.Fatal(err)
+	}
+	schedule = store.schedules[schedule.ScheduleKey]
+	if err := domain.processDueWarSchedule(t.Context(), app, "war-archiver.finalization", schedule); err != nil {
+		t.Fatal(err)
+	}
+	if calls != 2 {
+		t.Fatalf("war fetches = %d, want private source plus public opponent", calls)
+	}
+	if len(store.indexRows) != 1 {
+		t.Fatalf("stored wars = %d, want opponent-visible finished war", len(store.indexRows))
+	}
+	if _, exists := store.schedules[schedule.ScheduleKey]; exists {
+		t.Fatal("stored war schedule was retained")
+	}
+}
+
+func TestDueWarUsesCacheExpiryAndStopsAfterThreeUnfinishedResponses(t *testing.T) {
+	now := time.Date(2026, 9, 9, 9, 0, 0, 0, time.UTC)
+	schedule := dueWarTestSchedule(now)
+	var calls int
+	server := httptest.NewServer(http.HandlerFunc(func(response http.ResponseWriter, request *http.Request) {
+		calls++
+		response.Header().Set("Content-Type", "application/json")
+		response.Header().Set("Cache-Control", "public, max-age=17")
+		_ = json.NewEncoder(response).Encode(dueWarTestPayload(schedule, "inWar"))
+	}))
+	defer server.Close()
+
+	domain, app, store := newDueWarTestDomain(t, server.URL)
+	if err := store.Store(t.Context(), models.WarIngest{Schedules: []models.WarScheduleRow{schedule}}); err != nil {
+		t.Fatal(err)
+	}
+	schedule = store.schedules[schedule.ScheduleKey]
+	for attempt := 1; attempt <= warFinalizationRetries; attempt++ {
+		if err := domain.processDueWarSchedule(t.Context(), app, "war-archiver.finalization", schedule); err != nil {
+			t.Fatal(err)
+		}
+		stored, exists := store.schedules[schedule.ScheduleKey]
+		if attempt < warFinalizationRetries {
+			if !exists {
+				t.Fatalf("unfinished schedule removed after attempt %d", attempt)
+			}
+			if want := now.Add(17 * time.Second); !stored.NextRunAt.Equal(want) {
+				t.Fatalf("retry time = %s, want cache expiry %s", stored.NextRunAt, want)
+			}
+		} else if exists {
+			t.Fatal("unfinished schedule remained after three attempts")
+		}
+	}
+	if calls != warFinalizationRetries {
+		t.Fatalf("unfinished war fetches = %d, want %d", calls, warFinalizationRetries)
+	}
+}
+
+func newDueWarTestDomain(t *testing.T, baseURL string) (*warsDomain, *platform.App, *memoryWarStore) {
+	t.Helper()
+	clientConfig := clashy.DefaultClientConfig()
+	clientConfig.BaseURL = baseURL + "/v1"
+	clientConfig.LookupCache = false
+	clientConfig.UpdateCache = false
+	client, err := clashy.NewClient(clientConfig)
+	if err != nil {
+		t.Fatal(err)
+	}
+	limiter, err := newTrackingLimiter(100)
+	if err != nil {
+		t.Fatal(err)
+	}
+	store := newMemoryWarStore()
+	now := time.Date(2026, 9, 9, 9, 0, 0, 0, time.UTC)
+	domain := &warsDomain{
+		name: warDiscoveryDomainName, mode: warDiscoveryMode, store: store, limiter: limiter,
+		now: func() time.Time { return now }, scheduled: make(map[string]time.Time),
+	}
+	app := &platform.App{
+		Clash: client, Stats: platform.NewTracker(), Availability: platform.NewAvailabilityGate(nil),
+		Logger: slog.New(slog.NewTextHandler(io.Discard, nil)),
+	}
+	return domain, app, store
+}
+
+func dueWarTestSchedule(end time.Time) models.WarScheduleRow {
+	prep := end.Add(-25 * time.Hour)
+	return models.WarScheduleRow{
+		ScheduleKey: models.ComputeWarKey("#AAA", "#BBB", prep), WarID: 42,
+		SourceClanTag: "#AAA", OpponentTag: "#BBB", PrepTime: prep,
+		EndTime: end, NextRunAt: end, WarType: "random",
+	}
+}
+
+func dueWarTestPayload(schedule models.WarScheduleRow, state string) map[string]any {
+	return map[string]any{
+		"state": state, "teamSize": 15,
+		"preparationStartTime": schedule.PrepTime.Format("20060102T150405.000Z"),
+		"startTime":            schedule.PrepTime.Add(time.Hour).Format("20060102T150405.000Z"),
+		"endTime":              schedule.EndTime.Format("20060102T150405.000Z"),
+		"clan":                 map[string]any{"tag": "#AAA", "name": "Alpha", "members": []any{}},
+		"opponent":             map[string]any{"tag": "#BBB", "name": "Beta", "members": []any{}},
 	}
 }
 

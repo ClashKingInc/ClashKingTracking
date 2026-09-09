@@ -9,10 +9,12 @@ import (
 	"io"
 	"net/http"
 	"strings"
+	"sync"
 	"time"
 
 	"clashking_tracking/internal/platform"
 	"clashking_tracking/internal/wararchive"
+	"clashking_tracking/models"
 
 	"github.com/aws/aws-sdk-go-v2/aws"
 	"github.com/aws/aws-sdk-go-v2/credentials"
@@ -50,12 +52,37 @@ func (d *warArchiverDomain) Run(ctx context.Context, app *platform.App) error {
 	if app.Config.WarArchivePackSize <= 0 {
 		return errors.New("war_archiver.pack_size must be greater than zero")
 	}
+	if app.Config.WarArchiveRequestsPerSecond <= 0 {
+		return errors.New("war_archiver.requests_per_second must be greater than zero")
+	}
 	pool, err := pgxpool.New(ctx, app.Config.TimescaleURL)
 	if err != nil {
 		return err
 	}
 	defer pool.Close()
 	client := newWarArchiveS3(app.Config)
+	finalizerLimiter, err := newTrackingLimiter(app.Config.WarArchiveRequestsPerSecond)
+	if err != nil {
+		return err
+	}
+	finalizer := &warsDomain{
+		name: warArchiverDomainName, mode: warDiscoveryMode,
+		store: &timescaleWarStore{pool: pool}, limiter: finalizerLimiter,
+		now: time.Now, scheduled: make(map[string]time.Time),
+	}
+	runCtx, stopFinalizer := context.WithCancel(ctx)
+	var finalizerRun sync.WaitGroup
+	if !app.Config.RunOnce {
+		finalizerRun.Add(1)
+		go func() {
+			defer finalizerRun.Done()
+			finalizer.runDueWarScheduleLoop(runCtx, app)
+		}()
+	}
+	defer func() {
+		stopFinalizer()
+		finalizerRun.Wait()
+	}()
 
 	for {
 		started := time.Now()
@@ -89,6 +116,150 @@ func (d *warArchiverDomain) Run(ctx context.Context, app *platform.App) error {
 		case <-time.After(time.Duration(app.Config.WarArchiveScanSeconds) * time.Second):
 		}
 	}
+}
+
+func (d *warsDomain) runDueWarScheduleLoop(ctx context.Context, app *platform.App) {
+	statsName := trackingProgressName(d.name, "finalization")
+	ticker := time.NewTicker(15 * time.Second)
+	defer ticker.Stop()
+	batchLimit := max(100, app.Config.WarArchiveRequestsPerSecond*5)
+	workers := platform.RequestConcurrency(app.Config.WarArchiveRequestsPerSecond)
+	for {
+		started := time.Now()
+		var passErr error
+		schedules, err := d.store.LoadDueSchedules(ctx, batchLimit)
+		if err != nil {
+			app.Logger.Error("load due war schedules failed", "err", err)
+			passErr = err
+		} else {
+			app.Stats.SetQueueDepth(statsName, len(schedules))
+			var passErrMu sync.Mutex
+			runErr := runBounded(ctx, workers, schedules, func(workerCtx context.Context, schedule models.WarScheduleRow) error {
+				scheduleErr := d.processDueWarSchedule(workerCtx, app, statsName, schedule)
+				if scheduleErr != nil {
+					passErrMu.Lock()
+					passErr = scheduleErr
+					passErrMu.Unlock()
+				}
+				if workerCtx.Err() != nil {
+					return workerCtx.Err()
+				}
+				return nil
+			})
+			if runErr != nil && ctx.Err() != nil {
+				return
+			}
+		}
+		app.Stats.RecordProcess(statsName, time.Since(started))
+		if passErr != nil {
+			app.Stats.SetReady(statsName, false, passErr.Error())
+		} else {
+			app.Stats.SetReady(statsName, true, "")
+		}
+		if len(schedules) == batchLimit && passErr == nil {
+			continue
+		}
+		select {
+		case <-ctx.Done():
+			return
+		case <-ticker.C:
+		}
+	}
+}
+
+func (d *warsDomain) processDueWarSchedule(ctx context.Context, app *platform.App, statsName string, schedule models.WarScheduleRow) error {
+	queue := &warQueue{}
+	if err := queue.Enqueue(warFetchRequest{
+		ClanTag: schedule.SourceClanTag, OpponentTag: schedule.OpponentTag,
+		ScheduleKey: schedule.ScheduleKey, WarID: schedule.WarID,
+		PrepTime: schedule.PrepTime, EndTime: schedule.EndTime,
+		WarTag: schedule.WarTag, StoreOnly: true, StatsName: statsName,
+	}); err != nil {
+		app.Logger.Error("invalid due war schedule", "err", err)
+		return err
+	}
+	req := queue.items[0]
+	ingest, err := d.do(ctx, app, d.limiter, req)
+	if err == nil {
+		err = d.storeIngest(ctx, app, ingest)
+	}
+	if err == nil {
+		d.clearFinalizationAttempt(schedule.ScheduleKey)
+		d.mu.Lock()
+		delete(d.scheduled, schedule.ScheduleKey)
+		d.mu.Unlock()
+		return nil
+	}
+
+	now := d.currentTime().UTC()
+	var pending *scheduledWarPendingError
+	if errors.As(err, &pending) {
+		attempt := d.recordFinalizationAttempt(schedule.ScheduleKey)
+		if attempt >= warFinalizationRetries {
+			return d.abandonWarSchedule(ctx, app, schedule.ScheduleKey,
+				"abandoned war that was still unfinished after finalization attempts", err)
+		}
+		delay := pending.retryAfter
+		if delay <= 0 {
+			delay = warFinalizationFallbackRetry
+		}
+		if delay > warFinalizationMaxCacheWait {
+			delay = warFinalizationMaxCacheWait
+		}
+		if rescheduleErr := d.store.Reschedule(ctx, schedule.ScheduleKey, now.Add(delay)); rescheduleErr != nil {
+			return rescheduleErr
+		}
+		app.Logger.Warn("final war is still cached before completion; scheduled cache-expiry retry",
+			"schedule_key", schedule.ScheduleKey, "attempt", attempt, "retry_in", delay)
+		return nil
+	}
+	if isSkippableWarFetchError(err) || errors.Is(err, errScheduledWarUnavailable) {
+		return d.abandonWarSchedule(ctx, app, schedule.ScheduleKey,
+			"abandoned war after both clan war logs were unavailable", err)
+	}
+
+	if err != nil {
+		if !now.Before(schedule.EndTime.Add(warFinalizationGrace)) {
+			return d.abandonWarSchedule(ctx, app, schedule.ScheduleKey,
+				"abandoned unavailable ended war after finalization grace", err)
+		} else {
+			app.Logger.Error("final war fetch failed; retrying in one minute", "schedule_key", schedule.ScheduleKey, "err", err)
+			if rescheduleErr := d.store.Reschedule(ctx, schedule.ScheduleKey, now.Add(time.Minute)); rescheduleErr != nil {
+				return rescheduleErr
+			}
+		}
+		return err
+	}
+	return nil
+}
+
+func (d *warsDomain) recordFinalizationAttempt(scheduleKey string) int {
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	if d.finalizationAttempts == nil {
+		d.finalizationAttempts = make(map[string]int)
+	}
+	d.finalizationAttempts[scheduleKey]++
+	return d.finalizationAttempts[scheduleKey]
+}
+
+func (d *warsDomain) clearFinalizationAttempt(scheduleKey string) {
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	delete(d.finalizationAttempts, scheduleKey)
+}
+
+func (d *warsDomain) abandonWarSchedule(ctx context.Context, app *platform.App, scheduleKey, message string, cause error) error {
+	if err := d.store.DeleteSchedule(ctx, scheduleKey); err != nil {
+		app.Logger.Error("war schedule cleanup failed", "schedule_key", scheduleKey, "err", err)
+		return err
+	}
+	d.clearFinalizationAttempt(scheduleKey)
+	d.mu.Lock()
+	delete(d.scheduled, scheduleKey)
+	d.mu.Unlock()
+	app.Logger.Warn(message, "schedule_key", scheduleKey, "err", cause)
+	return nil
 }
 
 func countPendingArchiveWars(ctx context.Context, pool *pgxpool.Pool) (int, error) {

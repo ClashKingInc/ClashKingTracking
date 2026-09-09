@@ -85,6 +85,7 @@ type Config struct {
 	WarArchiveBucket                       string
 	WarArchiveAccessKeyID                  string
 	WarArchiveSecretAccessKey              string
+	WarArchiveRequestsPerSecond            int
 	WarArchiveScanSeconds                  int
 	WarArchivePackSize                     int
 	RunOnce                                bool
@@ -182,8 +183,9 @@ type jsonCWLConfig struct {
 }
 
 type jsonWarArchiverConfig struct {
-	ScanSeconds int `json:"scan_seconds"`
-	PackSize    int `json:"pack_size"`
+	RequestsPerSecond int `json:"requests_per_second"`
+	ScanSeconds       int `json:"scan_seconds"`
+	PackSize          int `json:"pack_size"`
 }
 
 type jsonTrackedClansConfig struct {
@@ -285,6 +287,7 @@ func loadConfigFile(path string) (Config, error) {
 		CWLWarRequestsPerSecond:                file.CWL.WarRequestsPerSecond,
 		CWLSyncSeconds:                         file.CWL.SyncSeconds,
 		CWLResolveLeagueFromClanProfile:        file.CWL.ResolveLeagueFromClanProfile,
+		WarArchiveRequestsPerSecond:            file.WarArchiver.RequestsPerSecond,
 		WarArchiveScanSeconds:                  file.WarArchiver.ScanSeconds,
 		WarArchivePackSize:                     file.WarArchiver.PackSize,
 		TrackedClanRequestsPerSecond:           file.TrackedClans.RequestsPerSecond,
@@ -374,6 +377,9 @@ func deriveConfig(cfg *Config) {
 	}
 	if cfg.WarArchiveScanSeconds == 0 {
 		cfg.WarArchiveScanSeconds = 30
+	}
+	if cfg.WarArchiveRequestsPerSecond == 0 {
+		cfg.WarArchiveRequestsPerSecond = 1_000
 	}
 	if cfg.WarArchivePackSize == 0 {
 		cfg.WarArchivePackSize = 10_000

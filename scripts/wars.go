@@ -21,11 +21,16 @@ import (
 )
 
 const (
-	warDiscoveryDomainName = "war-discovery"
-	cwlDomainName          = "cwl"
-	warFinalizationGrace   = 6 * time.Hour
-	warTargetCountRefresh  = 15 * time.Minute
+	warDiscoveryDomainName       = "war-discovery"
+	cwlDomainName                = "cwl"
+	warFinalizationGrace         = 6 * time.Hour
+	warFinalizationRetries       = 3
+	warFinalizationFallbackRetry = time.Minute
+	warFinalizationMaxCacheWait  = 2 * time.Minute
+	warTargetCountRefresh        = 15 * time.Minute
 )
+
+var errScheduledWarUnavailable = errors.New("scheduled war is no longer available from either clan")
 
 type warDomainMode string
 
@@ -154,8 +159,19 @@ type warsDomain struct {
 	limiter *clashy.Limiter
 	now     func() time.Time
 
-	mu        sync.Mutex
-	scheduled map[string]time.Time
+	mu                   sync.Mutex
+	scheduled            map[string]time.Time
+	finalizationAttempts map[string]int
+}
+
+type scheduledWarPendingError struct {
+	warID      int32
+	state      clashy.WarState
+	retryAfter time.Duration
+}
+
+func (e *scheduledWarPendingError) Error() string {
+	return fmt.Sprintf("scheduled war %d is still in state %s", e.warID, e.state)
 }
 
 // warFetchRequest is the queue boundary between Run and do. StoreOnly requests are end-time
@@ -290,14 +306,10 @@ func (d *warsDomain) Run(ctx context.Context, app *platform.App) error {
 	if err != nil {
 		return err
 	}
-	background.Add(5)
+	background.Add(4)
 	go func() {
 		defer background.Done()
 		d.runWarTargetCountLoop(runCtx, app)
-	}()
-	go func() {
-		defer background.Done()
-		d.runDueWarScheduleLoop(runCtx, app)
 	}()
 	go func() {
 		defer background.Done()
@@ -684,7 +696,10 @@ func (d *warsDomain) do(ctx context.Context, app *platform.App, limiter *clashy.
 		return models.WarIngest{}, nil
 	}
 	if req.StoreOnly && war.State != clashy.WarStateEnded {
-		return models.WarIngest{}, fmt.Errorf("scheduled war %d is still in state %s", req.WarID, war.State)
+		return models.WarIngest{}, &scheduledWarPendingError{
+			warID: req.WarID, state: war.State,
+			retryAfter: time.Duration(war.RetryAfter()) * time.Second,
+		}
 	}
 	ingest, err := buildWarIngest(*war, req.ClanTag, req.StoreOnly, req.WarTag, req.ScheduleKey, req.WarID)
 	if err != nil {
@@ -735,7 +750,7 @@ func (d *warsDomain) fetchWarForRequest(ctx context.Context, app *platform.App, 
 		lastErr = fmt.Errorf("clan %s no longer exposes schedule %s", clanTag, req.ScheduleKey)
 	}
 	if lastErr != nil {
-		return nil, lastErr
+		return nil, fmt.Errorf("%w: %v", errScheduledWarUnavailable, lastErr)
 	}
 	return nil, nil
 }
@@ -990,83 +1005,6 @@ func opponentTagForSource(source string, war clashy.ClanWar) string {
 		return war.Opponent.Tag
 	}
 	return ""
-}
-
-func (d *warsDomain) runDueWarScheduleLoop(ctx context.Context, app *platform.App) {
-	statsName := trackingProgressName(d.name, "finalization")
-	ticker := time.NewTicker(15 * time.Second)
-	defer ticker.Stop()
-	batchLimit := max(100, app.Config.WarDiscoveryActiveRequestsPerSecond*5)
-	workers := platform.RequestConcurrency(app.Config.WarDiscoveryActiveRequestsPerSecond)
-	for {
-		started := time.Now()
-		var passErr error
-		schedules, err := d.store.LoadDueSchedules(ctx, batchLimit)
-		if err != nil {
-			app.Logger.Error("load due war schedules failed", "err", err)
-			passErr = err
-		} else {
-			app.Stats.SetQueueDepth(statsName, len(schedules))
-			var passErrMu sync.Mutex
-			runErr := runBounded(ctx, workers, schedules, func(workerCtx context.Context, schedule models.WarScheduleRow) error {
-				scheduleErr := d.processDueWarSchedule(workerCtx, app, statsName, schedule)
-				if scheduleErr != nil {
-					passErrMu.Lock()
-					passErr = scheduleErr
-					passErrMu.Unlock()
-				}
-				if workerCtx.Err() != nil {
-					return workerCtx.Err()
-				}
-				return nil
-			})
-			if runErr != nil && ctx.Err() != nil {
-				return
-			}
-		}
-		app.Stats.RecordProcess(statsName, time.Since(started))
-		if passErr != nil {
-			app.Stats.SetReady(statsName, false, passErr.Error())
-		} else {
-			app.Stats.SetReady(statsName, true, "")
-		}
-		if len(schedules) == batchLimit && passErr == nil {
-			continue
-		}
-		select {
-		case <-ctx.Done():
-			return
-		case <-ticker.C:
-		}
-	}
-}
-
-func (d *warsDomain) processDueWarSchedule(ctx context.Context, app *platform.App, statsName string, schedule models.WarScheduleRow) error {
-	queue := &warQueue{}
-	if err := queue.Enqueue(warFetchRequest{
-		ClanTag: schedule.SourceClanTag, OpponentTag: schedule.OpponentTag,
-		ScheduleKey: schedule.ScheduleKey, WarID: schedule.WarID,
-		PrepTime: schedule.PrepTime, EndTime: schedule.EndTime,
-		WarTag: schedule.WarTag, StoreOnly: true, StatsName: statsName,
-	}); err != nil {
-		app.Logger.Error("invalid due war schedule", "err", err)
-		return err
-	}
-	if err := d.processQueue(ctx, app, d.limiter, queue.items); err != nil {
-		now := time.Now().UTC()
-		if !now.Before(schedule.EndTime.Add(warFinalizationGrace)) {
-			if deleteErr := d.store.DeleteSchedule(ctx, schedule.ScheduleKey); deleteErr != nil {
-				app.Logger.Error("expired unavailable war schedule cleanup failed", "schedule_key", schedule.ScheduleKey, "err", deleteErr)
-			} else {
-				app.Logger.Warn("abandoned unavailable ended war after finalization grace", "schedule_key", schedule.ScheduleKey, "err", err)
-			}
-		} else {
-			app.Logger.Error("final war fetch failed; retrying in one minute", "schedule_key", schedule.ScheduleKey, "err", err)
-			_ = d.store.Reschedule(ctx, schedule.ScheduleKey, now.Add(time.Minute))
-		}
-		return err
-	}
-	return nil
 }
 
 func (d *warsDomain) runCWLLoop(ctx context.Context, app *platform.App, groupLimiter, warLimiter *clashy.Limiter) {
