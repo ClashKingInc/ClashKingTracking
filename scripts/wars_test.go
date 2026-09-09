@@ -81,7 +81,6 @@ func TestWarTargetsSQLOnlyUsesPublicWarLogs(t *testing.T) {
 
 func TestCWLTargetsSkipKnownGroupSiblingsDuringDiscovery(t *testing.T) {
 	for _, required := range []string{
-		"EXTRACT(DAY FROM now() AT TIME ZONE 'UTC') BETWEEN 1 AND 15",
 		"WITH current_clans AS MATERIALIZED",
 		"JOIN cwl_group_clans known_clan",
 		"known_group.season >= to_char(now() AT TIME ZONE 'UTC', 'YYYY-MM')",
@@ -90,7 +89,7 @@ func TestCWLTargetsSkipKnownGroupSiblingsDuringDiscovery(t *testing.T) {
 			t.Fatalf("CWL discovery query is missing rule %q: %s", required, cwlDiscoveryTargetsSQL)
 		}
 	}
-	for _, excluded := range []string{"public_war_log", "cwl_league_id IS NOT NULL", "last_active", "last_war_at"} {
+	for _, excluded := range []string{"EXTRACT(DAY", "public_war_log", "cwl_league_id IS NOT NULL", "last_active", "last_war_at"} {
 		if strings.Contains(cwlDiscoveryTargetsSQL, excluded) {
 			t.Fatalf("CWL discovery query must not restrict candidates by %q: %s", excluded, cwlDiscoveryTargetsSQL)
 		}

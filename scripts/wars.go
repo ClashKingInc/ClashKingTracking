@@ -97,7 +97,6 @@ const cwlDiscoveryTargetsSQL = `
 	SELECT tag, name, COALESCE(cwl_league_id, 0)
 	FROM basic_clan
 	WHERE tag > $1
-	  AND EXTRACT(DAY FROM now() AT TIME ZONE 'UTC') BETWEEN 1 AND 15
 	  AND NOT EXISTS (
 	    SELECT 1
 	    FROM current_clans known_clan
@@ -1132,6 +1131,7 @@ func (d *warsDomain) runCWLLoop(ctx context.Context, app *platform.App, groupLim
 
 func (d *warsDomain) runCWLSweeps(ctx context.Context, app *platform.App, groupLimiter, warLimiter *clashy.Limiter, refresh bool) {
 	statsName := trackingProgressName(d.name, string(cwlTargets))
+	startup := true
 	timer := time.NewTimer(0)
 	defer timer.Stop()
 	for {
@@ -1141,7 +1141,7 @@ func (d *warsDomain) runCWLSweeps(ctx context.Context, app *platform.App, groupL
 		case <-timer.C:
 		}
 		start := time.Now()
-		if refresh || utils.IsCWL(d.currentTime()) {
+		if cwlSweepDue(d.currentTime(), refresh, startup) {
 			if err := d.syncCWLSweep(ctx, app, groupLimiter, warLimiter, refresh); err != nil {
 				app.Logger.Error("cwl sync failed", "err", err)
 				app.Stats.RecordProcess(statsName, time.Since(start))
@@ -1149,11 +1149,33 @@ func (d *warsDomain) runCWLSweeps(ctx context.Context, app *platform.App, groupL
 				timer.Reset(time.Duration(app.Config.CWLSyncSeconds) * time.Second)
 				continue
 			}
+			startup = false
 		}
 		app.Stats.RecordProcess(statsName, time.Since(start))
 		app.Stats.SetReady(statsName, true, "")
-		timer.Reset(time.Duration(app.Config.CWLSyncSeconds) * time.Second)
+		delay := time.Duration(app.Config.CWLSyncSeconds) * time.Second
+		if !refresh && cwlGlobalDiscoveryWindow(d.currentTime()) {
+			// Immediately begin another full pass, with a small idle floor for
+			// empty target sets so an exhausted database cannot busy-loop.
+			delay = time.Second
+		}
+		timer.Reset(delay)
 	}
+}
+
+func cwlGlobalDiscoveryWindow(now time.Time) bool {
+	now = now.UTC()
+	start := time.Date(now.Year(), now.Month(), 1, 8, 0, 0, 0, time.UTC)
+	return !now.Before(start) && now.Before(start.Add(52*time.Hour))
+}
+
+func cwlSweepDue(now time.Time, refresh, startup bool) bool {
+	if refresh {
+		// Stop starting group refresh passes on the 15th. The independent
+		// archiver continues draining already queued/scheduled wars.
+		return now.UTC().Day() < 15
+	}
+	return startup || cwlGlobalDiscoveryWindow(now)
 }
 
 func (d *warsDomain) syncCWLSweep(ctx context.Context, app *platform.App, groupLimiter, warLimiter *clashy.Limiter, refresh bool) error {

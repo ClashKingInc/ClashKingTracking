@@ -60,13 +60,13 @@ func TestCWLTargetsMidSeasonDatabase(t *testing.T) {
 	for _, day := range []string{"01", "03", "08", "15"} {
 		count(day, 3)
 	}
-	count("16", 0)
+	count("16", 3) // SQL supports startup recovery outside the recurring window.
 	_, err = tx.Exec(t.Context(), `INSERT INTO cwl_groups(cwl_id,season,rounds,state) VALUES ('localgroup12','2026-09-01','[]','inWar'); INSERT INTO cwl_group_clans(cwl_id,clan_tag) VALUES ('localgroup12','#LOCAL_A'),('localgroup12','#LOCAL_B')`)
 	if err != nil {
 		t.Fatal(err)
 	}
 	count("08", 2)
-	count("16", 1) // Refresh remains active after the discovery window.
+	count("16", 2) // Calendar gating belongs to the scheduler, not target SQL.
 	for _, season := range []string{"2026-09-02", "2026-09-03"} {
 		if _, err := tx.Exec(t.Context(), `UPDATE cwl_groups SET season=$1 WHERE cwl_id='localgroup12'`, season); err != nil {
 			t.Fatal(err)
