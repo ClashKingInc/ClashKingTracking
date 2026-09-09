@@ -2,15 +2,14 @@
 
 ## What this process is for
 
-Global war discovery scans public war logs across the game, records an active war once, and performs the durable final fetch when it ends. It works independently of Discord live tracking.
+Global war discovery scans public war logs across the game and records an active war once. The separate `war-archiver` process owns the durable final fetch when it ends.
 
 ## When it runs
 
-Two continuous discovery loops and one finalizer run inside `war-discovery`:
+Two continuous discovery loops run inside `war-discovery`:
 
 - Active clans: a war was found within 30 days, using `war_discovery.active_requests_per_second`.
 - Dormant clans: no known war within 30 days, using `war_discovery.dormant_requests_per_second`.
-- Due schedules: every 15 seconds, load wars whose `next_run_at` has arrived.
 
 A periodic cleanup removes expired `player_timers`.
 
@@ -32,36 +31,6 @@ Load next active or dormant clan page
 ```
 
 The canonical schedule key is a hash of the two alphabetically sorted clan tags and the original preparation start time. The viewpoint used to discover the war cannot change its identity.
-
-## Final-war decision flow
-
-```text
-war_schedule.next_run_at is due
-  -> fetch exact CWL war tag, or try both regular-war clan perspectives
-  -> require canonical tags + preparation time to match this schedule
-  -> API still says active? move next_run_at one minute forward
-  -> ended? store the searchable war row, pending archive JSON, and player mappings
-  -> delete completed schedule and its reminder jobs
-  -> still unavailable six hours after shifted end? remove the dead schedule
-```
-
-Pseudocode:
-
-```text
-for schedule in due_schedules:
-  final = fetch_exact_war_from_either_side(schedule)
-  if final is not ended:
-    if now < shifted_end + 6 hours:
-      reschedule(now + 1 minute)
-    else:
-      remove dead schedule and its war timers
-  else:
-    transaction:
-      insert canonical war metadata
-      insert the compact pending archive payload
-      append this integer war ID to every participant's history
-      remove schedule
-```
 
 ## Clash API used
 
@@ -93,7 +62,7 @@ flowchart LR
   D --> API
   API --> S[(war_schedule)]
   S --> R[reminders]
-  S --> F[durable finalizer]
+  S --> F[war-archiver finalizer]
   F --> W[(wars + pending archive)]
   W --> H[(player war history)]
   W --> A[war-archiver]
@@ -105,15 +74,15 @@ flowchart LR
 - `war_discovery.dormant_requests_per_second` (default supplied: 50)
 - `target_page_multiplier`, SQL, event stream, and proxy settings
 
-The active limiter is also used by due final-war fetches. CWL has its own process and its own `cwl.*` budget, so changing CWL throughput cannot consume the discovery allowance.
+CWL has its own process and its own `cwl.*` budget. The `war-archiver` finalizer has a separate request budget, so final storage does not consume either discovery allowance.
 
-Operational metrics expose `war-discovery.active` and `war-discovery.dormant` as separate finite target pools. Their target totals are recounted every 15 minutes and their processed counts advance with each attempted clan. `war-discovery.finalization` is queue-driven, so it reports queue depth, request rate, errors, and latency without presenting a misleading completion percentage.
+Operational metrics expose `war-discovery.active` and `war-discovery.dormant` as separate finite target pools. Their target totals are recounted every 15 minutes and their processed counts advance with each attempted clan. Finalization metrics belong to `war-archiver.finalization`.
 
 ## Outages and restarts
 
-Discovery waits at the availability gate. `war_schedule` is PostgreSQL-backed, so active clocks survive restarts without rebuilding an in-memory job list. During official Clash maintenance, `end_time`, `next_run_at`, related player expiry, and reminder run times are shifted together. A proxy-only outage pauses but does not shift game time.
+Discovery waits at the availability gate. `war_schedule` is PostgreSQL-backed, so the independent archiver can keep finalizing existing clocks while `war-discovery` or `cwl` restarts. During official Clash maintenance, `end_time`, `next_run_at`, related player expiry, and reminder run times are shifted together. A proxy-only outage pauses but does not shift game time.
 
-At finalization, both clan perspectives are tried because one public endpoint may already say `notInWar` while its opponent still exposes the exact ended war. The canonical identity check prevents a newer war between the same clans from being stored under the old schedule. If neither perspective can expose the exact war, the finalizer retries for six hours and then removes the unrecoverable schedule instead of leaving a dead row forever.
+Finalization behavior is documented with the `war-archiver` process.
 
 ## What it deliberately does not do
 

@@ -44,8 +44,9 @@ func TestLoadWithArgsReadsConfigJSON(t *testing.T) {
 			"sync_seconds": 22,
 			"resolve_league_from_clan_profile": true
 		},
-		"war_archiver": {
-			"scan_seconds": 31,
+			"war_archiver": {
+				"requests_per_second": 76,
+				"scan_seconds": 31,
 			"pack_size": 9999
 		},
 		"trackedclans": {
@@ -108,7 +109,7 @@ func TestLoadWithArgsReadsConfigJSON(t *testing.T) {
 	if cfg.WarDiscoveryActiveRequestsPerSecond != 99 || cfg.WarDiscoveryDormantRequestsPerSecond != 12 ||
 		cfg.CWLRequestsPerSecond != 44 || cfg.CWLWarRequestsPerSecond != 88 || cfg.CWLSyncSeconds != 22 ||
 		!cfg.CWLResolveLeagueFromClanProfile ||
-		cfg.WarArchiveScanSeconds != 31 || cfg.WarArchivePackSize != 9999 {
+		cfg.WarArchiveRequestsPerSecond != 76 || cfg.WarArchiveScanSeconds != 31 || cfg.WarArchivePackSize != 9999 {
 		t.Fatalf("war runtime config was not applied: %+v", cfg)
 	}
 	if cfg.TrackedClanRequestsPerSecond != 77 || cfg.TrackedClanTargetRefreshSeconds != 3800 ||

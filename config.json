@@ -33,6 +33,7 @@
     "resolve_league_from_clan_profile": true
   },
   "war_archiver": {
+    "requests_per_second": 1000,
     "scan_seconds": 30,
     "pack_size": 10000
   },

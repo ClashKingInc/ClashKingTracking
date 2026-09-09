@@ -171,6 +171,7 @@ func proxyConnectionLimit(cfg Config) int {
 		cfg.BattlelogPriorityRequestsPerSecond,
 		cfg.WarDiscoveryActiveRequestsPerSecond+cfg.WarDiscoveryDormantRequestsPerSecond,
 		cfg.CWLRequestsPerSecond+cfg.CWLWarRequestsPerSecond,
+		cfg.WarArchiveRequestsPerSecond,
 		cfg.TrackedClanRequestsPerSecond,
 		cfg.TrackedPlayerRequestsPerSecond,
 		cfg.BasicPlayerRequestsPerSecond,
@@ -185,7 +186,7 @@ func proxyConnectionLimit(cfg Config) int {
 
 func needsClashClient(cfg Config) bool {
 	switch cfg.Script {
-	case "globalclans", "trackedplayers", "basicplayers", "trackedclans", "war-discovery", "cwl", "capital", "reminders", "availability", "scheduled", "battlelogs", "leaderboards", "notifications":
+	case "globalclans", "trackedplayers", "basicplayers", "trackedclans", "war-discovery", "cwl", "war-archiver", "capital", "reminders", "availability", "scheduled", "battlelogs", "leaderboards", "notifications":
 		return true
 	default:
 		return false

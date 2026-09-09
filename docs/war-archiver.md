@@ -1,12 +1,23 @@
-# Finished-war archive (`war-archiver`)
+# Finished-war finalization and archive (`war-archiver`)
 
 ## What this process is for
 
-The war archiver moves completed war payloads from PostgreSQL into compact, immutable R2 packs. War discovery can finish quickly without waiting for object storage, while the API can read either the pending PostgreSQL JSON or the final R2 frame through the same archive reader.
+The war archiver owns the durable end-time queue for regular and CWL wars, then moves completed payloads from PostgreSQL into compact, immutable R2 packs. The `war-discovery` and `cwl` processes only discover and schedule wars, so either process can restart without stopping finalization of rows already in `war_schedule`.
 
 ## When it runs
 
-It checks every 30 seconds. It does nothing until exactly 10,000 unclaimed completed wars are ready; there is no time-based partial flush. `run_once` performs one check and exits.
+It checks due `war_schedule` rows every 15 seconds and archive candidates every 30 seconds. Packing does nothing until exactly 10,000 unclaimed completed wars are ready; there is no time-based partial flush. `run_once` performs one archive check and exits.
+
+## Final-war decision flow
+
+```text
+war_schedule.next_run_at is due
+  -> regular war: fetch the source clan and require the exact two tags + preparation start
+  -> private, missing, partial/cancelled, or newer war: try the opponent clan
+  -> neither perspective exposes the scheduled war: remove the schedule immediately
+  -> visible matching war not ended: keep retrying at the response cache expiry
+  -> ended: store the war row, pending archive JSON, and player history, then remove the schedule
+```
 
 ## Decision flow
 
@@ -50,6 +61,7 @@ Each pack stores additive statistics by day: wars by type, total and missed atta
 ## Configuration
 
 - `war_archiver.scan_seconds`: delay between archive passes.
+- `war_archiver.requests_per_second`: dedicated Clash API budget for due final-war fetches.
 - `war_archiver.pack_size`: completed wars claimed for one immutable object.
 - `TIMESCALE_*`: PostgreSQL connection.
 - `R2_ACCOUNT_ID`, or explicit `WAR_ARCHIVE_S3_ENDPOINT`.
@@ -64,7 +76,6 @@ The archiver is queue-driven rather than a finite crawl. Operational metrics the
 
 ## What it deliberately does not do
 
-- It does not call the Clash API or wait on the Clash maintenance gate.
 - It does not archive partial packs on a timer.
 - It does not store a manifest, ETag, dictionary ID, or format version.
 - It does not store integer war IDs inside compressed frames; PostgreSQL owns identity and location.

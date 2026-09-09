@@ -41,12 +41,11 @@ func TestRunCancelsSiblingDomainsAfterFailure(t *testing.T) {
 }
 
 func TestNewRequiresProxyForClashDomains(t *testing.T) {
-	_, err := New(context.Background(), Config{
-		MockDB: true,
-		Script: "globalclans",
-	})
-	if err == nil {
-		t.Fatal("expected missing proxy_url error for Clash-backed domains")
+	for _, script := range []string{"globalclans", "war-archiver"} {
+		_, err := New(context.Background(), Config{MockDB: true, Script: script})
+		if err == nil {
+			t.Fatalf("expected missing proxy_url error for Clash-backed domain %s", script)
+		}
 	}
 }
 
@@ -69,11 +68,12 @@ func TestProxyConnectionLimitUsesLargestRequestRate(t *testing.T) {
 		GlobalClanNonPriorityRequestsPerSecond: 50,
 		BattlelogRequestsPerSecond:             10,
 		WarDiscoveryActiveRequestsPerSecond:    950,
+		WarArchiveRequestsPerSecond:            1100,
 		TrackedClanRequestsPerSecond:           950,
 		TrackedPlayerRequestsPerSecond:         950,
 	}
 
-	if got, want := proxyConnectionLimit(cfg), 3000; got != want {
+	if got, want := proxyConnectionLimit(cfg), 3300; got != want {
 		t.Fatalf("proxyConnectionLimit = %d, want %d", got, want)
 	}
 }

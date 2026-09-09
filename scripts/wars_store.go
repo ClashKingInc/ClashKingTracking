@@ -82,8 +82,12 @@ func (s *timescaleWarStore) LoadDueSchedules(ctx context.Context, limit int) ([]
 	return out, rows.Err()
 }
 
-func (s *timescaleWarStore) Reschedule(ctx context.Context, scheduleKey string, nextRunAt time.Time) error {
-	_, err := s.pool.Exec(ctx, `UPDATE war_schedule SET next_run_at = $2 WHERE schedule_key = $1`, scheduleKey, nextRunAt)
+func (s *timescaleWarStore) Reschedule(ctx context.Context, scheduleKey string, nextRunAt time.Time, sourceClanTag, opponentTag string) error {
+	_, err := s.pool.Exec(ctx, `
+		UPDATE war_schedule
+		SET next_run_at = $2, source_clan_tag = $3, opponent_tag = $4
+		WHERE schedule_key = $1
+	`, scheduleKey, nextRunAt, sourceClanTag, opponentTag)
 	return warStoreError("reschedule", err)
 }
 
@@ -866,12 +870,14 @@ func (s *memoryWarStore) LoadDueSchedules(_ context.Context, limit int) ([]model
 	return out, nil
 }
 
-func (s *memoryWarStore) Reschedule(_ context.Context, scheduleKey string, nextRunAt time.Time) error {
+func (s *memoryWarStore) Reschedule(_ context.Context, scheduleKey string, nextRunAt time.Time, sourceClanTag, opponentTag string) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	row, ok := s.schedules[scheduleKey]
 	if ok {
 		row.NextRunAt = nextRunAt
+		row.SourceClanTag = sourceClanTag
+		row.OpponentTag = opponentTag
 		s.schedules[scheduleKey] = row
 	}
 	return nil
