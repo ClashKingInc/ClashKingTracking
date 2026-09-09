@@ -209,7 +209,7 @@ func (d *warsDomain) processDueWarSchedule(ctx context.Context, app *platform.Ap
 	}
 	if isSkippableWarFetchError(err) || errors.Is(err, errScheduledWarUnavailable) {
 		return d.abandonWarSchedule(ctx, app, schedule.ScheduleKey,
-			"abandoned war after both clan war logs were unavailable", err)
+			"abandoned war after neither API perspective exposed the scheduled war", err)
 	}
 
 	if err != nil {
