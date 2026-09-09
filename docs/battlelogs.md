@@ -45,7 +45,7 @@ for target_batch in targets:
   for battle in log:
     if battle time is at or before the checkpoint: skip
     if no checkpoint and battle time is older than 14 days: skip
-    keep farming attacks slim; store Ranked/Legend share codes, hashes, and both perspectives
+    keep farming attacks slim; store the requested player's Ranked/Legend perspective
     materialize structured army compositions for Legend battles only
     queue SQL insert
   commit inserts
@@ -60,7 +60,7 @@ Checkpoint batches feed one long-lived pool rather than waiting for every retry 
 
 ## Data read and written
 
-Reads target tables and the requested player's current Town Hall from `basic_player`. Farming attacks go to `battles_farming` with the player, time, result, duration, loot object, and share code; farming defenses and opponent metadata are discarded. Ranked and Legend battles go to `battles_ranked` as attack and defense perspectives. Aggregate readers use only `direction='attack'`, so each physical battle is counted once.
+Reads target tables and the requested player's current Town Hall from `basic_player`. Farming attacks go to `battles_farming` with the player, time, result, duration, loot object, and share code; farming defenses and opponent metadata are discarded. Each Ranked or Legend response contributes only the requested player's own attack or defense perspective to `battles_ranked`. When both players are tracked, their separate responses supply the two perspectives without synthesizing either one. Aggregate readers use only `direction='attack'`, so a battle observed from both players is counted once.
 
 Ranked and Legend rows retain a deterministic 32-byte hash and the normalized share code directly. Only Legend observations materialize an immutable exact army in `army_compositions`; a Ranked-only hash may have no composition row. Raw Ranked readers must not require an inner join to compositions. The Legend composition's structured columns preserve main troops, clan-castle troops, spells with clan-castle ownership, heroes, hero-equipment assignments, pet-hero assignments, and the siege machine. The hot writer performs no daily aggregation, group mutation, item-mask allocation, prefix rebuild, or tier enrichment.
 

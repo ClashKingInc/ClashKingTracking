@@ -5,6 +5,7 @@ package scripts
 import (
 	"context"
 	"os"
+	"reflect"
 	"testing"
 	"time"
 
@@ -25,22 +26,27 @@ func TestFinalSchemaBattleIngestAndLegendCloseoutAreIdempotent(t *testing.T) {
 	defer store.Close()
 	if _, err := store.pool.Exec(ctx, `
 		INSERT INTO basic_player(tag,name,league_id,townhall_level,trophies)
-		VALUES('#P0','attacker',105000035,18,6000),('#Y2','defender',105000035,18,6000)
+		VALUES('#P0','attacker',105000035,18,6000),('#Y2','defender',105000035,17,6000)
 	`); err != nil {
 		t.Fatal(err)
 	}
 	day := time.Date(2026, 9, 6, 0, 0, 0, 0, time.UTC)
 	shareCode := normalizeArmyShareCode("u100x0s10x0h0e0_1")
-	row := models.BattlelogRow{
+	attack := models.BattlelogRow{
 		ArmyShareCode: shareCode, ArmyHash: canonicalArmyHash(shareCode), ArmyColumns: parseArmyColumns(shareCode),
-		PlayerTag: "#P0", OpponentTag: "#Y2", OpponentTH: 18, BattleType: "legend", Attack: true,
+		PlayerTag: "#P0", OpponentTag: "#Y2", OpponentTH: 17, BattleType: "legend", Attack: true,
 		Stars: 3, DestructionPercentage: 100, Duration: 120, Timestamp: day.Add(time.Hour),
 	}
-	first, err := store.Store(ctx, models.BattlelogIngest{Rows: []models.BattlelogRow{row}})
+	defense := attack
+	defense.PlayerTag = "#Y2"
+	defense.OpponentTag = "#P0"
+	defense.OpponentTH = 18
+	defense.Attack = false
+	first, err := store.Store(ctx, models.BattlelogIngest{Rows: []models.BattlelogRow{attack, defense}})
 	if err != nil {
 		t.Fatal(err)
 	}
-	second, err := store.Store(ctx, models.BattlelogIngest{Rows: []models.BattlelogRow{row}})
+	second, err := store.Store(ctx, models.BattlelogIngest{Rows: []models.BattlelogRow{attack, defense}})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -53,6 +59,39 @@ func TestFinalSchemaBattleIngestAndLegendCloseoutAreIdempotent(t *testing.T) {
 	}
 	if total != 2 || attacks != 1 {
 		t.Fatalf("perspectives=%d attacks=%d", total, attacks)
+	}
+	rows, err := store.pool.Query(ctx, `
+		SELECT player_tag,direction,player_town_hall,opponent_town_hall
+		FROM battles_ranked
+		ORDER BY player_tag
+	`)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer rows.Close()
+	type storedPerspective struct {
+		playerTag  string
+		direction  string
+		playerTH   int
+		opponentTH int
+	}
+	var perspectives []storedPerspective
+	for rows.Next() {
+		var perspective storedPerspective
+		if err := rows.Scan(&perspective.playerTag, &perspective.direction, &perspective.playerTH, &perspective.opponentTH); err != nil {
+			t.Fatal(err)
+		}
+		perspectives = append(perspectives, perspective)
+	}
+	if err := rows.Err(); err != nil {
+		t.Fatal(err)
+	}
+	wantPerspectives := []storedPerspective{
+		{playerTag: "#P0", direction: "attack", playerTH: 18, opponentTH: 17},
+		{playerTag: "#Y2", direction: "defense", playerTH: 17, opponentTH: 18},
+	}
+	if !reflect.DeepEqual(perspectives, wantPerspectives) {
+		t.Fatalf("perspectives=%#v want=%#v", perspectives, wantPerspectives)
 	}
 
 	scheduled := &timescaleScheduledStore{pool: store.pool}
