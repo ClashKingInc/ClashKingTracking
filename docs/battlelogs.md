@@ -45,7 +45,8 @@ for target_batch in targets:
   for battle in log:
     if battle time is at or before the checkpoint: skip
     if no checkpoint and battle time is older than 14 days: skip
-    keep farming attacks slim; normalize Ranked/Legend armies and both players
+    keep farming attacks slim; store Ranked/Legend share codes, hashes, and both perspectives
+    materialize structured army compositions for Legend battles only
     queue SQL insert
   commit inserts
   save new checkpoint with its TTL
@@ -61,7 +62,9 @@ Checkpoint batches feed one long-lived pool rather than waiting for every retry 
 
 Reads target tables and the requested player's current Town Hall from `basic_player`. Farming attacks go to `battles_farming` with the player, time, result, duration, loot object, and share code; farming defenses and opponent metadata are discarded. Ranked and Legend battles go to `battles_ranked` as attack and defense perspectives. Aggregate readers use only `direction='attack'`, so each physical battle is counted once.
 
-Every Ranked or Legend row references an immutable exact army in `army_compositions`. The identity is a deterministic 32-byte hash of the normalized share code. Its structured columns preserve main troops, clan-castle troops, spells with clan-castle ownership, heroes, hero-equipment assignments, pet-hero assignments, and the siege machine. The hot writer performs no daily aggregation, group mutation, item-mask allocation, prefix rebuild, or tier enrichment.
+Ranked and Legend rows retain a deterministic 32-byte hash and the normalized share code directly. Only Legend observations materialize an immutable exact army in `army_compositions`; a Ranked-only hash may have no composition row. Raw Ranked readers must not require an inner join to compositions. The Legend composition's structured columns preserve main troops, clan-castle troops, spells with clan-castle ownership, heroes, hero-equipment assignments, pet-hero assignments, and the siege machine. The hot writer performs no daily aggregation, group mutation, item-mask allocation, prefix rebuild, or tier enrichment.
+
+Deploy this writer only after DevKit migration 012 removes the raw-battle composition foreign keys. Existing raw rows remain intact. Cleanup of Ranked-only compositions is a separate operator action after deployment, preserving all Legend and family references.
 
 The scheduled closeout rebuilds completed Legend-day and Ranked-season aggregates from raw attack perspectives. It groups newly observed Legend armies into immutable direct-anchor families and writes daily family outcomes. Farming and Ranked/Legend raw rows retain one year.
 
