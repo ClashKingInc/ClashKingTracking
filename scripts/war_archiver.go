@@ -184,7 +184,6 @@ func (d *warsDomain) processDueWarSchedule(ctx context.Context, app *platform.Ap
 		err = d.storeIngest(ctx, app, ingest)
 	}
 	if err == nil {
-		d.clearFinalizationAttempt(schedule.ScheduleKey)
 		d.mu.Lock()
 		delete(d.scheduled, schedule.ScheduleKey)
 		d.mu.Unlock()
@@ -194,11 +193,6 @@ func (d *warsDomain) processDueWarSchedule(ctx context.Context, app *platform.Ap
 	now := d.currentTime().UTC()
 	var pending *scheduledWarPendingError
 	if errors.As(err, &pending) {
-		attempt := d.recordFinalizationAttempt(schedule.ScheduleKey)
-		if attempt >= warFinalizationRetries {
-			return d.abandonWarSchedule(ctx, app, schedule.ScheduleKey,
-				"abandoned war that was still unfinished after finalization attempts", err)
-		}
 		delay := pending.retryAfter
 		if delay <= 0 {
 			delay = warFinalizationFallbackRetry
@@ -210,7 +204,7 @@ func (d *warsDomain) processDueWarSchedule(ctx context.Context, app *platform.Ap
 			return rescheduleErr
 		}
 		app.Logger.Warn("final war is still cached before completion; scheduled cache-expiry retry",
-			"schedule_key", schedule.ScheduleKey, "attempt", attempt, "retry_in", delay)
+			"schedule_key", schedule.ScheduleKey, "retry_in", delay)
 		return nil
 	}
 	if isSkippableWarFetchError(err) || errors.Is(err, errScheduledWarUnavailable) {
@@ -233,28 +227,11 @@ func (d *warsDomain) processDueWarSchedule(ctx context.Context, app *platform.Ap
 	return nil
 }
 
-func (d *warsDomain) recordFinalizationAttempt(scheduleKey string) int {
-	d.mu.Lock()
-	defer d.mu.Unlock()
-	if d.finalizationAttempts == nil {
-		d.finalizationAttempts = make(map[string]int)
-	}
-	d.finalizationAttempts[scheduleKey]++
-	return d.finalizationAttempts[scheduleKey]
-}
-
-func (d *warsDomain) clearFinalizationAttempt(scheduleKey string) {
-	d.mu.Lock()
-	defer d.mu.Unlock()
-	delete(d.finalizationAttempts, scheduleKey)
-}
-
 func (d *warsDomain) abandonWarSchedule(ctx context.Context, app *platform.App, scheduleKey, message string, cause error) error {
 	if err := d.store.DeleteSchedule(ctx, scheduleKey); err != nil {
 		app.Logger.Error("war schedule cleanup failed", "schedule_key", scheduleKey, "err", err)
 		return err
 	}
-	d.clearFinalizationAttempt(scheduleKey)
 	d.mu.Lock()
 	delete(d.scheduled, scheduleKey)
 	d.mu.Unlock()

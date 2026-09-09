@@ -12,9 +12,10 @@ It checks due `war_schedule` rows every 15 seconds and archive candidates every 
 
 ```text
 war_schedule.next_run_at is due
-  -> regular war: try the source clan, then the opponent if its war log is private
-  -> both war logs private: remove the schedule immediately
-  -> visible but not ended: retry at the response cache expiry, at most three fetches
+  -> regular war: fetch the source clan and require the exact two tags + preparation start
+  -> private, missing, partial/cancelled, or newer war: try the opponent clan
+  -> neither perspective exposes the scheduled war: remove the schedule immediately
+  -> visible matching war not ended: keep retrying at the response cache expiry
   -> ended: store the war row, pending archive JSON, and player history, then remove the schedule
 ```
 

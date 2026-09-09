@@ -24,7 +24,6 @@ const (
 	warDiscoveryDomainName       = "war-discovery"
 	cwlDomainName                = "cwl"
 	warFinalizationGrace         = 6 * time.Hour
-	warFinalizationRetries       = 3
 	warFinalizationFallbackRetry = time.Minute
 	warFinalizationMaxCacheWait  = 2 * time.Minute
 	warTargetCountRefresh        = 15 * time.Minute
@@ -159,9 +158,8 @@ type warsDomain struct {
 	limiter *clashy.Limiter
 	now     func() time.Time
 
-	mu                   sync.Mutex
-	scheduled            map[string]time.Time
-	finalizationAttempts map[string]int
+	mu        sync.Mutex
+	scheduled map[string]time.Time
 }
 
 type scheduledWarPendingError struct {

@@ -344,69 +344,109 @@ func TestScheduledWarIdentityAcceptsEitherPerspectiveAndRejectsNextWar(t *testin
 	}
 }
 
-func TestDueWarPrivateLogsTryBothClansThenAbandon(t *testing.T) {
-	var calls int
-	server := httptest.NewServer(http.HandlerFunc(func(response http.ResponseWriter, request *http.Request) {
-		calls++
-		response.Header().Set("Content-Type", "application/json")
-		response.WriteHeader(http.StatusForbidden)
-		_, _ = response.Write([]byte(`{"reason":"accessDenied","message":"Access denied"}`))
-	}))
-	defer server.Close()
-
-	domain, app, store := newDueWarTestDomain(t, server.URL)
-	schedule := dueWarTestSchedule(time.Date(2026, 9, 9, 9, 0, 0, 0, time.UTC))
-	if err := store.Store(t.Context(), models.WarIngest{Schedules: []models.WarScheduleRow{schedule}}); err != nil {
-		t.Fatal(err)
-	}
-	schedule = store.schedules[schedule.ScheduleKey]
-	if err := domain.processDueWarSchedule(t.Context(), app, "war-archiver.finalization", schedule); err != nil {
-		t.Fatal(err)
-	}
-	if calls != 2 {
-		t.Fatalf("private war fetches = %d, want source clan plus opponent", calls)
-	}
-	if _, exists := store.schedules[schedule.ScheduleKey]; exists {
-		t.Fatal("schedule with two private war logs was retained")
-	}
-}
-
-func TestDueWarPrivateSourceStoresFromPublicOpponent(t *testing.T) {
-	now := time.Date(2026, 9, 9, 9, 0, 0, 0, time.UTC)
-	schedule := dueWarTestSchedule(now)
-	var calls int
-	server := httptest.NewServer(http.HandlerFunc(func(response http.ResponseWriter, request *http.Request) {
-		calls++
-		response.Header().Set("Content-Type", "application/json")
-		if strings.Contains(request.URL.Path, "#AAA") {
+func TestDueWarTriesBothClansThenAbandonsUnrecoverableSchedule(t *testing.T) {
+	for _, test := range []struct {
+		name    string
+		respond func(http.ResponseWriter, models.WarScheduleRow)
+	}{
+		{name: "private", respond: func(response http.ResponseWriter, _ models.WarScheduleRow) {
 			response.WriteHeader(http.StatusForbidden)
 			_, _ = response.Write([]byte(`{"reason":"accessDenied","message":"Access denied"}`))
-			return
-		}
-		_ = json.NewEncoder(response).Encode(dueWarTestPayload(schedule, "warEnded"))
-	}))
-	defer server.Close()
+		}},
+		{name: "newer war", respond: func(response http.ResponseWriter, schedule models.WarScheduleRow) {
+			newer := schedule
+			newer.PrepTime = newer.PrepTime.Add(48 * time.Hour)
+			newer.EndTime = newer.EndTime.Add(48 * time.Hour)
+			_ = json.NewEncoder(response).Encode(dueWarTestPayload(newer, "warEnded"))
+		}},
+		{name: "cancelled partial war", respond: func(response http.ResponseWriter, _ models.WarScheduleRow) {
+			_ = json.NewEncoder(response).Encode(map[string]any{"state": "notInWar"})
+		}},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			schedule := dueWarTestSchedule(time.Date(2026, 9, 9, 9, 0, 0, 0, time.UTC))
+			var calls int
+			server := httptest.NewServer(http.HandlerFunc(func(response http.ResponseWriter, request *http.Request) {
+				calls++
+				response.Header().Set("Content-Type", "application/json")
+				test.respond(response, schedule)
+			}))
+			defer server.Close()
 
-	domain, app, store := newDueWarTestDomain(t, server.URL)
-	if err := store.Store(t.Context(), models.WarIngest{Schedules: []models.WarScheduleRow{schedule}}); err != nil {
-		t.Fatal(err)
-	}
-	schedule = store.schedules[schedule.ScheduleKey]
-	if err := domain.processDueWarSchedule(t.Context(), app, "war-archiver.finalization", schedule); err != nil {
-		t.Fatal(err)
-	}
-	if calls != 2 {
-		t.Fatalf("war fetches = %d, want private source plus public opponent", calls)
-	}
-	if len(store.indexRows) != 1 {
-		t.Fatalf("stored wars = %d, want opponent-visible finished war", len(store.indexRows))
-	}
-	if _, exists := store.schedules[schedule.ScheduleKey]; exists {
-		t.Fatal("stored war schedule was retained")
+			domain, app, store := newDueWarTestDomain(t, server.URL)
+			if err := store.Store(t.Context(), models.WarIngest{Schedules: []models.WarScheduleRow{schedule}}); err != nil {
+				t.Fatal(err)
+			}
+			schedule = store.schedules[schedule.ScheduleKey]
+			if err := domain.processDueWarSchedule(t.Context(), app, "war-archiver.finalization", schedule); err != nil {
+				t.Fatal(err)
+			}
+			if calls != 2 {
+				t.Fatalf("war fetches = %d, want source clan plus opponent", calls)
+			}
+			if _, exists := store.schedules[schedule.ScheduleKey]; exists {
+				t.Fatal("unrecoverable schedule was retained")
+			}
+		})
 	}
 }
 
-func TestDueWarUsesCacheExpiryAndStopsAfterThreeUnfinishedResponses(t *testing.T) {
+func TestDueWarFallsBackToOpponentForEveryUnusableSourceResponse(t *testing.T) {
+	for _, test := range []struct {
+		name   string
+		source func(http.ResponseWriter, models.WarScheduleRow)
+	}{
+		{name: "private", source: func(response http.ResponseWriter, _ models.WarScheduleRow) {
+			response.WriteHeader(http.StatusForbidden)
+			_, _ = response.Write([]byte(`{"reason":"accessDenied","message":"Access denied"}`))
+		}},
+		{name: "newer war", source: func(response http.ResponseWriter, schedule models.WarScheduleRow) {
+			newer := schedule
+			newer.PrepTime = newer.PrepTime.Add(48 * time.Hour)
+			newer.EndTime = newer.EndTime.Add(48 * time.Hour)
+			_ = json.NewEncoder(response).Encode(dueWarTestPayload(newer, "warEnded"))
+		}},
+		{name: "cancelled partial war", source: func(response http.ResponseWriter, _ models.WarScheduleRow) {
+			_ = json.NewEncoder(response).Encode(map[string]any{"state": "notInWar"})
+		}},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			now := time.Date(2026, 9, 9, 9, 0, 0, 0, time.UTC)
+			schedule := dueWarTestSchedule(now)
+			var calls int
+			server := httptest.NewServer(http.HandlerFunc(func(response http.ResponseWriter, request *http.Request) {
+				calls++
+				response.Header().Set("Content-Type", "application/json")
+				if strings.Contains(request.URL.Path, "#AAA") {
+					test.source(response, schedule)
+					return
+				}
+				_ = json.NewEncoder(response).Encode(dueWarTestPayload(schedule, "warEnded"))
+			}))
+			defer server.Close()
+
+			domain, app, store := newDueWarTestDomain(t, server.URL)
+			if err := store.Store(t.Context(), models.WarIngest{Schedules: []models.WarScheduleRow{schedule}}); err != nil {
+				t.Fatal(err)
+			}
+			schedule = store.schedules[schedule.ScheduleKey]
+			if err := domain.processDueWarSchedule(t.Context(), app, "war-archiver.finalization", schedule); err != nil {
+				t.Fatal(err)
+			}
+			if calls != 2 {
+				t.Fatalf("war fetches = %d, want unusable source plus public opponent", calls)
+			}
+			if len(store.indexRows) != 1 {
+				t.Fatalf("stored wars = %d, want opponent-visible finished war", len(store.indexRows))
+			}
+			if _, exists := store.schedules[schedule.ScheduleKey]; exists {
+				t.Fatal("stored war schedule was retained")
+			}
+		})
+	}
+}
+
+func TestDueWarUsesCacheExpiryWhileMatchingWarRemainsUnfinished(t *testing.T) {
 	now := time.Date(2026, 9, 9, 9, 0, 0, 0, time.UTC)
 	schedule := dueWarTestSchedule(now)
 	var calls int
@@ -423,24 +463,60 @@ func TestDueWarUsesCacheExpiryAndStopsAfterThreeUnfinishedResponses(t *testing.T
 		t.Fatal(err)
 	}
 	schedule = store.schedules[schedule.ScheduleKey]
-	for attempt := 1; attempt <= warFinalizationRetries; attempt++ {
+	const checks = 4
+	for attempt := 1; attempt <= checks; attempt++ {
 		if err := domain.processDueWarSchedule(t.Context(), app, "war-archiver.finalization", schedule); err != nil {
 			t.Fatal(err)
 		}
 		stored, exists := store.schedules[schedule.ScheduleKey]
-		if attempt < warFinalizationRetries {
-			if !exists {
-				t.Fatalf("unfinished schedule removed after attempt %d", attempt)
-			}
-			if want := now.Add(17 * time.Second); !stored.NextRunAt.Equal(want) {
-				t.Fatalf("retry time = %s, want cache expiry %s", stored.NextRunAt, want)
-			}
-		} else if exists {
-			t.Fatal("unfinished schedule remained after three attempts")
+		if !exists {
+			t.Fatalf("matching unfinished schedule removed after check %d", attempt)
+		}
+		if want := now.Add(17 * time.Second); !stored.NextRunAt.Equal(want) {
+			t.Fatalf("retry time = %s, want cache expiry %s", stored.NextRunAt, want)
 		}
 	}
-	if calls != warFinalizationRetries {
-		t.Fatalf("unfinished war fetches = %d, want %d", calls, warFinalizationRetries)
+	if calls != checks {
+		t.Fatalf("unfinished war fetches = %d, want %d", calls, checks)
+	}
+}
+
+func TestDueWarAbandonsWhenBothLogsBecomePrivateAfterCacheRetry(t *testing.T) {
+	now := time.Date(2026, 9, 9, 9, 0, 0, 0, time.UTC)
+	schedule := dueWarTestSchedule(now)
+	var calls int
+	server := httptest.NewServer(http.HandlerFunc(func(response http.ResponseWriter, request *http.Request) {
+		calls++
+		response.Header().Set("Content-Type", "application/json")
+		if calls == 1 {
+			response.Header().Set("Cache-Control", "public, max-age=17")
+			_ = json.NewEncoder(response).Encode(dueWarTestPayload(schedule, "inWar"))
+			return
+		}
+		response.WriteHeader(http.StatusForbidden)
+		_, _ = response.Write([]byte(`{"reason":"accessDenied","message":"Access denied"}`))
+	}))
+	defer server.Close()
+
+	domain, app, store := newDueWarTestDomain(t, server.URL)
+	if err := store.Store(t.Context(), models.WarIngest{Schedules: []models.WarScheduleRow{schedule}}); err != nil {
+		t.Fatal(err)
+	}
+	schedule = store.schedules[schedule.ScheduleKey]
+	if err := domain.processDueWarSchedule(t.Context(), app, "war-archiver.finalization", schedule); err != nil {
+		t.Fatal(err)
+	}
+	if _, exists := store.schedules[schedule.ScheduleKey]; !exists {
+		t.Fatal("matching unfinished war was not retained for its cache retry")
+	}
+	if err := domain.processDueWarSchedule(t.Context(), app, "war-archiver.finalization", schedule); err != nil {
+		t.Fatal(err)
+	}
+	if calls != 3 {
+		t.Fatalf("war fetches = %d, want initial visible response plus both private perspectives", calls)
+	}
+	if _, exists := store.schedules[schedule.ScheduleKey]; exists {
+		t.Fatal("schedule was retained after both war logs became private")
 	}
 }
 
