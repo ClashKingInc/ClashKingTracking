@@ -373,7 +373,7 @@ func deriveConfig(cfg *Config) {
 		cfg.CWLWarRequestsPerSecond = cfg.CWLRequestsPerSecond
 	}
 	if cfg.CWLSyncSeconds == 0 {
-		cfg.CWLSyncSeconds = 180
+		cfg.CWLSyncSeconds = 1800
 	}
 	if cfg.WarArchiveScanSeconds == 0 {
 		cfg.WarArchiveScanSeconds = 30

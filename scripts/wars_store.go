@@ -148,6 +148,24 @@ func (s *timescaleWarStore) LoadStoredCWLGroupLeague(ctx context.Context, cwlID 
 	return leagueID, true, nil
 }
 
+func (s *timescaleWarStore) LoadCWLWarTags(ctx context.Context, id string) ([]string, error) {
+	var rounds [][]string
+	err := s.pool.QueryRow(ctx, `SELECT rounds FROM cwl_groups WHERE cwl_id=$1`, id).Scan(&rounds)
+	if errors.Is(err, pgx.ErrNoRows) {
+		return nil, nil
+	}
+	if err != nil {
+		return nil, err
+	}
+	return warTags(cwlGroupFromRounds(rounds)), nil
+}
+
+func (s *memoryWarStore) LoadCWLWarTags(_ context.Context, id string) ([]string, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return warTags(cwlGroupFromRounds(s.cwlGroups[id].Rounds)), nil
+}
+
 func (s *timescaleWarStore) KnownCWLWarTags(ctx context.Context, warTags []string) (map[string]int, error) {
 	known := make(map[string]int, len(warTags))
 	if len(warTags) == 0 {
@@ -230,6 +248,25 @@ func (s *timescaleWarStore) Store(ctx context.Context, ingest models.WarIngest) 
 		return err
 	}
 	defer tx.Rollback(ctx)
+	if ingest.FinishedWarID > 0 && len(ingest.Schedules) > 0 {
+		// First observation of an already-ended tagged war: allocate and
+		// finalize atomically, without exposing a due row to another worker.
+		tag := ingest.Schedules[0].WarTag
+		if _, err := tx.Exec(ctx, `SELECT pg_advisory_xact_lock(hashtextextended($1, 0))`, tag); err != nil {
+			return err
+		}
+		var exists bool
+		if err := tx.QueryRow(ctx, `SELECT EXISTS(SELECT 1 FROM wars WHERE war_tag=$1)`, tag).Scan(&exists); err != nil {
+			return err
+		}
+		if exists {
+			return nil
+		}
+		if err := upsertWarSchedules(ctx, tx, ingest.Schedules); err != nil {
+			return err
+		}
+		ingest.Schedules = nil
+	}
 	if ingest.FinishedWarID > 0 {
 		if err := s.prepareFinishedWar(ctx, tx, &ingest); err != nil {
 			return err
@@ -778,6 +815,23 @@ func (s *memoryWarStore) DeleteExpiredPlayerTimers(_ context.Context) (int, erro
 func (s *memoryWarStore) Store(_ context.Context, ingest models.WarIngest) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	if ingest.FinishedWarID > 0 && len(ingest.Schedules) > 0 {
+		for _, row := range ingest.Schedules {
+			for _, stored := range s.indexRows {
+				if stored.WarTag == row.WarTag {
+					return nil
+				}
+			}
+			if existing, ok := s.schedules[row.ScheduleKey]; ok {
+				row.WarID = existing.WarID
+			} else {
+				row.WarID = s.nextWarID
+				s.nextWarID++
+			}
+			s.schedules[row.ScheduleKey] = row
+		}
+		ingest.Schedules = nil
+	}
 	if ingest.FinishedWarID > 0 && ingest.FinishedScheduleKey != "" {
 		if schedule, ok := s.schedules[ingest.FinishedScheduleKey]; ok {
 			rewriteWarIngestID(&ingest, schedule.WarID)

@@ -66,11 +66,18 @@ func TestCWLTargetsMidSeasonDatabase(t *testing.T) {
 		t.Fatal(err)
 	}
 	count("08", 2)
+	count("16", 1) // Refresh remains active after the discovery window.
+	for _, season := range []string{"2026-09-02", "2026-09-03"} {
+		if _, err := tx.Exec(t.Context(), `UPDATE cwl_groups SET season=$1 WHERE cwl_id='localgroup12'`, season); err != nil {
+			t.Fatal(err)
+		}
+		count("08", 2)
+	}
 	_, err = tx.Exec(t.Context(), `INSERT INTO war_schedule(schedule_key,source_clan_tag,opponent_tag,prep_time,end_time,next_run_at,war_type,war_tag) VALUES ('local-cwl-war','#LOCAL_A','#LOCAL_B','2026-09-07 12:00:00+00','2026-09-09 12:00:00+00','2026-09-09 12:00:00+00','cwl','#LOCAL_WAR'),('local-cwl-next-war','#LOCAL_A','#LOCAL_B','2026-09-08 12:00:00+00','2026-09-10 12:00:00+00','2026-09-10 12:00:00+00','cwl','#LOCAL_NEXT_WAR')`)
 	if err != nil {
 		t.Fatal(err)
 	}
-	count("08", 1)
+	count("08", 2) // Every non-ended group refreshes, even with its next war scheduled.
 	_, err = tx.Exec(t.Context(), `UPDATE war_schedule SET end_time='2026-09-08 11:59:59+00' WHERE schedule_key='local-cwl-war'`)
 	if err != nil {
 		t.Fatal(err)
