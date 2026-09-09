@@ -47,8 +47,6 @@ It deletes a pending payload only after its corresponding locator is durable. It
 
 Each pack stores additive statistics by day: wars by type, total and missed attacks, wars by size, and regular-war details. Regular-war details include Town Hall matchup hit rates with separate zero-, one-, two-, and three-star outcomes, destruction and duration where applicable, plus Town Hall distribution, total stars, wins, losses, and ties by war size. These values let broad statistics endpoints merge small pack rows instead of reading thousands of archived wars.
 
-Every live pack also computes the optional `stats.cwl` v1 histogram from all CWL frames in that pack. League attribution comes from a unique persisted `cwl_groups.rounds` war-tag match rather than a clan's current league. Missing or ambiguous attribution remains in the global `unknown` bucket and marks league coverage incomplete; a malformed frame marks overall coverage incomplete without publishing partial hit-rate data.
-
 ## Configuration
 
 - `war_archiver.scan_seconds`: delay between archive passes.

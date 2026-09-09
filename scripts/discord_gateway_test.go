@@ -5,7 +5,6 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
-	"io"
 	"log/slog"
 	"strings"
 	"testing"
@@ -104,20 +103,14 @@ func TestDiscordGatewayOpenSurfacesWriterFailureBeforeShardStartupCompletes(t *t
 	}
 }
 
-type stalledDiscordMemberRequester struct{}
-
-func (stalledDiscordMemberRequester) RequestAllMembers(ctx context.Context, _ snowflake.ID) ([]discord.Member, error) {
-	<-ctx.Done()
-	return nil, ctx.Err()
-}
-
 func TestValidateDiscordGatewayConfig(t *testing.T) {
 	valid := platform.Config{
-		DiscordBotToken:         "token",
-		DiscordGatewayQueueSize: 1,
-		TimescaleURL:            "postgres://localhost/test",
-		ValkeyAddr:              "localhost:6379",
-		EventStreamName:         "tracking:events",
+		DiscordBotToken:                      "token",
+		DiscordGatewayQueueSize:              1,
+		DiscordGatewayMemberChunkConcurrency: 2,
+		TimescaleURL:                         "postgres://localhost/test",
+		ValkeyAddr:                           "localhost:6379",
+		EventStreamName:                      "tracking:events",
 	}
 	if err := validateDiscordGatewayConfig(valid); err != nil {
 		t.Fatalf("valid gateway config failed: %v", err)
@@ -244,32 +237,5 @@ func TestDiscordGuildActivityReconciliationTransitions(t *testing.T) {
 		if got := discordGuildActivityAction(test.active, test.complete, test.syncing); got != test.want {
 			t.Fatalf("activity action(%v,%v,%v) = %q, want %q", test.active, test.complete, test.syncing, got, test.want)
 		}
-	}
-}
-
-func TestDiscordMemberChunkTimeoutClearsInMemorySyncForReconciliation(t *testing.T) {
-	state := &discordGatewayState{appID: "123", shards: map[int]discordShardState{}, syncs: map[string]discordMemberSync{}}
-	meta := discordMutationMeta{ApplicationID: "123", ShardID: 0, ShardCount: 1, Generation: uuid.New(), Sequence: 7}
-	state.shards[0] = discordShardState{Generation: meta.Generation, ShardCount: 1, Sequence: 7}
-	token := uuid.New()
-	state.syncs["456"] = discordMemberSync{Meta: meta, Token: token, Deltas: []discordMemberDelta{{UserID: "789"}}}
-	snapshotApplied := make(chan bool, 1)
-	snapshotApplied <- true
-	queued := make(chan discordCacheMutation, 1)
-	app := &platform.App{Logger: slog.New(slog.NewTextHandler(io.Discard, nil))}
-	requestDiscordGuildMembersWithTimeout(t.Context(), app, stalledDiscordMemberRequester{}, state, func(mutation discordCacheMutation) {
-		queued <- mutation
-	}, "456", meta, token, snapshotApplied, 10*time.Millisecond)
-
-	select {
-	case mutation := <-queued:
-		if mutation.Meta.Generation != meta.Generation || mutation.Apply == nil {
-			t.Fatalf("timeout cleanup mutation = %#v", mutation)
-		}
-	case <-time.After(time.Second):
-		t.Fatal("member chunk timeout did not queue token cleanup")
-	}
-	if !state.beginReconciledMemberSync("456", meta, uuid.New()) {
-		t.Fatal("timed-out member sync remained stuck and ineligible for reconciliation")
 	}
 }

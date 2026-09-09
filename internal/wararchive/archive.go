@@ -98,7 +98,6 @@ type Locator struct {
 
 type PackStats struct {
 	ByDay map[string]DayStats `json:"byDay"`
-	CWL   *CWLStats           `json:"cwl,omitempty"`
 }
 
 type DayStats struct {

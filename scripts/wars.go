@@ -81,80 +81,70 @@ const dormantWarTargetsSQL = `
 	LIMIT $2
 `
 
-const cwlTargetPredicateSQL = `
-	(
-	  (
-	    EXTRACT(DAY FROM now() AT TIME ZONE 'UTC') BETWEEN 1 AND 15
-	    AND NOT EXISTS (
-	      SELECT 1
-	      FROM cwl_group_clans known_clan
-	      JOIN cwl_groups known_group ON known_group.cwl_id = known_clan.cwl_id
-	      WHERE known_clan.clan_tag = basic_clan.tag
-	        AND left(known_group.season, 7) = to_char(now() AT TIME ZONE 'UTC', 'YYYY-MM')
-	    )
-	  )
-	  OR EXISTS (
-	    SELECT 1
-	    FROM cwl_group_clans group_clan
-	    JOIN cwl_groups cwl_group ON cwl_group.cwl_id = group_clan.cwl_id
-	    WHERE group_clan.clan_tag = basic_clan.tag
-	      AND left(cwl_group.season, 7) = to_char(now() AT TIME ZONE 'UTC', 'YYYY-MM')
-	      AND cwl_group.state <> 'ended'
-	      AND group_clan.clan_tag = (
-	        SELECT min(candidate.clan_tag)
-	        FROM cwl_group_clans candidate
-	        JOIN basic_clan candidate_clan ON candidate_clan.tag = candidate.clan_tag
-	        WHERE candidate.cwl_id = group_clan.cwl_id
-	      )
-	      AND NOT EXISTS (
-	        SELECT 1
-	        FROM war_schedule active_cwl_war
-	        WHERE active_cwl_war.war_type = 'cwl'
-	          AND active_cwl_war.end_time > now()
-	          AND active_cwl_war.end_time - INTERVAL '24 hours' <= now()
-	          AND EXISTS (
-	            SELECT 1
-	            FROM cwl_group_clans active_war_clan
-	            WHERE active_war_clan.cwl_id = cwl_group.cwl_id
-	              AND active_war_clan.clan_tag IN (active_cwl_war.source_clan_tag, active_cwl_war.opponent_tag)
-	          )
-	          AND EXISTS (
-	            SELECT 1
-	            FROM war_schedule next_cwl_war
-	            WHERE next_cwl_war.war_type = 'cwl'
-	              AND next_cwl_war.end_time > active_cwl_war.end_time
-	              AND EXISTS (
-	                SELECT 1
-	                FROM cwl_group_clans next_war_clan
-	                WHERE next_war_clan.cwl_id = cwl_group.cwl_id
-	                  AND next_war_clan.clan_tag IN (next_cwl_war.source_clan_tag, next_cwl_war.opponent_tag)
-	              )
-	          )
-	      )
-	  )
+const cwlDiscoveryTargetsSQL = `
+	WITH current_clans AS MATERIALIZED (
+	  SELECT DISTINCT known_clan.clan_tag
+	  FROM cwl_groups known_group
+	  JOIN cwl_group_clans known_clan ON known_clan.cwl_id = known_group.cwl_id
+	  WHERE known_group.season >= to_char(now() AT TIME ZONE 'UTC', 'YYYY-MM')
+	    AND known_group.season < to_char(date_trunc('month', now() AT TIME ZONE 'UTC') + INTERVAL '1 month', 'YYYY-MM')
 	)
-	AND NOT EXISTS (
-	  SELECT 1
-	  FROM cwl_group_clans group_clan
-	  JOIN cwl_groups cwl_group ON cwl_group.cwl_id = group_clan.cwl_id
-	  WHERE group_clan.clan_tag = basic_clan.tag
-	    AND left(cwl_group.season, 7) = to_char(now() AT TIME ZONE 'UTC', 'YYYY-MM')
-	    AND cwl_group.state = 'ended'
-	)
-`
-
-const cwlTargetsSQL = `
 	SELECT tag, name, COALESCE(cwl_league_id, 0)
 	FROM basic_clan
 	WHERE tag > $1
-	  AND ` + cwlTargetPredicateSQL + `
+	  AND EXTRACT(DAY FROM now() AT TIME ZONE 'UTC') BETWEEN 1 AND 15
+	  AND NOT EXISTS (
+	    SELECT 1
+	    FROM current_clans known_clan
+	    WHERE known_clan.clan_tag = basic_clan.tag
+	  )
 	ORDER BY tag
+	LIMIT $2
+`
+
+const cwlRefreshTargetsSQL = `
+	WITH current_groups AS MATERIALIZED (
+	  SELECT cwl_id
+	  FROM cwl_groups
+	  WHERE season >= to_char(now() AT TIME ZONE 'UTC', 'YYYY-MM')
+	    AND season < to_char(date_trunc('month', now() AT TIME ZONE 'UTC') + INTERVAL '1 month', 'YYYY-MM')
+	    AND state <> 'ended'
+	), representatives AS MATERIALIZED (
+	  SELECT current_group.cwl_id, min(group_clan.clan_tag) AS clan_tag
+	  FROM current_groups current_group
+	  JOIN cwl_group_clans group_clan ON group_clan.cwl_id = current_group.cwl_id
+	  JOIN basic_clan candidate_clan ON candidate_clan.tag = group_clan.clan_tag
+	  GROUP BY current_group.cwl_id
+	), group_wars AS MATERIALIZED (
+	  SELECT DISTINCT current_group.cwl_id, schedule.end_time
+	  FROM current_groups current_group
+	  JOIN cwl_group_clans group_clan ON group_clan.cwl_id = current_group.cwl_id
+	  JOIN war_schedule schedule
+	    ON schedule.war_type = 'cwl'
+	   AND group_clan.clan_tag IN (schedule.source_clan_tag, schedule.opponent_tag)
+	   AND schedule.end_time > now()
+	)
+	SELECT clan.tag, clan.name, COALESCE(clan.cwl_league_id, 0)
+	FROM representatives representative
+	JOIN basic_clan clan ON clan.tag = representative.clan_tag
+	WHERE representative.clan_tag > $1
+	  AND NOT EXISTS (
+	    SELECT 1
+	    FROM group_wars active_war
+	    WHERE active_war.cwl_id = representative.cwl_id
+	      AND active_war.end_time - INTERVAL '24 hours' <= now()
+	      AND EXISTS (
+	        SELECT 1 FROM group_wars next_war
+	        WHERE next_war.cwl_id = active_war.cwl_id
+	          AND next_war.end_time > active_war.end_time
+	      )
+	  )
+	ORDER BY representative.clan_tag
 	LIMIT $2
 `
 
 const activeWarTargetCountSQL = `SELECT count(*) FROM basic_clan WHERE ` + activeWarTargetPredicateSQL
 const dormantWarTargetCountSQL = `SELECT count(*) FROM basic_clan WHERE ` + dormantWarTargetPredicateSQL
-const cwlTargetCountSQL = `SELECT count(*) FROM basic_clan WHERE ` + cwlTargetPredicateSQL
 
 type warsDomain struct {
 	name    string
@@ -228,7 +218,8 @@ type warStore interface {
 type warTargetSource interface {
 	NextTargetBatch(context.Context, int) ([]models.BasicClanRow, error)
 	NextDormantTargetBatch(context.Context, int) ([]models.BasicClanRow, error)
-	NextCWLTargetBatch(context.Context, int) ([]models.BasicClanRow, error)
+	NextCWLDiscoveryTargetBatch(context.Context, int) ([]models.BasicClanRow, error)
+	NextCWLRefreshTargetBatch(context.Context, int) ([]models.BasicClanRow, error)
 	CountTargets(context.Context, warTargetKind) (int, error)
 	Close() error
 }
@@ -291,12 +282,6 @@ func (d *warsDomain) Run(ctx context.Context, app *platform.App) error {
 	}()
 
 	if d.mode == cwlMode {
-		d.refreshWarTargetCounts(runCtx, app)
-		background.Add(1)
-		go func() {
-			defer background.Done()
-			d.runWarTargetCountLoop(runCtx, app)
-		}()
 		d.runCWLLoop(runCtx, app, limiter, warLimiter)
 		return runCtx.Err()
 	}
@@ -380,11 +365,12 @@ func (d *warsDomain) openTargetSource(ctx context.Context, app *platform.App) (w
 }
 
 type timescaleWarTargetSource struct {
-	pool          *pgxpool.Pool
-	mu            sync.Mutex
-	cursor        string
-	dormantCursor string
-	cwlCursor     string
+	pool               *pgxpool.Pool
+	mu                 sync.Mutex
+	cursor             string
+	dormantCursor      string
+	cwlDiscoveryCursor string
+	cwlRefreshCursor   string
 }
 
 func newTimescaleWarTargetSource(ctx context.Context, dsn string) (*timescaleWarTargetSource, error) {
@@ -418,11 +404,19 @@ func (s *timescaleWarTargetSource) NextDormantTargetBatch(ctx context.Context, l
 	return targets, err
 }
 
-func (s *timescaleWarTargetSource) NextCWLTargetBatch(ctx context.Context, limit int) ([]models.BasicClanRow, error) {
+func (s *timescaleWarTargetSource) NextCWLDiscoveryTargetBatch(ctx context.Context, limit int) ([]models.BasicClanRow, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	targets, cursor, err := s.nextTargetBatch(ctx, cwlTargetsSQL, limit, s.cwlCursor)
-	s.cwlCursor = cursor
+	targets, cursor, err := s.nextTargetBatch(ctx, cwlDiscoveryTargetsSQL, limit, s.cwlDiscoveryCursor)
+	s.cwlDiscoveryCursor = cursor
+	return targets, err
+}
+
+func (s *timescaleWarTargetSource) NextCWLRefreshTargetBatch(ctx context.Context, limit int) ([]models.BasicClanRow, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	targets, cursor, err := s.nextTargetBatch(ctx, cwlRefreshTargetsSQL, limit, s.cwlRefreshCursor)
+	s.cwlRefreshCursor = cursor
 	return targets, err
 }
 
@@ -433,8 +427,6 @@ func (s *timescaleWarTargetSource) CountTargets(ctx context.Context, kind warTar
 		query = activeWarTargetCountSQL
 	case dormantWarTargets:
 		query = dormantWarTargetCountSQL
-	case cwlTargets:
-		query = cwlTargetCountSQL
 	default:
 		return 0, fmt.Errorf("unknown war target kind %q", kind)
 	}
@@ -495,12 +487,16 @@ func (s *memoryWarTargetSource) NextTargetBatch(_ context.Context, limit int) ([
 	return out, nil
 }
 
-func (s *memoryWarTargetSource) NextCWLTargetBatch(_ context.Context, limit int) ([]models.BasicClanRow, error) {
+func (s *memoryWarTargetSource) NextCWLDiscoveryTargetBatch(_ context.Context, limit int) ([]models.BasicClanRow, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	out, cursor := memoryWarTargetBatch(s.targets, s.cwlCursor, limit)
 	s.cwlCursor = cursor
 	return out, nil
+}
+
+func (s *memoryWarTargetSource) NextCWLRefreshTargetBatch(_ context.Context, _ int) ([]models.BasicClanRow, error) {
+	return nil, nil
 }
 
 func (s *memoryWarTargetSource) NextDormantTargetBatch(_ context.Context, _ int) ([]models.BasicClanRow, error) {
@@ -510,6 +506,9 @@ func (s *memoryWarTargetSource) NextDormantTargetBatch(_ context.Context, _ int)
 func (s *memoryWarTargetSource) CountTargets(_ context.Context, kind warTargetKind) (int, error) {
 	if kind == dormantWarTargets {
 		return 0, nil
+	}
+	if kind == cwlTargets {
+		return 0, fmt.Errorf("CWL target totals are intentionally not counted")
 	}
 	return len(s.targets), nil
 }
@@ -544,7 +543,7 @@ func newWarLimiter(app *platform.App, mode warDomainMode) (*clashy.Limiter, erro
 func (d *warsDomain) refreshWarTargetCounts(ctx context.Context, app *platform.App) {
 	kinds := []warTargetKind{activeWarTargets, dormantWarTargets}
 	if d.mode == cwlMode {
-		kinds = []warTargetKind{cwlTargets}
+		return
 	}
 	for _, kind := range kinds {
 		count, err := d.targets.CountTargets(ctx, kind)
@@ -1097,10 +1096,18 @@ func (d *warsDomain) runCWLLoop(ctx context.Context, app *platform.App, groupLim
 }
 
 func (d *warsDomain) syncCWLGroups(ctx context.Context, app *platform.App, groupLimiter, warLimiter *clashy.Limiter) error {
-	targets, err := d.targets.NextCWLTargetBatch(ctx, app.Config.CWLRequestsPerSecond*app.Config.TargetPageMultiplier)
+	limit := app.Config.CWLRequestsPerSecond * app.Config.TargetPageMultiplier
+	refreshTargets, err := d.targets.NextCWLRefreshTargetBatch(ctx, limit)
 	if err != nil {
 		return err
 	}
+	discoveryTargets, err := d.targets.NextCWLDiscoveryTargetBatch(ctx, limit)
+	if err != nil {
+		return err
+	}
+	// Refresh known groups first so a direct or restart-time pass catches newly
+	// exposed rounds before spending the request budget on first-time discovery.
+	targets := append(refreshTargets, discoveryTargets...)
 	return d.syncCWLTargets(ctx, app, groupLimiter, warLimiter, targets, false)
 }
 

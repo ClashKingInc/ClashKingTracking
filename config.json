@@ -81,6 +81,7 @@
   },
   "discord_gateway": {
     "queue_size": 4096,
+    "member_chunk_concurrency": 2,
     "message_create_enabled": true
   },
   "discord_delivery": {

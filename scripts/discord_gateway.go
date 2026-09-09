@@ -105,7 +105,11 @@ func (d *discordGatewayDomain) Run(ctx context.Context, app *platform.App) error
 		case <-runCtx.Done():
 		}
 	}
-	listener := discordCacheListener(runCtx, app, pool, state, enqueue)
+	var memberScheduler *discordMemberRequestScheduler
+	listener := discordCacheListener(runCtx, app, pool, state, enqueue,
+		func(request discordMemberRequest) { memberScheduler.Enqueue(request) },
+		func(guildID string) { memberScheduler.CancelGuild(guildID) },
+	)
 	// Discord can serialize snowflake fields as unquoted JSON integers. The
 	// snowflake package parses these directly as uint64 when enabled, without a
 	// float conversion; quoted canonical IDs remain unchanged.
@@ -128,6 +132,17 @@ func (d *discordGatewayDomain) Run(ctx context.Context, app *platform.App) error
 		return fmt.Errorf("create Discord gateway client: %w", err)
 	}
 	state.appID = client.ApplicationID.String()
+	memberScheduler = newDiscordMemberRequestScheduler(
+		runCtx, app, client.MemberChunkingManager, state, enqueue,
+		func(meta discordMutationMeta) bool {
+			current, ok := state.currentMeta(meta.ShardID)
+			shard := client.ShardManager.Shard(meta.ShardID)
+			return ok && current.Generation == meta.Generation && shard != nil && shard.Status() == gateway.StatusReady
+		},
+		app.Config.DiscordGatewayMemberChunkConcurrency,
+		app.Config.DiscordGatewayQueueSize,
+		discordMemberChunkTimeout,
+	)
 	ownership, err := acquireDiscordGatewayOwnership(ctx, pool, state.appID)
 	if err != nil {
 		client.Close(context.WithoutCancel(ctx))
@@ -142,11 +157,11 @@ func (d *discordGatewayDomain) Run(ctx context.Context, app *platform.App) error
 	go runDiscordGatewayHeartbeats(runCtx, client, state, enqueue)
 	reconcileDone := make(chan error, 1)
 	go func() {
-		reconcileDone <- runDiscordGuildActivityReconciler(runCtx, app, pool, client, state, enqueue)
+		reconcileDone <- runDiscordGuildActivityReconciler(runCtx, app, pool, client, state, enqueue, memberScheduler)
 	}()
 	activityDone := make(chan error, 1)
 	go func() {
-		activityDone <- runDiscordGuildActivitySignals(runCtx, app, pool, client, state, enqueue)
+		activityDone <- runDiscordGuildActivitySignals(runCtx, app, pool, client, state, enqueue, memberScheduler)
 	}()
 	wakeDone := make(chan error, 1)
 	go func() {
@@ -154,7 +169,7 @@ func (d *discordGatewayDomain) Run(ctx context.Context, app *platform.App) error
 			if event.Kind != "guild_reactivated" {
 				return nil
 			}
-			return reconcileOneDiscordGuildActivity(wakeCtx, app, pool, client, state, enqueue, event.ServerID)
+			return reconcileOneDiscordGuildActivity(wakeCtx, app, pool, client, state, enqueue, memberScheduler, event.ServerID)
 		})
 	}()
 
@@ -166,6 +181,7 @@ func (d *discordGatewayDomain) Run(ctx context.Context, app *platform.App) error
 		err = awaitDiscordGatewayExit(ctx, writerDone, ownershipDone, reconcileDone, activityDone, wakeDone)
 	}
 	stopRun()
+	memberScheduler.Wait()
 
 	closeCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), 10*time.Second)
 	defer cancel()
@@ -267,6 +283,9 @@ func validateDiscordGatewayConfig(cfg platform.Config) error {
 	if cfg.DiscordGatewayQueueSize < 1 {
 		return errors.New("discord_gateway.queue_size must be greater than zero")
 	}
+	if cfg.DiscordGatewayMemberChunkConcurrency < 1 {
+		return errors.New("discord_gateway.member_chunk_concurrency must be greater than zero")
+	}
 	if cfg.ValkeyAddr == "" || cfg.EventStreamName == "" {
 		return errors.New("Valkey and events.stream are required for discord-gateway activity signals")
 	}
@@ -329,7 +348,7 @@ func runDiscordGatewayHeartbeats(ctx context.Context, client *bot.Client, state 
 	}
 }
 
-func runDiscordGuildActivityReconciler(ctx context.Context, app *platform.App, pool *pgxpool.Pool, client *bot.Client, state *discordGatewayState, enqueue func(discordCacheMutation)) error {
+func runDiscordGuildActivityReconciler(ctx context.Context, app *platform.App, pool *pgxpool.Pool, client *bot.Client, state *discordGatewayState, enqueue func(discordCacheMutation), scheduler *discordMemberRequestScheduler) error {
 	ticker := time.NewTicker(discordGuildActivityReconcileInterval)
 	defer ticker.Stop()
 	for {
@@ -337,14 +356,14 @@ func runDiscordGuildActivityReconciler(ctx context.Context, app *platform.App, p
 		case <-ctx.Done():
 			return ctx.Err()
 		case <-ticker.C:
-			if err := reconcileDiscordGuildActivity(ctx, app, pool, client, state, enqueue); err != nil {
+			if err := reconcileDiscordGuildActivity(ctx, app, pool, client, state, enqueue, scheduler); err != nil {
 				return err
 			}
 		}
 	}
 }
 
-func runDiscordGuildActivitySignals(ctx context.Context, app *platform.App, pool *pgxpool.Pool, client *bot.Client, state *discordGatewayState, enqueue func(discordCacheMutation)) error {
+func runDiscordGuildActivitySignals(ctx context.Context, app *platform.App, pool *pgxpool.Pool, client *bot.Client, state *discordGatewayState, enqueue func(discordCacheMutation), scheduler *discordMemberRequestScheduler) error {
 	const group = "discord-gateway-activity"
 	err := app.Valkey.Do(ctx, app.Valkey.B().XgroupCreate().Key(app.Config.EventStreamName).Group(group).Id("0").Mkstream().Build()).Error()
 	if err != nil && !strings.Contains(err.Error(), "BUSYGROUP") {
@@ -365,7 +384,7 @@ func runDiscordGuildActivitySignals(ctx context.Context, app *platform.App, pool
 			if valid && event.Topic == "discord_guild_activity" {
 				guildID := stringMapValue(event.Value, "guild_id")
 				if parsed, parseErr := snowflake.Parse(guildID); parseErr == nil && parsed.String() == guildID {
-					if reconcileErr := reconcileOneDiscordGuildActivity(ctx, app, pool, client, state, enqueue, guildID); reconcileErr != nil {
+					if reconcileErr := reconcileOneDiscordGuildActivity(ctx, app, pool, client, state, enqueue, scheduler, guildID); reconcileErr != nil {
 						app.Logger.Error("Discord guild activity signal failed", "guild_id", guildID, "err", reconcileErr)
 					}
 				}
@@ -531,6 +550,14 @@ func (s *discordGatewayState) beginReconciledMemberSync(guildID string, meta dis
 	return true
 }
 
+func (s *discordGatewayState) memberSyncCurrent(guildID string, meta discordMutationMeta, token uuid.UUID) bool {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	shard, ok := s.shards[meta.ShardID]
+	memberSync, syncing := s.syncs[guildID]
+	return ok && shard.Generation == meta.Generation && syncing && memberSync.Token == token && memberSync.Meta.Generation == meta.Generation
+}
+
 func (s *discordGatewayState) enqueueMemberDelta(event *events.GenericEvent, guildID string, delta discordMemberDelta, enqueue func(discordCacheMutation), apply func(discordMutationMeta, context.Context, *pgxpool.Pool) error) bool {
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -570,50 +597,14 @@ type discordMemberRequester interface {
 	RequestAllMembers(context.Context, snowflake.ID) ([]discord.Member, error)
 }
 
-func requestDiscordGuildMembers(ctx context.Context, app *platform.App, requester discordMemberRequester, state *discordGatewayState, enqueue func(discordCacheMutation), guildID string, meta discordMutationMeta, token uuid.UUID, snapshotApplied <-chan bool) {
-	requestDiscordGuildMembersWithTimeout(ctx, app, requester, state, enqueue, guildID, meta, token, snapshotApplied, discordMemberChunkTimeout)
-}
-
-func requestDiscordGuildMembersWithTimeout(ctx context.Context, app *platform.App, requester discordMemberRequester, state *discordGatewayState, enqueue func(discordCacheMutation), guildID string, meta discordMutationMeta, token uuid.UUID, snapshotApplied <-chan bool, timeout time.Duration) {
-	go func() {
-		select {
-		case active := <-snapshotApplied:
-			if !active {
-				state.cancelMemberSync(guildID, token)
-				return
-			}
-		case <-ctx.Done():
-			state.cancelMemberSync(guildID, token)
-			return
-		}
-		id, err := snowflake.Parse(guildID)
-		var members []discord.Member
-		if err == nil {
-			requestCtx, cancel := context.WithTimeout(ctx, timeout)
-			members, err = requester.RequestAllMembers(requestCtx, id)
-			cancel()
-		}
-		if err == nil {
-			state.completeMemberSync(guildID, meta, token, enqueue, members)
-			return
-		}
-		state.cancelMemberSync(guildID, token)
-		enqueue(discordCacheMutation{Meta: meta, Apply: func(ctx context.Context, pool *pgxpool.Pool) error {
-			_, clearErr := pool.Exec(ctx, `UPDATE discord_cache.guilds SET members_sync_token = NULL, members_complete = false, updated_at = now() WHERE id = $1 AND application_id = $2 AND shard_id = $3 AND generation = $4 AND members_sync_token = $5`, guildID, meta.ApplicationID, meta.ShardID, meta.Generation, token)
-			return clearErr
-		}})
-		if !errors.Is(err, context.Canceled) {
-			app.Logger.Error("Discord member chunk failed", "guild_id", guildID, "err", err)
-		}
-	}()
-}
-
 func discordCacheListener(
 	ctx context.Context,
 	app *platform.App,
 	pool *pgxpool.Pool,
 	state *discordGatewayState,
 	enqueue func(discordCacheMutation),
+	scheduleMembers func(discordMemberRequest),
+	cancelMembers func(string),
 ) *events.ListenerAdapter {
 	handleGuildSnapshot := func(event *events.GenericEvent, client *bot.Client, guild discord.GatewayGuild, initial bool) {
 		guildID := guild.ID.String()
@@ -631,7 +622,11 @@ func discordCacheListener(
 			applied <- false
 			return
 		}
-		requestDiscordGuildMembers(ctx, app, client.MemberChunkingManager, state, enqueue, guildID, meta, token, applied)
+		priority := discordMemberRequestImmediate
+		if initial {
+			priority = discordMemberRequestBackground
+		}
+		scheduleMembers(discordMemberRequest{guildID: guildID, meta: meta, token: token, snapshotApplied: applied, priority: priority})
 	}
 
 	return &events.ListenerAdapter{
@@ -659,6 +654,7 @@ func discordCacheListener(
 		},
 		OnGuildUnavailable: func(event *events.GuildUnavailable) {
 			guildID := event.GuildID.String()
+			cancelMembers(guildID)
 			state.cancelMemberSync(guildID, uuid.Nil)
 			state.enqueueEvent(event.GenericEvent, enqueue, func(meta discordMutationMeta, ctx context.Context, pool *pgxpool.Pool) error {
 				return markDiscordGuildUnavailable(ctx, pool, guildID, meta)
@@ -672,6 +668,7 @@ func discordCacheListener(
 		},
 		OnGuildLeave: func(event *events.GuildLeave) {
 			guildID := event.GuildID.String()
+			cancelMembers(guildID)
 			state.cancelMemberSync(guildID, uuid.Nil)
 			state.enqueueEvent(event.GenericEvent, enqueue, func(meta discordMutationMeta, ctx context.Context, pool *pgxpool.Pool) error {
 				return deleteDiscordGuild(ctx, pool, guildID, meta)
@@ -778,7 +775,7 @@ type discordGuildActivity struct {
 	active   bool
 }
 
-func reconcileDiscordGuildActivity(ctx context.Context, app *platform.App, pool *pgxpool.Pool, client *bot.Client, state *discordGatewayState, enqueue func(discordCacheMutation)) error {
+func reconcileDiscordGuildActivity(ctx context.Context, app *platform.App, pool *pgxpool.Pool, client *bot.Client, state *discordGatewayState, enqueue func(discordCacheMutation), scheduler *discordMemberRequestScheduler) error {
 	rows, err := pool.Query(ctx, `
 		SELECT guild.id, guild.shard_id, guild.members_complete,
 		       guild.members_sync_token IS NOT NULL,
@@ -810,12 +807,12 @@ func reconcileDiscordGuildActivity(ctx context.Context, app *platform.App, pool 
 		return err
 	}
 	for _, item := range changes {
-		applyDiscordGuildActivity(ctx, app, pool, client, state, enqueue, item)
+		applyDiscordGuildActivity(ctx, app, pool, client, state, enqueue, scheduler, item, discordMemberRequestBackground)
 	}
 	return nil
 }
 
-func reconcileOneDiscordGuildActivity(ctx context.Context, app *platform.App, pool *pgxpool.Pool, client *bot.Client, state *discordGatewayState, enqueue func(discordCacheMutation), guildID string) error {
+func reconcileOneDiscordGuildActivity(ctx context.Context, app *platform.App, pool *pgxpool.Pool, client *bot.Client, state *discordGatewayState, enqueue func(discordCacheMutation), scheduler *discordMemberRequestScheduler, guildID string) error {
 	var item discordGuildActivity
 	err := pool.QueryRow(ctx, `
 		SELECT guild.id, guild.shard_id, guild.members_complete,
@@ -836,11 +833,11 @@ func reconcileOneDiscordGuildActivity(ctx context.Context, app *platform.App, po
 	if err != nil {
 		return err
 	}
-	applyDiscordGuildActivity(ctx, app, pool, client, state, enqueue, item)
+	applyDiscordGuildActivity(ctx, app, pool, client, state, enqueue, scheduler, item, discordMemberRequestImmediate)
 	return nil
 }
 
-func applyDiscordGuildActivity(ctx context.Context, app *platform.App, pool *pgxpool.Pool, client *bot.Client, state *discordGatewayState, enqueue func(discordCacheMutation), item discordGuildActivity) {
+func applyDiscordGuildActivity(ctx context.Context, app *platform.App, pool *pgxpool.Pool, client *bot.Client, state *discordGatewayState, enqueue func(discordCacheMutation), scheduler *discordMemberRequestScheduler, item discordGuildActivity, priority discordMemberRequestPriority) {
 	if discordGuildActivityAction(item.active, item.complete, item.syncing) == "" {
 		return
 	}
@@ -849,14 +846,11 @@ func applyDiscordGuildActivity(ctx context.Context, app *platform.App, pool *pgx
 		return
 	}
 	if !item.active {
+		scheduler.CancelGuild(item.guildID)
 		state.cancelMemberSync(item.guildID, uuid.Nil)
 		enqueue(discordCacheMutation{Meta: meta, Apply: func(ctx context.Context, pool *pgxpool.Pool) error {
 			return deactivateDiscordGuildMembers(ctx, pool, item.guildID, meta)
 		}})
-		return
-	}
-	gatewayShard := client.ShardManager.Shard(item.shardID)
-	if gatewayShard == nil || gatewayShard.Status() != gateway.StatusReady {
 		return
 	}
 	token := uuid.New()
@@ -864,6 +858,9 @@ func applyDiscordGuildActivity(ctx context.Context, app *platform.App, pool *pgx
 		return
 	}
 	applied := make(chan bool, 1)
+	if !scheduler.Enqueue(discordMemberRequest{guildID: item.guildID, meta: meta, token: token, snapshotApplied: applied, priority: priority}) {
+		return
+	}
 	enqueue(discordCacheMutation{Meta: meta, Apply: func(ctx context.Context, pool *pgxpool.Pool) error {
 		result, err := pool.Exec(ctx, `
 			UPDATE discord_cache.guilds AS guild
@@ -875,7 +872,9 @@ func applyDiscordGuildActivity(ctx context.Context, app *platform.App, pool *pgx
 		applied <- err == nil && result.RowsAffected() == 1
 		return err
 	}})
-	requestDiscordGuildMembers(ctx, app, client.MemberChunkingManager, state, enqueue, item.guildID, meta, token, applied)
+	_ = ctx
+	_ = app
+	_ = client
 }
 
 func discordGuildActivityAction(active, complete, syncing bool) string {
