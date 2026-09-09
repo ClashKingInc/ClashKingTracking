@@ -181,7 +181,7 @@ func TestBattlelogRequestConcurrencyIsMemoryBounded(t *testing.T) {
 	}
 }
 
-func TestBattlelogRowFromEntryUsesExactOpponentTownHall(t *testing.T) {
+func TestBattlelogRowFromEntryConvertsZeroIndexedOpponentTownHall(t *testing.T) {
 	entry := clashy.BattleLogEntry{
 		OpponentPlayerTag:     "#OPP",
 		OpponentName:          "Opponent Name",
@@ -194,8 +194,8 @@ func TestBattlelogRowFromEntryUsesExactOpponentTownHall(t *testing.T) {
 	if row.Duration != 173 {
 		t.Fatalf("duration = %d, want 173", row.Duration)
 	}
-	if row.OpponentTH != 16 {
-		t.Fatalf("opponent th = %d, want 16", row.OpponentTH)
+	if row.OpponentTH != 17 {
+		t.Fatalf("opponent th = %d, want 17", row.OpponentTH)
 	}
 	if row.ArmyShareCode != "" {
 		t.Fatalf("army share code = %q, want empty", row.ArmyShareCode)
@@ -288,4 +288,24 @@ func TestMergeBattlelogIngestsKeepsLatestCheckpoint(t *testing.T) {
 
 func clashTimestamp(value time.Time) string {
 	return value.UTC().Format("20060102T150405.000Z")
+}
+
+func TestBattlelogZeroIndexedTownHallBounds(t *testing.T) {
+	now := time.Date(2026, 9, 9, 12, 0, 0, 0, time.UTC)
+	for _, th := range []int{0, 16, 19, -1, 20} {
+		entry := clashy.BattleLogEntry{BattleType: clashy.BattleTypeLegend, Attack: true, OpponentPlayerTag: "#P0Y", OpponentTownHallLevel: th, ArmyShareCode: "u1x0", Timestamp: clashTimestamp(now)}
+		ingest, err := battlelogIngestFromEntries([]clashy.BattleLogEntry{entry}, "#Y2", models.BattlelogCheckpoint{}, now, 14)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if th < 0 || th >= 20 {
+			if len(ingest.Rows) != 0 || len(ingest.Checkpoints) != 0 {
+				t.Fatalf("invalid index %d advanced ingest", th)
+			}
+			continue
+		}
+		if len(ingest.Rows) != 1 || int(ingest.Rows[0].OpponentTH) != th+1 {
+			t.Fatalf("index %d: %#v", th, ingest.Rows)
+		}
+	}
 }

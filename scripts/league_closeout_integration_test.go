@@ -42,16 +42,23 @@ func TestFinalSchemaBattleIngestAndLegendCloseoutAreIdempotent(t *testing.T) {
 	defense.OpponentTag = "#P0"
 	defense.OpponentTH = 18
 	defense.Attack = false
-	first, err := store.Store(ctx, models.BattlelogIngest{Rows: []models.BattlelogRow{attack, defense}})
+	first, err := store.Store(ctx, models.BattlelogIngest{Rows: []models.BattlelogRow{attack}})
 	if err != nil {
 		t.Fatal(err)
+	}
+	if first != 1 {
+		t.Fatalf("one requested attack inserted %d rows", first)
+	}
+	defenseInserted, err := store.Store(ctx, models.BattlelogIngest{Rows: []models.BattlelogRow{defense}})
+	if err != nil || defenseInserted != 1 {
+		t.Fatalf("requested defense inserted %d rows: %v", defenseInserted, err)
 	}
 	second, err := store.Store(ctx, models.BattlelogIngest{Rows: []models.BattlelogRow{attack, defense}})
 	if err != nil {
 		t.Fatal(err)
 	}
-	if first != 2 || second != 0 {
-		t.Fatalf("writes = %d then %d, want 2 then 0", first, second)
+	if first != 1 || second != 0 {
+		t.Fatalf("writes = %d then %d, want 1 then 0", first, second)
 	}
 	var total, attacks int
 	if err := store.pool.QueryRow(ctx, `SELECT count(*),count(*) FILTER(WHERE direction='attack') FROM battles_ranked`).Scan(&total, &attacks); err != nil {

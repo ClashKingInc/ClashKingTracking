@@ -382,7 +382,7 @@ func battlelogIngestFromEntries(entries []clashy.BattleLogEntry, playerTag strin
 			// metadata. Home-village defenses can safely advance the checkpoint.
 			include = entry.Attack
 		case "ranked", "legend":
-			if entry.OpponentPlayerTag == "" || entry.OpponentTownHallLevel <= 0 {
+			if entry.OpponentPlayerTag == "" || entry.OpponentTownHallLevel < 0 || entry.OpponentTownHallLevel >= 20 {
 				// Persist only complete observations for the player that was requested.
 				return models.BattlelogIngest{}, nil
 			}
@@ -617,7 +617,7 @@ func (s *timescaleBattlelogStore) insertBattlelogRows(ctx context.Context, tx pg
 				NULLIF(duration_seconds, 0), looted_resources,
 				NULLIF(army_share_code, ''), army_hash
 			FROM observations
-			ON CONFLICT (player_tag, battle_time, battle_mode, direction, opponent_tag) DO NOTHING
+			ON CONFLICT (player_tag, battle_time) DO NOTHING
 			RETURNING 1
 		)
 		SELECT count(*)::integer FROM inserted
@@ -953,7 +953,7 @@ func battlelogRowFromEntry(playerTag string, entry clashy.BattleLogEntry) models
 		ArmyHash:              canonicalArmyHash(armyShareCode),
 		PlayerTag:             playerTag,
 		OpponentTag:           entry.OpponentPlayerTag,
-		OpponentTH:            uint8(entry.OpponentTownHallLevel),
+		OpponentTH:            uint8(entry.OpponentTownHallLevel + 1),
 		BattleType:            battlelogStorageMode(entry.BattleType),
 		Attack:                entry.Attack,
 		Stars:                 uint8(entry.Stars),
