@@ -32,6 +32,12 @@ An already-ended war is stored from its first response, without scheduling a sec
 
 ## League resolution and configuration
 
+### War-worker throughput and size assignment
+
+When a group first exposes real tags, the checker marks one job `setSize: true`; other jobs explicitly carry `false`. The designated job fills `war_size` only when it is null, using its fetched or already-stored war size. Temporary failures retain the flag. A permanently unavailable designated tag hands responsibility to the next stored round tag, when available. Legacy queued jobs without a flag remain supported: one job per group per process attempts the conditional update, so existing values are never rewritten.
+
+The archiver continuously feeds up to 256 in-flight hydration jobs from a bounded buffer. Known war tags are checked in batches. Each free slot refills without waiting for the slowest request; polling waits only when there are no additional jobs due. Hydration and finalization still share the configured request-start limiter. Run one archiver consumer: its in-flight set prevents duplicate dispatch within that process, and restart replay remains safe through SQL deduplication.
+
 The existing one-time league resolution is retained: reuse the group's saved league, otherwise use sibling `basic_clan` league data or the configured clan-profile lookup. A failed league lookup does not prevent storing the group; a later refresh can resolve it.
 
 - `cwl.requests_per_second`: shared discovery/refresh group and optional profile budget.

@@ -140,8 +140,9 @@ type warsDomain struct {
 	limiter *clashy.Limiter
 	now     func() time.Time
 
-	mu        sync.Mutex
-	scheduled map[string]time.Time
+	mu            sync.Mutex
+	scheduled     map[string]time.Time
+	cwlSizeClaims sync.Map
 }
 
 type scheduledWarPendingError struct {
@@ -709,6 +710,9 @@ func (d *warsDomain) do(ctx context.Context, app *platform.App, limiter *clashy.
 		}
 		return models.WarIngest{}, nil
 	}
+	if !req.StoreOnly && req.WarTag == "" && !discoverableRegularWar(*war, d.currentTime()) {
+		return models.WarIngest{}, nil
+	}
 	if req.StoreOnly && war.State != clashy.WarStateEnded {
 		opponentClanTag := req.OpponentTag
 		if sourceClanTag == req.OpponentTag {
@@ -859,6 +863,12 @@ func (d *warsDomain) fetchOneWarWithStats(ctx context.Context, app *platform.App
 		app.Stats.RecordRequest(statsName, time.Since(start), fetchErr)
 		return war, fetchErr
 	})
+}
+
+func discoverableRegularWar(war clashy.ClanWar, now time.Time) bool {
+	return (war.State == clashy.WarStatePreparation || war.State == clashy.WarStateInWar) &&
+		war.EndTime != nil && war.EndTime.Time.After(now) && war.PreparationStartTime != nil &&
+		war.Clan != nil && war.Clan.Tag != "" && war.Opponent != nil && war.Opponent.Tag != ""
 }
 
 func scheduledWarMatches(req warFetchRequest, war clashy.ClanWar) bool {
@@ -1221,7 +1231,12 @@ func (d *warsDomain) syncCWLTargets(ctx context.Context, app *platform.App, grou
 		}
 		// Enqueue before updating rounds, so a failed enqueue cannot make a new
 		// tag disappear from the next API-versus-database comparison.
-		if err := enqueueCWLWarTags(workerCtx, app, cwlID, newCWLWarTags(previous, warTags(group))); err != nil {
+		fetchedTags := warTags(group)
+		setSizeTag := ""
+		if len(previous) == 0 && len(fetchedTags) > 0 {
+			setSizeTag = fetchedTags[0]
+		}
+		if err := enqueueCWLWarTags(workerCtx, app, cwlID, newCWLWarTags(previous, fetchedTags), setSizeTag); err != nil {
 			return err
 		}
 		if err := d.storeIngest(workerCtx, app, models.WarIngest{CWLGroups: []models.CWLGroupRow{groupRow}}); err != nil {
@@ -1349,15 +1364,22 @@ func cwlGroupClanRows(group *clashy.ClanWarLeagueGroup) []models.CWLGroupClanRow
 	return rows
 }
 
-func (d *warsDomain) scheduleCWLWars(ctx context.Context, app *platform.App, limiter *clashy.Limiter, group *clashy.ClanWarLeagueGroup, strict bool) (int, error) {
+func (d *warsDomain) scheduleCWLWars(ctx context.Context, app *platform.App, limiter *clashy.Limiter, group *clashy.ClanWarLeagueGroup, strict bool, knownBatch ...map[string]int) (int, error) {
 	statsName := trackingProgressName(d.name, string(cwlTargets))
 	warSize := 0
 	tags := warTags(group)
-	known, err := d.store.KnownCWLWarTags(ctx, tags)
-	if err != nil {
-		return 0, err
+	var known map[string]int
+	if len(knownBatch) > 0 {
+		known = knownBatch[0]
+	} else {
+		var err error
+		known, err = d.store.KnownCWLWarTags(ctx, tags)
+		if err != nil {
+			return 0, err
+		}
 	}
-	for _, size := range known {
+	for _, tag := range tags {
+		size := known[tag]
 		if size > 0 {
 			warSize = size
 			break
