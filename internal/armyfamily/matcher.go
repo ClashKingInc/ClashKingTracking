@@ -1,20 +1,14 @@
 package armyfamily
 
 import (
-	"bytes"
 	"sort"
-	"time"
 )
 
 const (
-	MatchingVersion             = "army-family-v1"
-	MinimumTroopSimilarity      = 0.86
-	MinimumSpellSimilarity      = 0.80
-	MinimumEquipmentSimilarity  = 0.75
-	MaximumEquipmentDifferences = 2
+	MinimumTroopSimilarity     = 0.86
+	MinimumSpellSimilarity     = 0.80
+	MinimumEquipmentSimilarity = 0.75
 )
-
-type Hash [32]byte
 
 type Composition struct {
 	TroopHousing  map[int]int
@@ -24,35 +18,29 @@ type Composition struct {
 }
 
 type Anchor struct {
-	Hash        Hash
+	FamilyID    int64
+	ShareCode   string
 	Composition Composition
-	CreatedAt   time.Time
 }
 
 type Match struct {
-	AnchorHash               Hash
-	TroopHousingSimilarity   float64
-	SpellCapacitySimilarity  float64
-	HeroesExact              bool
-	EquipmentSimilarity      float64
-	EquipmentDifferenceCount int
-	MatchingVersion          string
+	FamilyID                int64
+	TroopHousingSimilarity  float64
+	SpellCapacitySimilarity float64
+	EquipmentSimilarity     float64
 }
 
 func FindDirectAnchor(candidate Composition, anchors []Anchor) (Match, bool) {
 	matches := make([]Match, 0, len(anchors))
-	created := make(map[Hash]time.Time, len(anchors))
 	for _, anchor := range anchors {
 		match := compare(candidate, anchor)
 		if match.TroopHousingSimilarity < MinimumTroopSimilarity ||
 			match.SpellCapacitySimilarity < MinimumSpellSimilarity ||
-			!match.HeroesExact ||
-			match.EquipmentSimilarity < MinimumEquipmentSimilarity ||
-			match.EquipmentDifferenceCount > MaximumEquipmentDifferences {
+			!sameSet(candidate.Heroes, anchor.Composition.Heroes) ||
+			match.EquipmentSimilarity < MinimumEquipmentSimilarity {
 			continue
 		}
 		matches = append(matches, match)
-		created[anchor.Hash] = anchor.CreatedAt
 	}
 	if len(matches) == 0 {
 		return Match{}, false
@@ -62,23 +50,17 @@ func FindDirectAnchor(candidate Composition, anchors []Anchor) (Match, bool) {
 		if left != right {
 			return left > right
 		}
-		if !created[matches[i].AnchorHash].Equal(created[matches[j].AnchorHash]) {
-			return created[matches[i].AnchorHash].Before(created[matches[j].AnchorHash])
-		}
-		return bytes.Compare(matches[i].AnchorHash[:], matches[j].AnchorHash[:]) < 0
+		return matches[i].FamilyID < matches[j].FamilyID
 	})
 	return matches[0], true
 }
 
 func compare(candidate Composition, anchor Anchor) Match {
 	return Match{
-		AnchorHash:               anchor.Hash,
-		TroopHousingSimilarity:   weightedSimilarity(candidate.TroopHousing, anchor.Composition.TroopHousing),
-		SpellCapacitySimilarity:  weightedSimilarity(candidate.SpellCapacity, anchor.Composition.SpellCapacity),
-		HeroesExact:              sameSet(candidate.Heroes, anchor.Composition.Heroes),
-		EquipmentSimilarity:      setSimilarity(candidate.Equipment, anchor.Composition.Equipment),
-		EquipmentDifferenceCount: symmetricDifferenceCount(candidate.Equipment, anchor.Composition.Equipment),
-		MatchingVersion:          MatchingVersion,
+		FamilyID:                anchor.FamilyID,
+		TroopHousingSimilarity:  weightedSimilarity(candidate.TroopHousing, anchor.Composition.TroopHousing),
+		SpellCapacitySimilarity: weightedSimilarity(candidate.SpellCapacity, anchor.Composition.SpellCapacity),
+		EquipmentSimilarity:     setSimilarity(candidate.Equipment, anchor.Composition.Equipment),
 	}
 }
 

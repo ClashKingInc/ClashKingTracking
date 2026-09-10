@@ -56,10 +56,6 @@ type Config struct {
 	LeaderboardNullAssetURL                string
 	ScheduledRequestsPerSecond             int
 	ScheduledIntervalSeconds               int
-	CloudflareAccountID                    string
-	CloudflareAIGatewayID                  string
-	CloudflareAIAPIToken                   string
-	CloudflareAIAPIOrigin                  string
 	ReminderRequestsPerSecond              int
 	GiveawayScanSeconds                    int
 	RedditPollSeconds                      int
@@ -338,10 +334,6 @@ func applyEnvironment(cfg *Config) {
 	cfg.SentryDSN = strings.TrimSpace(os.Getenv("SENTRY_DSN"))
 	cfg.SentryEnvironment = strings.TrimSpace(os.Getenv("SENTRY_ENVIRONMENT"))
 	cfg.SentryRelease = strings.TrimSpace(os.Getenv("SENTRY_RELEASE"))
-	cfg.CloudflareAccountID = strings.TrimSpace(os.Getenv("CLOUDFLARE_ACCOUNT_ID"))
-	cfg.CloudflareAIGatewayID = firstNonEmpty(strings.TrimSpace(os.Getenv("CLOUDFLARE_AI_GATEWAY_ID")), "clashking")
-	cfg.CloudflareAIAPIToken = os.Getenv("CLOUDFLARE_AI_API_TOKEN")
-	cfg.CloudflareAIAPIOrigin = normalizeOrigin(os.Getenv("CLASHKING_LOCAL_CLOUDFLARE_AI_API_ORIGIN"))
 	if value := strings.TrimSpace(os.Getenv("DISCORD_MESSAGE_CREATE_ENABLED")); value != "" {
 		cfg.DiscordMessageCreateEnabled = strings.EqualFold(value, "true") || value == "1"
 	}

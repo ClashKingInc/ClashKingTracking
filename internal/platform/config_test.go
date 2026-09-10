@@ -206,10 +206,6 @@ func TestLoadWithArgsReadsSecretsFromEnv(t *testing.T) {
 	t.Setenv("TIMESCALE_SSLMODE", "require")
 	t.Setenv("CLASHKING_LOCAL_DISCORD_API_URL", "http://127.0.0.1:18080/v10/")
 	t.Setenv("CLASHKING_LOCAL_FCM_API_ORIGIN", "http://127.0.0.1:18081/")
-	t.Setenv("CLOUDFLARE_ACCOUNT_ID", "cf-account")
-	t.Setenv("CLOUDFLARE_AI_GATEWAY_ID", "tracking-test")
-	t.Setenv("CLOUDFLARE_AI_API_TOKEN", "cf-token")
-	t.Setenv("CLASHKING_LOCAL_CLOUDFLARE_AI_API_ORIGIN", "http://127.0.0.1:18082/")
 	cfg := LoadWithArgs([]string{"--script", "wars"})
 
 	if cfg.TimescaleURL != "postgres://tracking:p%40ss%2Fword@timescale:5432/tracking%20data?sslmode=require" {
@@ -217,10 +213,6 @@ func TestLoadWithArgsReadsSecretsFromEnv(t *testing.T) {
 	}
 	if cfg.DiscordAPIURL != "http://127.0.0.1:18080/v10" || cfg.MobilePushFCMAPIOrigin != "http://127.0.0.1:18081" {
 		t.Fatalf("local provider overrides were not normalized: %+v", cfg)
-	}
-	if cfg.CloudflareAccountID != "cf-account" || cfg.CloudflareAIGatewayID != "tracking-test" ||
-		cfg.CloudflareAIAPIToken != "cf-token" || cfg.CloudflareAIAPIOrigin != "http://127.0.0.1:18082" {
-		t.Fatalf("Cloudflare AI Gateway environment was not applied: %+v", cfg)
 	}
 }
 

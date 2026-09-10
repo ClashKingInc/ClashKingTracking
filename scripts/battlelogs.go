@@ -2,10 +2,10 @@ package scripts
 
 import (
 	"context"
-	"crypto/sha256"
 	"encoding/json"
 	"errors"
 	"fmt"
+	"math"
 	"net/url"
 	"regexp"
 	"sort"
@@ -391,9 +391,9 @@ func battlelogIngestFromEntries(entries []clashy.BattleLogEntry, playerTag strin
 			// Unknown modes are outside this persistence contract.
 		}
 		if include {
-			row := battlelogRowFromEntry(playerTag, entry)
-			if row.ArmyShareCode == "" {
-				return models.BattlelogIngest{}, nil
+			row, err := battlelogRowFromEntry(playerTag, entry)
+			if err != nil {
+				return models.BattlelogIngest{}, err
 			}
 			rows = append(rows, row)
 		}
@@ -532,7 +532,6 @@ func (s *timescaleBattlelogStore) insertBattlelogRows(ctx context.Context, tx pg
 			looted_resources jsonb NOT NULL,
 			duration_seconds integer NOT NULL,
 			battle_time timestamp with time zone NOT NULL,
-			army_hash bytea NOT NULL,
 			army_share_code text NOT NULL
 		) ON COMMIT DELETE ROWS
 	`); err != nil {
@@ -540,7 +539,6 @@ func (s *timescaleBattlelogStore) insertBattlelogRows(ctx context.Context, tx pg
 	}
 
 	copyRows := make([][]any, 0, len(rows))
-	compositions := make(map[[sha256.Size]byte]models.BattlelogRow)
 	for _, row := range rows {
 		playerTag := clashy.CorrectTag(row.PlayerTag)
 		if playerTag == "" {
@@ -563,22 +561,14 @@ func (s *timescaleBattlelogStore) insertBattlelogRows(ctx context.Context, tx pg
 		copyRows = append(copyRows, []any{
 			playerTag, opponentTag, int16(row.OpponentTH), mode, row.Attack,
 			int16(row.Stars), int16(row.DestructionPercentage), loot,
-			int32(row.Duration), row.Timestamp, row.ArmyHash[:], row.ArmyShareCode,
+			int32(row.Duration), row.Timestamp, row.ArmyShareCode,
 		})
-		// Detailed army analytics cover Legend battles only. Keep the share code
-		// and hash in every raw battle without materializing Ranked compositions.
-		if mode == "legend" {
-			compositions[row.ArmyHash] = row
-		}
 	}
 	if _, err := tx.CopyFrom(ctx, pgx.Identifier{"battlelog_ingest_stage"}, []string{
 		"requested_tag", "opponent_tag", "opponent_th", "mode", "requested_attack",
 		"stars", "destruction_percentage", "looted_resources", "duration_seconds",
-		"battle_time", "army_hash", "army_share_code",
+		"battle_time", "army_share_code",
 	}, pgx.CopyFromRows(copyRows)); err != nil {
-		return 0, err
-	}
-	if err := insertArmyCompositions(ctx, tx, compositions); err != nil {
 		return 0, err
 	}
 
@@ -609,13 +599,14 @@ func (s *timescaleBattlelogStore) insertBattlelogRows(ctx context.Context, tx pg
 			INSERT INTO battles_ranked (
 				player_tag, battle_time, direction, opponent_tag, battle_mode,
 				player_town_hall, opponent_town_hall, stars, destruction_percentage,
-				duration_seconds, looted_resources, share_code, army_hash
+				duration_seconds, looted_resources, share_code
 			)
 			SELECT requested_tag, battle_time,
 				CASE WHEN requested_attack THEN 'attack' ELSE 'defense' END,
 				opponent_tag, mode, requested_th, opponent_th, stars, destruction_percentage,
-				NULLIF(duration_seconds, 0), looted_resources,
-				NULLIF(army_share_code, ''), army_hash
+				NULLIF(duration_seconds, 0),
+				CASE WHEN requested_attack THEN looted_resources ELSE NULL END,
+				NULLIF(army_share_code, '')
 			FROM observations
 			ON CONFLICT (player_tag, battle_time) DO NOTHING
 			RETURNING 1
@@ -657,96 +648,6 @@ type armyCompositionRecord struct {
 	Equipment        []armyHeroEquipment
 	PetAssignments   []armyPetAssignment
 	SiegeMachineID   *int32
-}
-
-func insertArmyCompositions(ctx context.Context, tx pgx.Tx, compositions map[[sha256.Size]byte]models.BattlelogRow) error {
-	if len(compositions) == 0 {
-		return nil
-	}
-	if _, err := tx.Exec(ctx, `
-		CREATE TEMP TABLE IF NOT EXISTS battlelog_army_composition_stage (
-			army_hash bytea NOT NULL,
-			normalized_share_code text NOT NULL,
-			main_troops jsonb NOT NULL,
-			clan_castle_troops jsonb NOT NULL,
-			spells jsonb NOT NULL,
-			heroes integer[] NOT NULL,
-			equipment jsonb NOT NULL,
-			pet_assignments jsonb NOT NULL,
-			siege_machine_id integer
-		) ON COMMIT DELETE ROWS
-	`); err != nil {
-		return err
-	}
-
-	hashes := make([][sha256.Size]byte, 0, len(compositions))
-	shareCodeHashes := make(map[string][sha256.Size]byte, len(compositions))
-	for hash, row := range compositions {
-		if existing, ok := shareCodeHashes[row.ArmyShareCode]; ok && existing != hash {
-			return fmt.Errorf("normalized army share code maps to multiple composition hashes: %q (%x, %x)", row.ArmyShareCode, existing, hash)
-		}
-		shareCodeHashes[row.ArmyShareCode] = hash
-		hashes = append(hashes, hash)
-	}
-	sort.Slice(hashes, func(i, j int) bool { return strings.Compare(string(hashes[i][:]), string(hashes[j][:])) < 0 })
-	static, err := clashy.LoadStaticData()
-	if err != nil {
-		return fmt.Errorf("load static data for army composition: %w", err)
-	}
-	compositionRows := make([][]any, 0, len(hashes))
-	for _, hash := range hashes {
-		row := compositions[hash]
-		record := armyCompositionFromColumns(static, row.ArmyShareCode, row.ArmyColumns)
-		mainTroops, _ := json.Marshal(record.MainTroops)
-		clanCastleTroops, _ := json.Marshal(record.ClanCastleTroops)
-		spells, _ := json.Marshal(record.Spells)
-		equipment, _ := json.Marshal(record.Equipment)
-		petAssignments, _ := json.Marshal(record.PetAssignments)
-		compositionRows = append(compositionRows, []any{
-			hash[:], row.ArmyShareCode, json.RawMessage(mainTroops), json.RawMessage(clanCastleTroops),
-			json.RawMessage(spells), record.Heroes, json.RawMessage(equipment),
-			json.RawMessage(petAssignments), record.SiegeMachineID,
-		})
-	}
-	columns := []string{
-		"army_hash", "normalized_share_code", "main_troops", "clan_castle_troops",
-		"spells", "heroes", "equipment", "pet_assignments", "siege_machine_id",
-	}
-	if _, err := tx.CopyFrom(ctx, pgx.Identifier{"battlelog_army_composition_stage"}, columns, pgx.CopyFromRows(compositionRows)); err != nil {
-		return err
-	}
-	if _, err := tx.Exec(ctx, `
-		INSERT INTO army_compositions (
-			army_hash, normalized_share_code, main_troops, clan_castle_troops,
-			spells, heroes, equipment, pet_assignments, siege_machine_id
-		)
-		SELECT army_hash, normalized_share_code, main_troops, clan_castle_troops,
-			spells, heroes, equipment, pet_assignments, siege_machine_id
-		FROM battlelog_army_composition_stage
-		ON CONFLICT (army_hash) DO NOTHING
-	`); err != nil {
-		return err
-	}
-	var mismatchCount int
-	if err := tx.QueryRow(ctx, `
-		SELECT count(*)::integer
-		FROM battlelog_army_composition_stage staged
-		JOIN army_compositions stored USING (army_hash)
-		WHERE staged.normalized_share_code <> stored.normalized_share_code
-		   OR staged.main_troops <> stored.main_troops
-		   OR staged.clan_castle_troops <> stored.clan_castle_troops
-		   OR staged.spells <> stored.spells
-		   OR staged.heroes <> stored.heroes
-		   OR staged.equipment <> stored.equipment
-		   OR staged.pet_assignments <> stored.pet_assignments
-		   OR staged.siege_machine_id IS DISTINCT FROM stored.siege_machine_id
-	`).Scan(&mismatchCount); err != nil {
-		return err
-	}
-	if mismatchCount > 0 {
-		return fmt.Errorf("%d canonical army hashes conflict with immutable compositions", mismatchCount)
-	}
-	return nil
 }
 
 func armyCompositionFromColumns(static *clashy.StaticData, shareCode string, columns map[string]uint16) armyCompositionRecord {
@@ -943,14 +844,18 @@ func battlelogEntryTimestamp(entry clashy.BattleLogEntry) time.Time {
 	return timestamp.UTC()
 }
 
-func battlelogRowFromEntry(playerTag string, entry clashy.BattleLogEntry) models.BattlelogRow {
-	gold, elixir, darkElixir := lootedResourceColumns(entry.LootedResources)
-	armyColumns := parseArmyColumns(entry.ArmyShareCode)
-	armyShareCode := normalizeArmyShareCode(entry.ArmyShareCode)
+func battlelogRowFromEntry(playerTag string, entry clashy.BattleLogEntry) (models.BattlelogRow, error) {
+	armyShareCode, err := normalizeArmyShareCodeChecked(entry.ArmyShareCode)
+	if err != nil {
+		return models.BattlelogRow{}, fmt.Errorf("normalize battle army: %w", err)
+	}
+	gold, elixir, darkElixir := 0, 0, 0
+	if entry.Attack {
+		gold, elixir, darkElixir = lootedResourceColumns(entry.LootedResources, entry.ExtraLootedResources)
+	}
 	timestamp := battlelogEntryTimestamp(entry)
 	return models.BattlelogRow{
 		ArmyShareCode:         armyShareCode,
-		ArmyHash:              canonicalArmyHash(armyShareCode),
 		PlayerTag:             playerTag,
 		OpponentTag:           entry.OpponentPlayerTag,
 		OpponentTH:            uint8(entry.OpponentTownHallLevel + 1),
@@ -963,8 +868,7 @@ func battlelogRowFromEntry(playerTag string, entry clashy.BattleLogEntry) models
 		DarkElixir:            uint32(darkElixir),
 		Duration:              uint16(entry.Duration),
 		Timestamp:             timestamp,
-		ArmyColumns:           armyColumns,
-	}
+	}, nil
 }
 
 func battlelogStorageMode(value clashy.BattleType) string {
@@ -981,30 +885,107 @@ func battlelogStorageMode(value clashy.BattleType) string {
 	}
 }
 
-func canonicalArmyHash(normalizedShareCode string) [sha256.Size]byte {
-	// The canonical share code sorts sections, heroes, pets, equipment, and item
-	// IDs. Hash the complete normalized loadout so equal item counts with
-	// different hero assignments cannot collapse into one composition.
-	hash := sha256.New()
-	hash.Write([]byte{2})
-	hash.Write([]byte(normalizedShareCode))
-	var out [sha256.Size]byte
-	copy(out[:], hash.Sum(nil))
-	return out
-}
-
-func lootedResourceColumns(resources []clashy.Resource) (gold, elixir, darkElixir int) {
-	for _, resource := range resources {
-		switch resource.Name {
-		case "Gold":
-			gold += resource.Amount
-		case "Elixir":
-			elixir += resource.Amount
-		case "DarkElixir":
-			darkElixir += resource.Amount
+func lootedResourceColumns(resourceGroups ...[]clashy.Resource) (gold, elixir, darkElixir int) {
+	for _, resources := range resourceGroups {
+		for _, resource := range resources {
+			if resource.Amount <= 0 {
+				continue
+			}
+			switch resource.Name {
+			case "Gold":
+				gold += resource.Amount
+			case "Elixir":
+				elixir += resource.Amount
+			case "DarkElixir":
+				darkElixir += resource.Amount
+			}
 		}
 	}
 	return gold, elixir, darkElixir
+}
+
+func normalizeArmyShareCodeChecked(link string) (string, error) {
+	payload := extractArmySharePayload(link)
+	if payload == "" {
+		return "", nil
+	}
+	if strings.TrimSpace(payload) != payload {
+		return "", errors.New("army code contains surrounding whitespace")
+	}
+	sections := splitArmyShareSections(payload)
+	if len(sections) == 0 || strings.Join(sections, "") != payload {
+		return "", errors.New("army code contains an unknown section")
+	}
+	for _, section := range sections {
+		if len(section) < 2 {
+			return "", fmt.Errorf("army section %q is empty", section)
+		}
+		var err error
+		switch section[0] {
+		case 'i', 'd', 'u', 's':
+			err = validateArmyItemSection(section[1:])
+		case 'h':
+			err = validateArmyHeroSection(section[1:])
+		default:
+			err = fmt.Errorf("unknown army section %q", section[0])
+		}
+		if err != nil {
+			return "", fmt.Errorf("invalid %c section: %w", section[0], err)
+		}
+	}
+	normalized := normalizeArmyShareCode(payload)
+	if normalized == "" {
+		return "", errors.New("army code normalized to empty")
+	}
+	return normalized, nil
+}
+
+func validateArmyItemSection(payload string) error {
+	for _, part := range strings.Split(payload, "-") {
+		quantityText, idText, ok := strings.Cut(part, "x")
+		quantity, quantityErr := strconv.Atoi(quantityText)
+		id, idErr := strconv.Atoi(idText)
+		if !ok || quantityErr != nil || idErr != nil || quantity <= 0 || quantity > math.MaxUint16 || id < 0 {
+			return fmt.Errorf("invalid item %q", part)
+		}
+	}
+	return nil
+}
+
+func validateArmyHeroSection(payload string) error {
+	for _, part := range strings.Split(payload, "-") {
+		heroID, rest := leadingInt(part)
+		if heroID < 0 {
+			return fmt.Errorf("invalid hero %q", part)
+		}
+		petSeen := false
+		equipmentSeen := false
+		for rest != "" {
+			marker := rest[0]
+			if marker == '_' {
+				if !equipmentSeen {
+					return fmt.Errorf("equipment continuation without equipment in %q", part)
+				}
+			} else if marker != 'p' && marker != 'e' {
+				return fmt.Errorf("unknown hero item marker %q in %q", marker, part)
+			}
+			value, next := leadingInt(rest[1:])
+			if value < 0 {
+				return fmt.Errorf("missing hero item id in %q", part)
+			}
+			if marker == 'p' {
+				if petSeen {
+					return fmt.Errorf("multiple pets in %q", part)
+				}
+				petSeen = true
+			}
+			if marker == 'e' || marker == '_' {
+				equipmentSeen = true
+			}
+			rest = next
+		}
+	}
+	return nil
 }
 
 func parseArmyColumns(link string) map[string]uint16 {
