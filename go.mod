@@ -2,6 +2,8 @@ module clashking_tracking
 
 go 1.26.4
 
+replace github.com/disgoorg/disgo => ./third_party/disgo
+
 require (
 	github.com/aws/aws-sdk-go-v2 v1.41.3
 	github.com/aws/aws-sdk-go-v2/credentials v1.19.11

@@ -6,6 +6,7 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
+	"slices"
 	"strings"
 	"sync"
 	"time"
@@ -21,6 +22,7 @@ import (
 	"github.com/disgoorg/disgo/sharding"
 	"github.com/disgoorg/snowflake/v2"
 	"github.com/google/uuid"
+	"github.com/gorilla/websocket"
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgconn"
 	"github.com/jackc/pgx/v5/pgxpool"
@@ -32,6 +34,7 @@ const discordGatewayDomainName = "discord-gateway"
 type discordGatewayDomain struct{}
 
 const discordGatewayHeartbeatInterval = 15 * time.Second
+const discordShardSupervisionInterval = time.Second
 const discordGuildActivityReconcileInterval = 5 * time.Minute
 const discordMemberChunkTimeout = 2 * time.Minute
 
@@ -52,6 +55,7 @@ type discordShardState struct {
 	Generation uuid.UUID
 	ShardCount int
 	Sequence   int64
+	Ready      bool
 }
 
 type discordGatewayState struct {
@@ -70,6 +74,11 @@ type discordMemberSync struct {
 type discordMemberDelta struct {
 	Member *discord.Member
 	UserID string
+}
+
+type discordShardFailure struct {
+	ShardID int
+	Err     error
 }
 
 func NewDiscordGatewayDomain() platform.Domain { return &discordGatewayDomain{} }
@@ -98,6 +107,7 @@ func (d *discordGatewayDomain) Run(ctx context.Context, app *platform.App) error
 	runCtx, stopRun := context.WithCancel(ctx)
 	defer stopRun()
 	state := &discordGatewayState{shards: map[int]discordShardState{}, syncs: map[string]discordMemberSync{}}
+	shardFailures := make(chan discordShardFailure, 64)
 	mutations := make(chan discordCacheMutation, app.Config.DiscordGatewayQueueSize)
 	enqueue := func(mutation discordCacheMutation) {
 		select {
@@ -120,6 +130,12 @@ func (d *discordGatewayDomain) Run(ctx context.Context, app *platform.App) error
 		bot.WithDefaultShardManager(),
 		bot.WithShardManagerConfigOpts(
 			sharding.WithGatewayConfigOpts(gateway.WithIntents(intents)),
+			sharding.WithCloseHandler(func(shard gateway.Gateway, err error, _ bool) {
+				select {
+				case shardFailures <- discordShardFailure{ShardID: shard.ShardID(), Err: err}:
+				case <-runCtx.Done():
+				}
+			}),
 		),
 		bot.WithCacheConfigOpts(cache.WithCaches(
 			cache.FlagGuilds,
@@ -174,11 +190,21 @@ func (d *discordGatewayDomain) Run(ctx context.Context, app *platform.App) error
 	}()
 
 	openDone := make(chan error, 1)
-	go func() { openDone <- client.OpenShardManager(runCtx) }()
+	go func() {
+		err := client.OpenShardManager(runCtx)
+		if err == nil {
+			err = validateDiscordShardReadiness(state, slices.Collect(client.ShardManager.Shards()))
+		}
+		openDone <- err
+	}()
 	opened, err := awaitDiscordGatewayOpen(ctx, openDone, writerDone, ownershipDone, reconcileDone, activityDone, wakeDone)
 	if opened {
+		shardDone := make(chan error, 1)
+		go func() {
+			shardDone <- runDiscordShardSupervisor(runCtx, app, slices.Collect(client.ShardManager.Shards()), state, enqueue, shardFailures)
+		}()
 		app.Stats.SetReady(discordGatewayDomainName, true, "")
-		err = awaitDiscordGatewayExit(ctx, writerDone, ownershipDone, reconcileDone, activityDone, wakeDone)
+		err = awaitDiscordGatewayExit(ctx, writerDone, ownershipDone, reconcileDone, activityDone, wakeDone, shardDone)
 	}
 	stopRun()
 	memberScheduler.Wait()
@@ -217,7 +243,7 @@ func awaitDiscordGatewayOpen(ctx context.Context, openDone, writerDone, ownershi
 	}
 }
 
-func awaitDiscordGatewayExit(ctx context.Context, writerDone, ownershipDone, reconcileDone, activityDone, wakeDone <-chan error) error {
+func awaitDiscordGatewayExit(ctx context.Context, writerDone, ownershipDone, reconcileDone, activityDone, wakeDone, shardDone <-chan error) error {
 	select {
 	case <-ctx.Done():
 		return ctx.Err()
@@ -231,6 +257,8 @@ func awaitDiscordGatewayExit(ctx context.Context, writerDone, ownershipDone, rec
 		return discordGatewayRuntimeError("guild activity signals", err)
 	case err := <-wakeDone:
 		return discordGatewayRuntimeError("PostgreSQL wake listener", err)
+	case err := <-shardDone:
+		return discordGatewayRuntimeError("shard supervision", err)
 	}
 }
 
@@ -241,6 +269,114 @@ func discordGatewayRuntimeError(component string, err error) error {
 	return fmt.Errorf("Discord gateway %s: %w", component, err)
 }
 
+func validateDiscordShardReadiness(state *discordGatewayState, shards []gateway.Gateway) error {
+	if len(shards) == 0 {
+		return errors.New("Discord shard manager opened without any shards")
+	}
+	expected := shards[0].ShardCount()
+	if expected < 1 || len(shards) != expected {
+		return fmt.Errorf("Discord shard manager opened %d of %d expected shards", len(shards), expected)
+	}
+	state.mu.Lock()
+	defer state.mu.Unlock()
+	seen := make(map[int]struct{}, len(shards))
+	for _, shard := range shards {
+		if shard.ShardCount() != expected || shard.ShardID() < 0 || shard.ShardID() >= expected {
+			return fmt.Errorf("Discord shard %d reported invalid count %d, expected %d", shard.ShardID(), shard.ShardCount(), expected)
+		}
+		if _, duplicate := seen[shard.ShardID()]; duplicate {
+			return fmt.Errorf("Discord shard %d was opened more than once", shard.ShardID())
+		}
+		seen[shard.ShardID()] = struct{}{}
+		tracked, ok := state.shards[shard.ShardID()]
+		if !ok || !tracked.Ready {
+			return fmt.Errorf("Discord shard %d has no READY or RESUMED evidence", shard.ShardID())
+		}
+		if status := shard.Status(); status != gateway.StatusReady {
+			return fmt.Errorf("Discord shard %d is %s after startup", shard.ShardID(), status)
+		}
+	}
+	return nil
+}
+
+func runDiscordShardSupervisor(
+	ctx context.Context,
+	app *platform.App,
+	shards []gateway.Gateway,
+	state *discordGatewayState,
+	enqueue func(discordCacheMutation),
+	failures <-chan discordShardFailure,
+) error {
+	expected := len(shards)
+	if expected == 0 {
+		return errors.New("no Discord shards to supervise")
+	}
+	terminal := make(map[int]struct{}, expected)
+	ticker := time.NewTicker(discordShardSupervisionInterval)
+	defer ticker.Stop()
+	for {
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+		case failure := <-failures:
+			terminal[failure.ShardID] = struct{}{}
+			markDiscordShardDisconnected(state, failure.ShardID, enqueue)
+			code := discordGatewayErrorCode(failure.Err)
+			app.Stats.SetReady(discordGatewayDomainName, false, fmt.Sprintf("Discord shard %d reached terminal close code %d", failure.ShardID, code))
+			app.Logger.Error("Discord shard reached a terminal gateway failure",
+				"category", "terminal_gateway_failure", "shard_id", failure.ShardID, "shard_count", expected, "close_code", code)
+			if app.Errors != nil {
+				app.Errors.Capture(errors.New("Discord shard reached a terminal gateway failure"), map[string]string{
+					"script": discordGatewayDomainName, "domain": discordGatewayDomainName,
+					"category": "terminal_gateway_failure", "shard_id": fmt.Sprint(failure.ShardID), "close_code": fmt.Sprint(code),
+				})
+			}
+			if len(terminal) == expected {
+				return fmt.Errorf("all %d Discord shards reached terminal gateway failures", expected)
+			}
+		case <-ticker.C:
+			reconcileDiscordShardReadiness(app, shards, state, enqueue)
+		}
+	}
+}
+
+func reconcileDiscordShardReadiness(app *platform.App, shards []gateway.Gateway, state *discordGatewayState, enqueue func(discordCacheMutation)) int {
+	ready := 0
+	for _, shard := range shards {
+		if shard.Status() != gateway.StatusReady {
+			markDiscordShardDisconnected(state, shard.ShardID(), enqueue)
+			continue
+		}
+		if state.shardReady(shard.ShardID()) {
+			ready++
+		}
+	}
+	if ready == len(shards) {
+		app.Stats.SetReady(discordGatewayDomainName, true, "")
+	} else {
+		app.Stats.SetReady(discordGatewayDomainName, false, fmt.Sprintf("%d of %d Discord shards have live READY or RESUMED state", ready, len(shards)))
+	}
+	return ready
+}
+
+func markDiscordShardDisconnected(state *discordGatewayState, shardID int, enqueue func(discordCacheMutation)) {
+	meta, changed, ok := state.transitionShardReady(shardID, false)
+	if !ok || !changed {
+		return
+	}
+	enqueue(discordCacheMutation{Meta: meta, Apply: func(ctx context.Context, pool *pgxpool.Pool) error {
+		return setDiscordShardHealthy(ctx, pool, meta, false)
+	}})
+}
+
+func discordGatewayErrorCode(err error) int {
+	var closeErr *websocket.CloseError
+	if errors.As(err, &closeErr) {
+		return closeErr.Code
+	}
+	return 0
+}
+
 // discordLibraryLogHandler keeps third-party Gateway diagnostics useful without
 // forwarding attributes. Disgo includes the complete raw payload inside some
 // decoder errors, so even an ordinary error attribute can contain guild/member
@@ -248,6 +384,7 @@ func discordGatewayRuntimeError(component string, err error) error {
 type discordLibraryLogHandler struct {
 	target   slog.Handler
 	reporter platform.ErrorReporter
+	attrs    []slog.Attr
 }
 
 func (h discordLibraryLogHandler) Enabled(ctx context.Context, level slog.Level) bool {
@@ -259,9 +396,23 @@ func (h discordLibraryLogHandler) Handle(ctx context.Context, record slog.Record
 		return nil
 	}
 	// Treat both the message and attributes as untrusted. Third-party loggers
-	// occasionally interpolate decoder input into either location.
+	// occasionally interpolate decoder input into either location. Only copy
+	// bounded lifecycle metadata whose value cannot contain a Discord payload.
 	safe := slog.NewRecord(record.Time, record.Level, "Discord library diagnostic", record.PC)
-	safe.AddAttrs(slog.Bool("discord_library", true))
+	category := discordLibraryLogCategory(record.Message)
+	safe.AddAttrs(slog.Bool("discord_library", true), slog.String("category", category))
+	for _, attr := range h.attrs {
+		safe.AddAttrs(attr)
+	}
+	record.Attrs(func(attr slog.Attr) bool {
+		if attr, ok := safeDiscordLibraryAttr(attr); ok {
+			safe.AddAttrs(attr)
+		}
+		return true
+	})
+	if category == "identify" || category == "resume" {
+		safe.AddAttrs(slog.String("decision", category))
+	}
 	if record.Level >= slog.LevelError && strings.Contains(record.Message, "error while parsing gateway message") && h.reporter != nil {
 		h.reporter.Capture(errors.New("Discord gateway payload could not be decoded"), map[string]string{
 			"script": discordGatewayDomainName, "domain": discordGatewayDomainName, "category": "invalid_gateway_payload",
@@ -270,8 +421,107 @@ func (h discordLibraryLogHandler) Handle(ctx context.Context, record slog.Record
 	return h.target.Handle(ctx, safe)
 }
 
-func (h discordLibraryLogHandler) WithAttrs(_ []slog.Attr) slog.Handler { return h }
-func (h discordLibraryLogHandler) WithGroup(_ string) slog.Handler      { return h }
+func (h discordLibraryLogHandler) WithAttrs(attrs []slog.Attr) slog.Handler {
+	for _, attr := range attrs {
+		if attr, ok := safeDiscordLibraryAttr(attr); ok {
+			h.attrs = append(h.attrs, attr)
+		}
+	}
+	return h
+}
+
+// Group names are caller-controlled and are intentionally omitted, but a
+// derived handler retains the safe attributes already bound to it.
+func (h discordLibraryLogHandler) WithGroup(_ string) slog.Handler { return h }
+
+func discordLibraryLogCategory(message string) string {
+	switch {
+	case strings.Contains(message, "error while parsing gateway message"):
+		return "invalid_gateway_payload"
+	case strings.Contains(message, "ACK of last heartbeat not received"):
+		return "heartbeat_timeout"
+	case strings.Contains(message, "failed to send heartbeat"):
+		return "heartbeat_send_failed"
+	case strings.Contains(message, "gateway close received"):
+		return "websocket_close"
+	case strings.Contains(message, "failed to read next message"):
+		return "websocket_read_failed"
+	case strings.Contains(message, "received reconnect"):
+		return "opcode_7_reconnect"
+	case strings.Contains(message, "received invalid session"):
+		return "invalid_session"
+	case strings.Contains(message, "sending Identify"):
+		return "identify"
+	case strings.Contains(message, "sending Resume"):
+		return "resume"
+	case strings.Contains(message, "successfully identified"):
+		return "ready"
+	case strings.Contains(message, "successfully resumed"):
+		return "resumed"
+	case strings.Contains(message, "error connecting to the gateway"):
+		return "dial_failed"
+	case strings.Contains(message, "failed to reconnect gateway"):
+		return "reconnect_failed"
+	case strings.Contains(message, "failed to reopen gateway"), strings.Contains(message, "failed to open shard"):
+		return "terminal_failure"
+	default:
+		return "gateway_diagnostic"
+	}
+}
+
+func safeDiscordLibraryAttr(attr slog.Attr) (slog.Attr, bool) {
+	attr.Value = attr.Value.Resolve()
+	switch attr.Key {
+	case "shard_id", "shardID":
+		if attr.Value.Kind() == slog.KindInt64 {
+			return slog.Int64("shard_id", attr.Value.Int64()), true
+		}
+	case "shard_count", "shardCount":
+		if attr.Value.Kind() == slog.KindInt64 {
+			return slog.Int64("shard_count", attr.Value.Int64()), true
+		}
+	case "code":
+		if attr.Value.Kind() == slog.KindInt64 {
+			return slog.Int64("close_code", attr.Value.Int64()), true
+		}
+	case "reconnect", "can_resume":
+		if attr.Value.Kind() == slog.KindBool {
+			return slog.Bool(attr.Key, attr.Value.Bool()), true
+		}
+	case "try", "retry":
+		if attr.Value.Kind() == slog.KindInt64 {
+			return slog.Int64("retry", attr.Value.Int64()), true
+		}
+	case "delay":
+		if attr.Value.Kind() == slog.KindDuration {
+			delay := attr.Value.Duration()
+			if delay < 0 {
+				delay = 0
+			}
+			if delay > time.Minute {
+				delay = time.Minute
+			}
+			return slog.Duration("delay", delay), true
+		}
+	case "err":
+		if attr.Value.Kind() == slog.KindAny {
+			if err, ok := attr.Value.Any().(error); ok {
+				var closeErr *websocket.CloseError
+				if errors.As(err, &closeErr) {
+					return slog.Int("close_code", closeErr.Code), true
+				}
+			}
+		}
+	case "name":
+		if attr.Value.Kind() == slog.KindString {
+			name := attr.Value.String()
+			if name == "gateway" || name == "sharding" {
+				return slog.String("component", name), true
+			}
+		}
+	}
+	return slog.Attr{}, false
+}
 
 func validateDiscordGatewayConfig(cfg platform.Config) error {
 	if cfg.DiscordBotToken == "" {
@@ -440,7 +690,7 @@ func (s *discordGatewayState) rotateShard(event *events.GenericEvent, shardCount
 		Generation:    uuid.New(),
 		Sequence:      int64(max(0, event.SequenceNumber())),
 	}
-	s.shards[meta.ShardID] = discordShardState{Generation: meta.Generation, ShardCount: shardCount, Sequence: meta.Sequence}
+	s.shards[meta.ShardID] = discordShardState{Generation: meta.Generation, ShardCount: shardCount, Sequence: meta.Sequence, Ready: true}
 	for guildID, memberSync := range s.syncs {
 		if memberSync.Meta.ShardID == meta.ShardID {
 			delete(s.syncs, guildID)
@@ -639,6 +889,7 @@ func discordCacheListener(
 			state.rotateShard(event.GenericEvent, shard.ShardCount(), event.EventReady.Guilds, enqueue)
 		},
 		OnResumed: func(event *events.Resumed) {
+			state.setShardReady(event.ShardID(), true)
 			state.enqueueEvent(event.GenericEvent, enqueue, func(meta discordMutationMeta, ctx context.Context, pool *pgxpool.Pool) error {
 				return setDiscordShardHealthy(ctx, pool, meta, true)
 			})
@@ -759,6 +1010,37 @@ func discordCacheListener(
 			}()
 		},
 	}
+}
+
+func (s *discordGatewayState) setShardReady(shardID int, ready bool) bool {
+	_, _, ok := s.transitionShardReady(shardID, ready)
+	return ok
+}
+
+func (s *discordGatewayState) transitionShardReady(shardID int, ready bool) (discordMutationMeta, bool, bool) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	shard, ok := s.shards[shardID]
+	if !ok {
+		return discordMutationMeta{}, false, false
+	}
+	changed := shard.Ready != ready
+	shard.Ready = ready
+	s.shards[shardID] = shard
+	return discordMutationMeta{
+		ApplicationID: s.appID,
+		ShardID:       shardID,
+		ShardCount:    shard.ShardCount,
+		Generation:    shard.Generation,
+		Sequence:      shard.Sequence,
+	}, changed, true
+}
+
+func (s *discordGatewayState) shardReady(shardID int) bool {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	shard, ok := s.shards[shardID]
+	return ok && shard.Ready
 }
 
 func isActiveDiscordGuild(ctx context.Context, pool *pgxpool.Pool, guildID string) (bool, error) {
