@@ -29,7 +29,6 @@ type BattlelogIngest struct {
 
 type BattlelogRow struct {
 	ArmyShareCode         string
-	ArmyHash              [32]byte
 	PlayerTag             string
 	OpponentTag           string
 	OpponentTH            uint8
@@ -42,5 +41,4 @@ type BattlelogRow struct {
 	DarkElixir            uint32
 	Duration              uint16
 	Timestamp             time.Time
-	ArmyColumns           map[string]uint16
 }

@@ -226,8 +226,7 @@ type scheduledStore interface {
 	MissingRankedGroupPlayers(context.Context, int64) ([]string, error)
 	FinalizeRankedTournament(context.Context, int64) (int, error)
 	ReconcileCWLSeasonStatistics(context.Context, []string) error
-	FinalizeLegendDay(context.Context, time.Time) (int, error)
-	FinalizeArmyFamilies(context.Context, time.Time, platform.Config) (int, error)
+	FinalizeLegendCloseout(context.Context, time.Time) (int, error)
 }
 
 func NewScheduledDomain() platform.Domain { return &scheduledDomain{} }
@@ -333,16 +332,11 @@ func (d *scheduledDomain) runLeagueCloseoutLoop(ctx context.Context, app *platfo
 		now := time.Now().UTC()
 		day := latestEligibleLegendDay(now)
 		started := time.Now()
-		writes, err := d.store.FinalizeLegendDay(ctx, day)
-		if err != nil {
-			return err
-		}
-		familyWrites, err := d.store.FinalizeArmyFamilies(ctx, day, app.Config)
+		writes, err := d.store.FinalizeLegendCloseout(ctx, day)
 		if err != nil {
 			return err
 		}
 		app.Stats.RecordWrite(trackingProgressName(scheduledDomainName, "legend-closeout"), writes)
-		app.Stats.RecordWrite(trackingProgressName(scheduledDomainName, "army-family-closeout"), familyWrites)
 		app.Stats.RecordProcess(trackingProgressName(scheduledDomainName, "league-closeout"), time.Since(started))
 		if rankedCloseoutDue(now) {
 			rankedWrites, err := d.doRankedGroupDiscovery(ctx, app, now)
@@ -419,7 +413,7 @@ func (d *scheduledDomain) runCycle(ctx context.Context, app *platform.App) error
 func latestEligibleLegendDay(now time.Time) time.Time {
 	now = now.UTC()
 	today := time.Date(now.Year(), now.Month(), now.Day(), 0, 0, 0, 0, time.UTC)
-	if now.Before(today.Add(5*time.Hour + 10*time.Minute)) {
+	if now.Before(today.Add(5*time.Hour + 12*time.Minute)) {
 		return today.AddDate(0, 0, -2)
 	}
 	return today.AddDate(0, 0, -1)
@@ -427,7 +421,7 @@ func latestEligibleLegendDay(now time.Time) time.Time {
 
 func nextLeagueCloseout(now time.Time) time.Time {
 	now = now.UTC()
-	next := time.Date(now.Year(), now.Month(), now.Day(), 5, 10, 0, 0, time.UTC)
+	next := time.Date(now.Year(), now.Month(), now.Day(), 5, 12, 0, 0, time.UTC)
 	if !next.After(now) {
 		next = next.AddDate(0, 0, 1)
 	}
@@ -1666,92 +1660,6 @@ func (s *timescaleScheduledStore) ReconcileCWLSeasonStatistics(ctx context.Conte
 	return cwlstats.Reconcile(ctx, s.pool, seasons)
 }
 
-func (s *timescaleScheduledStore) FinalizeLegendDay(ctx context.Context, day time.Time) (int, error) {
-	day = dayStart(day)
-	tx, err := s.pool.Begin(ctx)
-	if err != nil {
-		return 0, err
-	}
-	defer tx.Rollback(ctx)
-	if _, err := tx.Exec(ctx, `DELETE FROM league_hitrate_stats WHERE period_kind='legend_day' AND period_start=$1`, day); err != nil {
-		return 0, err
-	}
-	if _, err := tx.Exec(ctx, `DELETE FROM legend_daily_stats WHERE day=$1::date`, day); err != nil {
-		return 0, err
-	}
-	if _, err := tx.Exec(ctx, `
-		WITH attacks AS MATERIALIZED (
-			SELECT battle.*, player.league_id AS league_tier_id FROM battles_ranked battle
-			JOIN basic_player player ON player.tag=battle.player_tag
-			WHERE battle.direction='attack' AND battle.battle_mode='legend' AND battle.battle_time >= $1 AND battle.battle_time < $1 + interval '1 day' AND player.league_id > 0
-		)
-		INSERT INTO league_hitrate_stats (period_kind,period_start,league_tier_id,town_hall,attack_count,zero_star_count,one_star_count,two_star_count,three_star_count,refreshed_at)
-		SELECT 'legend_day',$1,league_tier_id,player_town_hall,count(*),count(*) FILTER (WHERE stars=0),count(*) FILTER (WHERE stars=1),count(*) FILTER (WHERE stars=2),count(*) FILTER (WHERE stars=3),now()
-		FROM attacks WHERE player_town_hall=opponent_town_hall GROUP BY league_tier_id,player_town_hall
-	`, day); err != nil {
-		return 0, err
-	}
-	inserted, err := tx.Exec(ctx, `
-		WITH attacks AS MATERIALIZED (
-			SELECT battle.*, player.league_id AS league_tier_id FROM battles_ranked battle
-			JOIN basic_player player ON player.tag=battle.player_tag
-			WHERE battle.direction='attack' AND battle.battle_mode='legend' AND battle.battle_time >= $1 AND battle.battle_time < $1 + interval '1 day' AND player.league_id > 0
-		), groups AS (
-			SELECT league_tier_id,player_town_hall AS town_hall,count(*) AS attack_count,count(DISTINCT player_tag) AS distinct_player_count,
-				count(*) FILTER (WHERE stars=0) AS zero_star_count,count(*) FILTER (WHERE stars=1) AS one_star_count,
-				count(*) FILTER (WHERE stars=2) AS two_star_count,count(*) FILTER (WHERE stars=3) AS three_star_count,
-				sum(destruction_percentage) AS destruction_percentage_sum,sum(coalesce(duration_seconds,0)) AS duration_seconds_sum
-			FROM attacks GROUP BY league_tier_id,player_town_hall
-		), perfect AS (
-			SELECT league_tier_id,player_town_hall AS town_hall,count(*) AS player_count FROM (
-				SELECT league_tier_id,player_town_hall,player_tag FROM attacks GROUP BY league_tier_id,player_town_hall,player_tag
-				HAVING count(*)=8 AND count(*) FILTER (WHERE stars=3)=8
-			) players GROUP BY league_tier_id,player_town_hall
-		), heroes AS (
-			SELECT league_tier_id,player_town_hall AS town_hall,hero_id,count(*) AS uses,count(*) FILTER (WHERE stars=3) AS triples
-			FROM attacks JOIN army_compositions composition USING (army_hash) CROSS JOIN LATERAL unnest(composition.heroes) hero_id
-			GROUP BY league_tier_id,player_town_hall,hero_id
-		), hero_json AS (
-			SELECT league_tier_id,town_hall,jsonb_agg(jsonb_build_object('id',hero_id,'uses',uses,'triples',triples) ORDER BY hero_id) AS value FROM heroes GROUP BY league_tier_id,town_hall
-		), pets AS (
-			SELECT league_tier_id,player_town_hall AS town_hall,(pet->>'petId')::integer AS pet_id,count(*) AS uses,count(*) FILTER (WHERE stars=3) AS triples
-			FROM attacks JOIN army_compositions composition USING (army_hash) CROSS JOIN LATERAL jsonb_array_elements(composition.pet_assignments) pet
-			GROUP BY league_tier_id,player_town_hall,(pet->>'petId')::integer
-		), pet_json AS (
-			SELECT league_tier_id,town_hall,jsonb_agg(jsonb_build_object('id',pet_id,'uses',uses,'triples',triples) ORDER BY pet_id) AS value FROM pets GROUP BY league_tier_id,town_hall
-		), equipment AS (
-			SELECT league_tier_id,player_town_hall AS town_hall,(item->>'equipmentId')::integer AS equipment_id,count(*) AS uses,count(*) FILTER (WHERE stars=3) AS triples
-			FROM attacks JOIN army_compositions composition USING (army_hash) CROSS JOIN LATERAL jsonb_array_elements(composition.equipment) item
-			GROUP BY league_tier_id,player_town_hall,(item->>'equipmentId')::integer
-		), equipment_json AS (
-			SELECT league_tier_id,town_hall,jsonb_agg(jsonb_build_object('id',equipment_id,'uses',uses,'triples',triples) ORDER BY equipment_id) AS value FROM equipment GROUP BY league_tier_id,town_hall
-		), assignments AS (
-			SELECT league_tier_id,player_town_hall AS town_hall,(item->>'petId')::integer AS pet_id,(item->>'heroId')::integer AS hero_id,
-				count(*) AS uses,count(*) FILTER (WHERE stars=3) AS triples
-			FROM attacks JOIN army_compositions composition USING (army_hash) CROSS JOIN LATERAL jsonb_array_elements(composition.pet_assignments) item
-			GROUP BY league_tier_id,player_town_hall,(item->>'petId')::integer,(item->>'heroId')::integer
-		), assignment_json AS (
-			SELECT league_tier_id,town_hall,jsonb_agg(jsonb_build_object('petId',pet_id,'heroId',hero_id,'uses',uses,'triples',triples) ORDER BY pet_id,hero_id) AS value FROM assignments GROUP BY league_tier_id,town_hall
-		)
-		INSERT INTO legend_daily_stats (day,league_tier_id,town_hall,attack_count,distinct_player_count,perfect_320_player_count,
-			zero_star_count,one_star_count,two_star_count,three_star_count,destruction_percentage_sum,duration_seconds_sum,
-			hero_stats,pet_stats,equipment_stats,pet_hero_assignments,refreshed_at)
-		SELECT $1::date,g.league_tier_id,g.town_hall,g.attack_count,g.distinct_player_count,coalesce(p.player_count,0),
-			g.zero_star_count,g.one_star_count,g.two_star_count,g.three_star_count,g.destruction_percentage_sum,g.duration_seconds_sum,
-			coalesce(h.value,'[]'),coalesce(pt.value,'[]'),coalesce(e.value,'[]'),coalesce(a.value,'[]'),now()
-		FROM groups g LEFT JOIN perfect p USING (league_tier_id,town_hall) LEFT JOIN hero_json h USING (league_tier_id,town_hall)
-		LEFT JOIN pet_json pt USING (league_tier_id,town_hall) LEFT JOIN equipment_json e USING (league_tier_id,town_hall)
-		LEFT JOIN assignment_json a USING (league_tier_id,town_hall)
-	`, day)
-	if err != nil {
-		return 0, err
-	}
-	if err := tx.Commit(ctx); err != nil {
-		return 0, err
-	}
-	return int(inserted.RowsAffected()), nil
-}
-
 func (s *timescaleScheduledStore) ReplaceLeaderboardHistory(
 	ctx context.Context,
 	groups []leaderboardHistoryGroup,
@@ -2584,11 +2492,7 @@ func (*memoryScheduledStore) ReconcileCWLSeasonStatistics(context.Context, []str
 	return nil
 }
 
-func (*memoryScheduledStore) FinalizeLegendDay(context.Context, time.Time) (int, error) {
-	return 0, nil
-}
-
-func (*memoryScheduledStore) FinalizeArmyFamilies(context.Context, time.Time, platform.Config) (int, error) {
+func (*memoryScheduledStore) FinalizeLegendCloseout(context.Context, time.Time) (int, error) {
 	return 0, nil
 }
 

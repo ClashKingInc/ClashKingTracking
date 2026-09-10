@@ -2,22 +2,20 @@ package armyfamily
 
 import (
 	"testing"
-	"time"
 )
 
-func TestFindDirectAnchorThresholdsAndOldestTie(t *testing.T) {
-	oldest := time.Unix(1, 0)
+func TestFindDirectAnchorThresholdsAndLowestFamilyIDTie(t *testing.T) {
 	composition := Composition{
 		TroopHousing:  map[int]int{1: 86, 2: 14},
 		SpellCapacity: map[int]int{10: 8, 11: 2},
 		Heroes:        []int{20, 21}, Equipment: []int{30, 31, 32, 33},
 	}
 	anchors := []Anchor{
-		{Hash: Hash{2}, CreatedAt: oldest.Add(time.Hour), Composition: Composition{
+		{FamilyID: 2, Composition: Composition{
 			TroopHousing: map[int]int{1: 100}, SpellCapacity: map[int]int{10: 10},
 			Heroes: []int{21, 20}, Equipment: []int{30, 31, 32},
 		}},
-		{Hash: Hash{1}, CreatedAt: oldest, Composition: Composition{
+		{FamilyID: 1, Composition: Composition{
 			TroopHousing: map[int]int{1: 100}, SpellCapacity: map[int]int{10: 10},
 			Heroes: []int{20, 21}, Equipment: []int{30, 31, 32},
 		}},
@@ -26,10 +24,10 @@ func TestFindDirectAnchorThresholdsAndOldestTie(t *testing.T) {
 	if !ok {
 		t.Fatal("expected inclusive threshold match")
 	}
-	if match.AnchorHash != anchors[1].Hash {
-		t.Fatalf("anchor = %x, want oldest %x", match.AnchorHash, anchors[1].Hash)
+	if match.FamilyID != anchors[1].FamilyID {
+		t.Fatalf("family = %d, want lowest id %d", match.FamilyID, anchors[1].FamilyID)
 	}
-	if match.TroopHousingSimilarity != .86 || match.SpellCapacitySimilarity != .8 || match.EquipmentSimilarity != .75 || match.EquipmentDifferenceCount != 1 {
+	if match.TroopHousingSimilarity != .86 || match.SpellCapacitySimilarity != .8 || match.EquipmentSimilarity != .75 {
 		t.Fatalf("unexpected match: %+v", match)
 	}
 }
@@ -43,14 +41,14 @@ func TestFindDirectAnchorRejectsEachBoundaryFailure(t *testing.T) {
 		{TroopHousing: map[int]int{1: 100}, SpellCapacity: map[int]int{2: 10}, Heroes: []int{3}, Equipment: []int{4, 8, 9, 10}},
 	}
 	for i, candidate := range tests {
-		if _, ok := FindDirectAnchor(candidate, []Anchor{{Hash: Hash{1}, Composition: base}}); ok {
+		if _, ok := FindDirectAnchor(candidate, []Anchor{{FamilyID: 1, Composition: base}}); ok {
 			t.Fatalf("case %d matched", i)
 		}
 	}
 }
 
 func TestFindDirectAnchorDoesNotChainThroughMembers(t *testing.T) {
-	anchor := Anchor{Hash: Hash{1}, Composition: Composition{TroopHousing: map[int]int{1: 100}, SpellCapacity: map[int]int{}, Heroes: []int{}, Equipment: []int{}}}
+	anchor := Anchor{FamilyID: 1, Composition: Composition{TroopHousing: map[int]int{1: 100}, SpellCapacity: map[int]int{}, Heroes: []int{}, Equipment: []int{}}}
 	memberNearAnchor := Composition{TroopHousing: map[int]int{1: 86, 2: 14}, SpellCapacity: map[int]int{}, Heroes: []int{}, Equipment: []int{}}
 	candidateNearMember := Composition{TroopHousing: map[int]int{1: 72, 2: 28}, SpellCapacity: map[int]int{}, Heroes: []int{}, Equipment: []int{}}
 	if _, ok := FindDirectAnchor(memberNearAnchor, []Anchor{anchor}); !ok {
@@ -58,5 +56,20 @@ func TestFindDirectAnchorDoesNotChainThroughMembers(t *testing.T) {
 	}
 	if _, ok := FindDirectAnchor(candidateNearMember, []Anchor{anchor}); ok {
 		t.Fatal("candidate must be compared directly with immutable anchor")
+	}
+}
+
+func TestFindDirectAnchorUsesEquipmentOverlapWithoutDifferenceGate(t *testing.T) {
+	anchor := Anchor{FamilyID: 7, Composition: Composition{
+		TroopHousing: map[int]int{1: 100}, SpellCapacity: map[int]int{2: 10}, Heroes: []int{3},
+		Equipment: []int{10, 11, 12, 13, 14, 15, 16, 17},
+	}}
+	candidate := Composition{
+		TroopHousing: map[int]int{1: 100}, SpellCapacity: map[int]int{2: 10}, Heroes: []int{3},
+		Equipment: []int{10, 11, 12, 13, 14, 15, 18, 19},
+	}
+	match, ok := FindDirectAnchor(candidate, []Anchor{anchor})
+	if !ok || match.EquipmentSimilarity != .75 {
+		t.Fatalf("six-of-eight equipment overlap should match: %+v, %v", match, ok)
 	}
 }

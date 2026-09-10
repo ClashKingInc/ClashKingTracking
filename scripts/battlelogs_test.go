@@ -4,7 +4,6 @@ package scripts
 
 import (
 	"context"
-	"reflect"
 	"testing"
 	"time"
 
@@ -81,26 +80,6 @@ func TestParseArmyColumnsAggregatesDuplicates(t *testing.T) {
 	}
 }
 
-func TestCanonicalArmyHashIgnoresLinkAndMapOrder(t *testing.T) {
-	left := normalizeArmyShareCode("u10x0-2x1s4x35i3x53d1x70h0p4e8_14")
-	right := normalizeArmyShareCode("h0p4e14_8d1x70i3x53s4x35u2x1-10x0")
-	if canonicalArmyHash(left) != canonicalArmyHash(right) {
-		t.Fatal("equivalent armies should have the same canonical hash")
-	}
-	changedQuantity := normalizeArmyShareCode("h0p4e14_8d1x70i3x53s4x35u3x1-10x0")
-	if canonicalArmyHash(left) == canonicalArmyHash(changedQuantity) {
-		t.Fatal("changing an army quantity should change the canonical hash")
-	}
-	differentAssignment := normalizeArmyShareCode("h0p4e8_14-1p9e39")
-	sameItemsDifferentAssignment := normalizeArmyShareCode("h0p9e14_8-1p4e39")
-	if reflect.DeepEqual(parseArmyColumns(differentAssignment), parseArmyColumns(sameItemsDifferentAssignment)) == false {
-		t.Fatal("assignment regression requires equal flat item counts")
-	}
-	if canonicalArmyHash(differentAssignment) == canonicalArmyHash(sameItemsDifferentAssignment) {
-		t.Fatal("different hero loadout assignments should change the canonical hash")
-	}
-}
-
 func TestLootedResourceColumns(t *testing.T) {
 	gold, elixir, darkElixir := lootedResourceColumns([]clashy.Resource{
 		{Name: "Gold", Amount: 10},
@@ -108,9 +87,14 @@ func TestLootedResourceColumns(t *testing.T) {
 		{Name: "DarkElixir", Amount: 3},
 		{Name: "Gold", Amount: 5},
 		{Name: "BuilderGold", Amount: 999},
+		{Name: "SourElixir", Amount: 999},
+	}, []clashy.Resource{
+		{Name: "Gold", Amount: 7},
+		{Name: "Elixir", Amount: 8},
+		{Name: "DarkElixir", Amount: 9},
 	})
-	if gold != 15 || elixir != 20 || darkElixir != 3 {
-		t.Fatalf("resources = %d/%d/%d, want 15/20/3", gold, elixir, darkElixir)
+	if gold != 22 || elixir != 28 || darkElixir != 12 {
+		t.Fatalf("resources = %d/%d/%d, want 22/28/12", gold, elixir, darkElixir)
 	}
 }
 
@@ -190,7 +174,10 @@ func TestBattlelogRowFromEntryConvertsZeroIndexedOpponentTownHall(t *testing.T) 
 		Timestamp:             clashTimestamp(time.Date(2026, 5, 20, 10, 0, 0, 0, time.UTC)),
 	}
 
-	row := battlelogRowFromEntry("#PLAYER", entry)
+	row, err := battlelogRowFromEntry("#PLAYER", entry)
+	if err != nil {
+		t.Fatal(err)
+	}
 	if row.Duration != 173 {
 		t.Fatalf("duration = %d, want 173", row.Duration)
 	}

@@ -9,7 +9,6 @@ import (
 	"testing"
 	"time"
 
-	"clashking_tracking/internal/platform"
 	"clashking_tracking/models"
 )
 
@@ -33,9 +32,9 @@ func TestFinalSchemaBattleIngestAndLegendCloseoutAreIdempotent(t *testing.T) {
 	day := time.Date(2026, 9, 6, 0, 0, 0, 0, time.UTC)
 	shareCode := normalizeArmyShareCode("u100x0s10x0h0e0_1")
 	attack := models.BattlelogRow{
-		ArmyShareCode: shareCode, ArmyHash: canonicalArmyHash(shareCode), ArmyColumns: parseArmyColumns(shareCode),
-		PlayerTag: "#P0", OpponentTag: "#Y2", OpponentTH: 17, BattleType: "legend", Attack: true,
-		Stars: 3, DestructionPercentage: 100, Duration: 120, Timestamp: day.Add(time.Hour),
+		ArmyShareCode: shareCode,
+		PlayerTag:     "#P0", OpponentTag: "#Y2", OpponentTH: 17, BattleType: "legend", Attack: true,
+		Stars: 3, DestructionPercentage: 100, Duration: 120, Timestamp: day.Add(6 * time.Hour),
 	}
 	defense := attack
 	defense.PlayerTag = "#Y2"
@@ -103,33 +102,29 @@ func TestFinalSchemaBattleIngestAndLegendCloseoutAreIdempotent(t *testing.T) {
 
 	scheduled := &timescaleScheduledStore{pool: store.pool}
 	for run := 0; run < 2; run++ {
-		if _, err := scheduled.FinalizeLegendDay(ctx, day); err != nil {
-			t.Fatal(err)
-		}
-		if _, err := scheduled.FinalizeArmyFamilies(ctx, day, platform.Config{}); err != nil {
+		if _, err := scheduled.FinalizeLegendCloseout(ctx, day); err != nil {
 			t.Fatal(err)
 		}
 	}
 	var attackCount, tripleCount int
-	if err := store.pool.QueryRow(ctx, `SELECT attack_count,three_star_count FROM legend_daily_stats`).Scan(&attackCount, &tripleCount); err != nil {
+	if err := store.pool.QueryRow(ctx, `SELECT attack_count,three_star_count FROM legend_daily_stats_v2`).Scan(&attackCount, &tripleCount); err != nil {
 		t.Fatal(err)
 	}
 	if attackCount != 1 || tripleCount != 1 {
 		t.Fatalf("legend aggregate attacks=%d triples=%d", attackCount, tripleCount)
 	}
 	var familyCount, memberCount, familyAttacks int
-	var source string
-	if err := store.pool.QueryRow(ctx, `SELECT count(*),min(source) FROM army_families`).Scan(&familyCount, &source); err != nil {
+	if err := store.pool.QueryRow(ctx, `SELECT count(*) FROM army_families`).Scan(&familyCount); err != nil {
 		t.Fatal(err)
 	}
 	if err := store.pool.QueryRow(ctx, `SELECT count(*) FROM army_family_members`).Scan(&memberCount); err != nil {
 		t.Fatal(err)
 	}
-	if err := store.pool.QueryRow(ctx, `SELECT attack_count FROM army_family_daily_stats`).Scan(&familyAttacks); err != nil {
+	if err := store.pool.QueryRow(ctx, `SELECT attack_count FROM army_family_daily_stats_v2`).Scan(&familyAttacks); err != nil {
 		t.Fatal(err)
 	}
-	if familyCount != 1 || memberCount != 1 || familyAttacks != 1 || source != "fallback" {
-		t.Fatalf("family count=%d members=%d attacks=%d source=%q", familyCount, memberCount, familyAttacks, source)
+	if familyCount != 1 || memberCount != 1 || familyAttacks != 1 {
+		t.Fatalf("family count=%d members=%d attacks=%d", familyCount, memberCount, familyAttacks)
 	}
 }
 
@@ -153,8 +148,8 @@ func TestFinalSchemaRankedCloseoutCountsAttackPerspectiveOnce(t *testing.T) {
 	seasonStart := time.Date(2026, 9, 7, 5, 0, 0, 0, time.UTC)
 	shareCode := normalizeArmyShareCode("u100x0s10x0h0e0_1")
 	row := models.BattlelogRow{
-		ArmyShareCode: shareCode, ArmyHash: canonicalArmyHash(shareCode), ArmyColumns: parseArmyColumns(shareCode),
-		PlayerTag: "#Q8", OpponentTag: "#G9", OpponentTH: 18, BattleType: "ranked", Attack: true,
+		ArmyShareCode: shareCode,
+		PlayerTag:     "#Q8", OpponentTag: "#G9", OpponentTH: 18, BattleType: "ranked", Attack: true,
 		Stars: 2, DestructionPercentage: 90, Duration: 150, Timestamp: seasonStart.Add(time.Hour),
 	}
 	if _, err := store.Store(ctx, models.BattlelogIngest{Rows: []models.BattlelogRow{row}}); err != nil {
