@@ -6,7 +6,7 @@
 
 ## When it runs
 
-The main scheduled cycle uses `scheduled.interval_seconds`. Current player/clan leaderboards run alongside it at the leaderboard interval. CWL season statistics refresh the current and previous UTC month immediately at startup and weekly afterward. League closeout processes the latest eligible shifted Legend day on startup, then runs daily at 05:12 UTC; Monday's closeout also discovers and finalizes completed Ranked seasons from the IDs returned by player profiles and matching league-history entries.
+The main scheduled cycle uses `scheduled.interval_seconds`. Current player/clan leaderboards run alongside it at the leaderboard interval. League closeout processes the latest eligible shifted Legend day on startup, then runs daily at 05:12 UTC; Monday's closeout also discovers and finalizes completed Ranked seasons from the IDs returned by player profiles and matching league-history entries.
 
 ## Work owned here
 
@@ -14,7 +14,6 @@ The main scheduled cycle uses `scheduled.interval_seconds`. Current player/clan 
 - Legend history completion/backfill for completed seasons.
 - Ranked league member snapshots and season tier aggregates.
 - Legend daily hit-rate, usage, and immutable army-family aggregates.
-- Current and previous UTC CWL group, clan, registered-player, and Town Hall totals.
 - Scheduled broad statistics and date-bound maintenance already implemented in `scripts/scheduled.go`.
 - The leaderboards workload described separately in [leaderboards.md](leaderboards.md).
 
@@ -39,11 +38,9 @@ Depending on the due subjob: player profile, locations, player/clan ranking endp
 
 ## Data read and written
 
-Writes typed leaderboard history/current tables, `legend_history`, current ranking tables, Ranked league members, `league_hitrate_stats`, `ranked_league_tier_stats`, `legend_daily_stats`, immutable army families and memberships, daily family outcomes, changed basic profile facts learned from rankings, and `cwl_season_statistics`. Legend and Ranked closeouts delete and rebuild only their completed day or season, and every battle aggregate reads `direction='attack'` so the stored defense perspective cannot double-count it.
+Writes typed leaderboard history/current tables, `legend_history`, current ranking tables, Ranked league members, `league_hitrate_stats`, `ranked_league_tier_stats`, `legend_daily_stats`, immutable army families and memberships, daily family outcomes, and changed basic profile facts learned from rankings. Legend and Ranked closeouts delete and rebuild only their completed day or season, and every battle aggregate reads `direction='attack'` so the stored defense perspective cannot double-count it.
 
 Army-family matching compares each exact army directly with immutable anchors. Troop housing similarity must be at least 0.86, spell-capacity similarity at least 0.80, heroes must match exactly, and equipment similarity must be at least 0.75 with no more than two differing equipment IDs. A new family name comes from Cloudflare AI Gateway when configured; invalid, duplicate, or unavailable AI output uses a deterministic fallback and records truthful provenance.
-
-The CWL refresh calls the schema-owned reconciliation procedure, whose shared advisory transaction lock atomically replaces each selected season from separate group, distinct-clan, registered-player, and Town Hall aggregates. Groups without both a league and war size are excluded, while partial eligible totals remain visible. `go run ./cmd/cwl-season-stats-reconcile --scope all` performs the explicit idempotent all-season repair through the same procedure.
 
 ## Events and Valkey
 
