@@ -2387,7 +2387,7 @@ func (s *timescaleScheduledStore) FinalizeRankedTournament(ctx context.Context, 
 		SELECT 'ranked_season',$2,member.league_tier_id,battle.player_town_hall,count(*),count(*) FILTER(WHERE stars=0),count(*) FILTER(WHERE stars=1),
 			count(*) FILTER(WHERE stars=2),count(*) FILTER(WHERE stars=3),now()
 		FROM battles_ranked battle JOIN ranked_league_group_members member ON member.season_id=$1 AND member.player_tag=battle.player_tag
-		WHERE battle.direction='attack' AND battle.battle_mode='ranked' AND battle.battle_time >= $2 AND battle.battle_time < $2 + interval '7 days'
+		WHERE battle.direction=1 AND battle.battle_mode=1 AND battle.battle_time >= $2 AND battle.battle_time < $2 + interval '7 days'
 		  AND battle.player_town_hall=battle.opponent_town_hall
 		GROUP BY member.league_tier_id,battle.player_town_hall
 	`, seasonID, periodStart)

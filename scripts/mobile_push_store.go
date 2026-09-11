@@ -170,10 +170,11 @@ func (s *timescaleMobilePushStore) AdminDashboard(ctx context.Context, days int,
 		count(*) FILTER (WHERE enabled AND platform = 'android'),
 		count(*) FILTER (WHERE enabled AND platform = 'ios'),
 		count(*) FILTER (WHERE enabled AND authorization_status IN ('authorized', 'provisional')),
-		count(*) FILTER (WHERE enabled AND announcements_enabled),
+		count(*) FILTER (WHERE device.enabled AND COALESCE(preference.announcements_enabled,false)),
 		count(*) FILTER (WHERE enabled AND last_seen_at >= $1::timestamptz - interval '24 hours'),
 		count(*) FILTER (WHERE enabled AND last_seen_at >= $1::timestamptz - interval '7 days')
-		FROM mobile_push_devices`, now).Scan(
+		FROM mobile_push_devices device
+		LEFT JOIN mobile_notification_preferences preference ON preference.user_id=device.user_id`, now).Scan(
 		&result.Devices.Total, &result.Devices.Production, &result.Devices.Sandbox,
 		&result.Devices.Android, &result.Devices.IOS, &result.Devices.Authorized,
 		&result.Devices.OptedIn, &result.Devices.Active24H, &result.Devices.Active7D,
@@ -1110,14 +1111,15 @@ func (s *timescaleMobilePushStore) DevicesForPlatforms(ctx context.Context, plat
 		SELECT d.user_id, d.device_id, d.platform, d.provider, d.environment, d.token_ciphertext,
 			lower(split_part(replace(coalesce(nullif(d.locale, ''), 'en'), '_', '-'), '-', 1))
 		FROM mobile_push_devices d
+		JOIN mobile_notification_preferences preference ON preference.user_id=d.user_id
 		WHERE d.enabled = true
 		  AND d.environment = 'production'
 		  AND d.authorization_status IN ('authorized', 'provisional')
 		  AND d.platform = ANY($1)
 		  AND CASE $3
-			WHEN 'monthly_support' THEN d.monthly_support_enabled
-			WHEN 'events' THEN d.events_enabled
-			ELSE d.announcements_enabled
+			WHEN 'monthly_support' THEN preference.monthly_support_enabled
+			WHEN 'events' THEN preference.events_enabled
+			ELSE preference.announcements_enabled
 		  END
 		  AND (
 			cardinality($2::text[]) = 0
@@ -1148,10 +1150,11 @@ func (s *timescaleMobilePushStore) AudienceCount(ctx context.Context, platforms 
 	err := s.pool.QueryRow(ctx, `
 		SELECT count(*)
 		FROM mobile_push_devices d
+		JOIN mobile_notification_preferences preference ON preference.user_id=d.user_id
 		WHERE d.enabled = true
 		  AND d.authorization_status IN ('authorized', 'provisional')
 		  AND d.platform = ANY($1)
-		  AND d.announcements_enabled = true
+		  AND preference.announcements_enabled = true
 		  AND (
 			cardinality($2::text[]) = 0
 			OR lower(split_part(replace(coalesce(nullif(d.locale, ''), ''), '_', '-'), '-', 1)) = ANY($2)

@@ -25,7 +25,9 @@ func TestFinalSchemaBattleIngestAndLegendCloseoutAreIdempotent(t *testing.T) {
 	defer store.Close()
 	if _, err := store.pool.Exec(ctx, `
 		INSERT INTO basic_player(tag,name,league_id,townhall_level,trophies)
-		VALUES('#P0','attacker',105000035,18,6000),('#Y2','defender',105000035,17,6000)
+		VALUES('#P0','attacker',105000036,18,6000),('#Y2','defender',105000036,17,5900);
+		INSERT INTO legend_rankings_current(tag,name,trophies,global_rank)
+		VALUES('#P0','attacker',6000,1),('#Y2','defender',5900,2)
 	`); err != nil {
 		t.Fatal(err)
 	}
@@ -60,7 +62,7 @@ func TestFinalSchemaBattleIngestAndLegendCloseoutAreIdempotent(t *testing.T) {
 		t.Fatalf("writes = %d then %d, want 1 then 0", first, second)
 	}
 	var total, attacks int
-	if err := store.pool.QueryRow(ctx, `SELECT count(*),count(*) FILTER(WHERE direction='attack') FROM battles_ranked`).Scan(&total, &attacks); err != nil {
+	if err := store.pool.QueryRow(ctx, `SELECT count(*),count(*) FILTER(WHERE direction=1) FROM battles_ranked`).Scan(&total, &attacks); err != nil {
 		t.Fatal(err)
 	}
 	if total != 2 || attacks != 1 {
@@ -77,7 +79,7 @@ func TestFinalSchemaBattleIngestAndLegendCloseoutAreIdempotent(t *testing.T) {
 	defer rows.Close()
 	type storedPerspective struct {
 		playerTag  string
-		direction  string
+		direction  int16
 		playerTH   int
 		opponentTH int
 	}
@@ -93,8 +95,8 @@ func TestFinalSchemaBattleIngestAndLegendCloseoutAreIdempotent(t *testing.T) {
 		t.Fatal(err)
 	}
 	wantPerspectives := []storedPerspective{
-		{playerTag: "#P0", direction: "attack", playerTH: 18, opponentTH: 17},
-		{playerTag: "#Y2", direction: "defense", playerTH: 17, opponentTH: 18},
+		{playerTag: "#P0", direction: battleDirectionAttack, playerTH: 18, opponentTH: 17},
+		{playerTag: "#Y2", direction: battleDirectionDefense, playerTH: 17, opponentTH: 18},
 	}
 	if !reflect.DeepEqual(perspectives, wantPerspectives) {
 		t.Fatalf("perspectives=%#v want=%#v", perspectives, wantPerspectives)
@@ -106,25 +108,31 @@ func TestFinalSchemaBattleIngestAndLegendCloseoutAreIdempotent(t *testing.T) {
 			t.Fatal(err)
 		}
 	}
-	var attackCount, tripleCount int
-	if err := store.pool.QueryRow(ctx, `SELECT attack_count,three_star_count FROM legend_daily_stats_v2`).Scan(&attackCount, &tripleCount); err != nil {
-		t.Fatal(err)
+	for _, cohort := range legendCloseoutCohorts {
+		var attackCount, tripleCount int
+		if err := store.pool.QueryRow(ctx, `SELECT attack_count,three_star_count FROM legend_daily_stats WHERE day=$1 AND cohort=$2`, day, cohort).Scan(&attackCount, &tripleCount); err != nil {
+			t.Fatal(err)
+		}
+		if attackCount != 1 || tripleCount != 1 {
+			t.Fatalf("%s legend aggregate attacks=%d triples=%d", cohort, attackCount, tripleCount)
+		}
 	}
-	if attackCount != 1 || tripleCount != 1 {
-		t.Fatalf("legend aggregate attacks=%d triples=%d", attackCount, tripleCount)
-	}
-	var familyCount, memberCount, familyAttacks int
+	var familyCount, memberCount, historyCount int
 	if err := store.pool.QueryRow(ctx, `SELECT count(*) FROM army_families`).Scan(&familyCount); err != nil {
 		t.Fatal(err)
 	}
 	if err := store.pool.QueryRow(ctx, `SELECT count(*) FROM army_family_members`).Scan(&memberCount); err != nil {
 		t.Fatal(err)
 	}
-	if err := store.pool.QueryRow(ctx, `SELECT attack_count FROM army_family_daily_stats_v2`).Scan(&familyAttacks); err != nil {
+	if err := store.pool.QueryRow(ctx, `SELECT count(*) FROM leaderboard_history_player_home WHERE day=$1`, day).Scan(&historyCount); err != nil {
 		t.Fatal(err)
 	}
-	if familyCount != 1 || memberCount != 1 || familyAttacks != 1 {
-		t.Fatalf("family count=%d members=%d attacks=%d", familyCount, memberCount, familyAttacks)
+	var familyStatsCount int
+	if err := store.pool.QueryRow(ctx, `SELECT count(*) FROM army_family_daily_stats WHERE day=$1 AND attack_count=1`, day).Scan(&familyStatsCount); err != nil {
+		t.Fatal(err)
+	}
+	if familyCount != 1 || memberCount != 1 || familyStatsCount != 3 || historyCount != 2 {
+		t.Fatalf("families=%d members=%d family cohorts=%d history=%d", familyCount, memberCount, familyStatsCount, historyCount)
 	}
 }
 

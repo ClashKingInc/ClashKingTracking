@@ -89,15 +89,9 @@ func TestAggregateLegendKeepsMissingCodesOnlyInGlobalTotals(t *testing.T) {
 	}
 }
 
-func TestPerfectPlayersRequiresExactlyEightTriples(t *testing.T) {
-	attacks := make([]legendAttack, 0, 17)
-	for i := 0; i < 8; i++ {
-		attacks = append(attacks, legendAttack{player: "#PERFECT", stars: 3})
-	}
-	for i := 0; i < 9; i++ {
-		attacks = append(attacks, legendAttack{player: "#NINE", stars: 3})
-	}
-	if got := perfectPlayers(attacks); got != 1 {
-		t.Fatalf("perfect players = %d, want 1", got)
+func TestLegendCloseoutUsesOnlyAgreedCohorts(t *testing.T) {
+	want := [...]string{"legend_i", "top_1000", "top_200"}
+	if legendCloseoutCohorts != want {
+		t.Fatalf("cohorts = %#v, want %#v", legendCloseoutCohorts, want)
 	}
 }

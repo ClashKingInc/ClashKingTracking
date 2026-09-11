@@ -14,6 +14,24 @@ func TestMobilePushConsumesWarAndRaidReminders(t *testing.T) {
 	}
 }
 
+func TestMobilePushConsumesOnlyLegendDefenseEvents(t *testing.T) {
+	if !mobilePushEventType(mobileWarEvent{Topic: "legend", Value: map[string]any{"type": "legend_defense"}}) {
+		t.Fatal("Legend defense event was not accepted")
+	}
+	if mobilePushEventType(mobileWarEvent{Topic: "legend", Value: map[string]any{"type": "legend_battle"}}) {
+		t.Fatal("retired Legend attack/combined event was accepted")
+	}
+	for _, fragment := range []string{
+		"account.enabled=true",
+		"preference.legend_defenses_enabled=true",
+		"account.player_tag=$1",
+	} {
+		if !strings.Contains(legendDefenseSubscriptionsSQL, fragment) {
+			t.Fatalf("Legend defense subscription query is missing %q: %s", fragment, legendDefenseSubscriptionsSQL)
+		}
+	}
+}
+
 func TestWarReminderDecoderAcceptsOnlyV2NestedData(t *testing.T) {
 	event := mobileWarEvent{Value: map[string]any{
 		"minutes_remaining": json.Number("45"),
@@ -45,30 +63,21 @@ func TestMobileSubscriptionsUseOnlyOrdinaryNotificationColumns(t *testing.T) {
 	for _, column := range []string{
 		"d.user_id",
 		"d.device_id",
-		"war_state_enabled",
-		"war_attacks_enabled",
+		"preference.war_state_enabled",
+		"preference.war_attacks_enabled",
+		"account.enabled = true",
 		"mobile_notification_accounts",
+		"mobile_notification_preferences",
 		"mobile_push_devices",
 	} {
 		if !strings.Contains(mobileSubscriptionsSQL, column) {
 			t.Fatalf("subscription query missing %q", column)
 		}
 	}
-	for _, retired := range []string{"mobile_war_subscriptions", "live_activity_enabled", "provider = 'apns'", "league_battles_enabled", "ranked_battlelog"} {
+	for _, retired := range []string{"mobile_war_subscriptions", "live_activity_enabled", "provider = 'apns'", "league_battles_enabled", "ranked_battlelog", "account.active", "account.source"} {
 		if strings.Contains(mobileSubscriptionsSQL, retired) {
 			t.Fatalf("subscription query still reads retired %q", retired)
 		}
-	}
-}
-
-func TestMobileLiveEventDeliveryKeyIsPerDevice(t *testing.T) {
-	first := mobileLiveEventDeliveryKey("123-0", mobileSubscription{DeviceID: "phone", Environment: "production"})
-	second := mobileLiveEventDeliveryKey("123-0", mobileSubscription{DeviceID: "tablet", Environment: "production"})
-	if first == second {
-		t.Fatalf("delivery keys must differ by device: %q", first)
-	}
-	if got := mobileLiveEventDeliveryKey("123-0", mobileSubscription{DeviceID: "phone", Environment: "production"}); got != first {
-		t.Fatalf("delivery key is not stable: %q != %q", got, first)
 	}
 }
 

@@ -28,6 +28,7 @@ const (
 	leaderboardLeagueKeyPrefix                = "leaderboards:league:"
 	leaderboardTHKeyPrefix                    = "leaderboards:townhall:"
 	leaderboardUpdateRetries                  = 3
+	legendLeaderboardRequestsPerSecond        = 20
 	leaderboardMaterializedViewRefreshSeconds = 1800
 	leaderboardMaterializedViewCount          = 5
 )
@@ -105,9 +106,22 @@ const leaderboardCandidateSQL = `
 	ORDER BY board_type, board_key, tag
 `
 
+const legendLeaderboardCandidatesSQL = `SELECT tag FROM basic_player WHERE league_id=105000036 ORDER BY tag`
+
+const replaceLegendRankingsCurrentSQL = `
+	INSERT INTO legend_rankings_current(tag,name,trophies,global_rank,clan_tag,clan_name)
+	SELECT player.tag,player.name,player.trophies,
+	       row_number() OVER (ORDER BY player.trophies DESC,player.tag)::integer,
+	       clan.tag,clan.name
+	FROM basic_player player
+	LEFT JOIN basic_clan clan ON clan.tag=player.clan_tag
+	WHERE player.league_id=105000036
+`
+
 type leaderboardsDomain struct {
 	store                       *timescaleLeaderboardStore
 	limiter                     *clashy.Limiter
+	legendLimiter               *clashy.Limiter
 	limit                       int
 	nullAssetURL                string
 	materializedViewRefreshMu   sync.Mutex
@@ -182,6 +196,11 @@ func (d *leaderboardsDomain) Run(ctx context.Context, app *platform.App) error {
 	}
 	d.limit = app.Config.LeaderboardLimit
 	d.nullAssetURL = app.Config.LeaderboardNullAssetURL
+	legendLimiter, err := newTrackingLimiter(legendLeaderboardRequestsPerSecond)
+	if err != nil {
+		return err
+	}
+	d.legendLimiter = legendLimiter
 	store, err := d.openStore(ctx, app)
 	if err != nil {
 		return err
@@ -246,6 +265,13 @@ func (d *leaderboardsDomain) runCycle(ctx context.Context, app *platform.App) er
 	if d.limiter == nil {
 		return errors.New("scheduled shared request limiter is required for leaderboards")
 	}
+	if d.legendLimiter == nil {
+		return errors.New("20 RPS Legend request limiter is required for leaderboards")
+	}
+	legendPlayers, err := d.refreshLegendRankings(ctx, app)
+	if err != nil {
+		return err
+	}
 	candidates, err := d.store.LoadCandidates(ctx, d.limit)
 	if err != nil {
 		return err
@@ -259,9 +285,24 @@ func (d *leaderboardsDomain) runCycle(ctx context.Context, app *platform.App) er
 	if err != nil {
 		return err
 	}
-	players, deletedTags, err := d.fetchPlayers(ctx, app, d.limiter, tags, leagues)
+	legendByTag := make(map[string]leaderboardPlayerRow, len(legendPlayers))
+	for _, player := range legendPlayers {
+		legendByTag[player.Tag] = player
+	}
+	standardTags := make([]string, 0, len(tags))
+	for _, tag := range tags {
+		if _, refreshedAsLegend := legendByTag[tag]; !refreshedAsLegend {
+			standardTags = append(standardTags, tag)
+		}
+	}
+	players, deletedTags, err := d.fetchPlayers(ctx, app, d.limiter, standardTags, leagues)
 	if err != nil {
 		return err
+	}
+	for _, tag := range tags {
+		if player, ok := legendByTag[tag]; ok {
+			players = append(players, player)
+		}
 	}
 	basicPlayers := leaderboardBasicPlayerRows(players)
 	deleted, err := d.store.DeletePlayers(ctx, deletedTags)
@@ -281,6 +322,38 @@ func (d *leaderboardsDomain) runCycle(ctx context.Context, app *platform.App) er
 		app.Stats.RecordWrite(leaderboardsDomainName, len(basicPlayers)+deleted+len(cache.Boards)+1)
 	}
 	return err
+}
+
+func (d *leaderboardsDomain) refreshLegendRankings(ctx context.Context, app *platform.App) ([]leaderboardPlayerRow, error) {
+	tags, err := d.store.LoadLegendTags(ctx)
+	if err != nil {
+		return nil, err
+	}
+	players, deletedTags, err := d.fetchPlayers(ctx, app, d.legendLimiter, tags, nil)
+	if err != nil {
+		return nil, err
+	}
+	if !legendRefreshComplete(len(tags), len(players), len(deletedTags)) {
+		return nil, fmt.Errorf("Legend refresh incomplete: resolved %d players and %d confirmed deletions from %d candidates", len(players), len(deletedTags), len(tags))
+	}
+	deleted, err := d.store.DeletePlayers(ctx, deletedTags)
+	if err != nil {
+		return nil, err
+	}
+	rows := leaderboardBasicPlayerRows(players)
+	if err := d.store.UpdatePlayers(ctx, rows); err != nil {
+		return nil, err
+	}
+	replaced, err := d.store.ReplaceLegendRankingsCurrent(ctx)
+	if err != nil {
+		return nil, err
+	}
+	app.Stats.RecordWrite(leaderboardsDomainName, len(rows)+deleted+replaced)
+	return players, nil
+}
+
+func legendRefreshComplete(candidates, players, confirmedDeletions int) bool {
+	return players+confirmedDeletions == candidates
 }
 
 func (d *leaderboardsDomain) refreshMaterializedViewsIfDue(ctx context.Context, app *platform.App, now time.Time) error {
@@ -604,6 +677,42 @@ func (s *timescaleLeaderboardStore) LoadCandidates(ctx context.Context, limit in
 		out = append(out, row)
 	}
 	return out, rows.Err()
+}
+
+func (s *timescaleLeaderboardStore) LoadLegendTags(ctx context.Context) ([]string, error) {
+	rows, err := s.pool.Query(ctx, legendLeaderboardCandidatesSQL)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var tags []string
+	for rows.Next() {
+		var tag string
+		if err := rows.Scan(&tag); err != nil {
+			return nil, err
+		}
+		tags = append(tags, tag)
+	}
+	return tags, rows.Err()
+}
+
+func (s *timescaleLeaderboardStore) ReplaceLegendRankingsCurrent(ctx context.Context) (int, error) {
+	tx, err := s.pool.Begin(ctx)
+	if err != nil {
+		return 0, err
+	}
+	defer tx.Rollback(ctx)
+	if _, err := tx.Exec(ctx, `TRUNCATE legend_rankings_current`); err != nil {
+		return 0, err
+	}
+	tag, err := tx.Exec(ctx, replaceLegendRankingsCurrentSQL)
+	if err != nil {
+		return 0, err
+	}
+	if err := tx.Commit(ctx); err != nil {
+		return 0, err
+	}
+	return int(tag.RowsAffected()), nil
 }
 
 func (s *timescaleLeaderboardStore) UpdatePlayers(ctx context.Context, players []models.BasicPlayerRow) error {

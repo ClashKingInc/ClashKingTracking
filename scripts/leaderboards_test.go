@@ -127,6 +127,37 @@ func TestLeaguePayloadForPlayerUsesLeagueTierMetadata(t *testing.T) {
 	}
 }
 
+func TestLegendLeaderboardRefreshUsesExactLiveContract(t *testing.T) {
+	if legendLeaderboardRequestsPerSecond != 20 {
+		t.Fatalf("Legend refresh rate = %d, want exactly 20 RPS", legendLeaderboardRequestsPerSecond)
+	}
+	if !strings.Contains(legendLeaderboardCandidatesSQL, "league_id=105000036") {
+		t.Fatalf("Legend candidates do not use the verified Legend I discriminator: %s", legendLeaderboardCandidatesSQL)
+	}
+	for _, fragment := range []string{
+		"INSERT INTO legend_rankings_current(tag,name,trophies,global_rank,clan_tag,clan_name)",
+		"row_number() OVER (ORDER BY player.trophies DESC,player.tag)",
+		"LEFT JOIN basic_clan",
+		"player.league_id=105000036",
+	} {
+		if !strings.Contains(replaceLegendRankingsCurrentSQL, fragment) {
+			t.Fatalf("Legend replacement SQL is missing %q: %s", fragment, replaceLegendRankingsCurrentSQL)
+		}
+	}
+}
+
+func TestLegendLeaderboardReplacementRequiresCompleteRefresh(t *testing.T) {
+	if !legendRefreshComplete(3, 2, 1) {
+		t.Fatal("usable players plus confirmed deletions should complete the refresh")
+	}
+	if legendRefreshComplete(3, 2, 0) {
+		t.Fatal("a transiently skipped Legend player must block snapshot replacement")
+	}
+	if !legendRefreshComplete(0, 0, 0) {
+		t.Fatal("an empty source set is a complete refresh")
+	}
+}
+
 func TestLeaderboardMaterializedViewRefreshSet(t *testing.T) {
 	if leaderboardMaterializedViewRefreshSeconds != 30*60 {
 		t.Fatalf("materialized view refresh cadence = %d seconds, want 30 minutes", leaderboardMaterializedViewRefreshSeconds)

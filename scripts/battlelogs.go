@@ -2,6 +2,7 @@ package scripts
 
 import (
 	"context"
+	"crypto/sha256"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -24,6 +25,14 @@ import (
 )
 
 const battlelogsDomainName = "battlelogs"
+
+const (
+	battleModeFarming      int16 = 0
+	battleModeRanked       int16 = 1
+	battleModeLegend       int16 = 2
+	battleDirectionAttack  int16 = 1
+	battleDirectionDefense int16 = 2
+)
 
 const (
 	// A first-seen player can contribute an entire battle-log page, so one
@@ -49,8 +58,10 @@ const (
 var battlelogColumnPattern = regexp.MustCompile(`^[disuhpe]_[0-9]+$`)
 
 type battlelogsDomain struct {
-	sink       battlelogStore
-	checkpoint battlelogTimestampCache
+	sink                 battlelogStore
+	checkpoint           battlelogTimestampCache
+	publishLegendDefense func(context.Context, *platform.App, models.BattlelogRow) error
+	updateCheckpoints    func(context.Context, []models.BattlelogCheckpoint) error
 }
 
 type battlelogStore interface {
@@ -65,7 +76,8 @@ type battlelogTargetJob struct {
 }
 
 type timescaleBattlelogStore struct {
-	pool *pgxpool.Pool
+	pool   *pgxpool.Pool
+	static *clashy.StaticData
 }
 
 func NewBattlelogsDomain() platform.Domain {
@@ -292,18 +304,21 @@ func battlelogRequestConcurrency(requestsPerSecond int) int {
 }
 
 func mergeBattlelogIngests(values []models.BattlelogIngest) models.BattlelogIngest {
-	var totalRows, totalCheckpoints int
+	var totalRows, totalNotifications, totalCheckpoints int
 	for _, value := range values {
 		totalRows += len(value.Rows)
+		totalNotifications += len(value.Notifications)
 		totalCheckpoints += len(value.Checkpoints)
 	}
 	out := models.BattlelogIngest{
-		Rows:        make([]models.BattlelogRow, 0, totalRows),
-		Checkpoints: make([]models.BattlelogCheckpoint, 0, totalCheckpoints),
+		Rows:          make([]models.BattlelogRow, 0, totalRows),
+		Notifications: make([]models.BattlelogRow, 0, totalNotifications),
+		Checkpoints:   make([]models.BattlelogCheckpoint, 0, totalCheckpoints),
 	}
 	checkpoints := make(map[string]models.BattlelogCheckpoint, totalCheckpoints)
 	for _, value := range values {
 		out.Rows = append(out.Rows, value.Rows...)
+		out.Notifications = append(out.Notifications, value.Notifications...)
 		for _, checkpoint := range value.Checkpoints {
 			if checkpoint.Tag == "" || checkpoint.Timestamp.IsZero() {
 				continue
@@ -408,6 +423,13 @@ func battlelogIngestFromEntries(entries []clashy.BattleLogEntry, playerTag strin
 	ingest := models.BattlelogIngest{
 		Rows: rows,
 	}
+	if !checkpoint.Timestamp.IsZero() {
+		for _, row := range rows {
+			if battlelogStorageMode(clashy.BattleType(row.BattleType)) == "legend" && !row.Attack {
+				ingest.Notifications = append(ingest.Notifications, row)
+			}
+		}
+	}
 	ingest.Checkpoints = []models.BattlelogCheckpoint{{Tag: playerTag, Timestamp: checkpointTime}}
 	return ingest, nil
 }
@@ -422,9 +444,22 @@ func (d *battlelogsDomain) store(ctx context.Context, app *platform.App, ingest 
 			return err
 		}
 	}
+	publish := d.publishLegendDefense
+	if publish == nil {
+		publish = publishLegendDefenseEvent
+	}
+	for _, defense := range ingest.Notifications {
+		if err := publish(ctx, app, defense); err != nil {
+			return err
+		}
+	}
 	if !app.Config.DryRun {
 		// Checkpoints move only after durable rows write successfully.
-		if err := d.checkpoint.UpdateMany(ctx, ingest.Checkpoints); err != nil {
+		update := d.updateCheckpoints
+		if update == nil {
+			update = d.checkpoint.UpdateMany
+		}
+		if err := update(ctx, ingest.Checkpoints); err != nil {
 			return err
 		}
 	}
@@ -432,6 +467,27 @@ func (d *battlelogsDomain) store(ctx context.Context, app *platform.App, ingest 
 	app.Stats.RecordStore(battlelogsDomainName, time.Since(start), len(ingest.Rows), insertedRows)
 	app.Stats.SetReady(battlelogsDomainName, true, "")
 	return nil
+}
+
+func publishLegendDefenseEvent(ctx context.Context, app *platform.App, row models.BattlelogRow) error {
+	eventID := legendDefenseEventID(row)
+	ttl := time.Duration(app.Config.BattlelogCheckpointTTLDays) * 24 * time.Hour
+	_, err := platform.AppendEventOnce(ctx, app.Valkey, app.Config, eventID, ttl, platform.Event{
+		Topic:     "legend",
+		Timestamp: row.Timestamp,
+		Value: map[string]any{
+			"type":        "legend_defense",
+			"event_id":    eventID,
+			"player_tag":  clashy.CorrectTag(row.PlayerTag),
+			"battle_time": row.Timestamp.UTC().Format(time.RFC3339Nano),
+		},
+	})
+	return err
+}
+
+func legendDefenseEventID(row models.BattlelogRow) string {
+	identity := "legend_defense\x00" + clashy.CorrectTag(row.PlayerTag) + "\x00" + row.Timestamp.UTC().Format(time.RFC3339Nano)
+	return fmt.Sprintf("%x", sha256.Sum256([]byte(identity)))
 }
 
 func (d *battlelogsDomain) fetchBattleLog(ctx context.Context, app *platform.App, statsName string, tag string) ([]clashy.BattleLogEntry, error) {
@@ -446,7 +502,12 @@ func newTimescaleBattlelogStore(ctx context.Context, dsn string) (*timescaleBatt
 	if err != nil {
 		return nil, err
 	}
-	return &timescaleBattlelogStore{pool: pool}, nil
+	static, err := clashy.LoadStaticData()
+	if err != nil {
+		pool.Close()
+		return nil, err
+	}
+	return &timescaleBattlelogStore{pool: pool, static: static}, nil
 }
 
 func (s *timescaleBattlelogStore) Close() error {
@@ -525,7 +586,7 @@ func (s *timescaleBattlelogStore) insertBattlelogRows(ctx context.Context, tx pg
 			requested_tag text NOT NULL,
 			opponent_tag text NOT NULL,
 			opponent_th smallint NOT NULL,
-			mode text NOT NULL,
+			mode smallint NOT NULL,
 			requested_attack boolean NOT NULL,
 			stars smallint NOT NULL,
 			destruction_percentage smallint NOT NULL,
@@ -548,9 +609,20 @@ func (s *timescaleBattlelogStore) insertBattlelogRows(ctx context.Context, tx pg
 		if opponentTag == "" {
 			opponentTag = "#0"
 		}
-		mode := battlelogStorageMode(clashy.BattleType(row.BattleType))
-		if mode == "" {
+		mode, ok := battlelogStorageModeCode(clashy.BattleType(row.BattleType))
+		if !ok {
 			return 0, fmt.Errorf("unsupported battle type %q", row.BattleType)
+		}
+		if row.Duration > math.MaxInt16 {
+			return 0, fmt.Errorf("battle duration %d exceeds smallint range", row.Duration)
+		}
+		shareCode := ""
+		if row.ArmyShareCode != "" {
+			var normalizeErr error
+			shareCode, normalizeErr = normalizeArmyShareCodeChecked(row.ArmyShareCode)
+			if normalizeErr != nil {
+				return 0, normalizeErr
+			}
 		}
 		loot, err := json.Marshal(map[string]uint32{
 			"gold": row.Gold, "elixir": row.Elixir, "darkElixir": row.DarkElixir,
@@ -561,7 +633,7 @@ func (s *timescaleBattlelogStore) insertBattlelogRows(ctx context.Context, tx pg
 		copyRows = append(copyRows, []any{
 			playerTag, opponentTag, int16(row.OpponentTH), mode, row.Attack,
 			int16(row.Stars), int16(row.DestructionPercentage), loot,
-			int32(row.Duration), row.Timestamp, row.ArmyShareCode,
+			int16(row.Duration), row.Timestamp, shareCode,
 		})
 	}
 	if _, err := tx.CopyFrom(ctx, pgx.Identifier{"battlelog_ingest_stage"}, []string{
@@ -571,6 +643,9 @@ func (s *timescaleBattlelogStore) insertBattlelogRows(ctx context.Context, tx pg
 	}, pgx.CopyFromRows(copyRows)); err != nil {
 		return 0, err
 	}
+	if err := s.upsertArmyCompositions(ctx, tx, rows); err != nil {
+		return 0, err
+	}
 
 	farmingTag, err := tx.Exec(ctx, `
 		INSERT INTO battles_farming (
@@ -578,9 +653,9 @@ func (s *timescaleBattlelogStore) insertBattlelogRows(ctx context.Context, tx pg
 			looted_resources, share_code
 		)
 		SELECT requested_tag, battle_time, stars, destruction_percentage,
-			NULLIF(duration_seconds, 0), looted_resources, NULLIF(army_share_code, '')
+			duration_seconds, looted_resources, NULLIF(army_share_code, '')
 		FROM battlelog_ingest_stage
-		WHERE mode = 'farming' AND requested_attack
+		WHERE mode = 0 AND requested_attack
 		ON CONFLICT (player_tag, battle_time) DO NOTHING
 	`)
 	if err != nil {
@@ -593,7 +668,7 @@ func (s *timescaleBattlelogStore) insertBattlelogRows(ctx context.Context, tx pg
 			SELECT stage.*, requested.townhall_level AS requested_th
 			FROM battlelog_ingest_stage stage
 			JOIN basic_player requested ON requested.tag = stage.requested_tag
-			WHERE stage.mode IN ('ranked', 'legend')
+			WHERE stage.mode IN (1, 2)
 			  AND requested.townhall_level BETWEEN 1 AND 20
 		), inserted AS (
 			INSERT INTO battles_ranked (
@@ -602,9 +677,9 @@ func (s *timescaleBattlelogStore) insertBattlelogRows(ctx context.Context, tx pg
 				duration_seconds, looted_resources, share_code
 			)
 			SELECT requested_tag, battle_time,
-				CASE WHEN requested_attack THEN 'attack' ELSE 'defense' END,
+				CASE WHEN requested_attack THEN 1 ELSE 2 END,
 				opponent_tag, mode, requested_th, opponent_th, stars, destruction_percentage,
-				NULLIF(duration_seconds, 0),
+				duration_seconds,
 				CASE WHEN requested_attack THEN looted_resources ELSE NULL END,
 				NULLIF(army_share_code, '')
 			FROM observations
@@ -617,6 +692,75 @@ func (s *timescaleBattlelogStore) insertBattlelogRows(ctx context.Context, tx pg
 		return 0, err
 	}
 	return int(farmingTag.RowsAffected()) + rankedInserted, nil
+}
+
+func battlelogStorageModeCode(battleType clashy.BattleType) (int16, bool) {
+	switch battlelogStorageMode(battleType) {
+	case "farming":
+		return battleModeFarming, true
+	case "ranked":
+		return battleModeRanked, true
+	case "legend":
+		return battleModeLegend, true
+	default:
+		return 0, false
+	}
+}
+
+func (s *timescaleBattlelogStore) upsertArmyCompositions(ctx context.Context, tx pgx.Tx, rows []models.BattlelogRow) error {
+	if s.static == nil {
+		return errors.New("Clash static data is required for army composition storage")
+	}
+	records := map[string]armyCompositionRecord{}
+	for _, row := range rows {
+		mode := battlelogStorageMode(clashy.BattleType(row.BattleType))
+		if (mode != "ranked" && mode != "legend") || row.ArmyShareCode == "" {
+			continue
+		}
+		code, err := normalizeArmyShareCodeChecked(row.ArmyShareCode)
+		if err != nil {
+			return err
+		}
+		records[code] = armyCompositionFromColumns(s.static, code, parseArmyColumns(code))
+	}
+	codes := make([]string, 0, len(records))
+	for code := range records {
+		codes = append(codes, code)
+	}
+	sort.Strings(codes)
+	for _, code := range codes {
+		record := records[code]
+		mainTroops, err := json.Marshal(record.MainTroops)
+		if err != nil {
+			return err
+		}
+		clanCastleTroops, err := json.Marshal(record.ClanCastleTroops)
+		if err != nil {
+			return err
+		}
+		spells, err := json.Marshal(record.Spells)
+		if err != nil {
+			return err
+		}
+		equipment, err := json.Marshal(record.Equipment)
+		if err != nil {
+			return err
+		}
+		petAssignments, err := json.Marshal(record.PetAssignments)
+		if err != nil {
+			return err
+		}
+		if _, err := tx.Exec(ctx, `
+			INSERT INTO army_compositions (
+				share_code, main_troops, clan_castle_troops, spells, heroes,
+				equipment, pet_assignments, siege_machine_id
+			) VALUES ($1,$2::jsonb,$3::jsonb,$4::jsonb,$5,$6::jsonb,$7::jsonb,$8)
+			ON CONFLICT (share_code) DO NOTHING
+		`, code, mainTroops, clanCastleTroops, spells, record.Heroes, equipment, petAssignments, record.SiegeMachineID); err != nil {
+			return err
+		}
+	}
+	return nil
 }
 
 type armyQuantity struct {
