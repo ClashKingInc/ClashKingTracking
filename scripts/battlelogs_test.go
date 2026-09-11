@@ -148,6 +148,59 @@ func TestBattlelogCheckpointTracksCompleteBattleDataInsteadOfPollTime(t *testing
 	}
 }
 
+func TestBattlelogIngestQueuesOnlyNewLegendDefensesForNotification(t *testing.T) {
+	now := time.Date(2026, 9, 11, 12, 0, 0, 0, time.UTC)
+	checkpoint := models.BattlelogCheckpoint{Tag: "#PLAYER", Timestamp: now.Add(-time.Hour)}
+	entry := func(mode clashy.BattleType, attack bool, offset time.Duration) clashy.BattleLogEntry {
+		return clashy.BattleLogEntry{
+			BattleType: mode, Attack: attack, OpponentPlayerTag: "#P0Y",
+			OpponentTownHallLevel: 17, Timestamp: clashTimestamp(now.Add(offset)),
+		}
+	}
+	ingest, err := battlelogIngestFromEntries([]clashy.BattleLogEntry{
+		entry(clashy.BattleTypeLegend, true, time.Minute),
+		entry(clashy.BattleTypeLegend, false, 2*time.Minute),
+		entry(clashy.BattleTypeRanked, false, 3*time.Minute),
+	}, "#PLAYER", checkpoint, now.Add(time.Hour), 14)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(ingest.Notifications) != 1 {
+		t.Fatalf("notification rows = %#v, want one Legend defense", ingest.Notifications)
+	}
+	if row := ingest.Notifications[0]; row.Attack || battlelogStorageMode(clashy.BattleType(row.BattleType)) != "legend" {
+		t.Fatalf("notification row = %#v, want Legend defense", row)
+	}
+
+	firstSeen, err := battlelogIngestFromEntries([]clashy.BattleLogEntry{
+		entry(clashy.BattleTypeLegend, false, 4*time.Minute),
+	}, "#PLAYER", models.BattlelogCheckpoint{}, now.Add(time.Hour), 14)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(firstSeen.Notifications) != 0 {
+		t.Fatalf("first-seen history must not emit notifications: %#v", firstSeen.Notifications)
+	}
+}
+
+func TestLegendDefenseEventIDUsesPlayerAndBattleTime(t *testing.T) {
+	timestamp := time.Date(2026, 9, 11, 12, 0, 0, 123, time.UTC)
+	base := models.BattlelogRow{PlayerTag: "#P0Y", Timestamp: timestamp}
+	if left, right := legendDefenseEventID(base), legendDefenseEventID(base); left == "" || left != right {
+		t.Fatalf("event ID is not deterministic: %q %q", left, right)
+	}
+	changedPlayer := base
+	changedPlayer.PlayerTag = "#Q0Y"
+	if legendDefenseEventID(base) == legendDefenseEventID(changedPlayer) {
+		t.Fatal("event ID did not change with player tag")
+	}
+	changedTime := base
+	changedTime.Timestamp = timestamp.Add(time.Nanosecond)
+	if legendDefenseEventID(base) == legendDefenseEventID(changedTime) {
+		t.Fatal("event ID did not change with battle time")
+	}
+}
+
 func TestBattlelogRequestConcurrencyIsMemoryBounded(t *testing.T) {
 	tests := []struct {
 		rps  int
@@ -206,8 +259,9 @@ func TestBattlelogStorageModeAcceptsWireAndConstantValues(t *testing.T) {
 }
 
 type fakeBattlelogStore struct {
-	ingest models.BattlelogIngest
-	calls  int
+	ingest  models.BattlelogIngest
+	calls   int
+	onStore func()
 }
 
 func (s *fakeBattlelogStore) LoadTargets(context.Context, string) ([]string, error) {
@@ -217,6 +271,9 @@ func (s *fakeBattlelogStore) LoadTargets(context.Context, string) ([]string, err
 func (s *fakeBattlelogStore) Store(_ context.Context, ingest models.BattlelogIngest) (int, error) {
 	s.ingest = ingest
 	s.calls++
+	if s.onStore != nil {
+		s.onStore()
+	}
 	return len(ingest.Rows), nil
 }
 
@@ -240,6 +297,66 @@ func TestBattlelogsStorePersistsRowsAndNames(t *testing.T) {
 	}
 	if len(sink.ingest.Rows) != 1 || len(sink.ingest.Checkpoints) != 1 {
 		t.Fatalf("unexpected stored ingest: %#v", sink.ingest)
+	}
+}
+
+func TestBattlelogsStoreEnqueuesDefenseBeforeAdvancingCheckpoint(t *testing.T) {
+	order := []string{}
+	sink := &fakeBattlelogStore{onStore: func() { order = append(order, "sql") }}
+	domain := &battlelogsDomain{
+		sink: sink,
+		publishLegendDefense: func(context.Context, *platform.App, models.BattlelogRow) error {
+			order = append(order, "stream")
+			return nil
+		},
+		updateCheckpoints: func(context.Context, []models.BattlelogCheckpoint) error {
+			order = append(order, "checkpoint")
+			return nil
+		},
+	}
+	app := &platform.App{Stats: platform.NewTracker()}
+	ingest := models.BattlelogIngest{
+		Rows:          []models.BattlelogRow{{PlayerTag: "#P0Y"}},
+		Notifications: []models.BattlelogRow{{PlayerTag: "#P0Y"}},
+		Checkpoints:   []models.BattlelogCheckpoint{{Tag: "#P0Y", Timestamp: time.Now().UTC()}},
+	}
+	if err := domain.store(t.Context(), app, ingest); err != nil {
+		t.Fatal(err)
+	}
+	want := []string{"sql", "stream", "checkpoint"}
+	if len(order) != len(want) {
+		t.Fatalf("store order = %#v, want %#v", order, want)
+	}
+	for i := range want {
+		if order[i] != want[i] {
+			t.Fatalf("store order = %#v, want %#v", order, want)
+		}
+	}
+}
+
+func TestBattlelogsStoreDoesNotCheckpointWhenDefenseEnqueueFails(t *testing.T) {
+	checkpointed := false
+	domain := &battlelogsDomain{
+		sink: &fakeBattlelogStore{},
+		publishLegendDefense: func(context.Context, *platform.App, models.BattlelogRow) error {
+			return context.Canceled
+		},
+		updateCheckpoints: func(context.Context, []models.BattlelogCheckpoint) error {
+			checkpointed = true
+			return nil
+		},
+	}
+	app := &platform.App{Stats: platform.NewTracker()}
+	err := domain.store(t.Context(), app, models.BattlelogIngest{
+		Rows:          []models.BattlelogRow{{PlayerTag: "#P0Y"}},
+		Notifications: []models.BattlelogRow{{PlayerTag: "#P0Y"}},
+		Checkpoints:   []models.BattlelogCheckpoint{{Tag: "#P0Y", Timestamp: time.Now().UTC()}},
+	})
+	if err == nil {
+		t.Fatal("expected stream enqueue failure")
+	}
+	if checkpointed {
+		t.Fatal("checkpoint advanced after stream enqueue failure")
 	}
 }
 

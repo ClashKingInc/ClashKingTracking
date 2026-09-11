@@ -12,7 +12,6 @@ import (
 	"strings"
 	"time"
 
-	"clashking_tracking/internal/cwlstats"
 	"clashking_tracking/internal/platform"
 	"clashking_tracking/internal/utils"
 	"clashking_tracking/models"
@@ -36,8 +35,7 @@ const (
 	legendSeasonV2Prefix = "v2-"
 	legendSeasonV2Length = 28 * 24 * time.Hour
 
-	currentClanRankingLimit     = 200
-	cwlSeasonStatisticsInterval = 7 * 24 * time.Hour
+	currentClanRankingLimit = 200
 )
 
 type leaderboardLoader func(context.Context, *clashy.Client, string) (any, error)
@@ -225,7 +223,6 @@ type scheduledStore interface {
 	StoreRankedLeagueGroup(context.Context, []models.RankedLeagueGroupMemberRow) (int, error)
 	MissingRankedGroupPlayers(context.Context, int64) ([]string, error)
 	FinalizeRankedTournament(context.Context, int64) (int, error)
-	ReconcileCWLSeasonStatistics(context.Context, []string) error
 	FinalizeLegendCloseout(context.Context, time.Time) (int, error)
 }
 
@@ -256,14 +253,11 @@ func (d *scheduledDomain) Run(ctx context.Context, app *platform.App) error {
 	go func() {
 		leaderboardDone <- (&leaderboardsDomain{limiter: limiter}).Run(leaderboardCtx, app)
 	}()
-	cwlStatisticsDone := make(chan error, 1)
-	go func() { cwlStatisticsDone <- d.runCWLSeasonStatisticsLoop(leaderboardCtx, app) }()
 	leagueCloseoutDone := make(chan error, 1)
 	go func() { leagueCloseoutDone <- d.runLeagueCloseoutLoop(leaderboardCtx, app) }()
 	defer func() {
 		stopLeaderboards()
 		<-leaderboardDone
-		<-cwlStatisticsDone
 		<-leagueCloseoutDone
 	}()
 
@@ -284,13 +278,6 @@ func (d *scheduledDomain) Run(ctx context.Context, app *platform.App) error {
 			stopLeaderboards()
 			leaderboardDone <- err
 			return fmt.Errorf("scheduled leaderboard refresh stopped: %w", err)
-		case err := <-cwlStatisticsDone:
-			if !timer.Stop() {
-				<-timer.C
-			}
-			stopLeaderboards()
-			cwlStatisticsDone <- err
-			return fmt.Errorf("scheduled CWL season statistics refresh stopped: %w", err)
 		case err := <-leagueCloseoutDone:
 			if !timer.Stop() {
 				<-timer.C
@@ -298,25 +285,6 @@ func (d *scheduledDomain) Run(ctx context.Context, app *platform.App) error {
 			stopLeaderboards()
 			leagueCloseoutDone <- err
 			return fmt.Errorf("scheduled league closeout stopped: %w", err)
-		case <-ctx.Done():
-			if !timer.Stop() {
-				<-timer.C
-			}
-			return ctx.Err()
-		case <-timer.C:
-		}
-	}
-}
-
-func (d *scheduledDomain) runCWLSeasonStatisticsLoop(ctx context.Context, app *platform.App) error {
-	for {
-		started := time.Now()
-		if err := d.store.ReconcileCWLSeasonStatistics(ctx, cwlstats.CurrentAndPreviousUTC(started)); err != nil {
-			return err
-		}
-		app.Stats.RecordProcess(trackingProgressName(scheduledDomainName, "cwl-season-statistics"), time.Since(started))
-		timer := time.NewTimer(cwlSeasonStatisticsInterval)
-		select {
 		case <-ctx.Done():
 			if !timer.Stop() {
 				<-timer.C
@@ -1656,10 +1624,6 @@ func (s *timescaleScheduledStore) Close() {
 	}
 }
 
-func (s *timescaleScheduledStore) ReconcileCWLSeasonStatistics(ctx context.Context, seasons []string) error {
-	return cwlstats.Reconcile(ctx, s.pool, seasons)
-}
-
 func (s *timescaleScheduledStore) ReplaceLeaderboardHistory(
 	ctx context.Context,
 	groups []leaderboardHistoryGroup,
@@ -2423,7 +2387,7 @@ func (s *timescaleScheduledStore) FinalizeRankedTournament(ctx context.Context, 
 		SELECT 'ranked_season',$2,member.league_tier_id,battle.player_town_hall,count(*),count(*) FILTER(WHERE stars=0),count(*) FILTER(WHERE stars=1),
 			count(*) FILTER(WHERE stars=2),count(*) FILTER(WHERE stars=3),now()
 		FROM battles_ranked battle JOIN ranked_league_group_members member ON member.season_id=$1 AND member.player_tag=battle.player_tag
-		WHERE battle.direction='attack' AND battle.battle_mode='ranked' AND battle.battle_time >= $2 AND battle.battle_time < $2 + interval '7 days'
+		WHERE battle.direction=1 AND battle.battle_mode=1 AND battle.battle_time >= $2 AND battle.battle_time < $2 + interval '7 days'
 		  AND battle.player_town_hall=battle.opponent_town_hall
 		GROUP BY member.league_tier_id,battle.player_town_hall
 	`, seasonID, periodStart)
@@ -2487,10 +2451,6 @@ func newMemoryScheduledStore() *memoryScheduledStore {
 }
 
 func (*memoryScheduledStore) Close() {}
-
-func (*memoryScheduledStore) ReconcileCWLSeasonStatistics(context.Context, []string) error {
-	return nil
-}
 
 func (*memoryScheduledStore) FinalizeLegendCloseout(context.Context, time.Time) (int, error) {
 	return 0, nil

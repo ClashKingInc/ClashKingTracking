@@ -74,7 +74,7 @@ Inactivity checks find members as their most recent `player_online_events` time 
 
 ## Data and Valkey used
 
-Reads `war_schedule`, `player_timers`, `reminders`, verified `mobile_notification_accounts`, `mobile_push_devices`, `basic_clan.members`, `player_stat_changes`, and `player_online_events`. Writes only `war_reminder_jobs` and deletes a job after it fires.
+Reads `war_schedule`, `player_timers`, `reminders`, verified and enabled `mobile_notification_accounts`, `mobile_notification_preferences`, `mobile_push_devices`, `basic_clan.members`, `player_stat_changes`, and `player_online_events`. Writes only `war_reminder_jobs` and deletes a job after it fires.
 
 Consumes `war_schedule` and `reminder_config` events from its own Valkey consumer group. Publishes `reminder` events containing the shared current snapshot and enough identity for downstream recipients.
 

@@ -292,10 +292,11 @@ func (d *remindersDomain) reconcileWar(ctx context.Context, scheduleKey string) 
 			SELECT DISTINCT timing
 			FROM schedule
 			JOIN player_timers timer ON timer.event_type = 'war' AND timer.event_key = schedule.schedule_key
-			JOIN mobile_notification_accounts account ON account.player_tag = timer.player_tag AND account.active = true AND account.source = 'verified'
+			JOIN mobile_notification_accounts account ON account.player_tag = timer.player_tag AND account.enabled = true
+			JOIN mobile_notification_preferences preference ON preference.user_id = account.user_id
 			JOIN mobile_push_devices device ON device.user_id = account.user_id
-			CROSS JOIN LATERAL unnest(device.reminder_timings) timing
-			WHERE device.enabled = true AND device.provider = 'fcm' AND device.war_reminders_enabled = true
+			CROSS JOIN LATERAL unnest(preference.reminder_timings) timing
+			WHERE device.enabled = true AND device.provider = 'fcm' AND preference.war_reminders_enabled = true
 		)
 		INSERT INTO war_reminder_jobs (schedule_key, minutes_remaining, run_at)
 		SELECT schedule.schedule_key, required.minutes_remaining,
@@ -323,11 +324,12 @@ func (d *remindersDomain) reconcileWar(ctx context.Context, scheduleKey string) 
 		  AND NOT EXISTS (
 			SELECT 1
 			FROM player_timers timer
-			JOIN mobile_notification_accounts account ON account.player_tag = timer.player_tag AND account.active = true AND account.source = 'verified'
+			JOIN mobile_notification_accounts account ON account.player_tag = timer.player_tag AND account.enabled = true
+			JOIN mobile_notification_preferences preference ON preference.user_id = account.user_id
 			JOIN mobile_push_devices device ON device.user_id = account.user_id
 			WHERE timer.event_type = 'war' AND timer.event_key = job.schedule_key
-			  AND device.enabled = true AND device.provider = 'fcm' AND device.war_reminders_enabled = true
-			  AND job.minutes_remaining = ANY(device.reminder_timings)
+			  AND device.enabled = true AND device.provider = 'fcm' AND preference.war_reminders_enabled = true
+			  AND job.minutes_remaining = ANY(preference.reminder_timings)
 		  )
 	`, scheduleKey)
 	if err != nil {
@@ -372,10 +374,11 @@ func (d *remindersDomain) reconcileMobileWars(ctx context.Context, userID string
 	rows, err := d.pool.Query(ctx, `
 		SELECT DISTINCT timer.event_key
 		FROM player_timers timer
-		JOIN mobile_notification_accounts account ON account.player_tag = timer.player_tag AND account.active = true AND account.source = 'verified'
+		JOIN mobile_notification_accounts account ON account.player_tag = timer.player_tag AND account.enabled = true
+		JOIN mobile_notification_preferences preference ON preference.user_id = account.user_id
 		JOIN mobile_push_devices device ON device.user_id = account.user_id
 		WHERE timer.event_type = 'war' AND timer.expires_at > now()
-		  AND device.enabled = true AND device.provider = 'fcm' AND device.war_reminders_enabled = true
+		  AND device.enabled = true AND device.provider = 'fcm' AND preference.war_reminders_enabled = true
 		  AND ($1 = '' OR account.user_id::text = $1)
 	`, userID)
 	if err != nil {
@@ -601,11 +604,12 @@ func (d *remindersDomain) sendRaidReminderInterval(ctx context.Context, app *pla
 	rows, err := d.pool.Query(ctx, `
 		SELECT DISTINCT account.user_id, account.player_tag
 		FROM mobile_notification_accounts account
+		JOIN mobile_notification_preferences preference ON preference.user_id = account.user_id
 		JOIN mobile_push_devices device ON device.user_id = account.user_id
-		WHERE account.active = true AND account.source = 'verified'
+		WHERE account.enabled = true
 		  AND device.enabled = true AND device.provider = 'fcm'
-		  AND device.raid_reminders_enabled = true
-		  AND $1 = ANY(device.raid_reminder_timings)
+		  AND preference.raid_reminders_enabled = true
+		  AND $1 = ANY(preference.raid_reminder_timings)
 	`, minutes)
 	if err != nil {
 		return err

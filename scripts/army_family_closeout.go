@@ -14,6 +14,8 @@ import (
 
 const armyFamilyCloseoutLockID int64 = 636413279150006789
 
+var legendCloseoutCohorts = [...]string{"legend_i", "top_1000", "top_200"}
+
 type decodedArmy struct {
 	code        string
 	record      armyCompositionRecord
@@ -21,13 +23,13 @@ type decodedArmy struct {
 	usage       int64
 }
 type legendAttack struct {
-	player, code       string
-	stars, destruction int
-	duration           *int32
+	cohort, player, code string
+	stars, destruction   int
+	duration             *int32
 }
 type dailyCounts struct {
-	attacks, zero, one, two, three, destruction, duration, durationCount int64
-	players                                                              map[string]struct{}
+	attacks, zero, one, two, three, destruction, duration int64
+	players                                               map[string]struct{}
 }
 type usageCount struct{ Uses, Triples int64 }
 type itemStat struct {
@@ -57,6 +59,17 @@ func (s *timescaleScheduledStore) FinalizeLegendCloseout(ctx context.Context, da
 	if _, err = tx.Exec(ctx, `SELECT pg_advisory_xact_lock($1)`, armyFamilyCloseoutLockID); err != nil {
 		return 0, err
 	}
+	day = dayStart(day)
+	if _, err = tx.Exec(ctx, `DELETE FROM leaderboard_history_player_home WHERE day=$1`, day); err != nil {
+		return 0, err
+	}
+	snapshotTag, err := tx.Exec(ctx, `
+		INSERT INTO leaderboard_history_player_home(day,tag,global_rank,trophies)
+		SELECT $1,tag,global_rank,trophies FROM legend_rankings_current
+	`, day)
+	if err != nil {
+		return 0, err
+	}
 	attacks, usage, err := readLegendAttacks(ctx, tx, start, end)
 	if err != nil {
 		return 0, err
@@ -73,63 +86,81 @@ func (s *timescaleScheduledStore) FinalizeLegendCloseout(ctx context.Context, da
 	if err != nil {
 		return 0, err
 	}
-	writes := 0
+	writes := int(snapshotTag.RowsAffected())
 	for _, code := range unassignedCodes(usage, members) {
 		a := decoded[code]
 		match, ok := armyfamily.FindDirectAnchor(a.composition, anchors)
 		if !ok {
-			h, e := representativeIDs(a.record)
-			if err = tx.QueryRow(ctx, `INSERT INTO army_families(representative_share_code,name,hero_ids,equipment_ids) VALUES($1,NULL,$2,$3) ON CONFLICT(representative_share_code) DO UPDATE SET representative_share_code=EXCLUDED.representative_share_code RETURNING family_id`, code, h, e).Scan(&match.FamilyID); err != nil {
+			if err = tx.QueryRow(ctx, `INSERT INTO army_families(representative_share_code,name) VALUES($1,NULL) ON CONFLICT(representative_share_code) DO UPDATE SET representative_share_code=EXCLUDED.representative_share_code RETURNING family_id`, code).Scan(&match.FamilyID); err != nil {
 				return 0, err
 			}
 			match.TroopHousingSimilarity, match.SpellCapacitySimilarity, match.EquipmentSimilarity = 1, 1, 1
 			anchors = append(anchors, armyfamily.Anchor{FamilyID: match.FamilyID, ShareCode: code, Composition: a.composition})
 			writes++
 		}
-		tag, e := tx.Exec(ctx, `INSERT INTO army_family_members(share_code,family_id,troop_similarity,spell_similarity,equipment_similarity) VALUES($1,$2,$3,$4,$5) ON CONFLICT(share_code) DO NOTHING`, code, match.FamilyID, match.TroopHousingSimilarity, match.SpellCapacitySimilarity, match.EquipmentSimilarity)
+		tag, e := tx.Exec(ctx, `INSERT INTO army_family_members(share_code,family_id) VALUES($1,$2) ON CONFLICT(share_code) DO NOTHING`, code, match.FamilyID)
 		if e != nil {
 			return 0, e
 		}
 		writes += int(tag.RowsAffected())
 		members[code] = match.FamilyID
 	}
-	g, fams, heroes, pets, equipment, assignments := aggregateLegend(attacks, members, decoded)
-	for _, anchor := range anchors {
-		if fams[anchor.FamilyID] == nil {
-			fams[anchor.FamilyID] = newCounts()
-		}
-	}
-	day = dayStart(day)
-	if _, err = tx.Exec(ctx, `DELETE FROM army_family_daily_stats_v2 WHERE day=$1; DELETE FROM legend_daily_stats_v2 WHERE day=$1`, day); err != nil {
+	if _, err = tx.Exec(ctx, `DELETE FROM army_family_daily_stats WHERE day=$1`, day); err != nil {
 		return 0, err
 	}
-	for _, id := range familyIDs(fams) {
-		c := fams[id]
-		_, err = tx.Exec(ctx, `INSERT INTO army_family_daily_stats_v2(family_id,day,attack_count,distinct_player_count,zero_star_count,one_star_count,two_star_count,three_star_count,destruction_percentage_sum,duration_seconds_sum,duration_count) VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11)`, id, day, c.attacks, len(c.players), c.zero, c.one, c.two, c.three, c.destruction, c.duration, c.durationCount)
+	if _, err = tx.Exec(ctx, `DELETE FROM legend_daily_stats WHERE day=$1`, day); err != nil {
+		return 0, err
+	}
+	byCohort := make(map[string][]legendAttack, len(legendCloseoutCohorts))
+	for _, attack := range attacks {
+		byCohort[attack.cohort] = append(byCohort[attack.cohort], attack)
+	}
+	for _, cohort := range legendCloseoutCohorts {
+		g, fams, heroes, pets, equipment, assignments := aggregateLegend(byCohort[cohort], members, decoded)
+		for _, id := range familyIDs(fams) {
+			c := fams[id]
+			_, err = tx.Exec(ctx, `INSERT INTO army_family_daily_stats(family_id,day,cohort,attack_count,distinct_player_count,zero_star_count,one_star_count,two_star_count,three_star_count,destruction_percentage_sum,duration_seconds_sum) VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11)`, id, day, cohort, c.attacks, len(c.players), c.zero, c.one, c.two, c.three, c.destruction, c.duration)
+			if err != nil {
+				return 0, err
+			}
+			writes++
+		}
+		hj, _ := json.Marshal(itemStats(heroes))
+		pj, _ := json.Marshal(itemStats(pets))
+		ej, _ := json.Marshal(itemStats(equipment))
+		aj, _ := json.Marshal(assignmentStats(assignments))
+		_, err = tx.Exec(ctx, `INSERT INTO legend_daily_stats(day,cohort,attack_count,distinct_player_count,zero_star_count,one_star_count,two_star_count,three_star_count,destruction_percentage_sum,duration_seconds_sum,hero_stats,pet_stats,equipment_stats,pet_hero_assignments) VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14)`, day, cohort, g.attacks, len(g.players), g.zero, g.one, g.two, g.three, g.destruction, g.duration, json.RawMessage(hj), json.RawMessage(pj), json.RawMessage(ej), json.RawMessage(aj))
 		if err != nil {
 			return 0, err
 		}
 		writes++
 	}
-	hj, _ := json.Marshal(itemStats(heroes))
-	pj, _ := json.Marshal(itemStats(pets))
-	ej, _ := json.Marshal(itemStats(equipment))
-	aj, _ := json.Marshal(assignmentStats(assignments))
-	_, err = tx.Exec(ctx, `INSERT INTO legend_daily_stats_v2(day,attack_count,distinct_player_count,perfect_320_player_count,zero_star_count,one_star_count,two_star_count,three_star_count,destruction_percentage_sum,duration_seconds_sum,duration_count,hero_stats,pet_stats,equipment_stats,pet_hero_assignments) VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15)`, day, g.attacks, len(g.players), perfectPlayers(attacks), g.zero, g.one, g.two, g.three, g.destruction, g.duration, g.durationCount, json.RawMessage(hj), json.RawMessage(pj), json.RawMessage(ej), json.RawMessage(aj))
-	if err != nil {
-		return 0, err
-	}
 	if err = tx.Commit(ctx); err != nil {
 		return 0, err
 	}
-	return writes + 1, nil
+	return writes, nil
 }
 func legendDayWindow(day time.Time) (time.Time, time.Time) {
 	s := dayStart(day).Add(5*time.Hour + 10*time.Minute)
 	return s, s.Add(24 * time.Hour)
 }
 func readLegendAttacks(ctx context.Context, tx pgx.Tx, start, end time.Time) ([]legendAttack, map[string]int64, error) {
-	r, e := tx.Query(ctx, `SELECT player_tag,stars,destruction_percentage,duration_seconds,coalesce(share_code,'') FROM battles_ranked WHERE battle_mode='legend' AND direction='attack' AND battle_time >= $1 AND battle_time < $2 ORDER BY player_tag,battle_time`, start, end)
+	r, e := tx.Query(ctx, `
+		WITH cohort_members AS (
+			SELECT tag AS player_tag,'legend_i'::text AS cohort FROM leaderboard_history_player_home WHERE day=$3
+			UNION ALL
+			SELECT tag,'top_1000'::text FROM leaderboard_history_player_home WHERE day=$3 AND global_rank <= 1000
+			UNION ALL
+			SELECT tag,'top_200'::text FROM leaderboard_history_player_home WHERE day=$3 AND global_rank <= 200
+		)
+		SELECT cohort.cohort,battle.player_tag,battle.stars,battle.destruction_percentage,
+		       battle.duration_seconds,coalesce(battle.share_code,'')
+		FROM battles_ranked battle
+		JOIN cohort_members cohort ON cohort.player_tag=battle.player_tag
+		WHERE battle.battle_mode=2 AND battle.direction=1
+		  AND battle.battle_time >= $1 AND battle.battle_time < $2
+		ORDER BY cohort.cohort,battle.player_tag,battle.battle_time
+	`, start, end, dayStart(start))
 	if e != nil {
 		return nil, nil, e
 	}
@@ -138,7 +169,7 @@ func readLegendAttacks(ctx context.Context, tx pgx.Tx, start, end time.Time) ([]
 	u := map[string]int64{}
 	for r.Next() {
 		var a legendAttack
-		if e = r.Scan(&a.player, &a.stars, &a.destruction, &a.duration, &a.code); e != nil {
+		if e = r.Scan(&a.cohort, &a.player, &a.stars, &a.destruction, &a.duration, &a.code); e != nil {
 			return nil, nil, e
 		}
 		out = append(out, a)
@@ -251,27 +282,6 @@ func unassignedCodes(u map[string]int64, m map[string]int64) []string {
 	})
 	return o
 }
-func representativeIDs(r armyCompositionRecord) ([]int32, []int32) {
-	h := map[int32]bool{}
-	e := map[int32]bool{}
-	for _, x := range r.Heroes {
-		h[x] = true
-	}
-	for _, x := range r.Equipment {
-		e[int32(x.EquipmentID)] = true
-	}
-	hs := []int32{}
-	es := []int32{}
-	for x := range h {
-		hs = append(hs, x)
-	}
-	for x := range e {
-		es = append(es, x)
-	}
-	sort.Slice(hs, func(i, j int) bool { return hs[i] < hs[j] })
-	sort.Slice(es, func(i, j int) bool { return es[i] < es[j] })
-	return hs, es
-}
 func newCounts() *dailyCounts { return &dailyCounts{players: map[string]struct{}{}} }
 func addResult(c *dailyCounts, a legendAttack) {
 	c.attacks++
@@ -289,7 +299,6 @@ func addResult(c *dailyCounts, a legendAttack) {
 	c.destruction += int64(a.destruction)
 	if a.duration != nil {
 		c.duration += int64(*a.duration)
-		c.durationCount++
 	}
 }
 func addUsage(m map[int]usageCount, id int, triple bool, seen map[int]bool) {
@@ -345,25 +354,6 @@ func aggregateLegend(a []legendAttack, m map[string]int64, d map[string]decodedA
 		}
 	}
 	return g, fs, hs, ps, es, as
-}
-func perfectPlayers(a []legendAttack) int64 {
-	type p struct{ n, t int }
-	m := map[string]p{}
-	for _, x := range a {
-		q := m[x.player]
-		q.n++
-		if x.stars == 3 {
-			q.t++
-		}
-		m[x.player] = q
-	}
-	var n int64
-	for _, q := range m {
-		if q.n == 8 && q.t == 8 {
-			n++
-		}
-	}
-	return n
 }
 func familyIDs(m map[int64]*dailyCounts) []int64 {
 	o := []int64{}

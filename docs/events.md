@@ -6,7 +6,7 @@ The Valkey stream carries requested live changes between independently running t
 
 ## Event shape
 
-Every published entry has a topic, optional clan tag, timestamp, and JSON value. Topics identify broad consumers such as `clan`, `war`, `war_schedule`, `capital`, `reminder`, `reminder_config`, and maintenance recovery.
+Every published entry has a topic, optional clan tag, timestamp, and JSON value. Topics identify broad consumers such as `clan`, `war`, `war_schedule`, `capital`, `reminder`, `reminder_config`, `legend`, and maintenance recovery.
 
 This is a v2-only contract. Structured payloads remain JSON objects instead of JSON encoded inside strings: clan changes use `clan`, war changes use `war` and optional `previous_war`, Capital changes use `raid` and optional `previous_raid`, and scheduled war reminders use `data`. Discord member reminders use `clan`, `reminder`, and `members`, adding `raid` for Raid Weekend. War events also state `war_type`, `war_role`, and `panel_target`; this lets a consumer keep one panel on the battle war while independently handling an overlapping CWL preparation war. There are no duplicate compatibility aliases or old `_data` names.
 
@@ -26,6 +26,8 @@ Create/reuse consumer group
 ```
 
 Different consumers have separate groups, so mobile delivery, reminder reconciliation, and bot delivery do not steal entries from one another.
+
+Legend defense entries use `topic=legend` and `type=legend_defense`, with a deterministic `event_id`, normalized `player_tag`, and exact `battle_time`. Their append helper atomically checks a TTL-bound dedupe key and writes the stream entry, which makes replay before checkpoint advancement safe.
 
 ## Durable state boundaries
 

@@ -6,7 +6,7 @@ Leaderboards fetch current global/location rankings and maintain the typed curre
 
 ## When it runs
 
-The current leaderboard loop runs every `leaderboards.interval_seconds`. Its Clash requests share `scheduled.requests_per_second` with the other work in the scheduled process, so concurrent scheduled jobs cannot each consume a full independent request budget.
+The current leaderboard loop runs every `leaderboards.interval_seconds`. Ordinary boards share `scheduled.requests_per_second`; the live Legend I player refresh has its own fixed 20-request-per-second limiter so its contract is independent of the general scheduled budget.
 
 ## Targets and endpoints
 
@@ -23,6 +23,8 @@ Load locations
   -> validate page/result completeness
   -> upsert current rows and delete stale rows for that exact board
   -> append/replace completed historical snapshot
+  -> fetch every stored Legend I player at 20 requests per second
+  -> atomically replace legend_rankings_current
   -> refresh API cache metadata
 ```
 
@@ -31,6 +33,7 @@ Load locations
 - `player_rankings_current` and `clan_rankings_current`.
 - Typed leaderboard history tables by game mode.
 - `legend_history` for completed Legend seasons.
+- `legend_rankings_current`, atomically replaced only after the full Legend I refresh.
 - `ranked_league_group_members`.
 - Changed `basic_player` facts learned from ranked players.
 
@@ -39,6 +42,7 @@ Leaderboard writes to `basic_player` are accepted because volume is bounded and 
 ## Configuration
 
 - `scheduled.requests_per_second`
+- fixed 20 requests per second for the live Legend I player refresh
 - `leaderboards.interval_seconds`
 - `leaderboards.limit`
 - `leaderboards.null_asset_url`

@@ -1,0 +1,150 @@
+package rest
+
+import (
+	"github.com/disgoorg/snowflake/v2"
+
+	"github.com/disgoorg/disgo/discord"
+)
+
+var _ Interactions = (*interactionImpl)(nil)
+
+func NewInteractions(client Client, defaultAllowedMentions discord.AllowedMentions) Interactions {
+	return &interactionImpl{client: client, defaultAllowedMentions: defaultAllowedMentions}
+}
+
+type Interactions interface {
+	GetInteractionResponse(applicationID snowflake.ID, interactionToken string, opts ...RequestOpt) (*discord.Message, error)
+	CreateInteractionResponse(interactionID snowflake.ID, interactionToken string, interactionResponse discord.InteractionResponse, opts ...RequestOpt) error
+	CreateInteractionResponseWithCallback(interactionID snowflake.ID, interactionToken string, interactionResponse discord.InteractionResponse, opts ...RequestOpt) (*discord.InteractionCallbackResponse, error)
+	UpdateInteractionResponse(applicationID snowflake.ID, interactionToken string, messageUpdate discord.MessageUpdate, opts ...RequestOpt) (*discord.Message, error)
+	DeleteInteractionResponse(applicationID snowflake.ID, interactionToken string, opts ...RequestOpt) error
+
+	GetFollowupMessage(applicationID snowflake.ID, interactionToken string, messageID snowflake.ID, opts ...RequestOpt) (*discord.Message, error)
+	CreateFollowupMessage(applicationID snowflake.ID, interactionToken string, messageCreate discord.MessageCreate, opts ...RequestOpt) (*discord.Message, error)
+	UpdateFollowupMessage(applicationID snowflake.ID, interactionToken string, messageID snowflake.ID, messageUpdate discord.MessageUpdate, opts ...RequestOpt) (*discord.Message, error)
+	DeleteFollowupMessage(applicationID snowflake.ID, interactionToken string, messageID snowflake.ID, opts ...RequestOpt) error
+}
+
+type interactionImpl struct {
+	client                 Client
+	defaultAllowedMentions discord.AllowedMentions
+}
+
+func (s *interactionImpl) GetInteractionResponse(interactionID snowflake.ID, interactionToken string, opts ...RequestOpt) (message *discord.Message, err error) {
+	err = s.client.Do(GetInteractionResponse.Compile(nil, interactionID, interactionToken), nil, &message, opts...)
+	return
+}
+
+// CreateInteractionResponse responds to the interaction without returning the callback.
+// If you need the callback, use CreateInteractionResponseWithCallback.
+func (s *interactionImpl) CreateInteractionResponse(interactionID snowflake.ID, interactionToken string, interactionResponse discord.InteractionResponse, opts ...RequestOpt) error {
+	s.applyDefaultAllowedMentions(&interactionResponse)
+
+	body, err := interactionResponse.ToBody()
+	if err != nil {
+		return err
+	}
+
+	return s.client.Do(CreateInteractionResponse.Compile(nil, interactionID, interactionToken), body, nil, opts...)
+}
+
+func (s *interactionImpl) CreateInteractionResponseWithCallback(interactionID snowflake.ID, interactionToken string, interactionResponse discord.InteractionResponse, opts ...RequestOpt) (callback *discord.InteractionCallbackResponse, err error) {
+	s.applyDefaultAllowedMentions(&interactionResponse)
+
+	body, err := interactionResponse.ToBody()
+	if err != nil {
+		return nil, err
+	}
+	values := discord.QueryValues{
+		"with_response": true,
+	}
+	err = s.client.Do(CreateInteractionResponse.Compile(values, interactionID, interactionToken), body, &callback, opts...)
+	return
+}
+
+func (s *interactionImpl) UpdateInteractionResponse(applicationID snowflake.ID, interactionToken string, messageUpdate discord.MessageUpdate, opts ...RequestOpt) (message *discord.Message, err error) {
+	if shouldApplyUpdateAllowedMentions(messageUpdate) {
+		messageUpdate.AllowedMentions = &s.defaultAllowedMentions
+	}
+
+	body, err := messageUpdate.ToBody()
+	if err != nil {
+		return
+	}
+
+	err = s.client.Do(UpdateInteractionResponse.Compile(nil, applicationID, interactionToken), body, &message, opts...)
+	return
+}
+
+func (s *interactionImpl) DeleteInteractionResponse(applicationID snowflake.ID, interactionToken string, opts ...RequestOpt) error {
+	return s.client.Do(DeleteInteractionResponse.Compile(nil, applicationID, interactionToken), nil, nil, opts...)
+}
+
+func (s *interactionImpl) GetFollowupMessage(applicationID snowflake.ID, interactionToken string, messageID snowflake.ID, opts ...RequestOpt) (message *discord.Message, err error) {
+	err = s.client.Do(GetFollowupMessage.Compile(nil, applicationID, interactionToken, messageID), nil, &message, opts...)
+	return
+}
+
+func (s *interactionImpl) CreateFollowupMessage(applicationID snowflake.ID, interactionToken string, messageCreate discord.MessageCreate, opts ...RequestOpt) (message *discord.Message, err error) {
+	if messageCreate.AllowedMentions == nil {
+		messageCreate.AllowedMentions = &s.defaultAllowedMentions
+	}
+
+	body, err := messageCreate.ToBody()
+	if err != nil {
+		return
+	}
+
+	err = s.client.Do(CreateFollowupMessage.Compile(nil, applicationID, interactionToken), body, &message, opts...)
+	return
+}
+
+func (s *interactionImpl) UpdateFollowupMessage(applicationID snowflake.ID, interactionToken string, messageID snowflake.ID, messageUpdate discord.MessageUpdate, opts ...RequestOpt) (message *discord.Message, err error) {
+	if shouldApplyUpdateAllowedMentions(messageUpdate) {
+		messageUpdate.AllowedMentions = &s.defaultAllowedMentions
+	}
+
+	body, err := messageUpdate.ToBody()
+	if err != nil {
+		return
+	}
+
+	err = s.client.Do(UpdateFollowupMessage.Compile(nil, applicationID, interactionToken, messageID), body, &message, opts...)
+	return
+}
+
+func (s *interactionImpl) DeleteFollowupMessage(applicationID snowflake.ID, interactionToken string, messageID snowflake.ID, opts ...RequestOpt) error {
+	return s.client.Do(DeleteFollowupMessage.Compile(nil, applicationID, interactionToken, messageID), nil, nil, opts...)
+}
+
+// applyDefaultAllowedMentions injects the default AllowedMentions into the response Data when it's a
+// MessageCreate / MessageUpdate (passed by value or pointer) without one set. The handler & events
+// packages forward these as values through Respond, while direct rest callers may pass a pointer — both
+// shapes are handled. For MessageUpdate the default is only applied when there is content to mention
+// against (non-nil Content or the Components V2 flag set), matching UpdateInteractionResponse's behavior.
+func (s *interactionImpl) applyDefaultAllowedMentions(response *discord.InteractionResponse) {
+	switch d := response.Data.(type) {
+	case discord.MessageCreate:
+		if d.AllowedMentions == nil {
+			d.AllowedMentions = &s.defaultAllowedMentions
+			response.Data = d
+		}
+	case *discord.MessageCreate:
+		if d != nil && d.AllowedMentions == nil {
+			d.AllowedMentions = &s.defaultAllowedMentions
+		}
+	case discord.MessageUpdate:
+		if shouldApplyUpdateAllowedMentions(d) {
+			d.AllowedMentions = &s.defaultAllowedMentions
+			response.Data = d
+		}
+	case *discord.MessageUpdate:
+		if d != nil && shouldApplyUpdateAllowedMentions(*d) {
+			d.AllowedMentions = &s.defaultAllowedMentions
+		}
+	}
+}
+
+func shouldApplyUpdateAllowedMentions(m discord.MessageUpdate) bool {
+	return m.AllowedMentions == nil && (m.Content != nil || (m.Flags != nil && m.Flags.Has(discord.MessageFlagIsComponentsV2)))
+}

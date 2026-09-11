@@ -1,0 +1,183 @@
+package discord
+
+import (
+	"time"
+
+	"github.com/disgoorg/omit"
+	"github.com/disgoorg/snowflake/v2"
+
+	"github.com/disgoorg/disgo/internal/flags"
+)
+
+var _ Mentionable = (*Member)(nil)
+
+// Member is a discord GuildMember
+type Member struct {
+	User                       User                  `json:"user"`
+	Nick                       *string               `json:"nick"`
+	Avatar                     *string               `json:"avatar"`
+	Banner                     *string               `json:"banner"`
+	RoleIDs                    []snowflake.ID        `json:"roles,omitempty"`
+	JoinedAt                   *time.Time            `json:"joined_at"`
+	PremiumSince               *time.Time            `json:"premium_since,omitempty"`
+	Deaf                       bool                  `json:"deaf,omitempty"`
+	Mute                       bool                  `json:"mute,omitempty"`
+	Flags                      MemberFlags           `json:"flags"`
+	Pending                    bool                  `json:"pending"`
+	CommunicationDisabledUntil *time.Time            `json:"communication_disabled_until"`
+	AvatarDecorationData       *AvatarDecorationData `json:"avatar_decoration_data"`
+	Collectibles               *Collectibles         `json:"collectibles"`
+
+	// This field is not present everywhere in the API and often populated by disgo
+	GuildID snowflake.ID `json:"guild_id"`
+}
+
+// String returns a mention of the user
+func (m Member) String() string {
+	return m.User.String()
+}
+
+// Mention returns a mention of the user
+func (m Member) Mention() string {
+	return m.String()
+}
+
+// EffectiveName returns the nickname of the member if set, falling back to User.EffectiveName()
+func (m Member) EffectiveName() string {
+	if m.Nick != nil {
+		return *m.Nick
+	}
+	return m.User.EffectiveName()
+}
+
+// EffectiveAvatarURL returns the guild-specific avatar URL of the user if set, falling back to the effective avatar URL of the user
+func (m Member) EffectiveAvatarURL(opts ...CDNOpt) string {
+	if m.Avatar == nil {
+		return m.User.EffectiveAvatarURL(opts...)
+	}
+	return formatAssetURL(MemberAvatar, opts, m.GuildID, m.User.ID, *m.Avatar)
+}
+
+// AvatarURL returns the guild-specific avatar URL of the user if set or nil
+func (m Member) AvatarURL(opts ...CDNOpt) *string {
+	if m.Avatar == nil {
+		return nil
+	}
+	url := formatAssetURL(MemberAvatar, opts, m.GuildID, m.User.ID, *m.Avatar)
+	return &url
+}
+
+// EffectiveBannerURL returns the guild-specific banner URL of the user if set, falling back to the banner URL of the user
+func (m Member) EffectiveBannerURL(opts ...CDNOpt) string {
+	if m.Banner == nil {
+		if banner := m.User.BannerURL(opts...); banner != nil {
+			return *banner
+		}
+		return ""
+	}
+	return formatAssetURL(MemberBanner, opts, m.GuildID, m.User.ID, *m.Banner)
+}
+
+// BannerURL returns the guild-specific banner URL of the user if set or nil
+func (m Member) BannerURL(opts ...CDNOpt) *string {
+	if m.Banner == nil {
+		return nil
+	}
+	url := formatAssetURL(MemberBanner, opts, m.GuildID, m.User.ID, *m.Banner)
+	return &url
+}
+
+// AvatarDecorationURL returns the avatar decoration URL if set or nil
+func (m Member) AvatarDecorationURL(opts ...CDNOpt) *string {
+	if m.AvatarDecorationData == nil {
+		return nil
+	}
+	url := formatAssetURL(AvatarDecoration, opts, m.AvatarDecorationData.Asset)
+	return &url
+}
+
+// CollectiblesNameplateURL returns the nameplate asset URL if set or nil
+func (m Member) CollectiblesNameplateURL(opts ...CDNOpt) *string {
+	if m.Collectibles == nil || m.Collectibles.Nameplate == nil {
+		return nil
+	}
+	url := formatAssetURL(NameplateAsset, opts, m.Collectibles.Nameplate.Asset)
+	return &url
+}
+
+// EffectiveCollectiblesNameplateURL returns the guild-specific nameplate URL if set, falling back to the user-level nameplate URL
+func (m Member) EffectiveCollectiblesNameplateURL(opts ...CDNOpt) *string {
+	if url := m.CollectiblesNameplateURL(opts...); url != nil {
+		return url
+	}
+	return m.User.CollectiblesNameplateURL(opts...)
+}
+
+func (m Member) CreatedAt() time.Time {
+	return m.User.CreatedAt()
+}
+
+// MemberAdd is used to add a member via the oauth2 access token to a guild
+type MemberAdd struct {
+	AccessToken string         `json:"access_token"`
+	Nick        string         `json:"nick,omitempty"`
+	Roles       []snowflake.ID `json:"roles,omitempty"`
+	Mute        bool           `json:"mute,omitempty"`
+	Deaf        bool           `json:"deaf,omitempty"`
+}
+
+// MemberUpdate is used to modify a member
+type MemberUpdate struct {
+	ChannelID                  *snowflake.ID         `json:"channel_id,omitempty"`
+	Nick                       *string               `json:"nick,omitempty"`
+	Roles                      *[]snowflake.ID       `json:"roles,omitempty"`
+	Mute                       *bool                 `json:"mute,omitempty"`
+	Deaf                       *bool                 `json:"deaf,omitempty"`
+	Flags                      *MemberFlags          `json:"flags,omitempty"`
+	CommunicationDisabledUntil omit.Omit[*time.Time] `json:"communication_disabled_until,omitzero"`
+}
+
+// CurrentMemberUpdate is used to update the current member
+type CurrentMemberUpdate struct {
+	Nick   *string          `json:"nick,omitempty"`
+	Banner omit.Omit[*Icon] `json:"banner,omitzero"`
+	Avatar omit.Omit[*Icon] `json:"avatar,omitzero"`
+	Bio    *string          `json:"bio,omitempty"`
+}
+
+type MemberFlags int
+
+const (
+	MemberFlagDidRejoin MemberFlags = 1 << iota
+	MemberFlagCompletedOnboarding
+	MemberFlagBypassesVerification
+	MemberFlagStartedOnboarding
+	MemberFlagIsGuest
+	MemberFlagStartedHomeActions
+	MemberFlagCompletedHomeActions
+	MemberFlagAutomodQuarantinedUsername
+	_
+	MemberFlagDMSettingsUpsellAcknowledged
+	MemberFlagAutomodQuarantinedGuildTag
+	MemberFlagsNone MemberFlags = 0
+)
+
+// Add allows you to add multiple bits together, producing a new bit
+func (f MemberFlags) Add(bits ...MemberFlags) MemberFlags {
+	return flags.Add(f, bits...)
+}
+
+// Remove allows you to subtract multiple bits from the first, producing a new bit
+func (f MemberFlags) Remove(bits ...MemberFlags) MemberFlags {
+	return flags.Remove(f, bits...)
+}
+
+// Has will ensure that the bit includes all the bits entered
+func (f MemberFlags) Has(bits ...MemberFlags) bool {
+	return flags.Has(f, bits...)
+}
+
+// Missing will check whether the bit is missing any one of the bits
+func (f MemberFlags) Missing(bits ...MemberFlags) bool {
+	return flags.Missing(f, bits...)
+}
