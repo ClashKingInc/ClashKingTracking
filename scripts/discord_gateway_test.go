@@ -358,6 +358,27 @@ func TestDiscordGatewayMutationCapturesSequenceAtEnqueue(t *testing.T) {
 	}
 }
 
+func TestDiscordMutationQueueAbsorbsWriterBacklogWithoutBlocking(t *testing.T) {
+	ctx, cancel := context.WithCancel(t.Context())
+	queue := newDiscordMutationQueue(1)
+	for sequence := range int64(5_000) {
+		depth, ok := queue.Enqueue(ctx, discordCacheMutation{Meta: discordMutationMeta{Sequence: sequence}})
+		if !ok || depth != int(sequence)+1 {
+			t.Fatalf("enqueue sequence %d returned depth=%d ok=%t", sequence, depth, ok)
+		}
+	}
+	for sequence := range int64(5_000) {
+		mutation, ok := queue.Dequeue(ctx)
+		if !ok || mutation.Meta.Sequence != sequence {
+			t.Fatalf("dequeue sequence %d returned mutation=%#v ok=%t", sequence, mutation, ok)
+		}
+	}
+	cancel()
+	if _, ok := queue.Dequeue(ctx); ok {
+		t.Fatal("canceled mutation queue returned another item")
+	}
+}
+
 func TestDiscordGatewayMemberSyncBuffersDeltasAndFencesOldGeneration(t *testing.T) {
 	state := &discordGatewayState{appID: "123", shards: map[int]discordShardState{}, syncs: map[string]discordMemberSync{}}
 	queued := make([]discordCacheMutation, 0, 4)

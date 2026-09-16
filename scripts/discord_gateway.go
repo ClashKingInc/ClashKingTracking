@@ -11,6 +11,7 @@ import (
 	"slices"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"clashking_tracking/internal/platform"
@@ -51,6 +52,57 @@ type discordMutationMeta struct {
 type discordCacheMutation struct {
 	Meta  discordMutationMeta
 	Apply func(context.Context, *pgxpool.Pool) error
+}
+
+type discordMutationQueue struct {
+	mu    sync.Mutex
+	items []discordCacheMutation
+	wake  chan struct{}
+}
+
+func newDiscordMutationQueue(initialCapacity int) *discordMutationQueue {
+	return &discordMutationQueue{
+		items: make([]discordCacheMutation, 0, max(1, initialCapacity)),
+		wake:  make(chan struct{}, 1),
+	}
+}
+
+func (q *discordMutationQueue) Enqueue(ctx context.Context, mutation discordCacheMutation) (int, bool) {
+	if ctx.Err() != nil {
+		return 0, false
+	}
+	q.mu.Lock()
+	if ctx.Err() != nil {
+		q.mu.Unlock()
+		return 0, false
+	}
+	q.items = append(q.items, mutation)
+	depth := len(q.items)
+	q.mu.Unlock()
+	select {
+	case q.wake <- struct{}{}:
+	default:
+	}
+	return depth, true
+}
+
+func (q *discordMutationQueue) Dequeue(ctx context.Context) (discordCacheMutation, bool) {
+	for {
+		q.mu.Lock()
+		if len(q.items) > 0 {
+			mutation := q.items[0]
+			q.items[0] = discordCacheMutation{}
+			q.items = q.items[1:]
+			q.mu.Unlock()
+			return mutation, true
+		}
+		q.mu.Unlock()
+		select {
+		case <-ctx.Done():
+			return discordCacheMutation{}, false
+		case <-q.wake:
+		}
+	}
 }
 
 type discordShardState struct {
@@ -113,11 +165,12 @@ func (d *discordGatewayDomain) Run(ctx context.Context, app *platform.App) error
 	defer stopRun()
 	state := &discordGatewayState{shards: map[int]discordShardState{}, syncs: map[string]discordMemberSync{}}
 	shardFailures := make(chan discordShardFailure, 64)
-	mutations := make(chan discordCacheMutation, app.Config.DiscordGatewayQueueSize)
+	mutations := newDiscordMutationQueue(app.Config.DiscordGatewayQueueSize)
+	var backlogWarned atomic.Bool
 	enqueue := func(mutation discordCacheMutation) {
-		select {
-		case mutations <- mutation:
-		case <-runCtx.Done():
+		depth, ok := mutations.Enqueue(runCtx, mutation)
+		if ok && depth > app.Config.DiscordGatewayQueueSize && backlogWarned.CompareAndSwap(false, true) {
+			app.Logger.Warn("Discord mutation writer is behind; buffering gateway events", "queue_depth", depth)
 		}
 	}
 	var memberScheduler *discordMemberRequestScheduler
@@ -803,33 +856,29 @@ func runDiscordGuildActivitySignals(ctx context.Context, app *platform.App, pool
 func runDiscordCacheWriter(
 	ctx context.Context,
 	pool *pgxpool.Pool,
-	mutations <-chan discordCacheMutation,
+	mutations *discordMutationQueue,
 ) error {
 	for {
-		select {
-		case <-ctx.Done():
+		mutation, ok := mutations.Dequeue(ctx)
+		if !ok {
 			return ctx.Err()
-		case mutation, ok := <-mutations:
-			if !ok {
-				return nil
-			}
-			if mutation.Apply == nil {
-				continue
-			}
-			if err := mutation.Apply(ctx, pool); err != nil {
-				return err
-			}
-			if mutation.Meta.Generation == uuid.Nil {
-				continue
-			}
-			if _, err := pool.Exec(ctx, `
+		}
+		if mutation.Apply == nil {
+			continue
+		}
+		if err := mutation.Apply(ctx, pool); err != nil {
+			return err
+		}
+		if mutation.Meta.Generation == uuid.Nil {
+			continue
+		}
+		if _, err := pool.Exec(ctx, `
 				UPDATE discord_cache.gateway_shards
 				SET heartbeat_at = now(),
 					last_applied_sequence = GREATEST(COALESCE(last_applied_sequence, 0), $5)
 				WHERE application_id = $1 AND shard_id = $2 AND shard_count = $3 AND generation = $4
-			`, mutation.Meta.ApplicationID, mutation.Meta.ShardID, mutation.Meta.ShardCount, mutation.Meta.Generation, mutation.Meta.Sequence); err != nil {
-				return err
-			}
+		`, mutation.Meta.ApplicationID, mutation.Meta.ShardID, mutation.Meta.ShardCount, mutation.Meta.Generation, mutation.Meta.Sequence); err != nil {
+			return err
 		}
 	}
 }
