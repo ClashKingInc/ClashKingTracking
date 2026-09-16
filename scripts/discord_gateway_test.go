@@ -318,6 +318,14 @@ func TestValidateDiscordGatewayConfig(t *testing.T) {
 	if err := validateDiscordGatewayConfig(valid); err != nil {
 		t.Fatalf("valid gateway config failed: %v", err)
 	}
+	dryRun := valid
+	dryRun.DryRun = true
+	dryRun.TimescaleURL = ""
+	dryRun.ValkeyAddr = ""
+	dryRun.EventStreamName = ""
+	if err := validateDiscordGatewayConfig(dryRun); err != nil {
+		t.Fatalf("dry-run gateway config without persistence failed: %v", err)
+	}
 
 	tests := []platform.Config{
 		{DiscordGatewayQueueSize: 1, TimescaleURL: valid.TimescaleURL, ValkeyAddr: valid.ValkeyAddr, EventStreamName: valid.EventStreamName},

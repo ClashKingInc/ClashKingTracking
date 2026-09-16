@@ -91,6 +91,9 @@ func (d *discordGatewayDomain) Run(ctx context.Context, app *platform.App) error
 	if err := validateDiscordGatewayConfig(app.Config); err != nil {
 		return err
 	}
+	if app.Config.DryRun {
+		return runDiscordGatewayDryRun(ctx, app)
+	}
 
 	pool, err := pgxpool.New(ctx, app.Config.TimescaleURL)
 	if err != nil {
@@ -221,6 +224,91 @@ func (d *discordGatewayDomain) Run(ctx context.Context, app *platform.App) error
 		return nil
 	}
 	return err
+}
+
+func runDiscordGatewayDryRun(ctx context.Context, app *platform.App) error {
+	intents := gateway.IntentGuilds | gateway.IntentGuildMembers
+	runCtx, stopRun := context.WithCancel(ctx)
+	defer stopRun()
+	state := &discordGatewayState{shards: map[int]discordShardState{}, syncs: map[string]discordMemberSync{}}
+	noopEnqueue := func(discordCacheMutation) {}
+
+	var requests sync.WaitGroup
+	var selectedMu sync.Mutex
+	selectedByShard := make(map[int]int)
+	stopping := false
+	listener := &events.ListenerAdapter{
+		OnReady: func(event *events.Ready) {
+			shard := event.Client().ShardManager.Shard(event.ShardID())
+			if shard != nil {
+				state.rotateShard(event.GenericEvent, shard.ShardCount(), event.EventReady.Guilds, noopEnqueue)
+			}
+		},
+		OnResumed: func(event *events.Resumed) {
+			state.setShardReady(event.ShardID(), true)
+		},
+		OnGuildReady: func(event *events.GuildReady) {
+			shardID := event.ShardID()
+			selectedMu.Lock()
+			if stopping || selectedByShard[shardID] >= app.Config.DiscordGatewayMemberChunkConcurrency {
+				selectedMu.Unlock()
+				return
+			}
+			selectedByShard[shardID]++
+			requests.Add(1)
+			selectedMu.Unlock()
+
+			go func() {
+				defer requests.Done()
+				requestCtx, cancel := context.WithTimeout(runCtx, discordMemberChunkTimeout)
+				members, err := event.Client().MemberChunkingManager.RequestAllMembers(requestCtx, event.Guild.ID)
+				cancel()
+				if err == nil {
+					app.Logger.Info("Discord dry-run member chunk completed", "shard_id", shardID, "member_count", len(members))
+				} else if !errors.Is(err, context.Canceled) {
+					app.Logger.Warn("Discord dry-run member chunk failed", "shard_id", shardID, "error_kind", "request_failed")
+				}
+			}()
+		},
+	}
+
+	snowflake.AllowUnquoted = true
+	client, err := disgo.New(
+		app.Config.DiscordBotToken,
+		bot.WithLogger(slog.New(discordLibraryLogHandler{target: app.Logger.Handler(), reporter: app.Errors})),
+		bot.WithDefaultShardManager(),
+		bot.WithShardManagerConfigOpts(
+			sharding.WithGatewayConfigOpts(gateway.WithIntents(intents)),
+		),
+		bot.WithCacheConfigOpts(cache.WithCaches(cache.FlagGuilds, cache.FlagChannels, cache.FlagRoles)),
+		bot.WithEventListeners(listener),
+	)
+	if err != nil {
+		return fmt.Errorf("create Discord dry-run gateway client: %w", err)
+	}
+	state.appID = client.ApplicationID.String()
+	defer func() {
+		selectedMu.Lock()
+		stopping = true
+		selectedMu.Unlock()
+		stopRun()
+		closeCtx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+		defer cancel()
+		client.Close(closeCtx)
+		requests.Wait()
+	}()
+
+	if err = client.OpenShardManager(runCtx); err != nil {
+		return fmt.Errorf("open Discord dry-run shard manager: %w", err)
+	}
+	shards := slices.Collect(client.ShardManager.Shards())
+	if err = validateDiscordShardReadiness(state, shards); err != nil {
+		return fmt.Errorf("open Discord dry-run shard manager: %w", err)
+	}
+	app.Stats.SetReady(discordGatewayDomainName, true, "")
+	app.Logger.Info("Discord dry-run gateway ready", "ready_shards", len(shards), "database_writes", false)
+	<-ctx.Done()
+	return nil
 }
 
 func awaitDiscordGatewayOpen(ctx context.Context, openDone, writerDone, ownershipDone, reconcileDone, activityDone, wakeDone <-chan error) (bool, error) {
@@ -593,7 +681,7 @@ func validateDiscordGatewayConfig(cfg platform.Config) error {
 	if cfg.DiscordBotToken == "" {
 		return errors.New("DISCORD_BOT_TOKEN is required for discord-gateway")
 	}
-	if cfg.TimescaleURL == "" {
+	if !cfg.DryRun && cfg.TimescaleURL == "" {
 		return errors.New("TIMESCALE_* connection variables are required for discord-gateway")
 	}
 	if cfg.DiscordGatewayQueueSize < 1 {
@@ -602,7 +690,7 @@ func validateDiscordGatewayConfig(cfg platform.Config) error {
 	if cfg.DiscordGatewayMemberChunkConcurrency < 1 {
 		return errors.New("discord_gateway.member_chunk_concurrency must be greater than zero")
 	}
-	if cfg.ValkeyAddr == "" || cfg.EventStreamName == "" {
+	if !cfg.DryRun && (cfg.ValkeyAddr == "" || cfg.EventStreamName == "") {
 		return errors.New("Valkey and events.stream are required for discord-gateway activity signals")
 	}
 	return nil

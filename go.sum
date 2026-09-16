@@ -1,8 +1,8 @@
 cloud.google.com/go v0.34.0/go.mod h1:aQUYkXzVsufM+DwF1aE+0xfcU+56JwCaLick0ClmMTw=
 cloud.google.com/go/compute/metadata v0.9.0 h1:pDUj4QMoPejqq20dK0Pg2N4yG9zIkYGdBtwLoEkH9Zs=
 cloud.google.com/go/compute/metadata v0.9.0/go.mod h1:E0bWwX5wTnLPedCKqk3pJmVgCBSM6qQI1yTBdEb3C10=
-github.com/ClashKingInc/disgo v0.19.6-clashking.2 h1:c6+N6M4UjrrcAdJ7o3RLFX6bl4QhZkbqBOGVo6noc80=
-github.com/ClashKingInc/disgo v0.19.6-clashking.2/go.mod h1:NnV63iw4lJdF1fnV0gX27XR43ZgRGqnL122svRMTgTE=
+github.com/ClashKingInc/disgo v0.19.6-clashking.4 h1:z1LxKMr6+uV0FysWvVyDbjZaqzMeYjulJIZnIcFLfsg=
+github.com/ClashKingInc/disgo v0.19.6-clashking.4/go.mod h1:NnV63iw4lJdF1fnV0gX27XR43ZgRGqnL122svRMTgTE=
 github.com/alecthomas/kingpin/v2 v2.4.0/go.mod h1:0gyi0zQnjuFk8xrkNKamJoyUo382HRL7ATRpFZCw6tE=
 github.com/alecthomas/units v0.0.0-20211218093645-b94a6e3cc137/go.mod h1:OMCwj8VM1Kc9e19TLln2VL61YJF0x1XFtfdL4JdbSyE=
 github.com/aws/aws-sdk-go-v2 v1.41.3 h1:4kQ/fa22KjDt13QCy1+bYADvdgcxpfH18f0zP542kZA=
