@@ -1,9 +1,12 @@
 package scripts
 
 import (
+	"context"
+	"errors"
 	"testing"
 	"time"
 
+	"clashking_tracking/internal/platform"
 	"github.com/clashkinginc/clashy.go"
 )
 
@@ -60,6 +63,32 @@ func TestLeagueCloseoutSchedule(t *testing.T) {
 	}
 }
 
+func TestLeagueCloseoutWaitsBeforeStartupWork(t *testing.T) {
+	for _, startup := range []time.Time{
+		time.Date(2026, 9, 7, 5, 11, 0, 0, time.UTC),
+		time.Date(2026, 9, 7, 12, 0, 0, 0, time.UTC),
+	} {
+		t.Run(startup.Format("15-04"), func(t *testing.T) {
+			ctx, cancel := context.WithCancel(t.Context())
+			store := newMemoryScheduledStore()
+			domain := &scheduledDomain{
+				store: store,
+				now:   func() time.Time { return startup },
+				waitUntil: func(context.Context, time.Time) error {
+					cancel()
+					return context.Canceled
+				},
+			}
+			if err := domain.runLeagueCloseoutLoop(ctx, &platform.App{Stats: platform.NewTracker()}); !errors.Is(err, context.Canceled) {
+				t.Fatalf("runLeagueCloseoutLoop error = %v, want cancellation", err)
+			}
+			if store.legendSnapshotCalls != 0 || store.legendCloseoutCalls != 0 {
+				t.Fatalf("startup ran snapshot=%d closeout=%d before the timer", store.legendSnapshotCalls, store.legendCloseoutCalls)
+			}
+		})
+	}
+}
+
 func TestLegendDayWindowUsesShiftedBoundary(t *testing.T) {
 	day := time.Date(2026, 9, 7, 18, 0, 0, 0, time.UTC)
 	start, end := legendDayWindow(day)
@@ -72,10 +101,9 @@ func TestLegendDayWindowUsesShiftedBoundary(t *testing.T) {
 }
 
 func TestAggregateLegendKeepsMissingCodesOnlyInGlobalTotals(t *testing.T) {
-	duration := int32(120)
 	attacks := []legendAttack{
-		{player: "#A", code: "known", stars: 3, destruction: 100, duration: &duration},
-		{player: "#B", code: "", stars: 2, destruction: 85},
+		{player: "#A", code: "known", stars: 3, destruction: 100, duration: 120},
+		{player: "#B", code: "", stars: 2, destruction: 85, duration: 0},
 	}
 	decoded := map[string]decodedArmy{
 		"known": {record: armyCompositionRecord{Heroes: []int32{100}, Equipment: []armyHeroEquipment{{EquipmentID: 200}}}},
@@ -83,6 +111,9 @@ func TestAggregateLegendKeepsMissingCodesOnlyInGlobalTotals(t *testing.T) {
 	global, families, heroes, _, equipment, _ := aggregateLegend(attacks, map[string]int64{"known": 7}, decoded)
 	if global.attacks != 2 || global.three != 1 || global.two != 1 || len(global.players) != 2 {
 		t.Fatalf("global = %+v", global)
+	}
+	if global.duration != 120 {
+		t.Fatalf("global duration = %d, want zero-duration attack retained in the 120 total", global.duration)
 	}
 	if families[7].attacks != 1 || heroes[100].Uses != 1 || equipment[200].Uses != 1 {
 		t.Fatalf("families=%+v heroes=%+v equipment=%+v", families, heroes, equipment)

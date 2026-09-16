@@ -4,6 +4,7 @@ package scripts
 
 import (
 	"context"
+	"strings"
 	"testing"
 	"time"
 
@@ -239,6 +240,27 @@ func TestBattlelogRowFromEntryConvertsZeroIndexedOpponentTownHall(t *testing.T) 
 	}
 	if row.ArmyShareCode != "" {
 		t.Fatalf("army share code = %q, want empty", row.ArmyShareCode)
+	}
+}
+
+func TestBattlelogRowFromEntryRejectsValuesBeforeNarrowing(t *testing.T) {
+	tests := []struct {
+		name  string
+		entry clashy.BattleLogEntry
+		want  string
+	}{
+		{name: "negative destruction", entry: clashy.BattleLogEntry{DestructionPercentage: -1}, want: "destruction percentage"},
+		{name: "oversized destruction", entry: clashy.BattleLogEntry{DestructionPercentage: 101}, want: "destruction percentage"},
+		{name: "negative duration", entry: clashy.BattleLogEntry{Duration: -1}, want: "duration"},
+		{name: "duration above smallint", entry: clashy.BattleLogEntry{Duration: 32768}, want: "duration"},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			_, err := battlelogRowFromEntry("#PLAYER", test.entry)
+			if err == nil || !strings.Contains(err.Error(), test.want) {
+				t.Fatalf("battlelogRowFromEntry error = %v, want %q validation error", err, test.want)
+			}
+		})
 	}
 }
 

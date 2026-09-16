@@ -2,8 +2,13 @@ package scripts
 
 import (
 	"context"
+	"crypto/aes"
+	"crypto/cipher"
+	"crypto/sha256"
+	"encoding/base64"
 	"encoding/json"
 	"io"
+	"log/slog"
 	"net/http"
 	"strings"
 	"testing"
@@ -18,6 +23,67 @@ import (
 type roundTripFunc func(*http.Request) (*http.Response, error)
 
 func (f roundTripFunc) RoundTrip(request *http.Request) (*http.Response, error) { return f(request) }
+
+func encryptPushTestSecret(t *testing.T, value, key string) string {
+	t.Helper()
+	keyHash := sha256.Sum256([]byte(key))
+	block, err := aes.NewCipher(keyHash[:])
+	if err != nil {
+		t.Fatal(err)
+	}
+	gcm, err := cipher.NewGCM(block)
+	if err != nil {
+		t.Fatal(err)
+	}
+	nonce := make([]byte, gcm.NonceSize())
+	sealed := gcm.Seal(append([]byte{}, nonce...), nonce, []byte(value), nil)
+	return "v1." + base64.RawURLEncoding.EncodeToString(sealed)
+}
+
+func TestSendPushToDevicesReturnsProviderFailures(t *testing.T) {
+	fcmADC.Lock()
+	previousSource := fcmADC.source
+	fcmADC.source = oauth2.StaticTokenSource(&oauth2.Token{AccessToken: "access-token"})
+	fcmADC.Unlock()
+	previousClient := pushHTTPClient
+	t.Cleanup(func() {
+		fcmADC.Lock()
+		fcmADC.source = previousSource
+		fcmADC.Unlock()
+		pushHTTPClient = previousClient
+	})
+	pushHTTPClient = &http.Client{Transport: roundTripFunc(func(*http.Request) (*http.Response, error) {
+		return &http.Response{StatusCode: http.StatusServiceUnavailable, Body: io.NopCloser(strings.NewReader("unavailable")), Header: make(http.Header)}, nil
+	})}
+	const key = "push-test-key"
+	app := &platform.App{
+		Config: platform.Config{MobilePushFCMProjectID: "test-project", MobilePushTokenKey: key},
+		Logger: slog.New(slog.NewTextHandler(io.Discard, nil)),
+	}
+	sent, skipped, err := sendPushToDevices(t.Context(), app, []models.PushDevice{{
+		DeviceID: "device", Provider: "fcm", TokenCiphertext: encryptPushTestSecret(t, "token", key),
+	}}, pushMessage{Title: "Reminder"})
+	if sent != 0 || skipped != 1 || err == nil {
+		t.Fatalf("delivery result = sent %d skipped %d err %v, want failed delivery", sent, skipped, err)
+	}
+}
+
+func TestPushProviderRetryClassification(t *testing.T) {
+	if isRetryablePushError(&pushProviderHTTPError{Status: http.StatusBadRequest}) {
+		t.Fatal("permanent 400 provider rejection was classified as retryable")
+	}
+	for _, status := range []int{http.StatusUnauthorized, http.StatusForbidden, http.StatusRequestTimeout, http.StatusTooManyRequests, http.StatusServiceUnavailable} {
+		if !isRetryablePushError(&pushProviderHTTPError{Status: status}) {
+			t.Fatalf("provider status %d was not classified as retryable", status)
+		}
+	}
+	if !isRetryablePushError(context.DeadlineExceeded) {
+		t.Fatal("transport timeout was not classified as retryable")
+	}
+	if isRetryablePushError(context.Canceled) {
+		t.Fatal("worker cancellation was classified as a delivery retry")
+	}
+}
 
 func TestCampaignNotificationPreference(t *testing.T) {
 	if got := campaignNotificationPreference(models.NotificationCampaign{Key: "monthly-support"}); got != "monthly_support" {

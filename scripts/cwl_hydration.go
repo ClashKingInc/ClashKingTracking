@@ -13,7 +13,20 @@ import (
 	"github.com/jackc/pgx/v5/pgxpool"
 )
 
-const cwlWarQueueKey = "tracking:cwl:war-tags"
+const (
+	cwlWarQueueKey         = "tracking:cwl:war-tags"
+	cwlHydrationDomainName = "wars.cwl-hydration"
+)
+
+func recordCWLHydrationFailure(app *platform.App, operation string, err error) {
+	if err == nil {
+		return
+	}
+	app.Stats.RecordRequest(cwlHydrationDomainName, 0, err)
+	if app.Errors != nil {
+		app.Errors.Capture(err, map[string]string{"domain": cwlHydrationDomainName, "operation": operation})
+	}
+}
 
 type cwlWarJob struct {
 	GroupID string `json:"groupId"`
@@ -97,6 +110,7 @@ func (d *warsDomain) runCWLHydrationLoop(ctx context.Context, app *platform.App,
 		if len(pending) == 0 {
 			raws, err := loadDueCWLJobs(ctx, app)
 			if err != nil {
+				recordCWLHydrationFailure(app, "queue-read", err)
 				app.Logger.Error("CWL war-tag queue read failed", "err", err)
 				if sleepOrDone(ctx, time.Second) != nil {
 					return
@@ -112,6 +126,7 @@ func (d *warsDomain) runCWLHydrationLoop(ctx context.Context, app *platform.App,
 			if len(available) > 0 {
 				known, err := d.knownCWLJobs(ctx, available)
 				if err != nil {
+					recordCWLHydrationFailure(app, "known-war-lookup", err)
 					app.Logger.Error("CWL known-war lookup failed", "err", err)
 					if sleepOrDone(ctx, time.Second) != nil {
 						return
@@ -141,7 +156,10 @@ func (d *warsDomain) runCWLHydrationLoop(ctx context.Context, app *platform.App,
 			go func() {
 				defer workers.Done()
 				if err := d.processCWLJob(ctx, app, pool, work.raw, work.known); err != nil && ctx.Err() == nil {
+					recordCWLHydrationFailure(app, "queue-acknowledgement", err)
 					app.Logger.Error("CWL job acknowledgement failed", "err", err)
+				} else if err == nil {
+					app.Stats.SetReady(cwlHydrationDomainName, true, "")
 				}
 				done <- work.raw
 			}()
@@ -230,6 +248,7 @@ func (d *warsDomain) processCWLJob(ctx context.Context, app *platform.App, pool 
 		if legacyClaim {
 			d.cwlSizeClaims.Delete(job.GroupID)
 		}
+		recordCWLHydrationFailure(app, "process", err)
 		app.Logger.Warn("CWL war-tag job deferred", "err", err)
 		return app.Valkey.Do(ctx, app.Valkey.B().Arbitrary("ZADD").Keys(cwlWarQueueKey).Args("XX", strconv.FormatInt(time.Now().Add(5*time.Minute).Unix(), 10), raw).Build()).Error()
 	}

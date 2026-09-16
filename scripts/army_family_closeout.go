@@ -3,6 +3,7 @@ package scripts
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"sort"
 	"time"
@@ -25,7 +26,7 @@ type decodedArmy struct {
 type legendAttack struct {
 	cohort, player, code string
 	stars, destruction   int
-	duration             *int32
+	duration             int16
 }
 type dailyCounts struct {
 	attacks, zero, one, two, three, destruction, duration int64
@@ -45,6 +46,47 @@ type assignmentStat struct {
 	Triples int64 `json:"triples"`
 }
 
+func (s *timescaleScheduledStore) CaptureLegendSnapshot(ctx context.Context, day time.Time) (int, error) {
+	tx, err := s.pool.Begin(ctx)
+	if err != nil {
+		return 0, err
+	}
+	defer tx.Rollback(ctx)
+	if _, err = tx.Exec(ctx, `SELECT pg_advisory_xact_lock($1)`, armyFamilyCloseoutLockID); err != nil {
+		return 0, err
+	}
+	day = dayStart(day)
+	var existing int
+	if err = tx.QueryRow(ctx, `SELECT count(*) FROM legend_rankings_history WHERE day=$1`, day).Scan(&existing); err != nil {
+		return 0, err
+	}
+	if existing > 0 {
+		if err = tx.Commit(ctx); err != nil {
+			return 0, err
+		}
+		return 0, nil
+	}
+	var current int
+	if err = tx.QueryRow(ctx, `SELECT count(*) FROM legend_rankings_current`).Scan(&current); err != nil {
+		return 0, err
+	}
+	if current == 0 {
+		return 0, errors.New("cannot capture Legend ranking snapshot from an empty current leaderboard")
+	}
+	tag, err := tx.Exec(ctx, `
+		INSERT INTO legend_rankings_history(day,tag,global_rank,trophies)
+		SELECT $1,current.tag,current.global_rank,current.trophies
+		FROM legend_rankings_current current
+	`, day)
+	if err != nil {
+		return 0, err
+	}
+	if err = tx.Commit(ctx); err != nil {
+		return 0, err
+	}
+	return int(tag.RowsAffected()), nil
+}
+
 func (s *timescaleScheduledStore) FinalizeLegendCloseout(ctx context.Context, day time.Time) (int, error) {
 	static, err := clashy.LoadStaticData()
 	if err != nil {
@@ -60,15 +102,12 @@ func (s *timescaleScheduledStore) FinalizeLegendCloseout(ctx context.Context, da
 		return 0, err
 	}
 	day = dayStart(day)
-	if _, err = tx.Exec(ctx, `DELETE FROM leaderboard_history_player_home WHERE day=$1`, day); err != nil {
+	var snapshotExists bool
+	if err = tx.QueryRow(ctx, `SELECT EXISTS(SELECT 1 FROM legend_rankings_history WHERE day=$1)`, day).Scan(&snapshotExists); err != nil {
 		return 0, err
 	}
-	snapshotTag, err := tx.Exec(ctx, `
-		INSERT INTO leaderboard_history_player_home(day,tag,global_rank,trophies)
-		SELECT $1,tag,global_rank,trophies FROM legend_rankings_current
-	`, day)
-	if err != nil {
-		return 0, err
+	if !snapshotExists {
+		return 0, fmt.Errorf("Legend ranking snapshot is unavailable for %s", day.Format("2006-01-02"))
 	}
 	attacks, usage, err := readLegendAttacks(ctx, tx, start, end)
 	if err != nil {
@@ -86,7 +125,7 @@ func (s *timescaleScheduledStore) FinalizeLegendCloseout(ctx context.Context, da
 	if err != nil {
 		return 0, err
 	}
-	writes := int(snapshotTag.RowsAffected())
+	writes := 0
 	for _, code := range unassignedCodes(usage, members) {
 		a := decoded[code]
 		match, ok := armyfamily.FindDirectAnchor(a.composition, anchors)
@@ -147,11 +186,11 @@ func legendDayWindow(day time.Time) (time.Time, time.Time) {
 func readLegendAttacks(ctx context.Context, tx pgx.Tx, start, end time.Time) ([]legendAttack, map[string]int64, error) {
 	r, e := tx.Query(ctx, `
 		WITH cohort_members AS (
-			SELECT tag AS player_tag,'legend_i'::text AS cohort FROM leaderboard_history_player_home WHERE day=$3
+			SELECT tag AS player_tag,'legend_i'::text AS cohort FROM legend_rankings_history WHERE day=$3
 			UNION ALL
-			SELECT tag,'top_1000'::text FROM leaderboard_history_player_home WHERE day=$3 AND global_rank <= 1000
+			SELECT tag,'top_1000'::text FROM legend_rankings_history WHERE day=$3 AND global_rank <= 1000
 			UNION ALL
-			SELECT tag,'top_200'::text FROM leaderboard_history_player_home WHERE day=$3 AND global_rank <= 200
+			SELECT tag,'top_200'::text FROM legend_rankings_history WHERE day=$3 AND global_rank <= 200
 		)
 		SELECT cohort.cohort,battle.player_tag,battle.stars,battle.destruction_percentage,
 		       battle.duration_seconds,coalesce(battle.share_code,'')
@@ -297,9 +336,7 @@ func addResult(c *dailyCounts, a legendAttack) {
 		c.three++
 	}
 	c.destruction += int64(a.destruction)
-	if a.duration != nil {
-		c.duration += int64(*a.duration)
-	}
+	c.duration += int64(a.duration)
 }
 func addUsage(m map[int]usageCount, id int, triple bool, seen map[int]bool) {
 	if seen[id] {

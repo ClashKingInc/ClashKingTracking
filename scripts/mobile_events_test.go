@@ -1,10 +1,118 @@
 package scripts
 
 import (
+	"context"
 	"encoding/json"
+	"errors"
+	"io"
+	"log/slog"
+	"net/http"
 	"strings"
 	"testing"
+
+	"clashking_tracking/internal/platform"
+	"clashking_tracking/models"
+
+	valkey "github.com/valkey-io/valkey-go"
+	"golang.org/x/oauth2"
 )
+
+type memoryLegendDeliveryMarkers struct{ delivered map[string]bool }
+
+func (m *memoryLegendDeliveryMarkers) Delivered(_ context.Context, eventID, deviceID string) (bool, error) {
+	return m.delivered[eventID+"\x00"+deviceID], nil
+}
+
+func (m *memoryLegendDeliveryMarkers) MarkDelivered(_ context.Context, eventID, deviceID string) error {
+	m.delivered[eventID+"\x00"+deviceID] = true
+	return nil
+}
+
+func TestLegendDefenseRetrySkipsDevicesAlreadyDelivered(t *testing.T) {
+	fcmADC.Lock()
+	previousSource := fcmADC.source
+	fcmADC.source = oauth2.StaticTokenSource(&oauth2.Token{AccessToken: "access-token"})
+	fcmADC.Unlock()
+	previousClient := pushHTTPClient
+	t.Cleanup(func() {
+		fcmADC.Lock()
+		fcmADC.source = previousSource
+		fcmADC.Unlock()
+		pushHTTPClient = previousClient
+	})
+
+	requests := map[string]int{}
+	pushHTTPClient = &http.Client{Transport: roundTripFunc(func(request *http.Request) (*http.Response, error) {
+		var payload struct {
+			Message struct {
+				Token string `json:"token"`
+			} `json:"message"`
+		}
+		if err := json.NewDecoder(request.Body).Decode(&payload); err != nil {
+			t.Fatal(err)
+		}
+		requests[payload.Message.Token]++
+		status := http.StatusOK
+		if payload.Message.Token == "token-b" && requests[payload.Message.Token] == 1 {
+			status = http.StatusServiceUnavailable
+		}
+		return &http.Response{StatusCode: status, Body: io.NopCloser(strings.NewReader("{}")), Header: make(http.Header)}, nil
+	})}
+
+	const key = "push-test-key"
+	markers := &memoryLegendDeliveryMarkers{delivered: make(map[string]bool)}
+	app := &platform.App{
+		Config: platform.Config{MobilePushFCMProjectID: "test-project", MobilePushTokenKey: key},
+		Logger: slog.New(slog.NewTextHandler(io.Discard, nil)),
+	}
+	worker := &mobileEventsWorker{app: app, cfg: app.Config, logger: app.Logger, legendMarkers: markers}
+	devices := []models.PushDevice{
+		{UserID: "user-a", DeviceID: "shared", Environment: "production", Provider: "fcm", TokenCiphertext: encryptPushTestSecret(t, "token-a", key)},
+		{UserID: "user-b", DeviceID: "shared", Environment: "production", Provider: "fcm", TokenCiphertext: encryptPushTestSecret(t, "token-b", key)},
+	}
+	message := pushMessage{Title: "Legend defense"}
+	if err := worker.deliverLegendDefenseDevices(t.Context(), "event-1", "#P0Y", devices, message); err == nil {
+		t.Fatal("first partial delivery succeeded")
+	}
+	if err := worker.deliverLegendDefenseDevices(t.Context(), "event-1", "#P0Y", devices, message); err != nil {
+		t.Fatal(err)
+	}
+	if requests["token-a"] != 1 || requests["token-b"] != 2 {
+		t.Fatalf("requests = %#v, want successful device once and failed device retried", requests)
+	}
+}
+
+func TestMobileEventBatchIsolatesFailedEntryAndAcknowledgesLaterSuccess(t *testing.T) {
+	failed := errors.New("temporary provider failure")
+	var processed, acknowledged []string
+	worker := &mobileEventsWorker{
+		processEntry: func(_ context.Context, id string, _ mobileWarEvent) error {
+			processed = append(processed, id)
+			if id == "1-0" {
+				return failed
+			}
+			return nil
+		},
+		ackEntry: func(_ context.Context, id string) error {
+			acknowledged = append(acknowledged, id)
+			return nil
+		},
+	}
+	entries := []valkey.XRangeEntry{
+		{ID: "1-0", FieldValues: map[string]string{"topic": "legend", "value": `{"type":"legend_defense"}`}},
+		{ID: "2-0", FieldValues: map[string]string{"topic": "legend", "value": `{"type":"legend_defense"}`}},
+	}
+	err := worker.processEntries(t.Context(), entries)
+	if !errors.Is(err, failed) {
+		t.Fatalf("batch error = %v, want failed first entry", err)
+	}
+	if strings.Join(processed, ",") != "1-0,2-0" {
+		t.Fatalf("processed = %#v, want both entries", processed)
+	}
+	if strings.Join(acknowledged, ",") != "2-0" {
+		t.Fatalf("acknowledged = %#v, want only healthy second entry", acknowledged)
+	}
+}
 
 func TestMobilePushConsumesWarAndRaidReminders(t *testing.T) {
 	for _, eventType := range []string{"war", "raid_mobile"} {

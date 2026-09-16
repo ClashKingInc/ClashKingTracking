@@ -989,6 +989,12 @@ func battlelogEntryTimestamp(entry clashy.BattleLogEntry) time.Time {
 }
 
 func battlelogRowFromEntry(playerTag string, entry clashy.BattleLogEntry) (models.BattlelogRow, error) {
+	if entry.DestructionPercentage < 0 || entry.DestructionPercentage > 100 {
+		return models.BattlelogRow{}, fmt.Errorf("battle destruction percentage %d is outside 0..100", entry.DestructionPercentage)
+	}
+	if entry.Duration < 0 || entry.Duration > math.MaxInt16 {
+		return models.BattlelogRow{}, fmt.Errorf("battle duration %d is outside smallint range", entry.Duration)
+	}
 	armyShareCode, err := normalizeArmyShareCodeChecked(entry.ArmyShareCode)
 	if err != nil {
 		return models.BattlelogRow{}, fmt.Errorf("normalize battle army: %w", err)

@@ -14,6 +14,7 @@ import (
 
 	clashy "github.com/clashkinginc/clashy.go"
 	"github.com/jackc/pgx/v5"
+	"github.com/jackc/pgx/v5/pgxpool"
 )
 
 const trackingWakeChannel = "clashking_tracking_wake_v1"
@@ -104,7 +105,12 @@ func runTrackingWakeListener(ctx context.Context, app *platform.App, handle func
 }
 
 func listenForTrackingWakes(ctx context.Context, dsn string, handle func(trackingWakeEvent)) error {
-	connection, err := pgx.Connect(ctx, dsn)
+	// Strip pool-only options before opening this dedicated session for LISTEN.
+	config, err := pgxpool.ParseConfig(dsn)
+	if err != nil {
+		return err
+	}
+	connection, err := pgx.ConnectConfig(ctx, config.ConnConfig)
 	if err != nil {
 		return err
 	}

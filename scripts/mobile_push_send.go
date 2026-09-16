@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"net/http"
 	"sync"
@@ -32,19 +33,52 @@ type pushMessage struct {
 	Data  map[string]string
 }
 
+type pushProviderHTTPError struct{ Status int }
+
+func (e *pushProviderHTTPError) Error() string {
+	switch e.Status {
+	case http.StatusUnauthorized, http.StatusForbidden:
+		return fmt.Sprintf("push provider authentication or configuration failed with status %d", e.Status)
+	case http.StatusBadRequest, http.StatusNotFound, http.StatusGone:
+		return fmt.Sprintf("push provider permanently rejected the request or device token with status %d", e.Status)
+	default:
+		return fmt.Sprintf("push provider returned status %d", e.Status)
+	}
+}
+
+func isRetryablePushError(err error) bool {
+	if err == nil || errors.Is(err, context.Canceled) {
+		return false
+	}
+	if errors.Is(err, context.DeadlineExceeded) {
+		return true
+	}
+	var providerErr *pushProviderHTTPError
+	if !errors.As(err, &providerErr) {
+		return true
+	}
+	return providerErr.Status == http.StatusUnauthorized ||
+		providerErr.Status == http.StatusForbidden ||
+		providerErr.Status == http.StatusRequestTimeout ||
+		providerErr.Status == http.StatusTooEarly ||
+		providerErr.Status == http.StatusTooManyRequests ||
+		providerErr.Status >= http.StatusInternalServerError
+}
+
 // sendPushToDevices decrypts each device's token (AES-GCM, same scheme
 // clashking-api used to write it) and sends via the matching provider.
 // Provider/configuration failures are counted as skipped and never reported
 // as successful deliveries. A bounded worker pool avoids serial network
 // latency without creating an unbounded goroutine per registered device.
-func sendPushToDevices(ctx context.Context, app *platform.App, devices []models.PushDevice, msg pushMessage) (sent int, skipped int) {
+func sendPushToDevices(ctx context.Context, app *platform.App, devices []models.PushDevice, msg pushMessage) (sent int, skipped int, deliveryErr error) {
 	if len(devices) == 0 {
-		return 0, 0
+		return 0, 0, nil
 	}
 	workerCount := min(20, len(devices))
 	jobs := make(chan models.PushDevice)
 	var wg sync.WaitGroup
 	var mu sync.Mutex
+	var deliveryErrors []error
 	for range workerCount {
 		wg.Add(1)
 		go func() {
@@ -74,6 +108,9 @@ func sendPushToDevices(ctx context.Context, app *platform.App, devices []models.
 					app.Logger.Warn("mobile_push: send failed", "device_id", device.DeviceID, "provider", device.Provider, "err", sendErr)
 					mu.Lock()
 					skipped++
+					if isRetryablePushError(sendErr) {
+						deliveryErrors = append(deliveryErrors, fmt.Errorf("deliver to device %s: %w", device.DeviceID, sendErr))
+					}
 					mu.Unlock()
 					continue
 				}
@@ -89,12 +126,12 @@ func sendPushToDevices(ctx context.Context, app *platform.App, devices []models.
 		case <-ctx.Done():
 			close(jobs)
 			wg.Wait()
-			return sent, skipped + len(devices) - sent - skipped
+			return sent, skipped + len(devices) - sent - skipped, errors.Join(append(deliveryErrors, ctx.Err())...)
 		}
 	}
 	close(jobs)
 	wg.Wait()
-	return sent, skipped
+	return sent, skipped, errors.Join(deliveryErrors...)
 }
 
 func sendFCM(ctx context.Context, app *platform.App, token string, msg pushMessage) error {
@@ -184,7 +221,7 @@ func doSend(req *http.Request) error {
 	}
 	defer resp.Body.Close()
 	if resp.StatusCode >= 300 {
-		return fmt.Errorf("push provider returned status %d", resp.StatusCode)
+		return &pushProviderHTTPError{Status: resp.StatusCode}
 	}
 	return nil
 }

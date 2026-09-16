@@ -209,6 +209,8 @@ type scheduledDomain struct {
 	limiter            *clashy.Limiter
 	loadLegendSeasons  legendSeasonsLoader
 	loadLegendRankings legendSeasonRankingsLoader
+	now                func() time.Time
+	waitUntil          func(context.Context, time.Time) error
 }
 
 type scheduledStore interface {
@@ -223,6 +225,7 @@ type scheduledStore interface {
 	StoreRankedLeagueGroup(context.Context, []models.RankedLeagueGroupMemberRow) (int, error)
 	MissingRankedGroupPlayers(context.Context, int64) ([]string, error)
 	FinalizeRankedTournament(context.Context, int64) (int, error)
+	CaptureLegendSnapshot(context.Context, time.Time) (int, error)
 	FinalizeLegendCloseout(context.Context, time.Time) (int, error)
 }
 
@@ -298,8 +301,27 @@ func (d *scheduledDomain) Run(ctx context.Context, app *platform.App) error {
 func (d *scheduledDomain) runLeagueCloseoutLoop(ctx context.Context, app *platform.App) error {
 	for {
 		now := time.Now().UTC()
+		if d.now != nil {
+			now = d.now().UTC()
+		}
+		waitUntil := waitUntilContext
+		if d.waitUntil != nil {
+			waitUntil = d.waitUntil
+		}
+		if err := waitUntil(ctx, nextLeagueCloseout(now)); err != nil {
+			return err
+		}
+		now = time.Now().UTC()
+		if d.now != nil {
+			now = d.now().UTC()
+		}
 		day := latestEligibleLegendDay(now)
 		started := time.Now()
+		snapshotWrites, err := d.store.CaptureLegendSnapshot(ctx, day)
+		if err != nil {
+			return err
+		}
+		app.Stats.RecordWrite(trackingProgressName(scheduledDomainName, "legend-snapshot"), snapshotWrites)
 		writes, err := d.store.FinalizeLegendCloseout(ctx, day)
 		if err != nil {
 			return err
@@ -313,15 +335,17 @@ func (d *scheduledDomain) runLeagueCloseoutLoop(ctx context.Context, app *platfo
 			}
 			app.Stats.RecordWrite(trackingProgressName(scheduledDomainName, "ranked-closeout"), rankedWrites)
 		}
-		timer := time.NewTimer(time.Until(nextLeagueCloseout(now)))
-		select {
-		case <-ctx.Done():
-			if !timer.Stop() {
-				<-timer.C
-			}
-			return ctx.Err()
-		case <-timer.C:
-		}
+	}
+}
+
+func waitUntilContext(ctx context.Context, deadline time.Time) error {
+	timer := time.NewTimer(time.Until(deadline))
+	defer timer.Stop()
+	select {
+	case <-ctx.Done():
+		return ctx.Err()
+	case <-timer.C:
+		return nil
 	}
 }
 
@@ -2440,6 +2464,8 @@ type memoryScheduledStore struct {
 	currentClanRankings map[string]map[string]currentClanRankingRow
 	leaderboardHistory  map[string]map[string]any
 	legendHistory       map[string]map[string]models.LegendHistoryRow
+	legendSnapshotCalls int
+	legendCloseoutCalls int
 }
 
 func newMemoryScheduledStore() *memoryScheduledStore {
@@ -2452,7 +2478,13 @@ func newMemoryScheduledStore() *memoryScheduledStore {
 
 func (*memoryScheduledStore) Close() {}
 
-func (*memoryScheduledStore) FinalizeLegendCloseout(context.Context, time.Time) (int, error) {
+func (s *memoryScheduledStore) CaptureLegendSnapshot(context.Context, time.Time) (int, error) {
+	s.legendSnapshotCalls++
+	return 0, nil
+}
+
+func (s *memoryScheduledStore) FinalizeLegendCloseout(context.Context, time.Time) (int, error) {
+	s.legendCloseoutCalls++
 	return 0, nil
 }
 

@@ -638,11 +638,7 @@ func (d *warsDomain) runDiscoveryCycle(ctx context.Context, app *platform.App, l
 			return err
 		}
 	}
-	err = d.processQueue(ctx, app, limiter, queue.items)
-	for range targets {
-		app.Stats.RecordTrackedTarget(statsName)
-	}
-	return err
+	return d.processQueue(ctx, app, limiter, queue.items)
 }
 
 func (d *warsDomain) processQueue(ctx context.Context, app *platform.App, limiter *clashy.Limiter, requests []warFetchRequest) error {
@@ -668,6 +664,18 @@ func (d *warsDomain) processQueue(ctx context.Context, app *platform.App, limite
 			defer wg.Done()
 			defer func() { <-slots }()
 			ingest, err := d.do(ctx, app, limiter, req)
+			var exhausted *platform.ClashFetchExhausted
+			if errors.As(err, &exhausted) && ctx.Err() == nil {
+				// Defer this clan to the next scan without storing an empty ingest
+				// or removing any pending finalization work. Other clans can proceed.
+				app.Logger.Error("war fetch deferred after retries", "clan", req.ClanTag,
+					"war_id", req.WarID, "attempts", exhausted.Attempts, "err", err)
+				app.Stats.RecordRequest(d.name+".fetch-failures", 0, err)
+				if app.Errors != nil {
+					app.Errors.Capture(err, map[string]string{"domain": d.name, "operation": "war-fetch"})
+				}
+				return
+			}
 			if err == nil {
 				err = d.storeIngest(ctx, app, ingest)
 			}
@@ -675,6 +683,11 @@ func (d *warsDomain) processQueue(ctx context.Context, app *platform.App, limite
 				d.mu.Lock()
 				delete(d.scheduled, req.ScheduleKey)
 				d.mu.Unlock()
+			}
+			if err == nil && !req.StoreOnly && req.StatsName != "" {
+				// Progress means a fetched target whose resulting SQL work also
+				// succeeded. Deferred fetches and failed writes remain pending.
+				app.Stats.RecordTrackedTarget(req.StatsName)
 			}
 			if err != nil && ctx.Err() == nil {
 				app.Logger.Error("war processing failed", "err", err)
@@ -689,7 +702,7 @@ func (d *warsDomain) processQueue(ctx context.Context, app *platform.App, limite
 			return err
 		}
 	}
-	return nil
+	return ctx.Err()
 }
 
 func (d *warsDomain) do(ctx context.Context, app *platform.App, limiter *clashy.Limiter, req warFetchRequest) (models.WarIngest, error) {

@@ -103,6 +103,38 @@ func TestFinalSchemaBattleIngestAndLegendCloseoutAreIdempotent(t *testing.T) {
 	}
 
 	scheduled := &timescaleScheduledStore{pool: store.pool}
+	if _, err := scheduled.FinalizeLegendCloseout(ctx, day); err == nil {
+		t.Fatal("closeout without a saved Legend ranking snapshot succeeded")
+	}
+	snapshotWrites, err := scheduled.CaptureLegendSnapshot(ctx, day)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if snapshotWrites != 2 {
+		t.Fatalf("snapshot writes = %d, want 2", snapshotWrites)
+	}
+	if _, err := store.pool.Exec(ctx, `
+		UPDATE legend_rankings_current SET global_rank = global_rank + 100;
+		UPDATE legend_rankings_current
+		SET global_rank = CASE tag WHEN '#P0' THEN 2 ELSE 1 END,
+		    trophies = trophies + 500
+	`); err != nil {
+		t.Fatal(err)
+	}
+	secondSnapshotWrites, err := scheduled.CaptureLegendSnapshot(ctx, day)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if secondSnapshotWrites != 0 {
+		t.Fatalf("rerun snapshot writes = %d, want preserved historical snapshot", secondSnapshotWrites)
+	}
+	var preservedRank, preservedTrophies int
+	if err := store.pool.QueryRow(ctx, `SELECT global_rank,trophies FROM legend_rankings_history WHERE day=$1 AND tag='#P0'`, day).Scan(&preservedRank, &preservedTrophies); err != nil {
+		t.Fatal(err)
+	}
+	if preservedRank != 1 || preservedTrophies != 6000 {
+		t.Fatalf("historical snapshot changed to rank=%d trophies=%d", preservedRank, preservedTrophies)
+	}
 	for run := 0; run < 2; run++ {
 		if _, err := scheduled.FinalizeLegendCloseout(ctx, day); err != nil {
 			t.Fatal(err)
@@ -124,7 +156,7 @@ func TestFinalSchemaBattleIngestAndLegendCloseoutAreIdempotent(t *testing.T) {
 	if err := store.pool.QueryRow(ctx, `SELECT count(*) FROM army_family_members`).Scan(&memberCount); err != nil {
 		t.Fatal(err)
 	}
-	if err := store.pool.QueryRow(ctx, `SELECT count(*) FROM leaderboard_history_player_home WHERE day=$1`, day).Scan(&historyCount); err != nil {
+	if err := store.pool.QueryRow(ctx, `SELECT count(*) FROM legend_rankings_history WHERE day=$1`, day).Scan(&historyCount); err != nil {
 		t.Fatal(err)
 	}
 	var familyStatsCount int
@@ -133,6 +165,27 @@ func TestFinalSchemaBattleIngestAndLegendCloseoutAreIdempotent(t *testing.T) {
 	}
 	if familyCount != 1 || memberCount != 1 || familyStatsCount != 3 || historyCount != 2 {
 		t.Fatalf("families=%d members=%d family cohorts=%d history=%d", familyCount, memberCount, familyStatsCount, historyCount)
+	}
+
+	officialDate := day.AddDate(0, 0, 1)
+	officialRows := []models.PlayerTrophyHistoryRow{{
+		LocationID: "global", Date: officialDate, PlayerTag: "#P0", PlayerName: "attacker",
+		ExpLevel: 250, Trophies: 6100, AttackWins: 8, DefenseWins: 4, Rank: 1,
+	}}
+	if _, err := scheduled.ReplaceLeaderboardHistory(ctx, []leaderboardHistoryGroup{{
+		Kind: leaderboardHistoryPlayerHomeTrophies, LocationID: "global", Date: officialDate, Rows: officialRows,
+	}}); err != nil {
+		t.Fatal(err)
+	}
+	var officialName string
+	if err := store.pool.QueryRow(ctx, `
+		SELECT player_name FROM leaderboard_history_player_home
+		WHERE location_id='global' AND date=$1 AND player_tag='#P0'
+	`, officialDate).Scan(&officialName); err != nil {
+		t.Fatal(err)
+	}
+	if officialName != "attacker" {
+		t.Fatalf("official history player_name = %q", officialName)
 	}
 }
 
