@@ -2,6 +2,27 @@
   "dry_run": false,
   "mock_db": false,
   "target_page_multiplier": 5,
+  "database_pools": {
+    "default_max_conns": 2,
+    "max_conns_by_script": {
+      "globalclans": 6,
+      "battlelogs": 6,
+      "war-discovery": 2,
+      "cwl": 2,
+      "war-archiver": 3,
+      "basicplayers": 1,
+      "scheduled": 1,
+      "notifications": 1,
+      "bot-automations": 1,
+      "availability": 1
+    },
+    "stats_max_conns": 1,
+    "min_conns": 0,
+    "max_idle_time": "5m",
+    "max_lifetime": "30m",
+    "max_lifetime_jitter": "5m",
+    "connect_timeout_seconds": 10
+  },
   "stats": {
     "timescale_flush_seconds": 60
   },

@@ -5,6 +5,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"io"
 	"log/slog"
 	"strings"
 	"testing"
@@ -17,6 +18,7 @@ import (
 	"github.com/disgoorg/disgo/gateway"
 	"github.com/disgoorg/snowflake/v2"
 	"github.com/google/uuid"
+	"github.com/gorilla/websocket"
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgxpool"
 )
@@ -53,9 +55,16 @@ func TestDiscordLibraryLoggerDropsRawPayloadFromMessageAttributesAndDerivedHandl
 	var output bytes.Buffer
 	reporter := &deliveryErrorRecorder{seen: map[string]bool{}}
 	handler := discordLibraryLogHandler{target: slog.NewJSONHandler(&output, nil), reporter: reporter}
-	handler = handler.WithAttrs([]slog.Attr{slog.String("bound", "bound-secret")}).WithGroup("private").(discordLibraryLogHandler)
+	handler = handler.WithAttrs([]slog.Attr{
+		slog.String("bound", "bound-secret"),
+		slog.Int("shard_id", 4),
+		slog.Int("shard_count", 15),
+	}).WithGroup("private").(discordLibraryLogHandler)
 	record := slog.NewRecord(time.Now(), slog.LevelError, `error while parsing gateway message: {"message-secret":true}`, 0)
-	record.AddAttrs(slog.Any("err", errors.New(`failed: {"guild":"private","members":["secret"]}`)))
+	record.AddAttrs(
+		slog.Any("err", errors.New(`failed: {"guild":"private","members":["secret"]}`)),
+		slog.String("url", "wss://secret.example/?session=private"),
+	)
 	if err := handler.Handle(t.Context(), record); err != nil {
 		t.Fatal(err)
 	}
@@ -66,8 +75,149 @@ func TestDiscordLibraryLoggerDropsRawPayloadFromMessageAttributesAndDerivedHandl
 	if !strings.Contains(got, `"discord_library":true`) || !strings.Contains(got, "Discord library diagnostic") {
 		t.Fatalf("safe Discord library diagnostic missing: %s", got)
 	}
+	if !strings.Contains(got, `"shard_id":4`) || !strings.Contains(got, `"shard_count":15`) || !strings.Contains(got, `"category":"invalid_gateway_payload"`) {
+		t.Fatalf("safe Discord library context missing: %s", got)
+	}
 	if len(reporter.captured) != 1 || strings.Contains(reporter.captured[0], "private") {
 		t.Fatalf("safe Discord library Sentry capture = %#v", reporter.captured)
+	}
+}
+
+func TestDiscordLibraryLoggerKeepsOnlyAllowlistedLifecycleContext(t *testing.T) {
+	var output bytes.Buffer
+	handler := discordLibraryLogHandler{target: slog.NewJSONHandler(&output, nil)}
+	handler = handler.WithGroup("private-session").WithAttrs([]slog.Attr{
+		slog.String("name", "gateway"),
+		slog.Int("shard_id", 7),
+		slog.Int("shard_count", 15),
+		slog.String("session_id", "secret-session"),
+	}).(discordLibraryLogHandler)
+	record := slog.NewRecord(time.Now(), slog.LevelError, "gateway close received", 0)
+	record.AddAttrs(
+		slog.Bool("reconnect", false),
+		slog.Any("err", &websocket.CloseError{Code: 4014, Text: "secret close text"}),
+		slog.String("url", "wss://secret.example/?session=secret-session"),
+	)
+	if err := handler.Handle(t.Context(), record); err != nil {
+		t.Fatal(err)
+	}
+	got := output.String()
+	for _, secret := range []string{"secret-session", "secret close text", "secret.example", "private-session"} {
+		if strings.Contains(got, secret) {
+			t.Fatalf("Discord lifecycle log exposed %q: %s", secret, got)
+		}
+	}
+	for _, safe := range []string{`"category":"websocket_close"`, `"component":"gateway"`, `"shard_id":7`, `"shard_count":15`, `"close_code":4014`, `"reconnect":false`} {
+		if !strings.Contains(got, safe) {
+			t.Fatalf("Discord lifecycle log omitted %s: %s", safe, got)
+		}
+	}
+}
+
+func TestDiscordGatewayDisconnectQueuesOneUnhealthyTransition(t *testing.T) {
+	state := &discordGatewayState{appID: "123", shards: map[int]discordShardState{
+		4: {Generation: uuid.New(), ShardCount: 15, Sequence: 91, Ready: true},
+	}}
+	var queued []discordCacheMutation
+	enqueue := func(mutation discordCacheMutation) { queued = append(queued, mutation) }
+	markDiscordShardDisconnected(state, 4, enqueue)
+	markDiscordShardDisconnected(state, 4, enqueue)
+	if state.shardReady(4) {
+		t.Fatal("disconnected shard remained ready")
+	}
+	if len(queued) != 1 || queued[0].Meta.ShardID != 4 || queued[0].Meta.ShardCount != 15 || queued[0].Meta.Sequence != 91 {
+		t.Fatalf("disconnect mutations = %#v, want one generation-fenced unhealthy write", queued)
+	}
+}
+
+func TestDiscordGatewayReadinessTracksLiveShardStatusAndResumeEvidence(t *testing.T) {
+	state := &discordGatewayState{appID: "123", shards: map[int]discordShardState{
+		0: {Generation: uuid.New(), ShardCount: 2, Ready: true},
+		1: {Generation: uuid.New(), ShardCount: 2, Ready: true},
+	}}
+	shards := []gateway.Gateway{
+		&fakeDiscordGateway{id: 0, count: 2, status: gateway.StatusReady},
+		&fakeDiscordGateway{id: 1, count: 2, status: gateway.StatusReady},
+	}
+	app := &platform.App{Stats: platform.NewTracker()}
+	var queued []discordCacheMutation
+	enqueue := func(mutation discordCacheMutation) { queued = append(queued, mutation) }
+	if ready := reconcileDiscordShardReadiness(app, shards, state, enqueue); ready != 2 {
+		t.Fatalf("ready shards = %d, want 2", ready)
+	}
+	shards[1].(*fakeDiscordGateway).status = gateway.StatusDisconnected
+	if ready := reconcileDiscordShardReadiness(app, shards, state, enqueue); ready != 1 {
+		t.Fatalf("ready shards after disconnect = %d, want 1", ready)
+	}
+	if len(queued) != 1 || state.shardReady(1) {
+		t.Fatalf("disconnect did not enqueue one unhealthy transition: %#v", queued)
+	}
+	stats := app.Stats.Snapshot()
+	if len(stats.Domains) != 1 || stats.Domains[0].Healthy || !strings.Contains(stats.Domains[0].LastError, "1 of 2") {
+		t.Fatalf("overall readiness after disconnect = %#v", stats.Domains)
+	}
+	shards[1].(*fakeDiscordGateway).status = gateway.StatusReady
+	state.setShardReady(1, true) // represents an observed RESUMED event
+	if ready := reconcileDiscordShardReadiness(app, shards, state, enqueue); ready != 2 {
+		t.Fatalf("ready shards after RESUMED = %d, want 2", ready)
+	}
+}
+
+func TestDiscordGatewaySimultaneousShardFailuresAreContained(t *testing.T) {
+	state := &discordGatewayState{appID: "123", shards: map[int]discordShardState{
+		0: {Generation: uuid.New(), ShardCount: 2, Sequence: 50, Ready: true},
+		1: {Generation: uuid.New(), ShardCount: 2, Sequence: 75, Ready: true},
+	}}
+	shards := []gateway.Gateway{
+		&fakeDiscordGateway{id: 0, count: 2, status: gateway.StatusDisconnected},
+		&fakeDiscordGateway{id: 1, count: 2, status: gateway.StatusDisconnected},
+	}
+	app := &platform.App{Stats: platform.NewTracker()}
+	var queued []discordCacheMutation
+	if ready := reconcileDiscordShardReadiness(app, shards, state, func(mutation discordCacheMutation) {
+		queued = append(queued, mutation)
+	}); ready != 0 {
+		t.Fatalf("ready shards = %d, want 0", ready)
+	}
+	if len(queued) != 2 || queued[0].Meta.ShardID == queued[1].Meta.ShardID {
+		t.Fatalf("simultaneous shard failures queued %#v, want one fenced transition per shard", queued)
+	}
+	if state.shardReady(0) || state.shardReady(1) {
+		t.Fatal("simultaneously disconnected shards retained READY evidence")
+	}
+}
+
+func TestDiscordGatewaySupervisorKeepsHealthyShardsUntilAllAreTerminal(t *testing.T) {
+	state := &discordGatewayState{appID: "123", shards: map[int]discordShardState{
+		0: {Generation: uuid.New(), ShardCount: 2, Ready: true},
+		1: {Generation: uuid.New(), ShardCount: 2, Ready: true},
+	}}
+	shards := []gateway.Gateway{
+		&fakeDiscordGateway{id: 0, count: 2, status: gateway.StatusReady},
+		&fakeDiscordGateway{id: 1, count: 2, status: gateway.StatusReady},
+	}
+	app := &platform.App{Stats: platform.NewTracker(), Logger: slog.New(slog.NewTextHandler(io.Discard, nil))}
+	failures := make(chan discordShardFailure, 2)
+	done := make(chan error, 1)
+	ctx, cancel := context.WithCancel(t.Context())
+	defer cancel()
+	go func() {
+		done <- runDiscordShardSupervisor(ctx, app, shards, state, func(discordCacheMutation) {}, failures)
+	}()
+	failures <- discordShardFailure{ShardID: 0, Err: &websocket.CloseError{Code: 4014}}
+	select {
+	case err := <-done:
+		t.Fatalf("one terminal shard stopped the whole gateway: %v", err)
+	case <-time.After(20 * time.Millisecond):
+	}
+	failures <- discordShardFailure{ShardID: 1, Err: &websocket.CloseError{Code: 4014}}
+	select {
+	case err := <-done:
+		if err == nil || !strings.Contains(err.Error(), "all 2") {
+			t.Fatalf("all-shard terminal result = %v", err)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("all terminal shards did not stop supervision")
 	}
 }
 
@@ -100,6 +250,28 @@ func TestDiscordGatewayOpenSurfacesWriterFailureBeforeShardStartupCompletes(t *t
 	opened, err := awaitDiscordGatewayOpen(t.Context(), openDone, writerDone, other, other, other, other)
 	if opened || err == nil || !strings.Contains(err.Error(), "cache writer") || !strings.Contains(err.Error(), "snapshot write failed") {
 		t.Fatalf("startup supervision = opened %v, err %v", opened, err)
+	}
+}
+
+func TestDiscordGatewayRequiresReadyEvidenceFromEveryExpectedShard(t *testing.T) {
+	state := &discordGatewayState{shards: map[int]discordShardState{}}
+	shards := make([]gateway.Gateway, 0, 15)
+	for shardID := range 15 {
+		state.shards[shardID] = discordShardState{ShardCount: 15, Ready: true}
+		shards = append(shards, &fakeDiscordGateway{id: shardID, count: 15, status: gateway.StatusReady})
+	}
+	if err := validateDiscordShardReadiness(state, shards); err != nil {
+		t.Fatalf("all expected shards should be ready: %v", err)
+	}
+
+	state.shards[14] = discordShardState{ShardCount: 15}
+	if err := validateDiscordShardReadiness(state, shards); err == nil || !strings.Contains(err.Error(), "READY or RESUMED") {
+		t.Fatalf("missing lifecycle evidence was accepted: %v", err)
+	}
+	state.shards[14] = discordShardState{ShardCount: 15, Ready: true}
+	shards[14] = &fakeDiscordGateway{id: 14, count: 15, status: gateway.StatusDisconnected}
+	if err := validateDiscordShardReadiness(state, shards); err == nil || !strings.Contains(err.Error(), "Disconnected") {
+		t.Fatalf("disconnected shard was accepted: %v", err)
 	}
 }
 
@@ -239,3 +411,24 @@ func TestDiscordGuildActivityReconciliationTransitions(t *testing.T) {
 		}
 	}
 }
+
+type fakeDiscordGateway struct {
+	id, count int
+	status    gateway.Status
+}
+
+func (g *fakeDiscordGateway) ShardID() int                             { return g.id }
+func (g *fakeDiscordGateway) ShardCount() int                          { return g.count }
+func (*fakeDiscordGateway) SessionID() *string                         { return nil }
+func (*fakeDiscordGateway) LastSequenceReceived() *int                 { return nil }
+func (*fakeDiscordGateway) ResumeURL() *string                         { return nil }
+func (*fakeDiscordGateway) Intents() gateway.Intents                   { return gateway.IntentsNone }
+func (*fakeDiscordGateway) Open(context.Context) error                 { return nil }
+func (*fakeDiscordGateway) Close(context.Context)                      {}
+func (*fakeDiscordGateway) CloseWithCode(context.Context, int, string) {}
+func (g *fakeDiscordGateway) Status() gateway.Status                   { return g.status }
+func (*fakeDiscordGateway) Send(context.Context, gateway.Opcode, gateway.MessageData) error {
+	return nil
+}
+func (*fakeDiscordGateway) Latency() time.Duration                       { return 0 }
+func (*fakeDiscordGateway) Presence() *gateway.MessageDataPresenceUpdate { return nil }

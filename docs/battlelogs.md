@@ -2,7 +2,7 @@
 
 ## What this process is for
 
-Battle-log tracking stores newly observed multiplayer battles for players whose history is worth polling. It no longer exists as a side effect of a mutable column on `basic_player`, and it does not send mobile Legend notifications.
+Battle-log tracking stores newly observed multiplayer battles for players whose history is worth polling. It also publishes a deduplicated mobile event for each newly observed Legend defense after the raw battle is durable.
 
 ## When it runs
 
@@ -46,9 +46,10 @@ for target_batch in targets:
     if battle time is at or before the checkpoint: skip
     if no checkpoint and battle time is older than 14 days: skip
     keep farming attacks slim; store the requested player's Ranked/Legend perspective
-    materialize structured army compositions for Legend battles only
+    materialize each distinct Ranked or Legend army by normalized share code
     queue SQL insert
   commit inserts
+  publish newly observed Legend defenses once
   save new checkpoint with its TTL
 ```
 
@@ -60,11 +61,11 @@ Checkpoint batches feed one long-lived pool rather than waiting for every retry 
 
 ## Data read and written
 
-Reads target tables and the requested player's current Town Hall from `basic_player`. Farming attacks go to `battles_farming` with the player, time, result, duration, loot object, and share code; farming defenses and opponent metadata are discarded. The opponent Town Hall is zero-indexed in the wire response and is converted with `+1` exactly once during ingestion. Each Ranked or Legend response contributes only the requested player's own attack or defense perspective to `battles_ranked`. When both players are tracked, their separate responses supply the two perspectives without synthesizing either one. Aggregate readers use only `direction='attack'`, so a battle observed from both players is counted once.
+Reads target tables and the requested player's current Town Hall from `basic_player`. Farming attacks go to `battles_farming` with the player, time, result, duration, loot object, and share code; farming defenses and opponent metadata are discarded. The opponent Town Hall is zero-indexed in the wire response and is converted with `+1` exactly once during ingestion. Each Ranked or Legend response contributes only the requested player's own attack or defense perspective to `battles_ranked`. When both players are tracked, their separate responses supply the two perspectives without synthesizing either one. The database contract uses numeric `battle_mode` values `1` for Ranked and `2` for Legend, numeric `direction` values `1` for attack and `2` for defense, and `0` when duration is absent. Aggregate readers use only `direction=1`, so a battle observed from both players is counted once.
 
-Ranked and Legend rows retain the normalized share code directly. The hot writer does not hash or materialize army compositions; the daily Legend closeout decodes each distinct code once for family and item aggregation.
+Ranked and Legend rows retain the normalized share code directly. The hot writer inserts each distinct code into `army_compositions`, keyed only by `share_code`; there is no army hash or parser-version identity. The daily Legend closeout reuses those compositions for family and item aggregation.
 
-The battle identity is `(player_tag, battle_time)`. Deploy this writer after DevKit migration 013 establishes that primary key and after migration 012 removes the raw-battle composition foreign keys. Existing raw rows remain intact. Cleanup of Ranked-only compositions is a separate operator action after deployment, preserving all Legend and family references.
+The battle identity is `(player_tag, battle_time)`. Deploy this writer only with the final DevKit migration 017 contract. Existing raw rows remain intact.
 
 The scheduled closeout rebuilds completed Legend-day and Ranked-season aggregates from raw attack perspectives. It groups newly observed Legend armies into immutable direct-anchor families and writes daily family outcomes. Farming and Ranked/Legend raw rows retain one year.
 
@@ -74,7 +75,7 @@ Every target is fetched on every pass whether it has a checkpoint or not, so an 
 
 ## Events and interaction
 
-No mobile Legend event is emitted. Battle-log storage remains available to API statistics and analytics. `trackedplayers` decides who belongs to the standard fast-player set; wars do not write player rows to opt people in.
+After SQL succeeds, each newly observed Legend defense publishes a `legend` stream entry whose value has `type=legend_defense`, `event_id`, normalized `player_tag`, and RFC3339-nanosecond `battle_time`. The event ID is deterministic for the player and battle time, and the Valkey append is atomically deduplicated. First-seen checkpoint seeding publishes no historical notifications. `trackedplayers` decides who belongs to the standard fast-player set; wars do not write player rows to opt people in.
 
 ```mermaid
 flowchart LR
@@ -84,6 +85,7 @@ flowchart LR
   B --> API[Battle-log endpoint]
   B --> C[Valkey checkpoints]
   B --> SQL[(farming and ranked battles)]
+  B --> E[deduplicated Legend defense event]
   SQL --> Stats[API analytics]
 ```
 
@@ -97,11 +99,11 @@ flowchart LR
 
 ## Outages and restarts
 
-Requests pause at the availability gate. A checkpoint is stored only after SQL succeeds, so a restart or failed transaction replays the same candidate instead of losing it. Duplicate SQL identities make that replay safe.
+Requests pause at the availability gate. Storage ordering is SQL, then the atomically deduplicated event append, then the checkpoint. A failure at any stage replays safely without losing a notification or creating duplicate raw rows or stream events.
 
 ## What it deliberately does not do
 
-- No bookmarked-player or Legend mobile notifications.
+- No bookmarked-player targeting or notifications.
 - No writes to general `basic_player` targeting state.
 - No stored trophy deltas or synthetic automatic defenses; API responses derive them from real results.
 - No war-derived TTL.

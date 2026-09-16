@@ -30,6 +30,18 @@ type App struct {
 }
 
 func New(ctx context.Context, cfg Config) (*App, error) {
+	statsDSN := cfg.TimescaleURL
+	if cfg.TimescaleURL != "" {
+		var err error
+		statsDSN, err = cfg.DatabasePools.connectionString(cfg.TimescaleURL, cfg.Script, true)
+		if err != nil {
+			return nil, err
+		}
+		cfg.TimescaleURL, err = cfg.DatabasePools.connectionString(cfg.TimescaleURL, cfg.Script, false)
+		if err != nil {
+			return nil, err
+		}
+	}
 	logger := slog.New(slog.NewJSONHandler(os.Stdout, &slog.HandlerOptions{Level: slog.LevelInfo}))
 	if needsClashClient(cfg) && cfg.ProxyURL == "" {
 		return nil, errors.New("proxy_url is required when Clash-backed domains are enabled")
@@ -49,7 +61,7 @@ func New(ctx context.Context, cfg Config) (*App, error) {
 	stats := NewTracker()
 	var statsWriter *TimescaleStatsWriter
 	if shouldPersistStats(cfg) {
-		statsWriter, err = NewTimescaleStatsWriter(ctx, cfg.TimescaleURL, stats, cfg.Script, time.Duration(cfg.StatsTimescaleFlushSeconds)*time.Second)
+		statsWriter, err = NewTimescaleStatsWriter(ctx, statsDSN, stats, cfg.Script, time.Duration(cfg.StatsTimescaleFlushSeconds)*time.Second)
 		if err != nil {
 			if valkeyClient != nil {
 				valkeyClient.Close()

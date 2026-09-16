@@ -377,40 +377,57 @@ func runTrackedClanTracker[T any](
 				app.Stats.RecordTrackedTarget(progressName)
 				return nil
 			}
-			current, err := retryLimitedClashFetch(workerCtx, app, limiter, func(fetchCtx context.Context) (*T, error) {
-				start := time.Now()
-				current, err := fetch(fetchCtx, tag)
-				app.Stats.RecordRequest(progressName, time.Since(start), err)
-				return current, err
-			})
-			app.Stats.RecordTrackedTarget(progressName)
-			if err != nil {
-				if workerCtx.Err() != nil {
-					return workerCtx.Err()
-				}
-				// A single private, throttled, or temporarily unavailable clan is
-				// retried on the next pass. Process-wide availability failures remain
-				// held at the shared gate, while SQL/snapshot/event errors from handle
-				// still stop the process.
-				app.Logger.Error("tracked clan fetch failed", "group", group, "tag", tag, "err", err)
-				app.Stats.SetReady(trackedClansDomainName, false, err.Error())
-				return nil
-			}
-			var raw []byte
-			if current != nil {
-				raw = jsonBytes(current)
-			}
-			return handle(workerCtx, app, TrackedItem[T]{
-				Group:   group,
-				Kind:    kind,
-				Tag:     tag,
-				Current: current,
-				Raw:     raw,
-			})
+			return processTrackedClanTarget(workerCtx, app, group, kind, tag, fetch, handle, limiter, progressName)
 		}); err != nil {
 			return err
 		}
 	}
+}
+
+func processTrackedClanTarget[T any](
+	ctx context.Context,
+	app *platform.App,
+	group string,
+	kind string,
+	tag string,
+	fetch trackedClanFetchFunc[T],
+	handle func(context.Context, *platform.App, TrackedItem[T]) error,
+	limiter *clashy.Limiter,
+	progressName string,
+) error {
+	current, err := retryLimitedClashFetch(ctx, app, limiter, func(fetchCtx context.Context) (*T, error) {
+		start := time.Now()
+		current, err := fetch(fetchCtx, tag)
+		app.Stats.RecordRequest(progressName, time.Since(start), err)
+		return current, err
+	})
+	if err != nil {
+		if ctx.Err() != nil {
+			return ctx.Err()
+		}
+		// A single private, throttled, or temporarily unavailable clan is
+		// retried on the next pass. Process-wide availability failures remain
+		// held at the shared gate, while SQL/snapshot/event errors from handle
+		// still stop the process.
+		app.Logger.Error("tracked clan fetch failed", "group", group, "tag", tag, "err", err)
+		app.Stats.SetReady(trackedClansDomainName, false, err.Error())
+		return nil
+	}
+	var raw []byte
+	if current != nil {
+		raw = jsonBytes(current)
+	}
+	if err := handle(ctx, app, TrackedItem[T]{
+		Group:   group,
+		Kind:    kind,
+		Tag:     tag,
+		Current: current,
+		Raw:     raw,
+	}); err != nil {
+		return err
+	}
+	app.Stats.RecordTrackedTarget(progressName)
+	return nil
 }
 
 func fetchClan(app *platform.App) trackedClanFetchFunc[clashy.Clan] {

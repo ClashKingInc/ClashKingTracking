@@ -5,6 +5,9 @@ package scripts
 import (
 	"context"
 	"encoding/json"
+	"errors"
+	"io"
+	"log/slog"
 	"net/http"
 	"net/http/httptest"
 	"os"
@@ -57,6 +60,52 @@ func TestTrackedClanSnapshotDiffDoesNotAdvanceUntilStored(t *testing.T) {
 	}
 	if !ok || stored == nil || stored.Name != "Before" {
 		t.Fatalf("snapshot advanced before store: %#v", stored)
+	}
+}
+
+func TestTrackedClanProgressOnlyAdvancesAfterFetchAndHandleSucceed(t *testing.T) {
+	app := trackedClansTestApp()
+	app.Logger = slog.New(slog.NewTextHandler(io.Discard, nil))
+	app.Availability = platform.NewAvailabilityGate(nil)
+	progressName := trackingProgressName(trackedClansDomainName, "clans")
+	app.Stats.SetTrackingTargets(progressName, 3)
+	limiter, err := newTrackingLimiter(100)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	fetchFailure := errors.New("fetch failed")
+	if err := processTrackedClanTarget(t.Context(), app, "clans", "clan", "#FETCH", func(context.Context, string) (*clashy.Clan, error) {
+		return nil, fetchFailure
+	}, func(context.Context, *platform.App, TrackedItem[clashy.Clan]) error {
+		t.Fatal("handler ran after failed fetch")
+		return nil
+	}, limiter, progressName); err != nil {
+		t.Fatalf("transient fetch failure should be deferred: %v", err)
+	}
+
+	handleFailure := errors.New("store failed")
+	err = processTrackedClanTarget(t.Context(), app, "clans", "clan", "#STORE", func(context.Context, string) (*clashy.Clan, error) {
+		return &clashy.Clan{Tag: "#STORE"}, nil
+	}, func(context.Context, *platform.App, TrackedItem[clashy.Clan]) error {
+		return handleFailure
+	}, limiter, progressName)
+	if !errors.Is(err, handleFailure) {
+		t.Fatalf("handler error = %v, want %v", err, handleFailure)
+	}
+
+	if err := processTrackedClanTarget(t.Context(), app, "clans", "clan", "#GOOD", func(context.Context, string) (*clashy.Clan, error) {
+		return &clashy.Clan{Tag: "#GOOD"}, nil
+	}, func(context.Context, *platform.App, TrackedItem[clashy.Clan]) error {
+		return nil
+	}, limiter, progressName); err != nil {
+		t.Fatal(err)
+	}
+
+	for _, domain := range app.Stats.Snapshot().Domains {
+		if domain.Name == progressName && domain.TargetProcessed != 1 {
+			t.Fatalf("processed targets = %d, want only the successful target", domain.TargetProcessed)
+		}
 	}
 }
 

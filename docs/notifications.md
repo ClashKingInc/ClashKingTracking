@@ -2,7 +2,7 @@
 
 ## What this runtime is for
 
-`notifications` is one process that runs two small components together: the event-to-mobile-post consumer and the mobile push sender. They remain separate Go files because decoding events, storing delivery work, and calling FCM are different responsibilities.
+`notifications` is one process that runs two small components together: the live-event mobile consumer and the administrative post/campaign sender. They remain separate Go files because decoding live events, storing administrative sends, and calling FCM are different responsibilities.
 
 ## The notification store
 
@@ -24,12 +24,12 @@ Read Valkey consumer group
   -> event is not a supported mobile type? acknowledge and ignore
   -> war reminder? resolve participating verified accounts and group by user
   -> raid_mobile reminder? use supplied user and remaining attacks
-  -> build one logical notification post
-  -> store delivery work
+  -> legend_defense? resolve the verified player account and enabled preference
+  -> send the supported live event through FCM
   -> acknowledge stream entry after processing succeeds
 ```
 
-Mobile accounts are verified accounts only. Bookmarked-player and Legend notification paths do not exist.
+Mobile accounts are verified accounts only. Legend defenses require an enabled account, `mobile_notification_preferences.legend_defenses_enabled`, and an enabled FCM device. Bookmark state is not a recipient source.
 
 War reminder events use a single v2 representation: `data` must be a nested war object and `minutes_remaining` must be a positive integer. Stringified JSON and formatted-hour compatibility fields are deliberately rejected so producers and consumers cannot silently disagree about the contract.
 
@@ -56,7 +56,7 @@ For Raid Weekend, the reminder producer has already grouped the user's verified 
 
 ## Data and services used
 
-Consumes the configured Valkey event stream. Reads mobile account/device configuration and war participation data as required. Writes mobile posts/campaigns, delivery attempts, retry times, and logical delivery keys. Calls Firebase Cloud Messaging; it never sends a Discord webhook.
+Consumes the configured Valkey event stream. Reads mobile account, preference, device, and war participation data as required. Administrative sends use posts, campaigns, and their delivery-attempt tables; live events are retried through unacknowledged stream entries. Calls Firebase Cloud Messaging; it never sends a Discord webhook.
 
 The event consumer reports `mobilepush.events` active-batch depth, processing duration, and readiness. The scheduled delivery worker reports its existing `mobilepush` run and write metrics; neither uses target progress because both consume ongoing work.
 
@@ -66,10 +66,9 @@ The event consumer reports `mobilepush.events` active-batch depth, processing du
 flowchart LR
   R[reminders and live events] --> E[Valkey stream]
   E --> C[mobile event consumer]
-  C --> S[(notification store tables)]
-  S --> P[mobile push sender]
+  C --> P[FCM live delivery]
+  A[(administrative posts and campaigns)] --> P
   P --> F[FCM]
-  P --> S
 ```
 
 Discord reminders share the same underlying clock and war fetch, but remain distinct recipient references because channels, threads, custom text, filters, roles, and webhooks can differ by server. The separate `discord-delivery` process owns that delivery.
@@ -84,11 +83,11 @@ Discord reminders share the same underlying clock and war fetch, but remain dist
 
 ## Outages and restarts
 
-The consumer group retains unacknowledged entries and can reclaim them after the configured idle period. SQL delivery attempts survive restart. FCM retry behavior is stored rather than held only in memory.
+The consumer group retains unacknowledged live events and can reclaim them after the configured idle period. Administrative post and campaign delivery attempts survive restart in SQL.
 
 ## What it deliberately does not do
 
-- No mobile Legend or bookmarked-player notifications.
+- No bookmarked-player notifications.
 - No direct war/raid polling.
 - No Discord delivery.
 - No separate container for each small notification source file.

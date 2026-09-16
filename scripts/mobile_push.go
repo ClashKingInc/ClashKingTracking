@@ -279,7 +279,7 @@ func sendLocalizedPush(ctx context.Context, app *platform.App, devices []models.
 	}
 	sent, skipped := 0, 0
 	for locale, localizedDevices := range groups {
-		groupSent, groupSkipped := sendPushToDevices(ctx, app, localizedDevices, messageForLocale(locale))
+		groupSent, groupSkipped, _ := sendPushToDevices(ctx, app, localizedDevices, messageForLocale(locale))
 		sent += groupSent
 		skipped += groupSkipped
 	}

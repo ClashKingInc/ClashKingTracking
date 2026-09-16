@@ -2,7 +2,9 @@ package platform
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
+	"fmt"
 	"io"
 	"time"
 
@@ -22,8 +24,21 @@ type ClashFetchRetry struct {
 	MaxRetries int
 }
 
+// ClashFetchExhausted marks a retriable failure at the upstream fetch boundary,
+// never a database write or an error decoding our own stored data.
+type ClashFetchExhausted struct {
+	Cause    error
+	Attempts int
+}
+
+func (e *ClashFetchExhausted) Error() string {
+	return fmt.Sprintf("upstream Clash fetch failed after %d attempts: %v", e.Attempts, e.Cause)
+}
+func (e *ClashFetchExhausted) Unwrap() error { return e.Cause }
+
 func ClashFetchRetryPolicy(err error) (ClashFetchRetry, bool) {
-	if errors.Is(err, io.EOF) || errors.Is(err, io.ErrUnexpectedEOF) {
+	var syntax *json.SyntaxError
+	if errors.Is(err, io.EOF) || errors.Is(err, io.ErrUnexpectedEOF) || errors.As(err, &syntax) {
 		return ClashFetchRetry{
 			RetryAfter: ClashGatewayTimeoutRetryDelay,
 			MaxRetries: ClashGatewayTimeoutMaxRetries,
@@ -83,7 +98,7 @@ func RetryClashFetch[T any](ctx context.Context, gate *AvailabilityGate, fetch f
 		}
 		if decision.MaxRetries > 0 {
 			if retries >= decision.MaxRetries {
-				return zero, err
+				return zero, &ClashFetchExhausted{Cause: err, Attempts: retries + 1}
 			}
 			retries++
 		}

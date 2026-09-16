@@ -655,8 +655,10 @@ func proveMobilePushRetry(t *testing.T, ctx context.Context, pool *pgxpool.Pool,
 	const deviceID = "mobile-device"
 	for _, statement := range []string{
 		`INSERT INTO auth_users (user_id, provider) VALUES ('mobile-user', 'discord')`,
-		`INSERT INTO mobile_notification_accounts (user_id, player_tag, source, active) VALUES ('mobile-user', '#P0Y', 'verified', true)`,
-		`INSERT INTO player_timers (player_tag, event_type, event_key, expires_at) VALUES ('#P0Y', 'war', 'local-integration-war', now() + interval '1 hour')`,
+		`INSERT INTO player_links (tag, source, user_id, is_verified) VALUES ('#Q0Y', 'local-integration', 'mobile-user', true)`,
+		`INSERT INTO mobile_notification_preferences (user_id, war_state_enabled) VALUES ('mobile-user', true)`,
+		`INSERT INTO mobile_notification_accounts (user_id, player_tag, enabled) VALUES ('mobile-user', '#Q0Y', true)`,
+		`INSERT INTO player_timers (player_tag, event_type, event_key, expires_at) VALUES ('#Q0Y', 'war', 'local-integration-war', now() + interval '1 hour')`,
 	} {
 		if _, err := pool.Exec(ctx, statement); err != nil {
 			t.Fatal(err)
@@ -666,8 +668,8 @@ func proveMobilePushRetry(t *testing.T, ctx context.Context, pool *pgxpool.Pool,
 	if _, err := pool.Exec(ctx, `
 		INSERT INTO mobile_push_devices (
 			user_id, device_id, platform, provider, environment, token_ciphertext, token_hash,
-			enabled, authorization_status, war_state_enabled
-		) VALUES ($1, $2, 'ios', 'fcm', 'sandbox', $3, 'local-device-token-hash', true, 'authorized', true)
+			enabled, authorization_status
+		) VALUES ($1, $2, 'ios', 'fcm', 'sandbox', $3, 'local-device-token-hash', true, 'authorized')
 	`, userID, deviceID, ciphertext); err != nil {
 		t.Fatal(err)
 	}
@@ -689,7 +691,6 @@ func proveMobilePushRetry(t *testing.T, ctx context.Context, pool *pgxpool.Pool,
 	if messageCalls != 1 {
 		t.Fatalf("FCM message calls after transient failure = %d, want 1", messageCalls)
 	}
-	assertMobileDeliveryCount(t, ctx, pool, 0)
 	waitForGroupPendingOnStream(t, ctx, cache, "tracking:mobile-events", "mobilepush", 1)
 
 	retry := startIntegrationProcess(t, ctx, binary, runtimeDir, environment, "notifications")
@@ -698,7 +699,6 @@ func proveMobilePushRetry(t *testing.T, ctx context.Context, pool *pgxpool.Pool,
 		_, calls := provider.calls()
 		return calls >= 2
 	})
-	assertMobileDeliveryCount(t, ctx, pool, 1)
 	waitForGroupPendingOnStream(t, ctx, cache, "tracking:mobile-events", "mobilepush", 0)
 	return retry
 }
@@ -720,17 +720,6 @@ func encryptIntegrationSecret(t *testing.T, value, key string) string {
 	}
 	sealed := gcm.Seal(nonce, nonce, []byte(value), nil)
 	return "v1." + base64.RawURLEncoding.EncodeToString(sealed)
-}
-
-func assertMobileDeliveryCount(t *testing.T, ctx context.Context, pool *pgxpool.Pool, want int) {
-	t.Helper()
-	var got int
-	if err := pool.QueryRow(ctx, `SELECT count(*) FROM mobile_notification_deliveries WHERE user_id = 'mobile-user'`).Scan(&got); err != nil {
-		t.Fatal(err)
-	}
-	if got != want {
-		t.Fatalf("mobile delivery receipt count = %d, want %d", got, want)
-	}
 }
 
 func waitForDeliveryPending(t *testing.T, ctx context.Context, cache valkey.Client, want int64) {

@@ -197,6 +197,17 @@ func (d *warsDomain) processDueWarSchedule(ctx context.Context, app *platform.Ap
 	}
 
 	now := d.currentTime().UTC()
+	var exhausted *platform.ClashFetchExhausted
+	if errors.As(err, &exhausted) {
+		// A malformed upstream reply is not evidence that this war is gone.
+		// Keep the schedule even beyond the normal unavailable-war grace period.
+		app.Logger.Error("final war upstream retries exhausted; preserving schedule", "schedule_key", schedule.ScheduleKey, "attempts", exhausted.Attempts, "err", err)
+		app.Stats.RecordRequest(d.name+".fetch-failures", 0, err)
+		if app.Errors != nil {
+			app.Errors.Capture(err, map[string]string{"domain": d.name, "operation": "war-finalization-fetch"})
+		}
+		return d.store.Reschedule(ctx, schedule.ScheduleKey, now.Add(time.Minute), schedule.SourceClanTag, schedule.OpponentTag)
+	}
 	var pending *scheduledWarPendingError
 	if errors.As(err, &pending) {
 		delay := pending.retryAfter

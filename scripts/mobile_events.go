@@ -2,6 +2,7 @@ package scripts
 
 import (
 	"context"
+	"crypto/sha256"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -45,7 +46,6 @@ type mobileWarEvent struct {
 }
 
 func (d *mobileEventsDomain) Run(ctx context.Context, app *platform.App) error {
-	statsName := trackingProgressName(mobileEventsDomainName, "events")
 	if err := validateMobileEventsConfig(app.Config, app.Valkey); err != nil {
 		return err
 	}
@@ -62,19 +62,31 @@ func (d *mobileEventsDomain) Run(ctx context.Context, app *platform.App) error {
 		app:    app,
 		logger: app.Logger,
 	}
-	if err := worker.ensureGroup(ctx); err != nil {
+	return worker.run(ctx, app, trackingProgressName(mobileEventsDomainName, "events"))
+}
+
+func (w *mobileEventsWorker) run(ctx context.Context, app *platform.App, statsName string) error {
+	if err := w.ensureGroup(ctx); err != nil {
 		return err
 	}
+	readFreshNext := false
 	for {
 		if err := ctx.Err(); err != nil {
 			return err
 		}
-		entries, err := worker.claimPending(ctx)
-		if err == nil && len(entries) == 0 {
-			entries, err = worker.readPending(ctx)
+		var err error
+		var entries []valkey.XRangeEntry
+		if readFreshNext {
+			entries, err = w.read(ctx)
+			readFreshNext = false
+		} else {
+			entries, err = w.claimPending(ctx)
+			if err == nil && len(entries) == 0 {
+				entries, err = w.readPending(ctx)
+			}
 		}
 		if err == nil && len(entries) == 0 {
-			entries, err = worker.read(ctx)
+			entries, err = w.read(ctx)
 		}
 		if err != nil {
 			if valkey.IsValkeyNil(err) {
@@ -84,8 +96,18 @@ func (d *mobileEventsDomain) Run(ctx context.Context, app *platform.App) error {
 		}
 		app.Stats.SetQueueDepth(statsName, len(entries))
 		started := time.Now()
-		if err := worker.processEntries(ctx, entries); err != nil {
-			return err
+		if err := w.processEntries(ctx, entries); err != nil {
+			readFreshNext = true
+			app.Stats.RecordRequest(statsName, time.Since(started), err)
+			app.Stats.SetReady(statsName, false, err.Error())
+			app.Logger.Error("mobile event delivery failed; leaving stream entry pending", "err", err)
+			if app.Errors != nil {
+				app.Errors.Capture(err, map[string]string{"domain": mobileEventsDomainName, "operation": "stream-delivery"})
+			}
+			if err := sleepOrDone(ctx, time.Second); err != nil {
+				return err
+			}
+			continue
 		}
 		app.Stats.SetQueueDepth(statsName, 0)
 		app.Stats.RecordProcess(statsName, time.Since(started))
@@ -116,11 +138,69 @@ func validateMobileEventsConfig(cfg platform.Config, client valkey.Client) error
 }
 
 type mobileEventsWorker struct {
+	client        valkey.Client
+	cfg           platform.Config
+	pool          *pgxpool.Pool
+	app           *platform.App
+	logger        *slog.Logger
+	legendMarkers legendDeliveryMarkerStore
+	processEntry  func(context.Context, string, mobileWarEvent) error
+	ackEntry      func(context.Context, string) error
+}
+
+type legendDeliveryMarkerStore interface {
+	Delivered(context.Context, string, string) (bool, error)
+	MarkDelivered(context.Context, string, string) error
+}
+
+type valkeyLegendDeliveryMarkers struct {
 	client valkey.Client
-	cfg    platform.Config
-	pool   *pgxpool.Pool
-	app    *platform.App
-	logger *slog.Logger
+	stream string
+	ttl    time.Duration
+}
+
+var markLegendDeliveryScript = valkey.NewLuaScript(`
+	redis.call('SADD', KEYS[1], ARGV[1])
+	redis.call('EXPIRE', KEYS[1], ARGV[2])
+	return 1
+`)
+
+func legendDeliveryMarkerTTL(cfg platform.Config) time.Duration {
+	// Keep per-device retry state slightly longer than the shared stream entry
+	// without extending retention for every high-volume domain event.
+	ttl := 2 * time.Duration(cfg.EventStreamRetentionSeconds) * time.Second
+	if ttl < 10*time.Minute {
+		ttl = 10 * time.Minute
+	}
+	if ttl > time.Hour {
+		ttl = time.Hour
+	}
+	return ttl
+}
+
+func legendDeliveryMarkerIdentity(value string) string {
+	return fmt.Sprintf("%x", sha256.Sum256([]byte(value)))
+}
+
+func (m *valkeyLegendDeliveryMarkers) key(eventID string) string {
+	return m.stream + ":mobilepush:legend-delivered:" + legendDeliveryMarkerIdentity(eventID)
+}
+
+func (m *valkeyLegendDeliveryMarkers) Delivered(ctx context.Context, eventID, deviceID string) (bool, error) {
+	if m == nil || m.client == nil {
+		return false, errors.New("Valkey is required for Legend delivery retry markers")
+	}
+	return m.client.Do(ctx, m.client.B().Sismember().Key(m.key(eventID)).Member(legendDeliveryMarkerIdentity(deviceID)).Build()).AsBool()
+}
+
+func (m *valkeyLegendDeliveryMarkers) MarkDelivered(ctx context.Context, eventID, deviceID string) error {
+	if m == nil || m.client == nil {
+		return errors.New("Valkey is required for Legend delivery retry markers")
+	}
+	seconds := int64(m.ttl / time.Second)
+	return markLegendDeliveryScript.Exec(ctx, m.client, []string{m.key(eventID)}, []string{
+		legendDeliveryMarkerIdentity(deviceID), fmt.Sprintf("%d", seconds),
+	}).Error()
 }
 
 func (w *mobileEventsWorker) group() string {
@@ -203,22 +283,41 @@ func (w *mobileEventsWorker) claimPending(ctx context.Context) ([]valkey.XRangeE
 }
 
 func (w *mobileEventsWorker) processEntries(ctx context.Context, entries []valkey.XRangeEntry) error {
+	process := w.processEvent
+	if w.processEntry != nil {
+		process = w.processEntry
+	}
+	ack := w.ack
+	if w.ackEntry != nil {
+		ack = w.ackEntry
+	}
+	var entryErrors []error
 	for _, entry := range entries {
 		event, ok := mobileEventFromEntry(entry)
 		if !ok || !mobilePushEventType(event) {
-			if err := w.ack(ctx, entry.ID); err != nil {
-				return err
+			if err := ack(ctx, entry.ID); err != nil {
+				if ctx.Err() != nil {
+					return ctx.Err()
+				}
+				entryErrors = append(entryErrors, fmt.Errorf("acknowledge ignored mobile event %s: %w", entry.ID, err))
 			}
 			continue
 		}
-		if err := w.processEvent(ctx, entry.ID, event); err != nil {
-			return err
+		if err := process(ctx, entry.ID, event); err != nil {
+			if ctx.Err() != nil {
+				return ctx.Err()
+			}
+			entryErrors = append(entryErrors, fmt.Errorf("process mobile event %s: %w", entry.ID, err))
+			continue
 		}
-		if err := w.ack(ctx, entry.ID); err != nil {
-			return err
+		if err := ack(ctx, entry.ID); err != nil {
+			if ctx.Err() != nil {
+				return ctx.Err()
+			}
+			entryErrors = append(entryErrors, fmt.Errorf("acknowledge mobile event %s: %w", entry.ID, err))
 		}
 	}
-	return nil
+	return errors.Join(entryErrors...)
 }
 
 func (w *mobileEventsWorker) ack(ctx context.Context, id string) error {
@@ -230,7 +329,7 @@ func (w *mobileEventsWorker) ack(ctx context.Context, id string) error {
 	).Error()
 }
 
-func (w *mobileEventsWorker) processEvent(ctx context.Context, streamID string, event mobileWarEvent) error {
+func (w *mobileEventsWorker) processEvent(ctx context.Context, entryID string, event mobileWarEvent) error {
 	if event.Topic == "reminder" {
 		switch stringValue(event.Value["type"]) {
 		case "war":
@@ -240,6 +339,9 @@ func (w *mobileEventsWorker) processEvent(ctx context.Context, streamID string, 
 		default:
 			return nil
 		}
+	}
+	if event.Topic == "legend" && stringValue(event.Value["type"]) == "legend_defense" {
+		return w.processLegendDefense(ctx, entryID, event)
 	}
 	subscriptions, err := w.subscriptions(ctx, event.ClanTag, event.Topic)
 	if err != nil {
@@ -259,29 +361,105 @@ func (w *mobileEventsWorker) processEvent(ctx context.Context, streamID string, 
 		if sub.Provider != "fcm" {
 			continue
 		}
-		deliveryKey := mobileLiveEventDeliveryKey(streamID, sub)
-		result, err := w.pool.Exec(ctx, `
-			INSERT INTO mobile_notification_deliveries (user_id, notification_key)
-			VALUES ($1, $2)
-			ON CONFLICT DO NOTHING
-		`, sub.UserID, deliveryKey)
-		if err != nil {
-			return err
-		}
-		if result.RowsAffected() == 0 {
-			continue
-		}
 		if err := sendFCM(ctx, w.app, token, pushMessage{Title: title, Body: body, Data: map[string]string{"type": mobileNotificationRouteType(event), "target_tag": event.ClanTag}}); err != nil {
 			w.logDeliveryError("mobile FCM delivery failed", "clan_tag", event.ClanTag, "err", err)
-			_, _ = w.pool.Exec(ctx, `DELETE FROM mobile_notification_deliveries WHERE user_id = $1 AND notification_key = $2`, sub.UserID, deliveryKey)
 			deliveryErrors = append(deliveryErrors, fmt.Errorf("deliver live event to device %s: %w", sub.DeviceID, err))
 		}
 	}
 	return errors.Join(deliveryErrors...)
 }
 
-func mobileLiveEventDeliveryKey(streamID string, sub mobileSubscription) string {
-	return fmt.Sprintf("live_event:%s:%s:%s", streamID, sub.DeviceID, sub.Environment)
+const legendDefenseSubscriptionsSQL = `
+	SELECT DISTINCT device.user_id,device.device_id,device.platform,device.provider,
+	       device.environment,device.token_ciphertext,device.locale
+	FROM mobile_notification_accounts account
+	JOIN mobile_notification_preferences preference ON preference.user_id=account.user_id
+	JOIN mobile_push_devices device ON device.user_id=account.user_id
+	WHERE account.player_tag=$1 AND account.enabled=true
+	  AND preference.legend_defenses_enabled=true
+	  AND device.enabled=true AND device.provider='fcm'
+`
+
+func (w *mobileEventsWorker) processLegendDefense(ctx context.Context, entryID string, event mobileWarEvent) error {
+	playerTag := stringValue(event.Value["player_tag"])
+	if playerTag == "" {
+		return errors.New("Legend defense event is missing player_tag")
+	}
+	rows, err := w.pool.Query(ctx, legendDefenseSubscriptionsSQL, playerTag)
+	if err != nil {
+		return err
+	}
+	defer rows.Close()
+	var devices []models.PushDevice
+	for rows.Next() {
+		var device models.PushDevice
+		if err := rows.Scan(&device.UserID, &device.DeviceID, &device.Platform, &device.Provider,
+			&device.Environment, &device.TokenCiphertext, &device.Locale); err != nil {
+			return err
+		}
+		devices = append(devices, device)
+	}
+	if err := rows.Err(); err != nil {
+		return err
+	}
+	data := map[string]string{"type": "legend_defense", "target_tag": playerTag}
+	if eventID := stringValue(event.Value["event_id"]); eventID != "" {
+		data["event_id"] = eventID
+	}
+	message := pushMessage{
+		Title: "Legend defense",
+		Body:  "A new Legend League defense is available.",
+		Data:  data,
+	}
+	deliveryID := stringValue(event.Value["event_id"])
+	if deliveryID == "" {
+		deliveryID = entryID
+	}
+	return w.deliverLegendDefenseDevices(ctx, deliveryID, playerTag, devices, message)
+}
+
+func (w *mobileEventsWorker) deliverLegendDefenseDevices(ctx context.Context, deliveryID, playerTag string, devices []models.PushDevice, message pushMessage) error {
+	markers := w.legendMarkers
+	if markers == nil {
+		markers = &valkeyLegendDeliveryMarkers{
+			client: w.client,
+			stream: w.cfg.EventStreamName,
+			ttl:    legendDeliveryMarkerTTL(w.cfg),
+		}
+	}
+	var deliveryErrors []error
+	for _, device := range devices {
+		deviceIdentity := strings.Join([]string{device.UserID, device.DeviceID, device.Provider, device.Environment}, "\x00")
+		delivered, err := markers.Delivered(ctx, deliveryID, deviceIdentity)
+		if err != nil {
+			return fmt.Errorf("read Legend delivery marker for device %s: %w", device.DeviceID, err)
+		}
+		if delivered {
+			continue
+		}
+		token, err := utils.DecryptSecret(device.TokenCiphertext, w.cfg.MobilePushTokenKey)
+		if err != nil || token == "" {
+			if err == nil {
+				err = errors.New("decrypted token is empty")
+			}
+			w.logDeliveryError("mobile FCM token decrypt failed", "player_tag", playerTag, "err", err)
+			continue
+		}
+		if err := sendFCM(ctx, w.app, token, message); err != nil {
+			w.logDeliveryError("mobile FCM Legend defense delivery failed", "player_tag", playerTag, "err", err)
+			if isRetryablePushError(err) {
+				deliveryErrors = append(deliveryErrors, fmt.Errorf("deliver Legend defense to device %s: %w", device.DeviceID, err))
+			}
+			continue
+		}
+		// The provider send deliberately precedes the marker so delivery remains
+		// at-least-once. A process crash between these calls can duplicate this
+		// device on retry; marking first would instead lose the notification.
+		if err := markers.MarkDelivered(ctx, deliveryID, deviceIdentity); err != nil {
+			deliveryErrors = append(deliveryErrors, fmt.Errorf("record Legend delivery for device %s: %w", device.DeviceID, err))
+		}
+	}
+	return errors.Join(deliveryErrors...)
 }
 
 func stringValue(value any) string { valueString, _ := value.(string); return valueString }
@@ -323,14 +501,14 @@ func (w *mobileEventsWorker) processWarReminder(ctx context.Context, event mobil
 		       device.platform, device.provider, device.environment,
 		       device.token_ciphertext, device.locale
 		FROM mobile_notification_accounts account
+		JOIN mobile_notification_preferences preference ON preference.user_id = account.user_id
 		JOIN mobile_push_devices device
 		  ON device.user_id = account.user_id
 		 AND device.enabled = true
 		 AND device.provider = 'fcm'
-		 AND device.war_reminders_enabled = true
-		 AND $2 = ANY(device.reminder_timings)
-		WHERE account.active = true
-		  AND account.source = 'verified'
+		WHERE account.enabled = true
+		  AND preference.war_reminders_enabled = true
+		  AND $2 = ANY(preference.reminder_timings)
 		  AND account.player_tag = ANY($1)
 	`, tags, minutes)
 	if err != nil {
@@ -366,43 +544,25 @@ func (w *mobileEventsWorker) processWarReminder(ctx context.Context, event mobil
 	if err := rows.Err(); err != nil {
 		return err
 	}
-	warID := war.WarTag
-	if warID == "" && war.PreparationStartTime != nil {
-		warID = war.PreparationStartTime.RawTime
-	}
-	if warID == "" {
-		return errors.New("war reminder payload has no stable war identity")
-	}
+	var deliveryErrors []error
 	for _, recipient := range recipients {
 		if recipient.remaining <= 0 {
-			continue
-		}
-		deliveryKey := fmt.Sprintf("war_reminder:%s:%s:%d", warID, recipient.userID, minutes)
-		result, err := w.pool.Exec(ctx, `
-			INSERT INTO mobile_notification_deliveries (user_id, notification_key)
-			VALUES ($1, $2)
-			ON CONFLICT DO NOTHING
-		`, recipient.userID, deliveryKey)
-		if err != nil {
-			return err
-		}
-		if result.RowsAffected() == 0 {
 			continue
 		}
 		devices := make([]models.PushDevice, 0, len(recipient.devices))
 		for _, device := range recipient.devices {
 			devices = append(devices, device)
 		}
-		sent, _ := sendPushToDevices(ctx, w.app, devices, pushMessage{
+		_, _, err := sendPushToDevices(ctx, w.app, devices, pushMessage{
 			Title: "War attacks remaining",
 			Body:  fmt.Sprintf("%s & %d attacks left in war!", formatReminderTime(minutes), recipient.remaining),
 			Data:  map[string]string{"type": "war_reminder", "target_tag": event.ClanTag},
 		})
-		if sent == 0 {
-			_, _ = w.pool.Exec(ctx, `DELETE FROM mobile_notification_deliveries WHERE user_id = $1 AND notification_key = $2`, recipient.userID, deliveryKey)
+		if err != nil {
+			deliveryErrors = append(deliveryErrors, fmt.Errorf("deliver war reminder to user %s: %w", recipient.userID, err))
 		}
 	}
-	return nil
+	return errors.Join(deliveryErrors...)
 }
 
 func decodeWarReminderEvent(event mobileWarEvent) (clashy.ClanWar, int, error) {
@@ -432,21 +592,13 @@ func (w *mobileEventsWorker) processRaidReminder(ctx context.Context, event mobi
 	if userID == "" || minutes <= 0 || remaining <= 0 {
 		return nil
 	}
-	deliveryKey := fmt.Sprintf("raid_reminder:%s:%s:%d", stringValue(event.Value["raid_end"]), userID, minutes)
-	result, err := w.pool.Exec(ctx, `
-		INSERT INTO mobile_notification_deliveries (user_id, notification_key)
-		VALUES ($1, $2)
-		ON CONFLICT DO NOTHING
-	`, userID, deliveryKey)
-	if err != nil || result.RowsAffected() == 0 {
-		return err
-	}
 	rows, err := w.pool.Query(ctx, `
 		SELECT device_id, platform, provider, environment, token_ciphertext, locale
-		FROM mobile_push_devices
-		WHERE user_id = $1 AND enabled = true AND provider = 'fcm'
-		  AND raid_reminders_enabled = true
-		  AND $2 = ANY(raid_reminder_timings)
+		FROM mobile_push_devices device
+		JOIN mobile_notification_preferences preference ON preference.user_id=device.user_id
+		WHERE device.user_id = $1 AND device.enabled = true AND device.provider = 'fcm'
+		  AND preference.raid_reminders_enabled = true
+		  AND $2 = ANY(preference.raid_reminder_timings)
 	`, userID, minutes)
 	if err != nil {
 		return err
@@ -463,13 +615,13 @@ func (w *mobileEventsWorker) processRaidReminder(ctx context.Context, event mobi
 		devices = append(devices, device)
 	}
 	rows.Close()
-	sent, _ := sendPushToDevices(ctx, w.app, devices, pushMessage{
+	_, _, err = sendPushToDevices(ctx, w.app, devices, pushMessage{
 		Title: "Raid attacks remaining",
 		Body:  fmt.Sprintf("%s & %d attacks left in Raid Weekend!", formatReminderTime(minutes), remaining),
 		Data:  map[string]string{"type": "raid_reminder", "target_tag": event.ClanTag},
 	})
-	if sent == 0 {
-		_, _ = w.pool.Exec(ctx, `DELETE FROM mobile_notification_deliveries WHERE user_id = $1 AND notification_key = $2`, userID, deliveryKey)
+	if err != nil {
+		return fmt.Errorf("deliver raid reminder to user %s: %w", userID, err)
 	}
 	return nil
 }
@@ -501,8 +653,9 @@ func formatReminderTime(minutes int) string {
 
 const mobileSubscriptionsSQL = `
 	SELECT DISTINCT d.user_id, d.device_id, d.provider, d.environment, d.token_ciphertext,
-	       d.war_state_enabled, d.war_attacks_enabled, d.war_state_enabled
+	       preference.war_state_enabled, preference.war_attacks_enabled, preference.war_state_enabled
 	FROM mobile_notification_accounts account
+	JOIN mobile_notification_preferences preference ON preference.user_id = account.user_id
 	JOIN mobile_push_devices d
 	  ON d.user_id = account.user_id
 	 AND d.enabled = true
@@ -512,8 +665,7 @@ const mobileSubscriptionsSQL = `
 	 AND timer.event_type = 'war'
 	 AND timer.expires_at > now()
 	JOIN war_schedule schedule ON schedule.schedule_key = timer.event_key
-	WHERE account.active = true
-	  AND account.source = 'verified'
+	WHERE account.enabled = true
 	  AND $2 IN ('war', 'cwl')
 	  AND $1 IN (schedule.source_clan_tag, schedule.opponent_tag)
 `
@@ -562,6 +714,8 @@ func mobilePushEventType(event mobileWarEvent) bool {
 		return event.Topic == "war"
 	case "war", "raid_mobile":
 		return event.Topic == "reminder"
+	case "legend_defense":
+		return event.Topic == "legend"
 	default:
 		return false
 	}

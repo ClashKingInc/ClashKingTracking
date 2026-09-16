@@ -47,6 +47,30 @@ func TestWarQueueRejectsIncompleteStoreWork(t *testing.T) {
 	}
 }
 
+func TestCWLHydrationFailureIsVisibleInRuntimeStatsAndErrorReporting(t *testing.T) {
+	reporter := &deliveryErrorRecorder{seen: make(map[string]bool)}
+	app := &platform.App{Stats: platform.NewTracker(), Errors: reporter}
+	err := errors.New("column does not exist")
+	recordCWLHydrationFailure(app, "store", err)
+
+	var found bool
+	for _, domain := range app.Stats.Snapshot().Domains {
+		if domain.Name != cwlHydrationDomainName {
+			continue
+		}
+		found = true
+		if domain.Errors != 1 || domain.Healthy || !strings.Contains(domain.LastError, err.Error()) {
+			t.Fatalf("CWL hydration stats = %#v, want one visible unhealthy error", domain)
+		}
+	}
+	if !found {
+		t.Fatal("CWL hydration metrics domain was not created")
+	}
+	if len(reporter.captured) != 1 || !strings.Contains(reporter.captured[0], err.Error()) {
+		t.Fatalf("captured errors = %#v, want the hydration failure", reporter.captured)
+	}
+}
+
 func TestPrimeWarArchiveCacheUsesOneByteGet(t *testing.T) {
 	var method, byteRange string
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -696,6 +720,93 @@ func newDueWarTestDomain(t *testing.T, baseURL string) (*warsDomain, *platform.A
 		Logger: slog.New(slog.NewTextHandler(io.Discard, nil)),
 	}
 	return domain, app, store
+}
+
+func TestWarQueueDefersMalformedClanAndContinues(t *testing.T) {
+	var bad, good atomic.Int32
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		if strings.Contains(r.URL.Path, "BAD") {
+			bad.Add(1)
+			_, _ = w.Write([]byte(`{"state":`))
+			return
+		}
+		good.Add(1)
+		_, _ = w.Write([]byte(`{"state":"notInWar"}`))
+	}))
+	defer server.Close()
+	domain, app, _ := newDueWarTestDomain(t, server.URL)
+	app.Config.WarDiscoveryMaxInFlight = 1
+	domain.scheduled["pending"] = time.Now()
+	const progress = "war-discovery.active"
+	app.Stats.SetTrackingTargets(progress, 2)
+	err := domain.processQueue(t.Context(), app, domain.limiter, []warFetchRequest{
+		{ClanTag: "#BAD", StoreOnly: true, ScheduleKey: "pending", StatsName: progress},
+		{ClanTag: "#GOOD", StatsName: progress},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if bad.Load() != 4 || good.Load() != 1 {
+		t.Fatalf("bad=%d good=%d", bad.Load(), good.Load())
+	}
+	if _, ok := domain.scheduled["pending"]; !ok {
+		t.Fatal("pending work removed after fetch failure")
+	}
+	if app.Stats.Domain(domain.name+".fetch-failures").Errors != 1 {
+		t.Fatal("exhausted fetch was not recorded")
+	}
+	if processed := app.Stats.Domain(progress).TargetProcessed; processed != 1 {
+		t.Fatalf("successfully processed targets=%d, want 1; failed fetches must remain pending", processed)
+	}
+}
+
+func TestWarDiscoveryProgressDoesNotMarkFailedFetchSuccessful(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		if strings.Contains(r.URL.Path, "BAD") {
+			_, _ = w.Write([]byte(`{"state":`))
+			return
+		}
+		_, _ = w.Write([]byte(`{"state":"notInWar"}`))
+	}))
+	defer server.Close()
+	domain, app, _ := newDueWarTestDomain(t, server.URL)
+	app.Config.TargetPageMultiplier = 1
+	app.Config.WarDiscoveryActiveRequestsPerSecond = 2
+	app.Config.WarDiscoveryMaxInFlight = 1
+	domain.targets = newMemoryWarTargetSource([]models.BasicClanRow{{Tag: "#BAD"}, {Tag: "#GOOD"}})
+	const progress = "war-discovery.active"
+	app.Stats.SetTrackingTargets(progress, 2)
+
+	if err := domain.runDiscoveryCycle(t.Context(), app, domain.limiter, false); err != nil {
+		t.Fatal(err)
+	}
+	if processed := app.Stats.Domain(progress).TargetProcessed; processed != 1 {
+		t.Fatalf("successfully processed targets=%d, want 1; failed fetches must remain pending", processed)
+	}
+}
+
+func TestFinalizationKeepsScheduleAfterMalformedResponseBeyondGrace(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"state":`))
+	}))
+	defer server.Close()
+	domain, app, store := newDueWarTestDomain(t, server.URL)
+	now := domain.currentTime()
+	schedule := dueWarTestSchedule(now.Add(-warFinalizationGrace - time.Hour))
+	schedule.NextRunAt = now
+	if err := store.Store(t.Context(), models.WarIngest{Schedules: []models.WarScheduleRow{schedule}}); err != nil {
+		t.Fatal(err)
+	}
+	if err := domain.processDueWarSchedule(t.Context(), app, "war-archiver.finalization", schedule); err != nil {
+		t.Fatal(err)
+	}
+	saved, exists := store.schedules[schedule.ScheduleKey]
+	if !exists || !saved.NextRunAt.Equal(now.Add(time.Minute)) {
+		t.Fatalf("schedule must be preserved for retry: %+v", saved)
+	}
 }
 
 func dueWarTestSchedule(end time.Time) models.WarScheduleRow {

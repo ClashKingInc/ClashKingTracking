@@ -19,6 +19,7 @@ type Config struct {
 	ClashKingAPIURL                        string
 	ClashKingAPIToken                      string
 	TimescaleURL                           string
+	DatabasePools                          DatabasePoolConfig
 	ValkeyAddr                             string
 	ValkeyPassword                         string
 	TargetPageMultiplier                   int
@@ -116,6 +117,7 @@ func LoadWithArgs(args []string) Config {
 }
 
 type jsonConfig struct {
+	DatabasePools        DatabasePoolConfig         `json:"database_pools"`
 	RunOnce              bool                       `json:"run_once"`
 	DryRun               bool                       `json:"dry_run"`
 	MockDB               bool                       `json:"mock_db"`
@@ -261,6 +263,7 @@ func loadConfigFile(path string) (Config, error) {
 		return Config{}, fmt.Errorf("parse config %s: %w", path, err)
 	}
 	return Config{
+		DatabasePools:                          file.DatabasePools,
 		RunOnce:                                file.RunOnce,
 		DryRun:                                 file.DryRun,
 		MockDB:                                 file.MockDB,
