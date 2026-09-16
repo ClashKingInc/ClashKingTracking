@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"io"
 	"log/slog"
+	"maps"
 	"strings"
 	"testing"
 	"time"
@@ -20,6 +21,7 @@ import (
 type deliveryErrorRecorder struct {
 	seen     map[string]bool
 	captured []string
+	details  []map[string]string
 }
 
 func (r *deliveryErrorRecorder) Capture(err error, tags map[string]string) bool {
@@ -29,6 +31,7 @@ func (r *deliveryErrorRecorder) Capture(err error, tags map[string]string) bool 
 	}
 	r.seen[key] = true
 	r.captured = append(r.captured, key)
+	r.details = append(r.details, maps.Clone(tags))
 	return true
 }
 

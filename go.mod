@@ -2,7 +2,7 @@ module clashking_tracking
 
 go 1.26.4
 
-replace github.com/disgoorg/disgo => github.com/ClashKingInc/disgo v0.19.6-clashking.1
+replace github.com/disgoorg/disgo => github.com/ClashKingInc/disgo v0.19.6-clashking.2
 
 require (
 	github.com/aws/aws-sdk-go-v2 v1.41.3

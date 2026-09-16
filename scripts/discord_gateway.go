@@ -5,7 +5,9 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"log/slog"
+	"net"
 	"slices"
 	"strings"
 	"sync"
@@ -401,12 +403,19 @@ func (h discordLibraryLogHandler) Handle(ctx context.Context, record slog.Record
 	safe := slog.NewRecord(record.Time, record.Level, "Discord library diagnostic", record.PC)
 	category := discordLibraryLogCategory(record.Message)
 	safe.AddAttrs(slog.Bool("discord_library", true), slog.String("category", category))
+	errorKind := ""
 	for _, attr := range h.attrs {
 		safe.AddAttrs(attr)
+		if attr.Key == "error_kind" && attr.Value.Kind() == slog.KindString {
+			errorKind = attr.Value.String()
+		}
 	}
 	record.Attrs(func(attr slog.Attr) bool {
-		if attr, ok := safeDiscordLibraryAttr(attr); ok {
-			safe.AddAttrs(attr)
+		for _, safeAttr := range safeDiscordLibraryAttrs(attr) {
+			safe.AddAttrs(safeAttr)
+			if safeAttr.Key == "error_kind" {
+				errorKind = safeAttr.Value.String()
+			}
 		}
 		return true
 	})
@@ -414,18 +423,20 @@ func (h discordLibraryLogHandler) Handle(ctx context.Context, record slog.Record
 		safe.AddAttrs(slog.String("decision", category))
 	}
 	if record.Level >= slog.LevelError && strings.Contains(record.Message, "error while parsing gateway message") && h.reporter != nil {
-		h.reporter.Capture(errors.New("Discord gateway payload could not be decoded"), map[string]string{
+		tags := map[string]string{
 			"script": discordGatewayDomainName, "domain": discordGatewayDomainName, "category": "invalid_gateway_payload",
-		})
+		}
+		if errorKind != "" {
+			tags["error_kind"] = errorKind
+		}
+		h.reporter.Capture(errors.New("Discord gateway payload could not be decoded"), tags)
 	}
 	return h.target.Handle(ctx, safe)
 }
 
 func (h discordLibraryLogHandler) WithAttrs(attrs []slog.Attr) slog.Handler {
 	for _, attr := range attrs {
-		if attr, ok := safeDiscordLibraryAttr(attr); ok {
-			h.attrs = append(h.attrs, attr)
-		}
+		h.attrs = append(h.attrs, safeDiscordLibraryAttrs(attr)...)
 	}
 	return h
 }
@@ -503,15 +514,6 @@ func safeDiscordLibraryAttr(attr slog.Attr) (slog.Attr, bool) {
 			}
 			return slog.Duration("delay", delay), true
 		}
-	case "err":
-		if attr.Value.Kind() == slog.KindAny {
-			if err, ok := attr.Value.Any().(error); ok {
-				var closeErr *websocket.CloseError
-				if errors.As(err, &closeErr) {
-					return slog.Int("close_code", closeErr.Code), true
-				}
-			}
-		}
 	case "name":
 		if attr.Value.Kind() == slog.KindString {
 			name := attr.Value.String()
@@ -521,6 +523,70 @@ func safeDiscordLibraryAttr(attr slog.Attr) (slog.Attr, bool) {
 		}
 	}
 	return slog.Attr{}, false
+}
+
+func safeDiscordLibraryAttrs(attr slog.Attr) []slog.Attr {
+	attr.Value = attr.Value.Resolve()
+	if attr.Key == "err" && attr.Value.Kind() == slog.KindAny {
+		if err, ok := attr.Value.Any().(error); ok {
+			return safeDiscordLibraryErrorAttrs(err)
+		}
+		return nil
+	}
+	if safeAttr, ok := safeDiscordLibraryAttr(attr); ok {
+		return []slog.Attr{safeAttr}
+	}
+	return nil
+}
+
+func safeDiscordLibraryErrorAttrs(err error) []slog.Attr {
+	var closeErr *websocket.CloseError
+	if errors.As(err, &closeErr) {
+		return []slog.Attr{slog.Int("close_code", closeErr.Code), slog.String("error_kind", "websocket_close")}
+	}
+
+	kind := "other"
+	switch {
+	case errors.Is(err, net.ErrClosed):
+		kind = "transport_closed"
+	case errors.Is(err, context.Canceled):
+		kind = "canceled"
+	case errors.Is(err, context.DeadlineExceeded):
+		kind = "deadline_exceeded"
+	case errors.Is(err, io.ErrUnexpectedEOF):
+		kind = "unexpected_eof"
+	case errors.Is(err, io.EOF):
+		kind = "eof"
+	}
+
+	attrs := []slog.Attr{slog.String("error_kind", kind)}
+	var opErr *net.OpError
+	if errors.As(err, &opErr) {
+		if kind == "other" {
+			if opErr.Timeout() {
+				attrs[0] = slog.String("error_kind", "network_timeout")
+				attrs = append(attrs, slog.Bool("timeout", true))
+			} else {
+				attrs[0] = slog.String("error_kind", "network")
+			}
+		}
+		switch opErr.Op {
+		case "accept", "dial", "read", "write":
+			attrs = append(attrs, slog.String("network_op", opErr.Op))
+		}
+		return attrs
+	}
+
+	var networkErr net.Error
+	if kind == "other" && errors.As(err, &networkErr) {
+		if networkErr.Timeout() {
+			attrs[0] = slog.String("error_kind", "network_timeout")
+			attrs = append(attrs, slog.Bool("timeout", true))
+		} else {
+			attrs[0] = slog.String("error_kind", "network")
+		}
+	}
+	return attrs
 }
 
 func validateDiscordGatewayConfig(cfg platform.Config) error {

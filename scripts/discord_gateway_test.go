@@ -5,8 +5,10 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"io"
 	"log/slog"
+	"net"
 	"strings"
 	"testing"
 	"time"
@@ -62,7 +64,7 @@ func TestDiscordLibraryLoggerDropsRawPayloadFromMessageAttributesAndDerivedHandl
 	}).WithGroup("private").(discordLibraryLogHandler)
 	record := slog.NewRecord(time.Now(), slog.LevelError, `error while parsing gateway message: {"message-secret":true}`, 0)
 	record.AddAttrs(
-		slog.Any("err", errors.New(`failed: {"guild":"private","members":["secret"]}`)),
+		slog.Any("err", fmt.Errorf(`failed: {"guild":"private","members":["secret"]}: %w`, io.ErrUnexpectedEOF)),
 		slog.String("url", "wss://secret.example/?session=private"),
 	)
 	if err := handler.Handle(t.Context(), record); err != nil {
@@ -78,8 +80,14 @@ func TestDiscordLibraryLoggerDropsRawPayloadFromMessageAttributesAndDerivedHandl
 	if !strings.Contains(got, `"shard_id":4`) || !strings.Contains(got, `"shard_count":15`) || !strings.Contains(got, `"category":"invalid_gateway_payload"`) {
 		t.Fatalf("safe Discord library context missing: %s", got)
 	}
+	if !strings.Contains(got, `"error_kind":"unexpected_eof"`) {
+		t.Fatalf("safe Discord library error classification missing: %s", got)
+	}
 	if len(reporter.captured) != 1 || strings.Contains(reporter.captured[0], "private") {
 		t.Fatalf("safe Discord library Sentry capture = %#v", reporter.captured)
+	}
+	if reporter.details[0]["error_kind"] != "unexpected_eof" {
+		t.Fatalf("safe Discord library Sentry tags = %#v", reporter.details[0])
 	}
 }
 
@@ -107,9 +115,32 @@ func TestDiscordLibraryLoggerKeepsOnlyAllowlistedLifecycleContext(t *testing.T) 
 			t.Fatalf("Discord lifecycle log exposed %q: %s", secret, got)
 		}
 	}
-	for _, safe := range []string{`"category":"websocket_close"`, `"component":"gateway"`, `"shard_id":7`, `"shard_count":15`, `"close_code":4014`, `"reconnect":false`} {
+	for _, safe := range []string{`"category":"websocket_close"`, `"component":"gateway"`, `"shard_id":7`, `"shard_count":15`, `"close_code":4014`, `"error_kind":"websocket_close"`, `"reconnect":false`} {
 		if !strings.Contains(got, safe) {
 			t.Fatalf("Discord lifecycle log omitted %s: %s", safe, got)
+		}
+	}
+}
+
+func TestDiscordLibraryLoggerClassifiesNetworkErrorWithoutExposingDetails(t *testing.T) {
+	var output bytes.Buffer
+	handler := discordLibraryLogHandler{target: slog.NewJSONHandler(&output, nil)}
+	record := slog.NewRecord(time.Now(), slog.LevelError, "failed to read next message", 0)
+	record.AddAttrs(slog.Any("err", &net.OpError{
+		Op:  "read",
+		Net: "tcp",
+		Err: errors.New("secret gateway endpoint and session"),
+	}))
+	if err := handler.Handle(t.Context(), record); err != nil {
+		t.Fatal(err)
+	}
+	got := output.String()
+	if strings.Contains(got, "secret") || strings.Contains(got, "endpoint") || strings.Contains(got, "session") {
+		t.Fatalf("Discord network log exposed error details: %s", got)
+	}
+	for _, safe := range []string{`"category":"websocket_read_failed"`, `"error_kind":"network"`, `"network_op":"read"`} {
+		if !strings.Contains(got, safe) {
+			t.Fatalf("Discord network log omitted %s: %s", safe, got)
 		}
 	}
 }
