@@ -334,6 +334,12 @@ func (d *scheduledDomain) runLeagueCloseoutLoop(ctx context.Context, app *platfo
 				return err
 			}
 			app.Stats.RecordWrite(trackingProgressName(scheduledDomainName, "ranked-closeout"), rankedWrites)
+			if store, ok := d.store.(*timescaleScheduledStore); ok {
+				if _, err := store.pool.Exec(ctx, `INSERT INTO tracking_scheduled_jobs(job,period,completed_at)
+				VALUES('ranked_closeout',$1,clock_timestamp()) ON CONFLICT(job,period) DO UPDATE SET completed_at=EXCLUDED.completed_at`, dayStart(now)); err != nil {
+					return err
+				}
+			}
 		}
 	}
 }
@@ -636,6 +642,7 @@ func (d *scheduledDomain) doLeaderboardHistory(
 ) ([]leaderboardHistoryGroup, error) {
 	date := dayStart(now)
 	groups := make([]leaderboardHistoryGroup, 0, len(leaderboardHistoryPaths)*len(locationIDs))
+	unavailable := 0
 	var groupErrors []error
 	for _, locationID := range locationIDs {
 		for _, path := range leaderboardHistoryPaths {
@@ -649,6 +656,10 @@ func (d *scheduledDomain) doLeaderboardHistory(
 				return payload, err
 			})
 			if err != nil {
+				if unavailableLocalRanking(locationID, err) {
+					unavailable++
+					continue
+				}
 				groupErrors = append(
 					groupErrors,
 					fmt.Errorf("fetch %s leaderboard history for %s: %w", path.Kind, locationID, err),
@@ -662,6 +673,9 @@ func (d *scheduledDomain) doLeaderboardHistory(
 			}
 			groups = append(groups, group)
 		}
+	}
+	if unavailable > 0 {
+		app.Logger.Info("leaderboard history skipped unavailable local rankings", "groups", unavailable)
 	}
 	return groups, errors.Join(groupErrors...)
 }
@@ -693,12 +707,12 @@ func (d *scheduledDomain) doLegendHistory(
 		return 0, err
 	}
 	missing, err := missingCompletedLegendSeasons(officialSeasons, completed, now)
-	if err != nil {
-		return 0, err
-	}
 	loadRankings := d.loadLegendRankings
 	writes := 0
 	var seasonErrors []error
+	if err != nil {
+		seasonErrors = append(seasonErrors, err)
+	}
 	for _, season := range missing {
 		var rankings []legendRankingItem
 		if loadRankings == nil {
@@ -842,10 +856,34 @@ func missingCompletedLegendSeasons(
 	now = now.UTC()
 	missing := make([]string, 0, len(official))
 	seen := make(map[string]struct{}, len(official))
+	// Routine scheduling is forward-only, not a historical backfill. A 35-day
+	// startup horizon covers the latest four-week season if no checkpoint exists.
+	floor := now.AddDate(0, 0, -35)
+	for season := range completed {
+		if window, err := officialLegendSeasonWindow(season); err == nil && window.EndTime.After(floor) {
+			floor = window.EndTime
+		}
+	}
+	var seasonErrors []error
 	for _, season := range official {
+		// Already archived seasons do not need their legacy identifiers parsed again.
+		if _, exists := completed[season]; exists {
+			continue
+		}
+		// Old date identifiers are only used as a cutoff here, never interpreted as
+		// a season boundary. They belong to explicit historical repair tooling.
+		if len(season) == 10 {
+			if date, e := time.Parse("2006-01-02", season); e == nil && date.Before(floor) {
+				continue
+			}
+		}
 		window, err := officialLegendSeasonWindow(season)
 		if err != nil {
-			return nil, err
+			seasonErrors = append(seasonErrors, err)
+			continue
+		}
+		if !window.EndTime.After(floor) {
+			continue
 		}
 		if _, duplicate := seen[season]; duplicate {
 			continue
@@ -858,7 +896,7 @@ func missingCompletedLegendSeasons(
 			missing = append(missing, season)
 		}
 	}
-	return missing, nil
+	return missing, errors.Join(seasonErrors...)
 }
 
 func officialLegendSeasonWindow(season string) (clashy.SeasonWindow, error) {
@@ -981,6 +1019,7 @@ func (d *scheduledDomain) doCurrentClanRankings(
 	updatedAt time.Time,
 ) (int, error) {
 	writes := 0
+	unavailable := 0
 	var groupErrors []error
 	for _, locationID := range locationIDs {
 		for _, path := range currentClanRankingPaths {
@@ -991,6 +1030,10 @@ func (d *scheduledDomain) doCurrentClanRankings(
 				return rankings, err
 			})
 			if err != nil {
+				if unavailableLocalRanking(locationID, err) {
+					unavailable++
+					continue
+				}
 				groupErrors = append(groupErrors, fmt.Errorf("fetch %s clan rankings for %s: %w", path.RankingType, locationID, err))
 				continue
 			}
@@ -1012,6 +1055,9 @@ func (d *scheduledDomain) doCurrentClanRankings(
 			}
 			writes += count
 		}
+	}
+	if unavailable > 0 {
+		app.Logger.Info("current clan rankings skipped unavailable local rankings", "groups", unavailable)
 	}
 	return writes, errors.Join(groupErrors...)
 }
@@ -1211,7 +1257,7 @@ func playerTrophyHistoryRow(
 	if err != nil {
 		return models.PlayerTrophyHistoryRow{}, fmt.Errorf("player trophy history %s: %w", item.Tag, err)
 	}
-	previousRank, err := optionalHistoryPositiveInt(item.PreviousRank)
+	previousRank, err := optionalPreviousRank(item.PreviousRank)
 	if err != nil {
 		return models.PlayerTrophyHistoryRow{}, fmt.Errorf("player trophy history %s previous rank: %w", item.Tag, err)
 	}
@@ -1254,7 +1300,7 @@ func playerBuilderBaseTrophyHistoryRow(
 	if err != nil {
 		return models.PlayerBuilderBaseTrophyHistoryRow{}, fmt.Errorf("builder base trophy history %s: %w", item.Tag, err)
 	}
-	previousRank, err := optionalHistoryPositiveInt(item.PreviousRank)
+	previousRank, err := optionalPreviousRank(item.PreviousRank)
 	if err != nil {
 		return models.PlayerBuilderBaseTrophyHistoryRow{}, fmt.Errorf("builder base trophy history %s previous rank: %w", item.Tag, err)
 	}
@@ -1397,7 +1443,7 @@ func leaderboardClanHistoryValues(
 	item clashy.RankedClan,
 ) (leaderboardClanHistoryCommon, error) {
 	token := badgeToken(item.Badge)
-	previousRank, err := optionalHistoryPositiveInt(item.PreviousRank)
+	previousRank, err := optionalPreviousRank(item.PreviousRank)
 	if err != nil {
 		return leaderboardClanHistoryCommon{}, fmt.Errorf("clan history %s previous rank: %w", item.Tag, err)
 	}
@@ -1442,7 +1488,8 @@ func leaderboardPlayerClan(
 	if strings.TrimSpace(clan.Tag) == "" ||
 		strings.TrimSpace(clan.Name) == "" ||
 		token == "" {
-		return nil, nil, nil, fmt.Errorf("invalid clan snapshot")
+		// Clan metadata is optional; it must not discard the player's ranking.
+		return nil, nil, nil, nil
 	}
 	tag := clan.Tag
 	name := clan.Name
@@ -1458,6 +1505,19 @@ func optionalHistoryPositiveInt(value int) (*int, error) {
 	}
 	result := value
 	return &result, nil
+}
+
+func optionalPreviousRank(value int) (*int, error) {
+	if value == -1 {
+		return nil, nil
+	}
+	return optionalHistoryPositiveInt(value)
+}
+
+func unavailableLocalRanking(location string, err error) bool {
+	var missing *clashy.NotFound
+	return location != "global" && errors.As(err, &missing) &&
+		strings.Contains(strings.ToLower(err.Error()), "rankings not found for location")
 }
 
 func validatePlayerTrophyHistoryRow(row models.PlayerTrophyHistoryRow) error {
@@ -2195,14 +2255,13 @@ func validLegendHistoryClan(row models.LegendHistoryRow) bool {
 
 const replaceCurrentClanRankingGroupSQL = `
 	INSERT INTO clan_rankings_current (
-		clan_tag, ranking_type, location_id, rank, points, updated_at
+		clan_tag, ranking_type, location_id, rank, points
 	)
-	SELECT clan_tag, $1, $2, rank, points, updated_at
+	SELECT clan_tag, $1, $2, rank, points
 	FROM clan_rankings_current_stage
 	ON CONFLICT (clan_tag, ranking_type, location_id) DO UPDATE SET
 		rank = EXCLUDED.rank,
-		points = EXCLUDED.points,
-		updated_at = EXCLUDED.updated_at
+		points = EXCLUDED.points
 `
 
 const deleteStaleCurrentClanRankingGroupSQL = `
@@ -2238,8 +2297,7 @@ func (s *timescaleScheduledStore) ReplaceCurrentClanRankingGroup(
 		CREATE TEMP TABLE clan_rankings_current_stage (
 			clan_tag text NOT NULL,
 			rank integer NOT NULL,
-			points integer NOT NULL,
-			updated_at timestamp with time zone NOT NULL
+			points integer NOT NULL
 		) ON COMMIT DROP
 	`); err != nil {
 		return 0, err
@@ -2248,10 +2306,10 @@ func (s *timescaleScheduledStore) ReplaceCurrentClanRankingGroup(
 		if _, err := tx.CopyFrom(
 			ctx,
 			pgx.Identifier{"clan_rankings_current_stage"},
-			[]string{"clan_tag", "rank", "points", "updated_at"},
+			[]string{"clan_tag", "rank", "points"},
 			pgx.CopyFromSlice(len(group.Rows), func(index int) ([]any, error) {
 				row := group.Rows[index]
-				return []any{row.ClanTag, row.Rank, row.Points, row.UpdatedAt}, nil
+				return []any{row.ClanTag, row.Rank, row.Points}, nil
 			}),
 		); err != nil {
 			return 0, err

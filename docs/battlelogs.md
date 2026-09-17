@@ -65,6 +65,8 @@ Reads target tables and the requested player's current Town Hall from `basic_pla
 
 Ranked and Legend rows retain the normalized share code directly. The hot writer inserts each distinct code into `army_compositions`, keyed only by `share_code`; there is no army hash or parser-version identity. The daily Legend closeout reuses those compositions for family and item aggregation.
 
+Hero mode segments such as `h2m1p16e5_41` are accepted and preserved in canonical share codes. Mode is not a composition column and does not participate in army-family similarity; `m0` and `m1` can remain distinct exact codes in the same family. The earlier rejection came from Tracking's share-code validator, not clashy.go.
+
 The battle identity is `(player_tag, battle_time)`. Deploy this writer only with the final DevKit migration 017 contract. Existing raw rows remain intact.
 
 The scheduled closeout rebuilds completed Legend-day and Ranked-season aggregates from raw attack perspectives. It groups newly observed Legend armies into immutable direct-anchor families and writes daily family outcomes. Farming and Ranked/Legend raw rows retain one year.

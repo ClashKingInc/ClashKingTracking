@@ -3,7 +3,6 @@ package scripts
 import (
 	"context"
 	"database/sql"
-	"encoding/json"
 	"errors"
 	"fmt"
 	"sort"
@@ -18,7 +17,6 @@ import (
 	clashy "github.com/clashkinginc/clashy.go"
 	"github.com/jackc/pgx/v5/pgconn"
 	"github.com/jackc/pgx/v5/pgxpool"
-	valkey "github.com/valkey-io/valkey-go"
 )
 
 const (
@@ -32,13 +30,6 @@ const (
 	leaderboardMaterializedViewRefreshSeconds = 1800
 	leaderboardMaterializedViewCount          = 5
 )
-
-var leaderboardCacheScript = valkey.NewLuaScript(`
-	for i = 1, #KEYS do
-		redis.call('SET', KEYS[i], ARGV[i])
-	end
-	return #KEYS
-`)
 
 var leaderboardMaterializedViewRefreshQueries = [...]string{
 	`REFRESH MATERIALIZED VIEW CONCURRENTLY clan_leaderboards`,
@@ -137,8 +128,7 @@ type leaderboardCandidate struct {
 }
 
 type timescaleLeaderboardStore struct {
-	pool   *pgxpool.Pool
-	valkey valkey.Client
+	pool *pgxpool.Pool
 }
 
 type leaderboardCacheSet struct {
@@ -208,6 +198,13 @@ func (d *leaderboardsDomain) Run(ctx context.Context, app *platform.App) error {
 	d.store = store
 	d.refreshMaterializedViews = store.RefreshMaterializedViews
 	defer store.Close()
+	maintenanceCtx, stopMaintenance := context.WithCancel(ctx)
+	maintenanceDone := make(chan struct{})
+	go func() {
+		defer close(maintenanceDone)
+		store.runPlayerLeaderboardMaintenance(maintenanceCtx, app)
+	}()
+	defer func() { stopMaintenance(); <-maintenanceDone }()
 
 	interval := time.Duration(app.Config.LeaderboardIntervalSeconds) * time.Second
 	for {
@@ -247,9 +244,6 @@ func validateLeaderboardsConfig(cfg platform.Config) error {
 	if cfg.TimescaleURL == "" {
 		return errors.New("TIMESCALE_* connection variables are required for leaderboards")
 	}
-	if cfg.ValkeyAddr == "" {
-		return errors.New("valkey_addr is required for leaderboards")
-	}
 	return nil
 }
 
@@ -258,7 +252,7 @@ func (d *leaderboardsDomain) openStore(ctx context.Context, app *platform.App) (
 	if err != nil {
 		return nil, err
 	}
-	return &timescaleLeaderboardStore{pool: pool, valkey: app.Valkey}, nil
+	return &timescaleLeaderboardStore{pool: pool}, nil
 }
 
 func (d *leaderboardsDomain) runCycle(ctx context.Context, app *platform.App) error {
@@ -268,59 +262,7 @@ func (d *leaderboardsDomain) runCycle(ctx context.Context, app *platform.App) er
 	if d.legendLimiter == nil {
 		return errors.New("20 RPS Legend request limiter is required for leaderboards")
 	}
-	legendPlayers, err := d.refreshLegendRankings(ctx, app)
-	if err != nil {
-		return err
-	}
-	candidates, err := d.store.LoadCandidates(ctx, d.limit)
-	if err != nil {
-		return err
-	}
-	tags := leaderboardCandidateTags(candidates)
-	if len(tags) == 0 {
-		cache := buildLeaderboardCache(candidates, nil, nil, time.Now().UTC(), d.limit, d.nullAssetURL)
-		return d.store.CacheBoards(ctx, cache)
-	}
-	leagues, err := d.fetchLeagues(ctx, app, d.limiter)
-	if err != nil {
-		return err
-	}
-	legendByTag := make(map[string]leaderboardPlayerRow, len(legendPlayers))
-	for _, player := range legendPlayers {
-		legendByTag[player.Tag] = player
-	}
-	standardTags := make([]string, 0, len(tags))
-	for _, tag := range tags {
-		if _, refreshedAsLegend := legendByTag[tag]; !refreshedAsLegend {
-			standardTags = append(standardTags, tag)
-		}
-	}
-	players, deletedTags, err := d.fetchPlayers(ctx, app, d.limiter, standardTags, leagues)
-	if err != nil {
-		return err
-	}
-	for _, tag := range tags {
-		if player, ok := legendByTag[tag]; ok {
-			players = append(players, player)
-		}
-	}
-	basicPlayers := leaderboardBasicPlayerRows(players)
-	deleted, err := d.store.DeletePlayers(ctx, deletedTags)
-	if err != nil {
-		return err
-	}
-	if err := d.store.UpdatePlayers(ctx, basicPlayers); err != nil {
-		return err
-	}
-	clans, err := d.store.LoadClanMetadata(ctx, leaderboardPlayerClanTags(players))
-	if err != nil {
-		return err
-	}
-	cache := buildLeaderboardCache(candidates, players, clans, time.Now().UTC(), d.limit, d.nullAssetURL)
-	err = d.store.CacheBoards(ctx, cache)
-	if err == nil {
-		app.Stats.RecordWrite(leaderboardsDomainName, len(basicPlayers)+deleted+len(cache.Boards)+1)
-	}
+	_, err := d.refreshLegendRankings(ctx, app)
 	return err
 }
 
@@ -787,26 +729,6 @@ func (s *timescaleLeaderboardStore) LoadClanMetadata(ctx context.Context, clanTa
 		}
 	}
 	return out, rows.Err()
-}
-
-func (s *timescaleLeaderboardStore) CacheBoards(ctx context.Context, cache leaderboardCacheSet) error {
-	rawIndex, err := json.Marshal(cache)
-	if err != nil {
-		return err
-	}
-	keys := make([]string, 0, len(cache.Boards)+1)
-	values := make([]string, 0, len(cache.Boards)+1)
-	for _, board := range cache.Boards {
-		raw, err := json.Marshal(board)
-		if err != nil {
-			return err
-		}
-		keys = append(keys, leaderboardCacheKey(board.Kind, board.Key))
-		values = append(values, string(raw))
-	}
-	keys = append(keys, leaderboardIndexKey)
-	values = append(values, string(rawIndex))
-	return leaderboardCacheScript.Exec(ctx, s.valkey, keys, values).Error()
 }
 
 func (s *timescaleLeaderboardStore) RefreshMaterializedViews(ctx context.Context) error {
