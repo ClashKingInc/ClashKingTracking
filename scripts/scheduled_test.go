@@ -707,7 +707,9 @@ func TestMissingCompletedLegendSeasonsUsesExactOfficialIDs(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if want := []string{"2026-04", v2Season}; !reflect.DeepEqual(missing, want) {
+	// Old seasons are deliberately excluded from routine forward-only discovery.
+	// Keep the old ID in the input to guard against accidental backfilling.
+	if want := []string{v2Season}; !reflect.DeepEqual(missing, want) {
 		t.Fatalf("missing completed legend seasons = %#v, want %#v", missing, want)
 	}
 	atBoundary, err := missingCompletedLegendSeasons(
