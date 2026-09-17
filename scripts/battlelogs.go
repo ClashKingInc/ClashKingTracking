@@ -1110,18 +1110,25 @@ func validateArmyHeroSection(payload string) error {
 		}
 		petSeen := false
 		equipmentSeen := false
+		modeSeen := false
 		for rest != "" {
 			marker := rest[0]
 			if marker == '_' {
 				if !equipmentSeen {
 					return fmt.Errorf("equipment continuation without equipment in %q", part)
 				}
-			} else if marker != 'p' && marker != 'e' {
+			} else if marker != 'p' && marker != 'e' && marker != 'm' {
 				return fmt.Errorf("unknown hero item marker %q in %q", marker, part)
 			}
 			value, next := leadingInt(rest[1:])
 			if value < 0 {
 				return fmt.Errorf("missing hero item id in %q", part)
+			}
+			if marker == 'm' {
+				if modeSeen {
+					return fmt.Errorf("multiple hero modes in %q", part)
+				}
+				modeSeen = true
 			}
 			if marker == 'p' {
 				if petSeen {
@@ -1298,6 +1305,7 @@ func normalizeArmyShareCode(link string) string {
 
 type armyHeroLoadout struct {
 	HeroID    int
+	Mode      *int // Preserved in share codes, intentionally absent from composition/family fields.
 	PetID     int
 	Equipment []int
 }
@@ -1315,6 +1323,14 @@ func parseArmyHeroLoadouts(payload string) []armyHeroLoadout {
 		loadout := armyHeroLoadout{HeroID: heroID, PetID: -1}
 		for rest != "" {
 			marker := rest[0]
+			if marker == 'm' {
+				value, next := leadingInt(rest[1:])
+				if value >= 0 {
+					loadout.Mode = &value
+				}
+				rest = next
+				continue
+			}
 			if marker != 'p' && marker != 'e' {
 				if marker == '_' {
 					rest = rest[1:]
@@ -1364,6 +1380,9 @@ func encodeArmyHeroSection(heroes []armyHeroLoadout) string {
 	parts := make([]string, 0, len(heroes))
 	for _, hero := range heroes {
 		part := strconv.Itoa(hero.HeroID)
+		if hero.Mode != nil {
+			part += "m" + strconv.Itoa(*hero.Mode)
+		}
 		if hero.PetID >= 0 {
 			part += "p" + strconv.Itoa(hero.PetID)
 		}

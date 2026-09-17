@@ -6,12 +6,12 @@
 
 ## When it runs
 
-The main scheduled cycle uses `scheduled.interval_seconds`. Current player/clan leaderboards run alongside it at the leaderboard interval. League closeout processes the latest eligible shifted Legend day on startup, then runs daily at 05:12 UTC; Monday's closeout also discovers and finalizes completed Ranked seasons from the IDs returned by player profiles and matching league-history entries.
+The main scheduled cycle uses `scheduled.interval_seconds`. The Legend player refresh runs alongside it. League closeout runs daily at 05:12 UTC, not on startup; Monday's closeout also discovers and finalizes completed Ranked seasons from player profiles and matching league-history entries, then records completion for the guarded weekly trophy reset.
 
 ## Work owned here
 
 - Current and historical player/clan leaderboard snapshots.
-- Legend history completion/backfill for completed seasons.
+- Forward-only Legend history completion for recent completed seasons. Already stored season IDs are skipped before parsing; routine discovery never backfills beyond a 35-day lookback or the newest stored completion, whichever is later. Older repairs require an explicit separate operation.
 - Ranked league member snapshots and season tier aggregates.
 - Legend daily hit-rate, usage, and immutable army-family aggregates.
 - Scheduled broad statistics and date-bound maintenance already implemented in `scripts/scheduled.go`.
@@ -44,7 +44,9 @@ Army-family matching compares each exact army directly with immutable anchors. T
 
 ## Events and Valkey
 
-Scheduled statistics normally write SQL/cache snapshots and do not emit live Discord events. Leaderboard cache output is consumed by API reads. This process does not use the event stream as a job queue.
+Scheduled statistics write SQL snapshots and do not emit live Discord events. Player and clan leaderboards are not published to Valkey. This process does not use the event stream as a job queue.
+
+Official player history retains valid ranking facts when optional clan metadata is incomplete, leaving all three clan snapshot fields absent rather than borrowing today's clan details. Upstream `previousRank=-1` means no previous rank and is stored as SQL NULL; other negative ranks remain invalid. Current clan ranking writes use only the existing five schema columns, without `updated_at`.
 
 ## Configuration
 
