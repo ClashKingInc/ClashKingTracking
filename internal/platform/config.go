@@ -76,6 +76,7 @@ type Config struct {
 	DiscordGatewayQueueSize                int
 	DiscordGatewayMemberChunkConcurrency   int
 	DiscordMessageCreateEnabled            bool
+	DiscordGuildAllowlist                  map[string]struct{}
 	DiscordDeliveryBatchSize               int
 	WarArchiveEndpoint                     string
 	WarArchiveOrigin                       string
@@ -334,6 +335,7 @@ func applyEnvironment(cfg *Config) {
 	cfg.MobilePushTokenKey = os.Getenv("DATA_ENCRYPTION_KEY")
 	cfg.DiscordBotToken = firstNonEmpty(os.Getenv("DISCORD_BOT_TOKEN"), os.Getenv("BOT_TOKEN"))
 	cfg.DiscordAPIURL = normalizeOrigin(os.Getenv("CLASHKING_LOCAL_DISCORD_API_URL"))
+	cfg.DiscordGuildAllowlist = parseStringSet(os.Getenv("DISCORD_GUILD_ALLOWLIST"))
 	cfg.SentryDSN = strings.TrimSpace(os.Getenv("SENTRY_DSN"))
 	cfg.SentryEnvironment = strings.TrimSpace(os.Getenv("SENTRY_ENVIRONMENT"))
 	cfg.SentryRelease = strings.TrimSpace(os.Getenv("SENTRY_RELEASE"))
@@ -351,6 +353,30 @@ func applyEnvironment(cfg *Config) {
 	cfg.WarArchiveBucket = firstNonEmpty(os.Getenv("WAR_ARCHIVE_BUCKET"), os.Getenv("R2_WARS_BUCKET"), "clashking-wars")
 	cfg.WarArchiveAccessKeyID = os.Getenv("R2_ACCESS_KEY_ID")
 	cfg.WarArchiveSecretAccessKey = os.Getenv("R2_SECRET_ACCESS_KEY")
+}
+
+func parseStringSet(value string) map[string]struct{} {
+	items := strings.FieldsFunc(value, func(r rune) bool {
+		return r == ',' || r == ';' || r == ' ' || r == '\t' || r == '\n'
+	})
+	if len(items) == 0 {
+		return nil
+	}
+	result := make(map[string]struct{}, len(items))
+	for _, item := range items {
+		if item = strings.TrimSpace(item); item != "" {
+			result[item] = struct{}{}
+		}
+	}
+	return result
+}
+
+func (cfg Config) AllowsDiscordGuild(guildID string) bool {
+	if len(cfg.DiscordGuildAllowlist) == 0 {
+		return true
+	}
+	_, ok := cfg.DiscordGuildAllowlist[guildID]
+	return ok
 }
 
 func deriveConfig(cfg *Config) {
