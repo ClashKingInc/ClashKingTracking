@@ -135,8 +135,7 @@ func TestLocalCrossProcessBoundaries(t *testing.T) {
 	proveCWLAttributionShape(t, ctx, pool)
 	proveReminderRescheduling(t, ctx, pool)
 	proveDiscordDeliveryAndReadiness(t, ctx, pool, cache, provider)
-	retry := proveMobilePushRetry(t, ctx, pool, cache, notifications, pushProvider, binary, mobileRuntimeDir, baseEnv)
-	processes = append(processes, retry)
+	proveMobilePushRetry(t, ctx, pool, cache, notifications, pushProvider)
 }
 
 func proveDiscordGuildSnapshotUUIDFence(t *testing.T, ctx context.Context, pool *pgxpool.Pool) {
@@ -278,6 +277,7 @@ type fakePushProvider struct {
 	mu           sync.Mutex
 	tokenCalls   int
 	messageCalls int
+	retryEnabled bool
 }
 
 func newFakePushProvider(t *testing.T) *fakePushProvider {
@@ -301,7 +301,7 @@ func (p *fakePushProvider) handle(response http.ResponseWriter, request *http.Re
 			http.Error(response, `{"error":"unauthorized"}`, http.StatusUnauthorized)
 			return
 		}
-		if p.messageCalls == 1 {
+		if !p.retryEnabled {
 			http.Error(response, `{"error":"temporary"}`, http.StatusInternalServerError)
 			return
 		}
@@ -338,6 +338,12 @@ func (p *fakePushProvider) calls() (int, int) {
 	p.mu.Lock()
 	defer p.mu.Unlock()
 	return p.tokenCalls, p.messageCalls
+}
+
+func (p *fakePushProvider) enableRetry() {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	p.retryEnabled = true
 }
 
 func startIntegrationProcess(t *testing.T, ctx context.Context, binary, directory string, environment []string, script string) *integrationProcess {
@@ -649,7 +655,7 @@ func publishDeliveryEvent(t *testing.T, ctx context.Context, cache valkey.Client
 	}
 }
 
-func proveMobilePushRetry(t *testing.T, ctx context.Context, pool *pgxpool.Pool, cache valkey.Client, first *integrationProcess, provider *fakePushProvider, binary, runtimeDir string, environment []string) *integrationProcess {
+func proveMobilePushRetry(t *testing.T, ctx context.Context, pool *pgxpool.Pool, cache valkey.Client, process *integrationProcess, provider *fakePushProvider) {
 	t.Helper()
 	const userID = "mobile-user"
 	const deviceID = "mobile-device"
@@ -679,28 +685,31 @@ func proveMobilePushRetry(t *testing.T, ctx context.Context, pool *pgxpool.Pool,
 		t.Fatal(err)
 	}
 
-	select {
-	case <-first.done:
-		if first.exitError() == nil {
-			t.Fatalf("notifications exited successfully after transient FCM failure\n%s", first.logs.String())
+	assertRunning := func() {
+		t.Helper()
+		select {
+		case <-process.done:
+			t.Fatalf("notifications exited instead of retaining the failed delivery for retry: %v\n%s", process.exitError(), process.logs.String())
+		default:
 		}
-	case <-ctx.Done():
-		t.Fatalf("notifications did not expose transient FCM failure for supervisor retry: %v\n%s", ctx.Err(), first.logs.String())
 	}
-	_, messageCalls := provider.calls()
-	if messageCalls != 1 {
-		t.Fatalf("FCM message calls after transient failure = %d, want 1", messageCalls)
-	}
+	// The worker now isolates delivery failures in-process. Keep the fake
+	// provider unavailable until we prove the failed event is still pending.
+	waitFor(t, ctx, "transient mobile FCM failure", func() bool {
+		assertRunning()
+		_, calls := provider.calls()
+		return calls >= 1 && strings.Contains(process.logs.String(), "leaving stream entry pending")
+	})
 	waitForGroupPendingOnStream(t, ctx, cache, "tracking:mobile-events", "mobilepush", 1)
-
-	retry := startIntegrationProcess(t, ctx, binary, runtimeDir, environment, "notifications")
-	retry.name = "notifications-retry"
+	assertRunning()
+	provider.enableRetry()
 	waitFor(t, ctx, "mobile FCM retry", func() bool {
+		assertRunning()
 		_, calls := provider.calls()
 		return calls >= 2
 	})
 	waitForGroupPendingOnStream(t, ctx, cache, "tracking:mobile-events", "mobilepush", 0)
-	return retry
+	assertRunning()
 }
 
 func encryptIntegrationSecret(t *testing.T, value, key string) string {
