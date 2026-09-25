@@ -47,12 +47,18 @@ func TestPlayerBoardRefreshAndWeeklyReset(t *testing.T) {
 	if _, e := batch(now.Add(time.Hour)); e == nil {
 		t.Fatal("reset outside window")
 	}
+	// The fixture is shared with other integration tests. The production batch
+	// processes all eligible players, not only this test's #RESET rows.
+	var eligibleBefore int
+	if e := pool.QueryRow(ctx, `SELECT count(*) FROM basic_player WHERE league_id BETWEEN 105000000 AND 105000035 AND trophies<>0`).Scan(&eligibleBefore); e != nil {
+		t.Fatal(e)
+	}
 	done, e := batch(now)
 	if e != nil || done {
 		t.Fatalf("first batch: %v %v", done, e)
 	}
 	var remaining int
-	if e = pool.QueryRow(ctx, `SELECT count(*) FROM basic_player WHERE tag LIKE '#RESET%' AND league_id BETWEEN 105000000 AND 105000035 AND trophies<>0`).Scan(&remaining); e != nil || remaining != 2 {
+	if e = pool.QueryRow(ctx, `SELECT count(*) FROM basic_player WHERE league_id BETWEEN 105000000 AND 105000035 AND trophies<>0`).Scan(&remaining); e != nil || eligibleBefore-remaining != 5000 {
 		t.Fatalf("batch remaining=%d: %v", remaining, e)
 	}
 	// Each call opens a fresh transaction, matching a restart resuming the stored cursor.
@@ -64,6 +70,9 @@ func TestPlayerBoardRefreshAndWeeklyReset(t *testing.T) {
 	}
 	if !done {
 		t.Fatal("reset did not finish")
+	}
+	if e = pool.QueryRow(ctx, `SELECT count(*) FROM basic_player WHERE tag LIKE '#RESET%' AND league_id BETWEEN 105000000 AND 105000035 AND trophies<>0`).Scan(&remaining); e != nil || remaining != 0 {
+		t.Fatalf("fixture players remaining after completion=%d: %v", remaining, e)
 	}
 	var preserved int
 	if e = pool.QueryRow(ctx, `SELECT sum(trophies) FROM basic_player WHERE tag IN ('#RESETLEGEND','#RESETUNKNOWN')`).Scan(&preserved); e != nil || preserved != 9000 {
