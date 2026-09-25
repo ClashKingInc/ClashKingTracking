@@ -231,6 +231,28 @@ func TestLoadWithArgsDoesNotAcceptLegacyConnectivityVariables(t *testing.T) {
 	}
 }
 
+func TestDiscordGuildAllowlist(t *testing.T) {
+	clearConfigEnv(t)
+	writeConfig(t, `{}`)
+	t.Setenv("DISCORD_GUILD_ALLOWLIST", " 123,456; 789\n123 ")
+
+	cfg := LoadWithArgs(nil)
+	for _, guildID := range []string{"123", "456", "789"} {
+		if !cfg.AllowsDiscordGuild(guildID) {
+			t.Fatalf("guild %s was not allowed", guildID)
+		}
+	}
+	if cfg.AllowsDiscordGuild("999") {
+		t.Fatal("guild outside the configured allowlist was allowed")
+	}
+
+	t.Setenv("DISCORD_GUILD_ALLOWLIST", "")
+	cfg = LoadWithArgs(nil)
+	if !cfg.AllowsDiscordGuild("999") {
+		t.Fatal("empty allowlist did not retain all-guild behavior")
+	}
+}
+
 func writeConfig(t *testing.T, body string) {
 	t.Helper()
 	t.Chdir(t.TempDir())

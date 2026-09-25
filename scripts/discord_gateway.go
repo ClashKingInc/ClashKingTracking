@@ -279,6 +279,25 @@ func (d *discordGatewayDomain) Run(ctx context.Context, app *platform.App) error
 	return err
 }
 
+func allowedDiscordReadyGuilds(cfg platform.Config, guilds []discord.UnavailableGuild) []discord.UnavailableGuild {
+	allowed := make([]discord.UnavailableGuild, 0, len(guilds))
+	for _, guild := range guilds {
+		if cfg.AllowsDiscordGuild(guild.ID.String()) {
+			allowed = append(allowed, guild)
+		}
+	}
+	return allowed
+}
+
+// Caller holds selectedMu while reserving a dry-run member chunk slot.
+func reserveDryRunMemberChunk(cfg platform.Config, guildID snowflake.ID, shardID int, selectedByShard map[int]int, stopping bool) bool {
+	if stopping || !cfg.AllowsDiscordGuild(guildID.String()) || selectedByShard[shardID] >= cfg.DiscordGatewayMemberChunkConcurrency {
+		return false
+	}
+	selectedByShard[shardID]++
+	return true
+}
+
 func runDiscordGatewayDryRun(ctx context.Context, app *platform.App) error {
 	intents := gateway.IntentGuilds | gateway.IntentGuildMembers
 	runCtx, stopRun := context.WithCancel(ctx)
@@ -294,7 +313,7 @@ func runDiscordGatewayDryRun(ctx context.Context, app *platform.App) error {
 		OnReady: func(event *events.Ready) {
 			shard := event.Client().ShardManager.Shard(event.ShardID())
 			if shard != nil {
-				state.rotateShard(event.GenericEvent, shard.ShardCount(), event.EventReady.Guilds, noopEnqueue)
+				state.rotateShard(event.GenericEvent, shard.ShardCount(), allowedDiscordReadyGuilds(app.Config, event.EventReady.Guilds), noopEnqueue)
 			}
 		},
 		OnResumed: func(event *events.Resumed) {
@@ -303,11 +322,10 @@ func runDiscordGatewayDryRun(ctx context.Context, app *platform.App) error {
 		OnGuildReady: func(event *events.GuildReady) {
 			shardID := event.ShardID()
 			selectedMu.Lock()
-			if stopping || selectedByShard[shardID] >= app.Config.DiscordGatewayMemberChunkConcurrency {
+			if !reserveDryRunMemberChunk(app.Config, event.Guild.ID, shardID, selectedByShard, stopping) {
 				selectedMu.Unlock()
 				return
 			}
-			selectedByShard[shardID]++
 			requests.Add(1)
 			selectedMu.Unlock()
 
@@ -1059,7 +1077,13 @@ func discordCacheListener(
 	scheduleMembers func(discordMemberRequest),
 	cancelMembers func(string),
 ) *events.ListenerAdapter {
+	allowedGuild := func(guildID snowflake.ID) bool {
+		return app.Config.AllowsDiscordGuild(guildID.String())
+	}
 	handleGuildSnapshot := func(event *events.GenericEvent, client *bot.Client, guild discord.GatewayGuild, initial bool) {
+		if !allowedGuild(guild.ID) {
+			return
+		}
 		guildID := guild.ID.String()
 		token := uuid.New()
 		applied := make(chan bool, 1)
@@ -1089,7 +1113,7 @@ func discordCacheListener(
 				app.Logger.Error("Discord ready event has no shard", "shard_id", event.ShardID())
 				return
 			}
-			state.rotateShard(event.GenericEvent, shard.ShardCount(), event.EventReady.Guilds, enqueue)
+			state.rotateShard(event.GenericEvent, shard.ShardCount(), allowedDiscordReadyGuilds(app.Config, event.EventReady.Guilds), enqueue)
 		},
 		OnResumed: func(event *events.Resumed) {
 			state.setShardReady(event.ShardID(), true)
@@ -1107,6 +1131,9 @@ func discordCacheListener(
 			handleGuildSnapshot(event.GenericEvent, event.Client(), event.Guild, false)
 		},
 		OnGuildUnavailable: func(event *events.GuildUnavailable) {
+			if !allowedGuild(event.GuildID) {
+				return
+			}
 			guildID := event.GuildID.String()
 			cancelMembers(guildID)
 			state.cancelMemberSync(guildID, uuid.Nil)
@@ -1116,11 +1143,17 @@ func discordCacheListener(
 		},
 		OnGuildUpdate: func(event *events.GuildUpdate) {
 			guild := event.Guild
+			if !allowedGuild(guild.ID) {
+				return
+			}
 			state.enqueueEvent(event.GenericEvent, enqueue, func(meta discordMutationMeta, ctx context.Context, pool *pgxpool.Pool) error {
 				return upsertDiscordGuildScoped(ctx, pool, guild, meta)
 			})
 		},
 		OnGuildLeave: func(event *events.GuildLeave) {
+			if !allowedGuild(event.GuildID) {
+				return
+			}
 			guildID := event.GuildID.String()
 			cancelMembers(guildID)
 			state.cancelMemberSync(guildID, uuid.Nil)
@@ -1130,17 +1163,26 @@ func discordCacheListener(
 		},
 		OnGuildChannelCreate: func(event *events.GuildChannelCreate) {
 			channel := event.Channel
+			if !allowedGuild(channel.GuildID()) {
+				return
+			}
 			state.enqueueEvent(event.GenericEvent, enqueue, func(meta discordMutationMeta, ctx context.Context, pool *pgxpool.Pool) error {
 				return upsertDiscordChannelScoped(ctx, pool, channel, meta)
 			})
 		},
 		OnGuildChannelUpdate: func(event *events.GuildChannelUpdate) {
 			channel := event.Channel
+			if !allowedGuild(channel.GuildID()) {
+				return
+			}
 			state.enqueueEvent(event.GenericEvent, enqueue, func(meta discordMutationMeta, ctx context.Context, pool *pgxpool.Pool) error {
 				return upsertDiscordChannelScoped(ctx, pool, channel, meta)
 			})
 		},
 		OnGuildChannelDelete: func(event *events.GuildChannelDelete) {
+			if !allowedGuild(event.GuildID) {
+				return
+			}
 			channelID := event.ChannelID.String()
 			guildID := event.GuildID.String()
 			state.enqueueEvent(event.GenericEvent, enqueue, func(meta discordMutationMeta, ctx context.Context, pool *pgxpool.Pool) error {
@@ -1149,6 +1191,9 @@ func discordCacheListener(
 			})
 		},
 		OnGuildMemberJoin: func(event *events.GuildMemberJoin) {
+			if !allowedGuild(event.GuildID) {
+				return
+			}
 			guildID, member := event.GuildID.String(), event.Member
 			copy := member
 			state.enqueueMemberDelta(event.GenericEvent, guildID, discordMemberDelta{Member: &copy}, enqueue, func(meta discordMutationMeta, ctx context.Context, pool *pgxpool.Pool) error {
@@ -1156,6 +1201,9 @@ func discordCacheListener(
 			})
 		},
 		OnGuildMemberUpdate: func(event *events.GuildMemberUpdate) {
+			if !allowedGuild(event.GuildID) {
+				return
+			}
 			guildID, member := event.GuildID.String(), event.Member
 			copy := member
 			state.enqueueMemberDelta(event.GenericEvent, guildID, discordMemberDelta{Member: &copy}, enqueue, func(meta discordMutationMeta, ctx context.Context, pool *pgxpool.Pool) error {
@@ -1163,6 +1211,9 @@ func discordCacheListener(
 			})
 		},
 		OnGuildMemberLeave: func(event *events.GuildMemberLeave) {
+			if !allowedGuild(event.GuildID) {
+				return
+			}
 			guildID, userID := event.GuildID.String(), event.User.ID.String()
 			state.enqueueMemberDelta(event.GenericEvent, guildID, discordMemberDelta{UserID: userID}, enqueue, func(meta discordMutationMeta, ctx context.Context, pool *pgxpool.Pool) error {
 				_, err := pool.Exec(ctx, `DELETE FROM discord_cache.members member USING discord_cache.guilds guild WHERE member.guild_id = $1 AND member.user_id = $2 AND guild.id = member.guild_id AND guild.application_id = $3 AND guild.shard_id = $4 AND guild.generation = $5`, guildID, userID, meta.ApplicationID, meta.ShardID, meta.Generation)
@@ -1170,18 +1221,27 @@ func discordCacheListener(
 			})
 		},
 		OnRoleCreate: func(event *events.RoleCreate) {
+			if !allowedGuild(event.GuildID) {
+				return
+			}
 			guildID, role := event.GuildID.String(), event.Role
 			state.enqueueEvent(event.GenericEvent, enqueue, func(meta discordMutationMeta, ctx context.Context, pool *pgxpool.Pool) error {
 				return upsertDiscordRoleScoped(ctx, pool, guildID, role, meta)
 			})
 		},
 		OnRoleUpdate: func(event *events.RoleUpdate) {
+			if !allowedGuild(event.GuildID) {
+				return
+			}
 			guildID, role := event.GuildID.String(), event.Role
 			state.enqueueEvent(event.GenericEvent, enqueue, func(meta discordMutationMeta, ctx context.Context, pool *pgxpool.Pool) error {
 				return upsertDiscordRoleScoped(ctx, pool, guildID, role, meta)
 			})
 		},
 		OnRoleDelete: func(event *events.RoleDelete) {
+			if !allowedGuild(event.GuildID) {
+				return
+			}
 			guildID, roleID := event.GuildID.String(), event.RoleID.String()
 			state.enqueueEvent(event.GenericEvent, enqueue, func(meta discordMutationMeta, ctx context.Context, pool *pgxpool.Pool) error {
 				_, err := pool.Exec(ctx, `DELETE FROM discord_cache.roles role USING discord_cache.guilds guild WHERE role.guild_id = $1 AND role.id = $2 AND guild.id = role.guild_id AND guild.application_id = $3 AND guild.shard_id = $4 AND guild.generation = $5`, guildID, roleID, meta.ApplicationID, meta.ShardID, meta.Generation)
@@ -1189,7 +1249,7 @@ func discordCacheListener(
 			})
 		},
 		OnGuildMessageCreate: func(event *events.GuildMessageCreate) {
-			if !app.Config.DiscordMessageCreateEnabled || event.Message.Author.Bot || event.Message.WebhookID != nil {
+			if !allowedGuild(event.GuildID) || !app.Config.DiscordMessageCreateEnabled || event.Message.Author.Bot || event.Message.WebhookID != nil {
 				return
 			}
 			message := event.Message
