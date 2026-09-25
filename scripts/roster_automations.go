@@ -217,7 +217,11 @@ const expandDueRosterAutomationsSQL = `
 	WHERE rule.enabled = true
 	  AND (rule.executed = false OR rule.event_offset_days IS NOT NULL)
 	  AND schedule.due_at <= $1
-	ON CONFLICT (execution_id) DO NOTHING
+	ON CONFLICT (execution_id) DO UPDATE SET
+	  status = 'pending', next_attempt_at = EXCLUDED.next_attempt_at,
+	  claimed_at = NULL, last_error = NULL, updated_at = $1
+	WHERE roster_automation_executions.status = 'missed'
+	  AND roster_automation_executions.last_error = 'Event time or offset changed before execution'
 `
 
 const markUntargetedRosterAutomationsSQL = `
