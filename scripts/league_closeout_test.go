@@ -105,18 +105,34 @@ func TestAggregateLegendKeepsMissingCodesOnlyInGlobalTotals(t *testing.T) {
 		{player: "#A", code: "known", stars: 3, destruction: 100, duration: 120},
 		{player: "#B", code: "", stars: 2, destruction: 85, duration: 0},
 	}
+	siege := int32(500)
 	decoded := map[string]decodedArmy{
-		"known": {record: armyCompositionRecord{Heroes: []int32{100}, Equipment: []armyHeroEquipment{{EquipmentID: 200}}}},
+		"known": {record: armyCompositionRecord{
+			MainTroops:     []armyQuantity{{ID: 300, Quantity: 12}, {ID: 300, Quantity: 2}},
+			Spells:         []armySpellQuantity{{ID: 400, Quantity: 2}, {ID: 400, Quantity: 1, ClanCastle: true}},
+			Heroes:         []int32{100},
+			Equipment:      []armyHeroEquipment{{HeroID: 100, EquipmentID: 202}, {HeroID: 100, EquipmentID: 200}},
+			PetAssignments: []armyPetAssignment{{HeroID: 100, PetID: 602}, {HeroID: 101, PetID: 600}, {HeroID: 102, PetID: 602}}, SiegeMachineID: &siege,
+		}},
 	}
-	global, families, heroes, _, equipment, _ := aggregateLegend(attacks, map[string]int64{"known": 7}, decoded)
+	global, families, metadata := aggregateLegend(attacks, map[string]int64{"known": 7}, decoded)
 	if global.attacks != 2 || global.three != 1 || global.two != 1 || len(global.players) != 2 {
 		t.Fatalf("global = %+v", global)
 	}
 	if global.duration != 120 {
 		t.Fatalf("global duration = %d, want zero-duration attack retained in the 120 total", global.duration)
 	}
-	if families[7].attacks != 1 || heroes[100].Uses != 1 || equipment[200].Uses != 1 {
-		t.Fatalf("families=%+v heroes=%+v equipment=%+v", families, heroes, equipment)
+	if families[7].attacks != 1 || metadata.heroes[100].Uses != 1 || metadata.equipment[200].Uses != 1 ||
+		metadata.troops[300].Uses != 1 || metadata.spells[400].Uses != 1 || metadata.sieges[500].Uses != 1 {
+		t.Fatalf("families=%+v metadata=%+v", families, metadata)
+	}
+	if metadata.petAssignments[assignmentKey{pet: 600, hero: 101}].Triples != 1 ||
+		metadata.equipmentPairs[equipmentPairKey{hero: 100, first: 200, second: 202}].Triples != 1 {
+		t.Fatalf("assignment metadata=%+v", metadata)
+	}
+	combo := metadata.petCombos[intsKey([]int{600, 602})]
+	if combo.Uses != 1 || combo.Triples != 1 || len(combo.PetIDs) != 2 {
+		t.Fatalf("pet combo = %+v", combo)
 	}
 }
 
@@ -124,5 +140,9 @@ func TestLegendCloseoutUsesOnlyAgreedCohorts(t *testing.T) {
 	want := [...]string{"legend_i", "top_1000", "top_200"}
 	if legendCloseoutCohorts != want {
 		t.Fatalf("cohorts = %#v, want %#v", legendCloseoutCohorts, want)
+	}
+	experimentalWant := [...]string{"legend_i", "top_1000", "top_200", "top_100"}
+	if experimentalLegendCloseoutCohorts != experimentalWant {
+		t.Fatalf("experimental cohorts = %#v, want %#v", experimentalLegendCloseoutCohorts, experimentalWant)
 	}
 }

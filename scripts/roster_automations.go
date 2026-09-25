@@ -193,20 +193,30 @@ func (s *timescaleRosterAutomationStore) MarkRetry(ctx context.Context, executio
 }
 
 const expandDueRosterAutomationsSQL = `
+	WITH obsolete AS (
+	  UPDATE roster_automation_executions execution SET status = 'missed', updated_at = $1,
+	    last_error = 'Event time or offset changed before execution'
+	  FROM roster_automation_rules rule, rosters roster
+	  WHERE execution.automation_id = rule.automation_id AND execution.roster_id = roster.id
+	    AND execution.status = 'pending' AND rule.event_offset_days IS NOT NULL
+	    AND execution.scheduled_at IS DISTINCT FROM to_timestamp(roster.event_start_time + rule.event_offset_days::bigint * 86400)
+	)
 	INSERT INTO roster_automation_executions (
 		execution_id, automation_id, roster_id, scheduled_at, status, next_attempt_at
 	)
 	SELECT
-		rule.automation_id || ':' || roster.id::text || ':' || extract(epoch FROM rule.scheduled_at)::bigint,
-		rule.automation_id, roster.id, rule.scheduled_at, 'pending', rule.scheduled_at
+		rule.automation_id || ':' || roster.id::text || ':' || extract(epoch FROM schedule.due_at)::bigint,
+		rule.automation_id, roster.id, schedule.due_at, 'pending', schedule.due_at
 	FROM roster_automation_rules rule
 	JOIN rosters roster ON (
 		rule.roster_id = roster.id
 		OR (rule.roster_id IS NULL AND rule.group_id IS NOT NULL AND roster.group_id = rule.group_id AND roster.server_id = rule.server_id)
 	)
+	CROSS JOIN LATERAL (SELECT CASE WHEN rule.event_offset_days IS NULL THEN rule.scheduled_at
+	  ELSE to_timestamp(roster.event_start_time + rule.event_offset_days::bigint * 86400) END AS due_at) schedule
 	WHERE rule.enabled = true
-	  AND rule.executed = false
-	  AND rule.scheduled_at <= $1
+	  AND (rule.executed = false OR rule.event_offset_days IS NOT NULL)
+	  AND schedule.due_at <= $1
 	ON CONFLICT (execution_id) DO NOTHING
 `
 
@@ -216,6 +226,7 @@ const markUntargetedRosterAutomationsSQL = `
 		execution_status = 'missed', last_missed_at = extract(epoch FROM rule.scheduled_at)::bigint,
 		updated_at = $1
 	WHERE rule.enabled = true
+	  AND rule.event_offset_days IS NULL
 	  AND rule.executed = false
 	  AND rule.scheduled_at <= $1
 	  AND NOT EXISTS (
@@ -231,7 +242,7 @@ const claimDueRosterAutomationsSQL = `
 		FROM roster_automation_executions
 		WHERE (
 			status = 'pending'
-			OR (status = 'dispatching' AND claimed_at < $1 - interval '5 minutes')
+			OR (status = 'processing' AND claimed_at < $1::timestamptz - interval '5 minutes')
 		)
 		  AND next_attempt_at <= $1
 		ORDER BY scheduled_at, execution_id
@@ -239,7 +250,7 @@ const claimDueRosterAutomationsSQL = `
 		LIMIT $2
 	), claimed AS (
 		UPDATE roster_automation_executions execution
-		SET status = 'dispatching', claimed_at = $1, attempt_count = attempt_count + 1,
+		SET status = 'processing', claimed_at = $1, attempts = attempts + 1,
 			updated_at = $1
 		FROM candidates
 		WHERE execution.execution_id = candidates.execution_id
@@ -249,7 +260,7 @@ const claimDueRosterAutomationsSQL = `
 		roster.id::text, coalesce(rule.group_id, ''), rule.action_type,
 		claimed.scheduled_at, coalesce(rule.discord_channel_id, ''), coalesce(rule.ping_type, ''),
 		coalesce(roster.webhook_id, ''), coalesce(roster.message_id, ''), roster.alias,
-		roster.event_start_time, claimed.attempt_count
+		roster.event_start_time, claimed.attempts
 	FROM claimed
 	JOIN roster_automation_rules rule ON rule.automation_id = claimed.automation_id
 	JOIN rosters roster ON roster.id = claimed.roster_id
@@ -259,19 +270,19 @@ const claimDueRosterAutomationsSQL = `
 const markRosterAutomationDispatchedSQL = `
 	WITH marked AS (
 		UPDATE roster_automation_executions
-		SET status = 'dispatched', dispatched_at = $3, last_error = NULL, updated_at = $3
-		WHERE execution_id = $1 AND status = 'dispatching'
+		SET status = 'completed', completed_at = $3, last_error = NULL, updated_at = $3
+		WHERE execution_id = $1 AND status = 'processing'
 		RETURNING automation_id
 	)
 	UPDATE roster_automation_rules rule
 	SET executed = true, executed_at = extract(epoch FROM $3)::bigint,
-		execution_status = 'dispatched', updated_at = $3
+		execution_status = 'completed', updated_at = $3
 	WHERE rule.automation_id = $2
 	  AND EXISTS (SELECT 1 FROM marked)
 	  AND NOT EXISTS (
 		SELECT 1 FROM roster_automation_executions execution
 		WHERE execution.automation_id = rule.automation_id
-		  AND execution.status IN ('pending', 'dispatching')
+		  AND execution.status IN ('pending', 'processing')
 	  )
 `
 
@@ -279,7 +290,7 @@ const markRosterAutomationRetrySQL = `
 	UPDATE roster_automation_executions
 	SET status = 'pending', next_attempt_at = $2, last_error = $3,
 		claimed_at = NULL, updated_at = now()
-	WHERE execution_id = $1 AND status = 'dispatching'
+	WHERE execution_id = $1 AND status = 'processing'
 `
 
 type memoryRosterAutomationStore struct {

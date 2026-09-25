@@ -163,7 +163,7 @@ func TestFinalSchemaBattleIngestAndLegendCloseoutAreIdempotent(t *testing.T) {
 	if err := store.pool.QueryRow(ctx, `SELECT count(*) FROM army_family_daily_stats WHERE day=$1 AND attack_count=1`, day).Scan(&familyStatsCount); err != nil {
 		t.Fatal(err)
 	}
-	if familyCount != 1 || memberCount != 1 || familyStatsCount != 3 || historyCount != 2 {
+	if familyCount != 1 || memberCount != 1 || familyStatsCount != 4 || historyCount != 2 {
 		t.Fatalf("families=%d members=%d family cohorts=%d history=%d", familyCount, memberCount, familyStatsCount, historyCount)
 	}
 
