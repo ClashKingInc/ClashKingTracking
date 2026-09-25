@@ -53,6 +53,28 @@ func TestSnapshotChannelUsesEnclosingGuildWhenDiscordOmitsGuildID(t *testing.T) 
 	}
 }
 
+func TestDryRunReadyInventoryRespectsGuildAllowlist(t *testing.T) {
+	guilds := []discord.UnavailableGuild{{ID: snowflake.ID(123)}, {ID: snowflake.ID(456)}}
+	cfg := platform.Config{DiscordGuildAllowlist: map[string]struct{}{"456": {}}, DiscordGatewayMemberChunkConcurrency: 1}
+	allowed := allowedDiscordReadyGuilds(cfg, guilds)
+	if len(allowed) != 1 || allowed[0].ID != 456 {
+		t.Fatalf("allowlisted READY guilds = %+v", allowed)
+	}
+	if all := allowedDiscordReadyGuilds(platform.Config{}, guilds); len(all) != len(guilds) {
+		t.Fatalf("unrestricted READY guilds = %+v", all)
+	}
+	selected := map[int]int{}
+	if reserveDryRunMemberChunk(cfg, 123, 0, selected, false) || selected[0] != 0 {
+		t.Fatal("non-allowlisted guild consumed a member chunk slot")
+	}
+	if !reserveDryRunMemberChunk(cfg, 456, 0, selected, false) || selected[0] != 1 {
+		t.Fatal("allowlisted guild did not reserve its member chunk slot")
+	}
+	if reserveDryRunMemberChunk(cfg, 456, 0, selected, false) || reserveDryRunMemberChunk(cfg, 456, 1, selected, true) {
+		t.Fatal("dry-run member chunk cap or shutdown was ignored")
+	}
+}
+
 func TestDiscordLibraryLoggerDropsRawPayloadFromMessageAttributesAndDerivedHandlers(t *testing.T) {
 	var output bytes.Buffer
 	reporter := &deliveryErrorRecorder{seen: map[string]bool{}}

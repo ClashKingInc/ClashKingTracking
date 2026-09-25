@@ -279,6 +279,25 @@ func (d *discordGatewayDomain) Run(ctx context.Context, app *platform.App) error
 	return err
 }
 
+func allowedDiscordReadyGuilds(cfg platform.Config, guilds []discord.UnavailableGuild) []discord.UnavailableGuild {
+	allowed := make([]discord.UnavailableGuild, 0, len(guilds))
+	for _, guild := range guilds {
+		if cfg.AllowsDiscordGuild(guild.ID.String()) {
+			allowed = append(allowed, guild)
+		}
+	}
+	return allowed
+}
+
+// Caller holds selectedMu while reserving a dry-run member chunk slot.
+func reserveDryRunMemberChunk(cfg platform.Config, guildID snowflake.ID, shardID int, selectedByShard map[int]int, stopping bool) bool {
+	if stopping || !cfg.AllowsDiscordGuild(guildID.String()) || selectedByShard[shardID] >= cfg.DiscordGatewayMemberChunkConcurrency {
+		return false
+	}
+	selectedByShard[shardID]++
+	return true
+}
+
 func runDiscordGatewayDryRun(ctx context.Context, app *platform.App) error {
 	intents := gateway.IntentGuilds | gateway.IntentGuildMembers
 	runCtx, stopRun := context.WithCancel(ctx)
@@ -294,7 +313,7 @@ func runDiscordGatewayDryRun(ctx context.Context, app *platform.App) error {
 		OnReady: func(event *events.Ready) {
 			shard := event.Client().ShardManager.Shard(event.ShardID())
 			if shard != nil {
-				state.rotateShard(event.GenericEvent, shard.ShardCount(), event.EventReady.Guilds, noopEnqueue)
+				state.rotateShard(event.GenericEvent, shard.ShardCount(), allowedDiscordReadyGuilds(app.Config, event.EventReady.Guilds), noopEnqueue)
 			}
 		},
 		OnResumed: func(event *events.Resumed) {
@@ -303,11 +322,10 @@ func runDiscordGatewayDryRun(ctx context.Context, app *platform.App) error {
 		OnGuildReady: func(event *events.GuildReady) {
 			shardID := event.ShardID()
 			selectedMu.Lock()
-			if stopping || selectedByShard[shardID] >= app.Config.DiscordGatewayMemberChunkConcurrency {
+			if !reserveDryRunMemberChunk(app.Config, event.Guild.ID, shardID, selectedByShard, stopping) {
 				selectedMu.Unlock()
 				return
 			}
-			selectedByShard[shardID]++
 			requests.Add(1)
 			selectedMu.Unlock()
 
@@ -1095,13 +1113,7 @@ func discordCacheListener(
 				app.Logger.Error("Discord ready event has no shard", "shard_id", event.ShardID())
 				return
 			}
-			readyGuilds := make([]discord.UnavailableGuild, 0, len(event.EventReady.Guilds))
-			for _, guild := range event.EventReady.Guilds {
-				if allowedGuild(guild.ID) {
-					readyGuilds = append(readyGuilds, guild)
-				}
-			}
-			state.rotateShard(event.GenericEvent, shard.ShardCount(), readyGuilds, enqueue)
+			state.rotateShard(event.GenericEvent, shard.ShardCount(), allowedDiscordReadyGuilds(app.Config, event.EventReady.Guilds), enqueue)
 		},
 		OnResumed: func(event *events.Resumed) {
 			state.setShardReady(event.ShardID(), true)

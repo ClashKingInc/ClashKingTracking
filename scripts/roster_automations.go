@@ -198,8 +198,10 @@ const expandDueRosterAutomationsSQL = `
 	    last_error = 'Event time or offset changed before execution'
 	  FROM roster_automation_rules rule, rosters roster
 	  WHERE execution.automation_id = rule.automation_id AND execution.roster_id = roster.id
-	    AND execution.status = 'pending' AND rule.event_offset_days IS NOT NULL
-	    AND execution.scheduled_at IS DISTINCT FROM to_timestamp(roster.event_start_time + rule.event_offset_days::bigint * 86400)
+	    AND (execution.status = 'pending'
+	      OR (execution.status = 'processing' AND execution.claimed_at < $1::timestamptz - interval '5 minutes'))
+	    AND execution.scheduled_at IS DISTINCT FROM CASE WHEN rule.event_offset_days IS NULL THEN rule.scheduled_at
+	      ELSE to_timestamp(roster.event_start_time + rule.event_offset_days::bigint * 86400) END
 	)
 	INSERT INTO roster_automation_executions (
 		execution_id, automation_id, roster_id, scheduled_at, status, next_attempt_at

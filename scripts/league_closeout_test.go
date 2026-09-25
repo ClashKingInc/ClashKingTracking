@@ -101,6 +101,10 @@ func TestLegendDayWindowUsesShiftedBoundary(t *testing.T) {
 }
 
 func TestAggregateLegendKeepsMissingCodesOnlyInGlobalTotals(t *testing.T) {
+	static, err := clashy.LoadStaticData()
+	if err != nil {
+		t.Fatal(err)
+	}
 	attacks := []legendAttack{
 		{player: "#A", code: "known", stars: 3, destruction: 100, duration: 120},
 		{player: "#B", code: "", stars: 2, destruction: 85, duration: 0},
@@ -115,7 +119,7 @@ func TestAggregateLegendKeepsMissingCodesOnlyInGlobalTotals(t *testing.T) {
 			PetAssignments: []armyPetAssignment{{HeroID: 100, PetID: 602}, {HeroID: 101, PetID: 600}, {HeroID: 102, PetID: 602}}, SiegeMachineID: &siege,
 		}},
 	}
-	global, families, metadata := aggregateLegend(attacks, map[string]int64{"known": 7}, decoded)
+	global, families, metadata := aggregateLegend(attacks, map[string]int64{"known": 7}, decoded, static)
 	if global.attacks != 2 || global.three != 1 || global.two != 1 || len(global.players) != 2 {
 		t.Fatalf("global = %+v", global)
 	}
@@ -133,6 +137,40 @@ func TestAggregateLegendKeepsMissingCodesOnlyInGlobalTotals(t *testing.T) {
 	combo := metadata.petCombos[intsKey([]int{600, 602})]
 	if combo.Uses != 1 || combo.Triples != 1 || len(combo.PetIDs) != 2 {
 		t.Fatalf("pet combo = %+v", combo)
+	}
+}
+
+func TestAggregateLegendCountsDonatedSelectedSiege(t *testing.T) {
+	static, err := clashy.LoadStaticData()
+	if err != nil {
+		t.Fatal(err)
+	}
+	code := normalizeArmyShareCode("u10x0i1x51")
+	record := armyCompositionFromColumns(static, code, parseArmyColumns(code))
+	if record.SiegeMachineID != nil || len(record.ClanCastleTroops) != 1 {
+		t.Fatalf("donated siege was not kept in Clan Castle troops: %+v", record)
+	}
+	_, _, metadata := aggregateLegend(
+		[]legendAttack{{code: code, player: "#A", stars: 3}},
+		nil,
+		map[string]decodedArmy{code: {record: record}},
+		static,
+	)
+	selected := clashy.TroopBaseID + 51
+	if metadata.sieges[selected] != (usageCount{Uses: 1, Triples: 1}) || len(metadata.sieges) != 1 {
+		t.Fatalf("donated siege metadata=%+v", metadata.sieges)
+	}
+	code = normalizeArmyShareCode("u10x0-1x52i1x51")
+	record = armyCompositionFromColumns(static, code, parseArmyColumns(code))
+	if record.SiegeMachineID == nil || *record.SiegeMachineID != int32(clashy.TroopBaseID+52) {
+		t.Fatalf("main siege fixture=%+v", record)
+	}
+	_, _, metadata = aggregateLegend(
+		[]legendAttack{{code: code, player: "#A", stars: 3}}, nil,
+		map[string]decodedArmy{code: {record: record}}, static,
+	)
+	if metadata.sieges[selected] != (usageCount{Uses: 1, Triples: 1}) || len(metadata.sieges) != 1 {
+		t.Fatalf("donated siege did not take precedence: %+v", metadata.sieges)
 	}
 }
 

@@ -119,3 +119,91 @@ func TestRosterAutomationRestoredEventTimeRearmsOnlyMissedExecution(t *testing.T
 		t.Fatalf("completed event repeated: %+v, %v", rows, err)
 	}
 }
+
+func TestRosterAutomationRescheduleRetiresExpiredProcessingLease(t *testing.T) {
+	if os.Getenv("CLASHKING_DISPOSABLE_TIMESCALE") != "1" || os.Getenv("TEST_DATABASE_URL") == "" {
+		t.Skip("requires disposable authoritative Goose schema")
+	}
+	ctx := t.Context()
+	pool, err := pgxpool.New(ctx, os.Getenv("TEST_DATABASE_URL"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer pool.Close()
+	const server = "953456789012345680"
+	const roster = "ad135787-67c3-40a3-8ca3-d20364532982"
+	now := time.Now().UTC().Truncate(time.Second)
+	if _, err := pool.Exec(ctx, `INSERT INTO servers (id, name) VALUES ($1, 'Expired lease fixture')`, server); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := pool.Exec(ctx, `INSERT INTO rosters (id, server_id, alias, roster_type, signup_scope, event_start_time) VALUES ($1, $2, 'Expired lease', 'clan', 'anyone', $3)`, roster, server, now.Add(48*time.Hour).Unix()); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := pool.Exec(ctx, `INSERT INTO roster_automation_rules (automation_id, server_id, roster_id, action_type, scheduled_at, event_offset_days) VALUES ('expired-lease-fixture', $1, $2, 'roster_post', $3, -2)`, server, roster, now); err != nil {
+		t.Fatal(err)
+	}
+	store := &timescaleRosterAutomationStore{pool: pool}
+	claimed, err := store.ClaimDue(ctx, now, 10)
+	if err != nil || len(claimed) != 1 || claimed[0].AutomationID != "expired-lease-fixture" {
+		t.Fatalf("initial claim = %+v, %v", claimed, err)
+	}
+	if _, err := pool.Exec(ctx, `UPDATE rosters SET event_start_time=$2 WHERE id=$1`, roster, now.Add(72*time.Hour).Unix()); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := store.ClaimDue(ctx, now.Add(time.Minute), 0); err != nil {
+		t.Fatal(err)
+	}
+	var status string
+	if err := pool.QueryRow(ctx, `SELECT status FROM roster_automation_executions WHERE automation_id='expired-lease-fixture'`).Scan(&status); err != nil || status != "processing" {
+		t.Fatalf("active lease was retired: status=%q err=%v", status, err)
+	}
+	stale, err := store.ClaimDue(ctx, now.Add(6*time.Minute), 10)
+	if err != nil || len(stale) != 0 {
+		t.Fatalf("stale execution was reclaimed: %+v, %v", stale, err)
+	}
+	if err := pool.QueryRow(ctx, `SELECT status FROM roster_automation_executions WHERE automation_id='expired-lease-fixture'`).Scan(&status); err != nil || status != "missed" {
+		t.Fatalf("expired lease status=%q err=%v", status, err)
+	}
+}
+
+func TestRosterAutomationRelativeToAbsoluteRetiresOldPendingExecution(t *testing.T) {
+	if os.Getenv("CLASHKING_DISPOSABLE_TIMESCALE") != "1" || os.Getenv("TEST_DATABASE_URL") == "" {
+		t.Skip("requires disposable authoritative Goose schema")
+	}
+	ctx := t.Context()
+	pool, err := pgxpool.New(ctx, os.Getenv("TEST_DATABASE_URL"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer pool.Close()
+	const server = "953456789012345681"
+	const roster = "ad135787-67c3-40a3-8ca3-d20364532983"
+	now := time.Now().UTC().Truncate(time.Second)
+	if _, err := pool.Exec(ctx, `INSERT INTO servers (id, name) VALUES ($1, 'Absolute switch fixture')`, server); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := pool.Exec(ctx, `INSERT INTO rosters (id, server_id, alias, roster_type, signup_scope, event_start_time) VALUES ($1, $2, 'Absolute switch', 'clan', 'anyone', $3)`, roster, server, now.Add(48*time.Hour).Unix()); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := pool.Exec(ctx, `INSERT INTO roster_automation_rules (automation_id, server_id, roster_id, action_type, scheduled_at, event_offset_days) VALUES ('absolute-switch-fixture', $1, $2, 'roster_post', $3, -2)`, server, roster, now); err != nil {
+		t.Fatal(err)
+	}
+	store := &timescaleRosterAutomationStore{pool: pool}
+	if _, err := store.ClaimDue(ctx, now, 0); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := pool.Exec(ctx, `UPDATE roster_automation_rules SET event_offset_days=NULL, scheduled_at=$2 WHERE automation_id=$1`, "absolute-switch-fixture", now.Add(time.Hour)); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := store.ClaimDue(ctx, now, 0); err != nil {
+		t.Fatal(err)
+	}
+	var missed int
+	if err := pool.QueryRow(ctx, `SELECT count(*) FROM roster_automation_executions WHERE automation_id='absolute-switch-fixture' AND status='missed'`).Scan(&missed); err != nil || missed != 1 {
+		t.Fatalf("obsolete relative execution count=%d err=%v", missed, err)
+	}
+	rows, err := store.ClaimDue(ctx, now.Add(time.Hour), 10)
+	if err != nil || len(rows) != 1 || rows[0].AutomationID != "absolute-switch-fixture" || !rows[0].ScheduledAt.Equal(now.Add(time.Hour)) {
+		t.Fatalf("absolute execution = %+v, %v", rows, err)
+	}
+}

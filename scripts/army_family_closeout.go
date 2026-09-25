@@ -211,7 +211,7 @@ func (s *timescaleScheduledStore) finalizeLegendCloseout(ctx context.Context, da
 		cohorts = experimentalLegendCloseoutCohorts[:]
 	}
 	for _, cohort := range cohorts {
-		g, fams, metadata := aggregateLegend(byCohort[cohort], members, decoded)
+		g, fams, metadata := aggregateLegend(byCohort[cohort], members, decoded, static)
 		for _, id := range familyIDs(fams) {
 			c := fams[id]
 			_, err = tx.Exec(ctx, `INSERT INTO army_family_daily_stats(family_id,day,cohort,attack_count,distinct_player_count,zero_star_count,one_star_count,two_star_count,three_star_count,destruction_percentage_sum,duration_seconds_sum) VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11)`, id, day, cohort, c.attacks, len(c.players), c.zero, c.one, c.two, c.three, c.destruction, c.duration)
@@ -460,7 +460,7 @@ func addUsage(m map[int]usageCount, id int, triple bool, seen map[int]bool) {
 	}
 	m[id] = v
 }
-func aggregateLegend(a []legendAttack, m map[string]int64, d map[string]decodedArmy) (*dailyCounts, map[int64]*dailyCounts, legendMetadata) {
+func aggregateLegend(a []legendAttack, m map[string]int64, d map[string]decodedArmy, static *clashy.StaticData) (*dailyCounts, map[int64]*dailyCounts, legendMetadata) {
 	g := newCounts()
 	fs := map[int64]*dailyCounts{}
 	metadata := legendMetadata{
@@ -498,8 +498,8 @@ func aggregateLegend(a []legendAttack, m map[string]int64, d map[string]decodedA
 		for _, v := range z.record.Spells {
 			addUsage(metadata.spells, v.ID, t, seen)
 		}
-		if z.record.SiegeMachineID != nil {
-			addUsage(metadata.sieges, int(*z.record.SiegeMachineID), t, map[int]bool{})
+		if siegeID := selectedLegendSiegeID(static, z.record); siegeID != 0 {
+			addUsage(metadata.sieges, siegeID, t, map[int]bool{})
 		}
 		seen = map[int]bool{}
 		for _, v := range z.record.PetAssignments {
@@ -546,6 +546,23 @@ func aggregateLegend(a []legendAttack, m map[string]int64, d map[string]decodedA
 		}
 	}
 	return g, fs, metadata
+}
+
+// Donated siege machines remain in ClanCastleTroops in the persisted army
+// composition. Prefer that selected machine over a main-army siege, matching
+// the normalized setup closeout's selection rule.
+func selectedLegendSiegeID(static *clashy.StaticData, record armyCompositionRecord) int {
+	if static != nil {
+		for _, troop := range record.ClanCastleTroops {
+			if data := static.LookupByID(troop.ID); data != nil && data["production_building"] == "Workshop" {
+				return troop.ID
+			}
+		}
+	}
+	if record.SiegeMachineID != nil {
+		return int(*record.SiegeMachineID)
+	}
+	return 0
 }
 func familyIDs(m map[int64]*dailyCounts) []int64 {
 	o := []int64{}
