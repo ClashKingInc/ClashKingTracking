@@ -208,6 +208,9 @@ func (s *timescaleTrackedClanStore) UpsertCurrentWar(ctx context.Context, source
 	if err := upsertPlayerTimers(ctx, tx, ingest.PlayerTimers); err != nil {
 		return "", err
 	}
+	if err := advancePlayerActivity(ctx, tx, ingest.PlayerActivity); err != nil {
+		return "", err
+	}
 	if err := tx.Commit(ctx); err != nil {
 		return "", err
 	}
@@ -215,31 +218,7 @@ func (s *timescaleTrackedClanStore) UpsertCurrentWar(ctx context.Context, source
 }
 
 func (s *timescaleTrackedClanStore) ListTargets(ctx context.Context) ([]trackedClanTarget, error) {
-	rows, err := s.pool.Query(ctx, `
-			SELECT tag,
-			       bool_or(kind = 'clan') AS clan_events,
-			       bool_or(kind IN ('war_event', 'war_reminder')) AS war_events,
-			       bool_or(kind = 'war_event') AS publish_war_events
-			FROM (
-				SELECT log.clan_tag AS tag,
-				       CASE WHEN log.type IN ('join_log', 'leave_log') THEN 'clan' ELSE 'war_event' END AS kind
-				FROM server_logs log
-				JOIN servers server ON server.id = log.server_id
-				WHERE server.last_command_at >= now() - interval '90 days'
-				  AND log.disabled = false
-				  AND log.clan_tag <> ''
-				  AND log.type IN ('join_log', 'leave_log', 'war_log', 'war_panel')
-				UNION
-				SELECT reminder.clan_tag AS tag, 'war_reminder' AS kind
-				FROM reminders reminder
-				JOIN servers server ON server.id = reminder.server_id
-				WHERE server.last_command_at >= now() - interval '90 days'
-				  AND reminder.type_name = 'War'
-				  AND reminder.clan_tag <> ''
-			) targets
-			GROUP BY tag
-			ORDER BY tag
-		`)
+	rows, err := s.pool.Query(ctx, trackedClanTargetsSQL)
 	if err != nil {
 		return nil, err
 	}
@@ -254,6 +233,42 @@ func (s *timescaleTrackedClanStore) ListTargets(ctx context.Context) ([]trackedC
 	}
 	return out, rows.Err()
 }
+
+// Active configured clans must have snapshots even when they only use player
+// logs: trackedplayers obtains its TH9+ membership from these snapshots.
+const trackedClanTargetsSQL = `
+			SELECT tag,
+			       bool_or(kind = 'clan') AS clan_events,
+			       bool_or(kind IN ('war_event', 'war_reminder')) AS war_events,
+			       bool_or(kind = 'war_event') AS publish_war_events
+			FROM (
+				SELECT tracked_clan.tag, 'clan' AS kind
+				FROM server_clans tracked_clan
+				JOIN servers server ON server.id = tracked_clan.server_id
+				WHERE server.last_command_at >= now() - interval '90 days'
+				  AND tracked_clan.tag <> ''
+				UNION
+				SELECT log.clan_tag AS tag,
+				       CASE WHEN log.type IN ('war_log', 'war_panel', 'cwl_lineup_change_log') THEN 'war_event' ELSE 'clan' END AS kind
+				FROM server_logs log
+				JOIN servers server ON server.id = log.server_id
+				WHERE server.last_command_at >= now() - interval '90 days'
+				  AND log.disabled = false
+				  AND log.clan_tag <> ''
+				  AND log.type IN ('join_log', 'leave_log', 'donation_log', 'role_change', 'clan_achievement_log', 'clan_requirements_log', 'clan_description_log', 'ban_alert', 'war_log', 'war_panel', 'cwl_lineup_change_log')
+				UNION
+				SELECT reminder.clan_tag AS tag, 'war_reminder' AS kind
+				FROM reminders reminder
+				JOIN servers server ON server.id = reminder.server_id
+				WHERE server.last_command_at >= now() - interval '90 days'
+				  AND reminder.type_name = 'War'
+				  AND reminder.clan_tag <> ''
+				UNION
+				SELECT tag, 'war_event' AS kind FROM clan_notification_tracking WHERE war_tracked
+			) targets
+			GROUP BY tag
+			ORDER BY tag
+		`
 
 type memoryTrackedClanStore struct {
 	tags []string
@@ -471,6 +486,9 @@ func (d *trackedClansDomain) handleClanChange(ctx context.Context, app *platform
 	}
 	if hasPrevious && previous != nil {
 		app.Stats.SetReady(trackedClansDomainName, true, "")
+		if err := queueClanRoleRefreshes(ctx, d.store, *previous, *item.Current); err != nil {
+			return err
+		}
 		joined, left := trackedClanMemberChanges(*previous, *item.Current)
 		for _, member := range joined {
 			if err := app.PublishEvent(ctx, platform.Event{Topic: "clan", ClanTag: item.Tag, Value: map[string]any{
@@ -483,6 +501,11 @@ func (d *trackedClansDomain) handleClanChange(ctx context.Context, app *platform
 			if err := app.PublishEvent(ctx, platform.Event{Topic: "clan", ClanTag: item.Tag, Value: map[string]any{
 				"type": "member_leave", "member": member, "clan": json.RawMessage(raw),
 			}}); err != nil {
+				return err
+			}
+		}
+		for _, event := range trackedClanLogChanges(*previous, *item.Current) {
+			if err := app.PublishEvent(ctx, event); err != nil {
 				return err
 			}
 		}
@@ -536,7 +559,11 @@ func (d *trackedClansDomain) handleWarChange(ctx context.Context, app *platform.
 			return err
 		}
 	}
-	if hasPrevious && d.publishesWarEvents(item.Tag) {
+	// The official notInWar response has no clan or identity. Store that
+	// snapshot, but never publish it as a newly started war.
+	validWar := current.Clan != nil && current.Opponent != nil && current.Clan.Tag != "" && current.Opponent.Tag != "" &&
+		(current.State == "preparation" || current.State == "inWar" || current.State == "warEnded")
+	if validWar && hasPrevious && d.publishesWarEvents(item.Tag) {
 		app.Stats.SetReady(trackedClansDomainName, true, "")
 		if previous != nil {
 			warPayload := json.RawMessage(raw)
@@ -871,6 +898,7 @@ func (d *trackedClansDomain) processCWLTarget(ctx context.Context, app *platform
 	}
 	season := utils.CurrentSeason(now)
 	if ok {
+		state.Season = cwlSeasonMonth(state.Season)
 		d.setCWLActive(tag, state.Season == season && !state.Ended && !state.NoSpin && (state.BattleWarTag != "" || state.PreparationWarTag != "" || state.GroupState == "preparation" || state.GroupState == "inWar"))
 	}
 	if !ok && !cwlDiscoveryWindow(now) {
@@ -1249,6 +1277,7 @@ func storeTrackedClanValue(ctx context.Context, store trackedClanSnapshotStore, 
 
 func shouldPollCWL(now time.Time, state botCWLState) bool {
 	season := utils.CurrentSeason(now)
+	state.Season = cwlSeasonMonth(state.Season)
 	if state.Season == season && (state.Ended || state.NoSpin) {
 		return false
 	}
@@ -1273,7 +1302,7 @@ func cwlStateFromGroup(group *clashy.ClanWarLeagueGroup, raw []byte, now time.Ti
 		return state
 	}
 	if group.Season != "" {
-		state.Season = group.Season
+		state.Season = cwlSeasonMonth(group.Season)
 	}
 	state.GroupState = group.State
 	state.GroupHash = hashBytes(raw)

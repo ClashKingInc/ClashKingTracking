@@ -198,6 +198,8 @@ func proxyConnectionLimit(cfg Config) int {
 
 func needsClashClient(cfg Config) bool {
 	switch cfg.Script {
+	case "discord-delivery":
+		return cfg.ProxyURL != ""
 	case "globalclans", "trackedplayers", "basicplayers", "trackedclans", "war-discovery", "cwl", "war-archiver", "capital", "reminders", "availability", "scheduled", "battlelogs", "leaderboards", "notifications":
 		return true
 	default:

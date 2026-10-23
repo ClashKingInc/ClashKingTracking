@@ -260,6 +260,7 @@ func loadConfigFile(path string) (Config, error) {
 		return Config{}, fmt.Errorf("read config %s: %w", path, err)
 	}
 	var file jsonConfig
+	file.Battlelogs.PriorityRequestsPerSecond = 100
 	if err := json.Unmarshal(raw, &file); err != nil {
 		return Config{}, fmt.Errorf("parse config %s: %w", path, err)
 	}
@@ -404,9 +405,6 @@ func deriveConfig(cfg *Config) {
 	}
 	if cfg.WarArchivePackSize == 0 {
 		cfg.WarArchivePackSize = 10_000
-	}
-	if cfg.BattlelogPriorityRequestsPerSecond == 0 {
-		cfg.BattlelogPriorityRequestsPerSecond = 100
 	}
 	if cfg.TrackedClanRequestsPerSecond == 0 {
 		cfg.TrackedClanRequestsPerSecond = 950

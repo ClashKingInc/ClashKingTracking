@@ -946,6 +946,8 @@ func buildWarIngest(war clashy.ClanWar, sourceClanTag string, finished bool, war
 	warType := war.Type()
 	if warTag != "" {
 		warType = "cwl"
+	} else if war.StartTime != nil && friendlyWarWindow(prepAt, war.StartTime.Time.UTC(), endAt) {
+		warType = "friendly"
 	}
 	if !finished {
 		// Discovery creates an end-time schedule, including an immediately due
@@ -953,6 +955,7 @@ func buildWarIngest(war clashy.ClanWar, sourceClanTag string, finished bool, war
 		// rows are always written by the fenced finalizer fetch.
 		nextRunAt := warScheduleNextRunAt(endAt, warTag, time.Now().UTC())
 		return models.WarIngest{
+			PlayerActivity: warPlayerActivity(war),
 			Schedules: []models.WarScheduleRow{{
 				ScheduleKey:   scheduleKey,
 				WarID:         warID,
@@ -981,6 +984,8 @@ func buildWarIngest(war clashy.ClanWar, sourceClanTag string, finished bool, war
 		warIndexRow(warID, clan, opponent, prepAt, startAt, endAt, war, warType, warTag),
 	}
 	ingest := models.WarIngest{
+		ClanActivity:        warClanActivity(war, time.Now().UTC()),
+		PlayerActivity:      warPlayerActivity(war),
 		IndexRows:           indexRows,
 		ArchivePayload:      archivePayload,
 		ArchiveParticipants: archiveParticipants(archiveWar),
@@ -1245,6 +1250,14 @@ func (d *warsDomain) syncCWLTargets(ctx context.Context, app *platform.App, grou
 			app.Stats.RecordRequest(statsName, time.Since(start), err)
 			return group, err
 		})
+		var notFound *clashy.NotFound
+		if errors.As(err, &notFound) {
+			if store, ok := d.store.(interface {
+				CompleteCWLGroupsForClan(context.Context, string, string) error
+			}); ok {
+				return store.CompleteCWLGroupsForClan(workerCtx, target.Tag, season)
+			}
+		}
 		if err != nil || group == nil || cwlSeasonMonth(group.Season) != season {
 			return nil
 		}

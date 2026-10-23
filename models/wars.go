@@ -69,6 +69,8 @@ type CWLGroupClanRow struct {
 }
 
 type WarIngest struct {
+	ClanActivity        map[string]time.Time
+	PlayerActivity      map[string]time.Time
 	IndexRows           []WarLogIndexRow
 	ArchivePayload      []byte
 	ArchiveParticipants []string

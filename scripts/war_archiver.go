@@ -172,6 +172,13 @@ func (d *warsDomain) runDueWarScheduleLoop(ctx context.Context, app *platform.Ap
 }
 
 func (d *warsDomain) processDueWarSchedule(ctx context.Context, app *platform.App, statsName string, schedule models.WarScheduleRow) error {
+	if schedule.PrepTime.IsZero() || schedule.PrepTime.After(d.currentTime().UTC()) {
+		// A legacy row without a usable preparation identity cannot be matched
+		// safely to either current-war response. Retire it through the same
+		// atomic terminal fallback instead of retrying invalid queue input forever.
+		return d.abandonWarSchedule(ctx, app, schedule.ScheduleKey,
+			"abandoned war with unusable stored preparation time", errors.New("invalid scheduled war preparation time"))
+	}
 	queue := &warQueue{}
 	if err := queue.Enqueue(warFetchRequest{
 		ClanTag: schedule.SourceClanTag, OpponentTag: schedule.OpponentTag,

@@ -104,8 +104,21 @@ func (s *timescaleScheduledStore) rebuildDailyArmySetups(ctx context.Context, da
 	if _, err = tx.Exec(ctx, `SELECT pg_advisory_xact_lock($1)`, armyFamilyCloseoutLockID); err != nil {
 		return 0, err
 	}
+	writes, err := rebuildDailyArmySetupsTx(ctx, tx, day, static)
+	if err != nil {
+		return 0, err
+	}
+	if err = tx.Commit(ctx); err != nil {
+		return 0, err
+	}
+	return writes, nil
+}
+
+// The normal closeout shares its transaction and lock with metadata writes, so
+// neither half becomes visible if setup classification or persistence fails.
+func rebuildDailyArmySetupsTx(ctx context.Context, tx pgx.Tx, day time.Time, static *clashy.StaticData) (int, error) {
 	var snapshot bool
-	if err = tx.QueryRow(ctx, `SELECT EXISTS(SELECT 1 FROM legend_rankings_history WHERE day=$1)`, day).Scan(&snapshot); err != nil {
+	if err := tx.QueryRow(ctx, `SELECT EXISTS(SELECT 1 FROM legend_rankings_history WHERE day=$1)`, day).Scan(&snapshot); err != nil {
 		return 0, err
 	}
 	if !snapshot {
@@ -163,9 +176,6 @@ func (s *timescaleScheduledStore) rebuildDailyArmySetups(ctx context.Context, da
 		if err != nil {
 			return 0, err
 		}
-	}
-	if err = tx.Commit(ctx); err != nil {
-		return 0, err
 	}
 	return writes, nil
 }
