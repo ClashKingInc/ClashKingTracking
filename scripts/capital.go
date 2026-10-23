@@ -17,7 +17,7 @@ import (
 
 const (
 	capitalDomainName = "capital"
-	capitalCacheTTL   = 6 * time.Hour
+	capitalCacheTTL   = 96 * time.Hour
 )
 
 type capitalTarget struct {
@@ -59,7 +59,7 @@ func (d *capitalDomain) Run(ctx context.Context, app *platform.App) error {
 		return err
 	}
 	for {
-		if !capitalWeekendActive(time.Now().UTC()) {
+		if !capitalPollingActive(time.Now().UTC()) {
 			if err := sleepOrDone(ctx, 15*time.Minute); err != nil {
 				return err
 			}
@@ -103,6 +103,8 @@ func (d *capitalDomain) refreshTargets(ctx context.Context, app *platform.App) e
 		  AND log.disabled = false
 		  AND server.last_command_at >= now() - interval '90 days'
 		  AND log.type IN ('capital_donations', 'capital_attacks', 'raid_panel', 'capital_weekly_summary')
+		UNION
+		SELECT tag FROM clan_notification_tracking WHERE raid_tracked
 	`)
 	if err != nil {
 		return err
@@ -119,22 +121,6 @@ func (d *capitalDomain) refreshTargets(ctx context.Context, app *platform.App) e
 	rows.Close()
 	if err := rows.Err(); err != nil {
 		return err
-	}
-	values, err := app.Valkey.Do(ctx, app.Valkey.B().Hvals().Key(verifiedPlayerClanHashKey).Build()).ToArray()
-	if err != nil {
-		return err
-	}
-	for _, value := range values {
-		tag, valueErr := value.ToString()
-		if valueErr != nil || tag == "" {
-			continue
-		}
-		if existing, ok := configured[tag]; ok {
-			existing.EmitEvents = true
-			configured[tag] = existing
-		} else {
-			configured[tag] = capitalTarget{Tag: tag}
-		}
 	}
 	d.mu.Lock()
 	previous := d.targets
@@ -213,19 +199,27 @@ func (d *capitalDomain) pollTarget(ctx context.Context, app *platform.App, limit
 	if !d.stillTargeted(target.Tag) {
 		return nil
 	}
-	if err := app.Valkey.Do(ctx, app.Valkey.B().Set().Key(key).Value(string(compressed)).Ex(capitalCacheTTL).Build()).Error(); err != nil {
+	if err := commitCapitalRaidUpdate(ctx, target.Tag, previousRaid, raw, target.EmitEvents && hasPrevious, app.PublishEvent, func() error {
+		return app.Valkey.Do(ctx, app.Valkey.B().Set().Key(key).Value(string(compressed)).Ex(capitalCacheTTL).Build()).Error()
+	}); err != nil {
 		return err
 	}
 	app.Stats.RecordWrite(capitalDomainName, inserted+1)
-	if target.EmitEvents && hasPrevious {
-		event, eventErr := capitalRaidUpdateEvent(target.Tag, previousRaid, raw)
-		if eventErr != nil {
-			return eventErr
-		}
-		return app.PublishEvent(ctx, event)
-	}
 	app.Stats.RecordTrackedTarget(capitalDomainName)
 	return nil
+}
+
+func commitCapitalRaidUpdate(ctx context.Context, clanTag string, previousRaw, currentRaw []byte, emit bool, publish func(context.Context, platform.Event) error, store func() error) error {
+	if emit {
+		event, err := capitalRaidUpdateEvent(clanTag, previousRaw, currentRaw)
+		if err != nil {
+			return err
+		}
+		if err := publish(ctx, event); err != nil {
+			return err
+		}
+	}
+	return store()
 }
 
 func capitalRaidUpdateEvent(clanTag string, previousRaw, currentRaw []byte) (platform.Event, error) {
@@ -336,6 +330,19 @@ func capitalWeekendActive(now time.Time) bool {
 		return true
 	}
 	return weekday == time.Monday && now.Hour() < 7
+}
+
+// Medals can be posted after the Monday 07:00 UTC raid close. Continue the
+// existing-clan raid poll until Wednesday 07:00 UTC to observe final rewards.
+func capitalPollingActive(now time.Time) bool {
+	if capitalWeekendActive(now) {
+		return true
+	}
+	now = now.UTC()
+	if now.Weekday() == time.Monday || now.Weekday() == time.Tuesday {
+		return true
+	}
+	return now.Weekday() == time.Wednesday && now.Hour() < 7
 }
 
 func isValkeyMiss(err error) bool {

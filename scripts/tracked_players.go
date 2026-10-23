@@ -229,6 +229,9 @@ func validateTrackedPlayersConfig(cfg platform.Config) error {
 	if !cfg.DryRun && !cfg.MockDB && cfg.ValkeyAddr == "" {
 		return errors.New("valkey_addr is required for trackedplayers snapshots")
 	}
+	if !cfg.DryRun && !cfg.MockDB && cfg.TrackedClanSnapshotPrefix == "" {
+		return errors.New("trackedclans.snapshot_prefix is required for trackedplayers targets")
+	}
 	return nil
 }
 
@@ -321,7 +324,7 @@ func newTrackedPlayerStore(ctx context.Context, app *platform.App) (trackedPlaye
 	if app.Config.MockDB || app.Config.DryRun || app.Config.TimescaleURL == "" {
 		return newMemoryTrackedPlayerStore(), nil
 	}
-	return newTimescaleTrackedPlayerStore(ctx, app.Config.TimescaleURL)
+	return newTimescaleTrackedPlayerStore(ctx, app.Config.TimescaleURL, newTrackedClanSnapshotStore(app), app.Config.TrackedClanSnapshotPrefix)
 }
 
 func (d *trackedPlayersDomain) fetchAndPreparePlayer(
@@ -362,6 +365,9 @@ func (d *trackedPlayersDomain) storePlayerIngest(ctx context.Context, app *platf
 		return d.savePlayerSnapshot(ctx, ingest.SnapshotTag, ingest.SnapshotRaw)
 	}
 	if err := d.store.StoreIngest(ctx, ingest); err != nil {
+		return err
+	}
+	if err := queuePlayerRoleRefreshes(ctx, d.store, ingest); err != nil {
 		return err
 	}
 	app.Stats.RecordWrite(trackedPlayersDomainName,
@@ -449,6 +455,7 @@ func (d *trackedPlayersDomain) doPlayer(
 				"tag":             tag,
 				"name":            player.Name,
 				"clan_tag":        clan,
+				"clan":            current["clan"],
 				"town_hall_level": player.TownHall,
 				"changed_types":   playerChangeTypes(eventChanges),
 				"log_types":       eventLogTypes,
@@ -487,7 +494,7 @@ func (d *trackedPlayersDomain) interestedPlayerChanges(
 	matchedLogs := make(map[string]struct{})
 	for _, change := range changes {
 		matched := false
-		for _, logType := range playerLogTypesForChange(change.ChangeType) {
+		for _, logType := range playerLogTypesForProfileChange(change) {
 			if _, exists := interests[logType]; exists {
 				matched = true
 				matchedLogs[logType] = struct{}{}
@@ -508,7 +515,7 @@ func (d *trackedPlayersDomain) interestedPlayerChanges(
 func playerLogTypesForChange(changeType string) []string {
 	switch changeType {
 	case "troops":
-		return []string{"super_troop_boost", "troop_upgrade"}
+		return []string{"troop_upgrade"}
 	case "heroes":
 		return []string{"hero_upgrade"}
 	case "spells":
@@ -521,6 +528,8 @@ func playerLogTypesForChange(changeType string) []string {
 		return []string{"league_change"}
 	case "name":
 		return []string{"name_change"}
+	case "clanCapitalContributions":
+		return []string{"capital_donations"}
 	default:
 		return nil
 	}
@@ -844,7 +853,7 @@ func isHistoricalField(key string) bool {
 	switch key {
 	case "name", "troops", "heroes", "spells", "heroEquipment", "townHallLevel",
 		"leagueTier", "warStars", "warPreference", "bestBuilderBaseTrophies", "bestTrophies",
-		"expLevel":
+		"expLevel", "clanCapitalContributions":
 		return true
 	default:
 		return false
@@ -898,18 +907,24 @@ func clanTag(player map[string]any) string {
 }
 
 type timescaleTrackedPlayerStore struct {
-	pool *pgxpool.Pool
+	pool           *pgxpool.Pool
+	clanSnapshots  trackedClanSnapshotStore
+	snapshotPrefix string
+	targets        []models.TrackedPlayerTarget
+	targetsLoaded  bool
 }
 
 func newTimescaleTrackedPlayerStore(
 	ctx context.Context,
 	dsn string,
+	clanSnapshots trackedClanSnapshotStore,
+	snapshotPrefix string,
 ) (*timescaleTrackedPlayerStore, error) {
 	pool, err := pgxpool.New(ctx, dsn)
 	if err != nil {
 		return nil, err
 	}
-	return &timescaleTrackedPlayerStore{pool: pool}, nil
+	return &timescaleTrackedPlayerStore{pool: pool, clanSnapshots: clanSnapshots, snapshotPrefix: snapshotPrefix}, nil
 }
 
 func (s *timescaleTrackedPlayerStore) Close() {
@@ -926,26 +941,22 @@ func (s *timescaleTrackedPlayerStore) NextTargetPage(
 	if limit <= 0 {
 		return trackedPlayerTargetPage{}, nil
 	}
-	rows, err := s.pool.Query(ctx, trackedPlayerTargetsSQL, cursor, limit+1)
-	if err != nil {
-		return trackedPlayerTargetPage{}, err
-	}
-	defer rows.Close()
-	var targets []models.TrackedPlayerTarget
-	for rows.Next() {
-		var target models.TrackedPlayerTarget
-		if err := rows.Scan(&target.Tag, &target.Verified); err != nil {
+	if cursor == "" || !s.targetsLoaded {
+		targets, err := loadTrackedPlayerTargets(ctx, s.pool, s.clanSnapshots, s.snapshotPrefix)
+		if err != nil {
 			return trackedPlayerTargetPage{}, err
 		}
-		targets = append(targets, target)
+		s.targets, s.targetsLoaded = targets, true
 	}
-	if err := rows.Err(); err != nil {
-		return trackedPlayerTargetPage{}, err
+	start := sort.Search(len(s.targets), func(i int) bool { return s.targets[i].Tag > cursor })
+	if start == len(s.targets) {
+		return trackedPlayerTargetPage{}, nil
 	}
+	end := min(start+limit, len(s.targets))
+	targets := append([]models.TrackedPlayerTarget(nil), s.targets[start:end]...)
 	nextCursor := ""
-	if len(targets) > limit {
-		nextCursor = targets[limit-1].Tag
-		targets = targets[:limit]
+	if end < len(s.targets) {
+		nextCursor = targets[len(targets)-1].Tag
 	}
 	return trackedPlayerTargetPage{Targets: targets, NextCursor: nextCursor}, nil
 }
@@ -1042,7 +1053,7 @@ const trackedPlayerEventInterestsSQL = `
 	  AND log.type IN (
 	      'troop_upgrade', 'super_troop_boost', 'th_upgrade',
 	      'league_change', 'spell_upgrade', 'hero_upgrade',
-	      'hero_equipment_upgrade', 'name_change'
+	      'hero_equipment_upgrade', 'name_change', 'capital_donations', 'legend_log_attacks', 'legend_log_defenses'
 	  )
 `
 
@@ -1063,26 +1074,30 @@ func insertPlayerProfileChanges(
 	if len(rows) == 0 {
 		return nil
 	}
+	static, err := clashy.LoadStaticData()
+	if err != nil {
+		return fmt.Errorf("load player history static data: %w", err)
+	}
 	batch := &pgx.Batch{}
 	for _, row := range rows {
-		if row.PlayerTag == "" || row.ChangeType == "" {
-			continue
+		for _, change := range normalizePlayerProfileChange(row, static) {
+			batch.Queue(insertPlayerProfileChangeSQL,
+				change.EventTime, change.PlayerTag, change.ChangeType, change.ItemID,
+				change.TownHallLevel, change.PreviousValue, change.CurrentValue)
 		}
-		previous, _ := json.Marshal(row.PreviousValue)
-		current, _ := json.Marshal(row.CurrentValue)
-		batch.Queue(insertPlayerProfileChangeSQL,
-			row.EventTime, row.PlayerTag, row.ClanTag, row.TownHallLevel, row.ChangeType,
-			string(previous), string(current))
+	}
+	if batch.Len() == 0 {
+		return nil
 	}
 	return utils.SendBatch(ctx, tx, batch)
 }
 
 const insertPlayerProfileChangeSQL = `
 	INSERT INTO player_change_history (
-		event_time, player_tag, clan_tag, townhall_level, change_type,
+		event_time, player_tag, change_type, item_id, townhall_level,
 		previous_value, current_value
 	)
-	VALUES ($1, $2, $3, $4, $5, $6::jsonb, $7::jsonb)
+	VALUES ($1, $2, $3, $4, $5, $6, $7)
 	ON CONFLICT DO NOTHING
 `
 

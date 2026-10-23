@@ -414,6 +414,7 @@ func (d *globalClansDomain) runGroup(
 	// all of the HTTP requests it contains.
 	groupCtx, cancelGroup := context.WithCancel(ctx)
 	defer cancelGroup()
+	go recordGlobalClanPauseTime(groupCtx, app, statsName)
 	jobs := make(chan string)
 	results := make(chan globalClanSnapshot, globalClanDiffBatchSize*2)
 	errCh := make(chan error, 1)
@@ -441,7 +442,7 @@ func (d *globalClansDomain) runGroup(
 				case tag = <-jobs:
 				}
 
-				clan, err := retryLimitedClashFetch(groupCtx, app, limiter, func(fetchCtx context.Context) (*clashy.Clan, error) {
+				clan, err := retryGlobalClanFetch(groupCtx, app, limiter, func(fetchCtx context.Context) (*clashy.Clan, error) {
 					return fetchGlobalClan(fetchCtx, app, group.Name, tag)
 				})
 				app.Stats.RecordTrackedTarget(statsName)
@@ -450,6 +451,7 @@ func (d *globalClansDomain) runGroup(
 						return
 					}
 					if isClashNotFound(err) {
+						app.Stats.RecordRequest(statsName+".fetch-deferred", 0, err)
 						// Clans remain addressable with zero members, so a 404 for a
 						// persisted tag is an upstream anomaly rather than a deletion
 						// signal. Keep the row and retry it on the next complete scan.
@@ -461,10 +463,11 @@ func (d *globalClansDomain) runGroup(
 						}
 						continue
 					}
-					if isDeferredBulkFetch(err) {
+					if isDeferredBulkFetch(err) || isGlobalClanBadGateway(err) {
 						// The tag stays in SQL and is naturally retried on the next
 						// complete scan. One upstream tail request must not hold the
 						// rest of this multi-million-clan pool behind it.
+						app.Stats.RecordRequest(statsName+".fetch-deferred", 0, err)
 						continue
 					}
 					reportError(fmt.Errorf("global clan fetch %s: %w", tag, err))
@@ -474,6 +477,7 @@ func (d *globalClansDomain) runGroup(
 					reportError(fmt.Errorf("global clan fetch %s: empty clan payload", tag))
 					return
 				}
+				app.Stats.RecordProcess(statsName+".fetch-success", 0)
 				snapshot := globalClanSnapshot{
 					Clan:      *clan,
 					Row:       basicClanRow(*clan),
@@ -497,6 +501,19 @@ func (d *globalClansDomain) runGroup(
 
 	pageSize := group.RequestsPerSecond * app.Config.TargetPageMultiplier
 	cursor := ""
+	scanStarted := time.Now()
+	scanTargets := 0
+	recordWrap := func() {
+		if scanTargets > 0 {
+			// A wrap measures dispatch of a full ordered SQL sweep. Tail HTTP
+			// requests and asynchronous SQL writes can still be in flight.
+			app.Stats.RecordProcess(statsName+".scan-wrap", time.Since(scanStarted))
+			app.Logger.Info("global clan scan wrapped", "group", group.Name,
+				"targets", scanTargets, "duration", time.Since(scanStarted))
+		}
+		scanTargets = 0
+		scanStarted = time.Now()
+	}
 	for {
 		select {
 		case err := <-errCh:
@@ -508,6 +525,7 @@ func (d *globalClansDomain) runGroup(
 			return err
 		}
 		if len(page.Tags) == 0 {
+			recordWrap()
 			cursor = ""
 			if err := sleepOrDone(groupCtx, time.Second); err != nil {
 				return err
@@ -521,9 +539,83 @@ func (d *globalClansDomain) runGroup(
 			case <-groupCtx.Done():
 				return groupCtx.Err()
 			case jobs <- tag:
+				scanTargets++
 			}
 		}
 		cursor = page.NextCursor
+		if cursor == "" {
+			recordWrap()
+		}
+	}
+}
+
+func isGlobalClanBadGateway(err error) bool {
+	var gateway *clashy.GatewayError
+	return errors.As(err, &gateway) && gateway.HTTPException != nil && gateway.Status == 502
+}
+
+// Only bulk clan reads treat an isolated proxy 502 as a bounded target failure.
+// A 502 must not close the process-wide gate and stop both pools. Controller
+// outages still pause every attempt; maintenance and other unavailable errors
+// retain the shared gate's existing behavior.
+func retryGlobalClanFetch[T any](ctx context.Context, app *platform.App, limiter *clashy.Limiter, fetch func(context.Context) (T, error)) (T, error) {
+	var zero T
+	retries := 0
+	for {
+		if err := app.Availability.Wait(ctx); err != nil {
+			return zero, err
+		}
+		release, err := limiter.Acquire(ctx)
+		if err != nil {
+			return zero, err
+		}
+		value, err := fetch(ctx)
+		release()
+		if err == nil {
+			return value, nil
+		}
+		decision := platform.ClashFetchRetry{RetryAfter: platform.ClashGatewayTimeoutRetryDelay, MaxRetries: platform.ClashGatewayTimeoutMaxRetries}
+		if !isGlobalClanBadGateway(err) {
+			if app.Availability.Observe(err) {
+				continue
+			}
+			var ok bool
+			decision, ok = platform.ClashFetchRetryPolicy(err)
+			if !ok {
+				return zero, err
+			}
+		}
+		if decision.MaxRetries > 0 {
+			if retries >= decision.MaxRetries {
+				return zero, &platform.ClashFetchExhausted{Cause: err, Attempts: retries + 1}
+			}
+			retries++
+		}
+		if err := sleepOrDone(ctx, decision.RetryAfter); err != nil {
+			return zero, err
+		}
+	}
+}
+
+func recordGlobalClanPauseTime(ctx context.Context, app *platform.App, statsName string) {
+	previous := app.Availability.PausedDuration()
+	ticker := time.NewTicker(time.Second)
+	defer ticker.Stop()
+	record := func() {
+		now := app.Availability.PausedDuration()
+		if delta := now - previous; delta > 0 {
+			app.Stats.RecordProcess(statsName+".availability-paused", delta)
+		}
+		previous = now
+	}
+	for {
+		select {
+		case <-ctx.Done():
+			record()
+			return
+		case <-ticker.C:
+			record()
+		}
 	}
 }
 
@@ -578,13 +670,9 @@ func buildGlobalClanIngest(current globalClanSnapshot, previous *globalClanSnaps
 		ClanRecords: clanRecordRows(current.Clan, previousRow, current.FetchedAt),
 	}
 	if previous != nil && !isGlobalClanFirstHydration(previous.Row, current.Clan) {
-		// Joins are the only member movement that marks a clan active. Leave-only
-		// changes are still persisted, but they should not promote a clan into
-		// the priority polling bucket.
+		// Membership history is independent of polling priority. Only observed
+		// war lifecycle timestamps advance basic_clan.last_active.
 		ingest.JoinLeaves = joinLeaveRows(previous.Row, current.Clan, current.FetchedAt)
-		if hasJoin(ingest.JoinLeaves) {
-			ingest.ActiveClanTags = []string{current.Clan.Tag}
-		}
 		ingest.ClanChanges = clanChangeRows(previous.Row, current.Row, current.FetchedAt)
 	}
 	return ingest
@@ -695,7 +783,7 @@ func durationMillis(value time.Duration) float64 {
 }
 
 func globalClanIngestWriteCount(ingest models.GlobalClanIngest) int {
-	return len(ingest.Clans) + len(ingest.Players) + len(ingest.ClanRecords) + len(ingest.ActiveClanTags) +
+	return len(ingest.Clans) + len(ingest.Players) + len(ingest.ClanRecords) +
 		len(ingest.DeletedClanTags) + len(ingest.ClanChanges) + len(ingest.JoinLeaves)
 }
 
@@ -749,7 +837,7 @@ func joinLeaveRows(previous models.BasicClanRow, current clashy.Clan, now time.T
 	currentMembers := clanMembersByTag(current.Members)
 	currentTags := stringSet(memberTagsFromSnapshot(memberSnapshot(current.Members)))
 	previousTags := stringSet(memberTagsFromSnapshot(previous.Members))
-	previousNames := memberNamesByTag(previous.Members)
+	previousMembers := snapshotMembersByTag(previous.Members)
 	var out []models.JoinLeaveRow
 	for tag := range currentTags {
 		if _, ok := previousTags[tag]; ok {
@@ -770,11 +858,12 @@ func joinLeaveRows(previous models.BasicClanRow, current clashy.Clan, now time.T
 			continue
 		}
 		out = append(out, models.JoinLeaveRow{
-			EventTime:  now,
-			EventType:  "leave",
-			ClanTag:    current.Tag,
-			PlayerTag:  tag,
-			PlayerName: previousNames[tag],
+			EventTime:     now,
+			EventType:     "leave",
+			ClanTag:       current.Tag,
+			PlayerTag:     tag,
+			PlayerName:    previousMembers[tag].Name,
+			TownHallLevel: previousMembers[tag].TownHall,
 		})
 	}
 	sort.Slice(out, func(i, j int) bool {
@@ -816,7 +905,6 @@ func mergeGlobalClanIngest(left, right models.GlobalClanIngest) models.GlobalCla
 	left.Clans = append(left.Clans, right.Clans...)
 	left.Players = append(left.Players, right.Players...)
 	left.ClanRecords = append(left.ClanRecords, right.ClanRecords...)
-	left.ActiveClanTags = append(left.ActiveClanTags, right.ActiveClanTags...)
 	left.DeletedClanTags = append(left.DeletedClanTags, right.DeletedClanTags...)
 	left.ClanChanges = append(left.ClanChanges, right.ClanChanges...)
 	left.JoinLeaves = append(left.JoinLeaves, right.JoinLeaves...)
@@ -840,15 +928,6 @@ func clanRecordRows(clan clashy.Clan, previous models.BasicClanRow, now time.Tim
 		return nil
 	}
 	return []models.ClanRecordRow{row}
-}
-
-func hasJoin(rows []models.JoinLeaveRow) bool {
-	for _, row := range rows {
-		if row.EventType == "join" {
-			return true
-		}
-	}
-	return false
 }
 
 func basicPlayerRows(clanTag string, members []clashy.ClanMember) []models.BasicPlayerRow {
@@ -903,11 +982,11 @@ func memberTagsFromSnapshot(members []models.BasicClanMember) []string {
 	return out
 }
 
-func memberNamesByTag(members []models.BasicClanMember) map[string]string {
-	out := make(map[string]string, len(members))
+func snapshotMembersByTag(members []models.BasicClanMember) map[string]models.BasicClanMember {
+	out := make(map[string]models.BasicClanMember, len(members))
 	for _, member := range members {
 		if member.Tag != "" {
-			out[member.Tag] = member.Name
+			out[member.Tag] = member
 		}
 	}
 	return out
@@ -1206,13 +1285,6 @@ func (s *timescaleGlobalClanStore) Store(ctx context.Context, ingest models.Glob
 	}
 	result.WriteCount += count
 	stageStart = time.Now()
-	count, err = updateActiveClans(ctx, tx, ingest.ActiveClanTags)
-	result.ActivityDuration = time.Since(stageStart)
-	if err != nil {
-		return globalClanStoreResult{}, err
-	}
-	result.WriteCount += count
-	stageStart = time.Now()
 	if err := tx.Commit(ctx); err != nil {
 		return globalClanStoreResult{}, err
 	}
@@ -1309,19 +1381,6 @@ func upsertBasicClans(ctx context.Context, tx pgx.Tx, clans []models.BasicClanRo
 		err = closeErr
 	}
 	return changed, affected, err
-}
-
-func updateActiveClans(ctx context.Context, tx pgx.Tx, tags []string) (int, error) {
-	tags = uniqueStrings(tags)
-	if len(tags) == 0 {
-		return 0, nil
-	}
-	tag, err := tx.Exec(ctx, `
-		UPDATE basic_clan
-		SET last_active = now()
-		WHERE tag = ANY($1)
-	`, tags)
-	return int(tag.RowsAffected()), err
 }
 
 func deleteBasicClans(ctx context.Context, tx pgx.Tx, tags []string) (int, error) {
@@ -1599,16 +1658,6 @@ func (s *memoryGlobalClanStore) Store(_ context.Context, ingest models.GlobalCla
 			row.RecordWarWinStreakAt = record.WarWinStreakAt
 		}
 		s.rows[record.Tag] = row
-	}
-	now := time.Now().UTC()
-	for _, tag := range uniqueStrings(ingest.ActiveClanTags) {
-		row, ok := s.rows[tag]
-		if !ok {
-			continue
-		}
-		row.LastActive = &now
-		s.rows[tag] = row
-		result.WriteCount++
 	}
 	result.WriteCount += len(ingest.Players) + len(ingest.ClanChanges) + len(ingest.JoinLeaves)
 	result.WriteCount += len(ingest.ClanRecords)
