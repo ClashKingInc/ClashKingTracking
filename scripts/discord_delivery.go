@@ -26,20 +26,27 @@ import (
 
 const discordDeliveryDomainName = "discord-delivery"
 
+const (
+	discordEmojiRefreshInterval = 5 * time.Minute
+	discordEmojiRetryInterval   = 30 * time.Second
+)
+
 type discordDeliveryDomain struct{}
 
 type discordDeliveryTarget struct {
-	ServerID  string
-	ChannelID string
-	ThreadID  string
-	Custom    string
-	Config    string
-	ConfigID  string
-	WebhookID string
-	LogType   string
-	ClanTag   string
-	Revision  time.Time
-	Secret    string
+	ServerID    string
+	ChannelID   string
+	ThreadID    string
+	Custom      string
+	Config      string
+	ConfigID    string
+	WebhookID   string
+	LogType     string
+	ClanTag     string
+	ActiveWarID string
+	MessageID   string
+	Revision    time.Time
+	Secret      string
 }
 
 func NewDiscordDeliveryDomain() platform.Domain { return &discordDeliveryDomain{} }
@@ -54,7 +61,7 @@ func (d *discordDeliveryDomain) Run(ctx context.Context, app *platform.App) erro
 		return err
 	}
 	defer pool.Close()
-	var clientOpts []bot.ConfigOpt
+	clientOpts := []bot.ConfigOpt{bot.WithLogger(discordSafeLogger(app.Logger))}
 	if app.Config.DiscordAPIURL != "" {
 		if err := platform.ValidateLoopbackProviderURL(app.Config.DiscordAPIURL); err != nil {
 			return fmt.Errorf("invalid CLASHKING_LOCAL_DISCORD_API_URL: %w", err)
@@ -73,6 +80,18 @@ func (d *discordDeliveryDomain) Run(ctx context.Context, app *platform.App) erro
 	}
 	app.Stats.SetReady(discordDeliveryDomainName, true, "")
 	for {
+		if now := time.Now(); !now.Before(worker.nextBoardCheck) {
+			worker.nextBoardCheck = now.Add(5 * time.Second)
+			if err := worker.refreshDueDonationBoards(ctx); err != nil {
+				app.Logger.Error("donation autoboard scan failed", "err", err)
+			}
+			if err := worker.refreshDueFarmingBoards(ctx); err != nil {
+				app.Logger.Error("farming autoboard scan failed", "err", err)
+			}
+		}
+		if err := worker.recoverGiveawayPublications(ctx); err != nil {
+			app.Logger.Error("giveaway publication recovery failed", "err", err)
+		}
 		entries, err := worker.claimPending(ctx)
 		if err == nil && len(entries) == 0 {
 			entries, err = worker.readPending(ctx)
@@ -117,6 +136,10 @@ func validateDiscordDeliveryConfig(cfg platform.Config, client valkey.Client) er
 }
 
 type discordDeliveryWorker struct {
+	emojis         map[string]string
+	nextEmojiLoad  time.Time
+	nextBoardCheck time.Time
+	loadEmojisFn   func() (map[string]string, error)
 	app            *platform.App
 	client         *bot.Client
 	pool           *pgxpool.Pool
@@ -263,6 +286,9 @@ func discordDeliveryEventExpired(event mobileWarEvent, now time.Time, retentionS
 }
 
 func (w *discordDeliveryWorker) processEvent(ctx context.Context, event mobileWarEvent) (bool, error) {
+	if event.Topic == "clan" && stringMapValue(event.Value, "type") == "all_member_donations" {
+		return true, w.markDonationBoardsDirty(ctx, event)
+	}
 	switch event.Topic {
 	case "reminder":
 		return true, w.deliverReminder(ctx, event)
@@ -270,7 +296,7 @@ func (w *discordDeliveryWorker) processEvent(ctx context.Context, event mobileWa
 		return true, w.deliverGiveaway(ctx, event)
 	case "discord_message_create":
 		return true, w.deliverLinkParse(ctx, event)
-	case "clan", "war", "capital", "player", "reddit":
+	case "clan", "war", "capital", "player", "reddit", "discord_legend":
 		return true, w.deliverLogEvent(ctx, event)
 	default:
 		return false, nil
@@ -278,13 +304,19 @@ func (w *discordDeliveryWorker) processEvent(ctx context.Context, event mobileWa
 }
 
 func (w *discordDeliveryWorker) deliverReminder(ctx context.Context, event mobileWarEvent) error {
+	tags := reminderMemberTags(event)
+	if len(tags) == 0 {
+		return nil
+	}
 	targets, err := w.reminderTargets(ctx, event)
 	if err != nil {
 		return err
 	}
-	tags := reminderMemberTags(event)
 	return attemptDiscordDestinations(targets, func(target discordDeliveryTarget) error {
-		userIDs, err := w.linkedGuildUsers(ctx, target.ServerID, tags)
+		if !w.app.Config.AllowsDiscordGuild(target.ServerID) {
+			return nil
+		}
+		linked, userIDs, err := w.linkedGuildAccounts(ctx, target.ServerID, tags)
 		if err != nil {
 			return fmt.Errorf("resolve Discord reminder destination %s: %w", discordDestinationID(target), err)
 		}
@@ -292,9 +324,14 @@ func (w *discordDeliveryWorker) deliverReminder(ctx context.Context, event mobil
 		if reminder, ok := mapValue(event.Value["reminder"]); ok {
 			minutes = intValue(reminder["minutes_remaining"])
 		}
-		content := reminderText(event, minutes, target.Custom, userIDs)
-		if err := w.send(ctx, target, content, userIDs); err != nil {
-			return fmt.Errorf("send Discord reminder destination %s: %w", discordDestinationID(target), w.handleDestinationFailure(ctx, target, err))
+		// Missing links suppress mentions, never the eligible player rows.
+		if err := w.refreshLogEmojis(time.Now()); err != nil {
+			w.app.Logger.Warn("reminder emoji lookup failed; using text", "err", err)
+		}
+		for _, content := range discordReminderMessages(event, minutes, target.Custom, linked, w.emojis) {
+			if err := w.send(ctx, target, content, userIDs); err != nil {
+				return fmt.Errorf("send Discord reminder destination %s: %w", discordDestinationID(target), w.handleDestinationFailure(ctx, target, err))
+			}
 		}
 		return nil
 	})
@@ -354,12 +391,12 @@ func (w *discordDeliveryWorker) reminderTargets(ctx context.Context, event mobil
 	return targets, rows.Err()
 }
 
-func (w *discordDeliveryWorker) linkedGuildUsers(ctx context.Context, guildID string, tags []string) ([]snowflake.ID, error) {
+func (w *discordDeliveryWorker) linkedGuildAccounts(ctx context.Context, guildID string, tags []string) (map[string][]snowflake.ID, []snowflake.ID, error) {
 	if len(tags) == 0 || guildID == "" {
-		return nil, nil
+		return nil, nil, nil
 	}
 	rows, err := w.pool.Query(ctx, `
-		SELECT DISTINCT link.user_id
+		SELECT DISTINCT link.tag, link.user_id
 		FROM player_links link
 		JOIN discord_cache.guilds guild
 		  ON guild.id = $1
@@ -375,24 +412,28 @@ func (w *discordDeliveryWorker) linkedGuildUsers(ctx context.Context, guildID st
 		JOIN discord_cache.members member
 		  ON member.guild_id = $1 AND member.user_id = link.user_id
 		WHERE link.tag = ANY($2) AND link.user_id IS NOT NULL
-		ORDER BY link.user_id
+		ORDER BY link.tag, link.user_id
 	`, guildID, tags, w.client.ApplicationID.String())
 	if err != nil {
-		return nil, err
+		return nil, nil, err
 	}
 	defer rows.Close()
 	var users []snowflake.ID
+	linked := make(map[string][]snowflake.ID)
 	for rows.Next() {
-		var raw string
-		if err := rows.Scan(&raw); err != nil {
-			return nil, err
+		var tag, raw string
+		if err := rows.Scan(&tag, &raw); err != nil {
+			return nil, nil, err
 		}
 		id, err := snowflake.Parse(raw)
 		if err == nil {
-			users = append(users, id)
+			linked[tag] = append(linked[tag], id)
+			if !slices.Contains(users, id) {
+				users = append(users, id)
+			}
 		}
 	}
-	return users, rows.Err()
+	return linked, users, rows.Err()
 }
 
 func (w *discordDeliveryWorker) deliverLogEvent(ctx context.Context, event mobileWarEvent) error {
@@ -400,8 +441,39 @@ func (w *discordDeliveryWorker) deliverLogEvent(ctx context.Context, event mobil
 	if len(logTypes) == 0 {
 		return nil
 	}
+	if err := w.refreshLogEmojis(time.Now()); err != nil {
+		return err
+	}
+	if event.Topic == "capital" && event.Value["clan"] == nil && w.app.Clash != nil {
+		clan, err := w.app.Clash.GetClan(ctx, event.ClanTag)
+		if err != nil {
+			return fmt.Errorf("load capital log clan: %w", err)
+		}
+		var details map[string]any
+		if err := json.Unmarshal(jsonBytes(clan), &details); err != nil {
+			return err
+		}
+		event.Value["clan"] = details
+	}
+	// Join/leave events contain the clan-list member, not the full player.
+	// Fetch the same profile details the legacy logs displayed (heroes/stars).
+	if event.Topic == "clan" && (stringMapValue(event.Value, "type") == "member_join" || stringMapValue(event.Value, "type") == "member_leave") {
+		if _, supplied := event.Value["player"]; !supplied && w.app.Clash != nil {
+			member, _ := mapValue(event.Value["member"])
+			player, err := w.app.Clash.GetPlayer(ctx, stringMapValue(member, "tag"))
+			if err != nil {
+				return fmt.Errorf("load log player details: %w", err)
+			}
+			var details map[string]any
+			if err := json.Unmarshal(jsonBytes(player), &details); err != nil {
+				return err
+			}
+			event.Value["player"] = details
+		}
+	}
 	query := `
-		SELECT server_id, COALESCE(clan_tag, ''), type, webhook_id, COALESCE(thread_id, ''), updated_at
+		SELECT server_id, COALESCE(clan_tag, ''), type, webhook_id, COALESCE(thread_id, ''), updated_at,
+		       COALESCE(active_war_id, ''), COALESCE(message_id, '')
 		FROM server_logs
 		WHERE disabled = false AND type = ANY($1)
 	`
@@ -414,26 +486,120 @@ func (w *discordDeliveryWorker) deliverLogEvent(ctx context.Context, event mobil
 	if err != nil {
 		return err
 	}
-	defer rows.Close()
-	content := discordEventText(event)
-	var deliveryErr error
+	var targets []discordDeliveryTarget
 	for rows.Next() {
 		var target discordDeliveryTarget
-		if err := rows.Scan(&target.ServerID, &target.ClanTag, &target.LogType, &target.WebhookID, &target.ThreadID, &target.Revision); err != nil {
+		if err := rows.Scan(&target.ServerID, &target.ClanTag, &target.LogType, &target.WebhookID, &target.ThreadID, &target.Revision, &target.ActiveWarID, &target.MessageID); err != nil {
+			rows.Close()
 			return err
 		}
 		target.Config = "server_log"
+		targets = append(targets, target)
+	}
+	if err := rows.Err(); err != nil {
+		rows.Close()
+		return err
+	}
+	rows.Close()
+	if len(targets) > 0 && event.Topic == "clan" && stringMapValue(event.Value, "achievement") == "cwl_promotion" {
+		details, err := loadDiscordCWLPromotionDetails(ctx, w.pool, event)
+		if err != nil {
+			return err
+		}
+		if details != nil {
+			event.Value["cwl_details"] = details
+		}
+	}
+	var deliveryErr error
+	for _, target := range targets {
+		if !w.app.Config.AllowsDiscordGuild(target.ServerID) {
+			continue
+		}
 		resolved, err := w.webhookTarget(ctx, target.ServerID, target.WebhookID, target.ThreadID)
 		if err != nil {
 			deliveryErr = errors.Join(deliveryErr, fmt.Errorf("resolve Discord log webhook %s: %w", target.WebhookID, w.handleDestinationFailure(ctx, target, err)))
 			continue
 		}
 		resolved.Config, resolved.WebhookID, resolved.LogType, resolved.ClanTag, resolved.Revision = target.Config, target.WebhookID, target.LogType, target.ClanTag, target.Revision
-		if err := w.send(ctx, resolved, content, nil); err != nil {
-			deliveryErr = errors.Join(deliveryErr, fmt.Errorf("send Discord log destination %s: %w", discordDestinationID(resolved), w.handleDestinationFailure(ctx, resolved, err)))
+		if event.Topic == "war" && target.LogType == "war_panel" {
+			if err := w.deliverWarPanel(ctx, event, target, resolved); err != nil {
+				deliveryErr = errors.Join(deliveryErr, fmt.Errorf("deliver war panel %s: %w", discordDestinationID(resolved), w.handleDestinationFailure(ctx, resolved, err)))
+			}
+			continue
+		}
+		if event.Topic == "war" && target.LogType == "war_log" && stringMapValue(event.Value, "type") != "new_attacks" {
+			for _, message := range discordWarStateMessages(event, w.emojis) {
+				if err := w.sendMessage(ctx, resolved, message, nil); err != nil {
+					deliveryErr = errors.Join(deliveryErr, fmt.Errorf("send war state %s: %w", discordDestinationID(resolved), w.handleDestinationFailure(ctx, resolved, err)))
+					break
+				}
+			}
+			if discordWarEnded(event) {
+				if err := w.sendWarResultOnce(ctx, event, resolved); err != nil {
+					deliveryErr = errors.Join(deliveryErr, fmt.Errorf("send war result %s: %w", discordDestinationID(resolved), w.handleDestinationFailure(ctx, resolved, err)))
+				}
+			}
+			continue
+		}
+		if event.Topic == "clan" && target.LogType == "ban_alert" {
+			member, _ := mapValue(event.Value["member"])
+			ban, found, err := loadDiscordBanAlert(ctx, w.pool, target.ServerID, stringMapValue(member, "tag"), event.ClanTag)
+			if err != nil {
+				deliveryErr = errors.Join(deliveryErr, err)
+				continue
+			}
+			if !found {
+				continue
+			}
+			if err := w.sendMessage(ctx, resolved, discordBanAlertMessage(event, ban), nil); err != nil {
+				deliveryErr = errors.Join(deliveryErr, fmt.Errorf("send ban alert %s: %w", discordDestinationID(resolved), w.handleDestinationFailure(ctx, resolved, err)))
+			}
+			continue
+		}
+		for _, message := range discordLogMessages(event, target.LogType, w.emojis) {
+			if err := w.sendMessage(ctx, resolved, message, nil); err != nil {
+				deliveryErr = errors.Join(deliveryErr, fmt.Errorf("send Discord log destination %s: %w", discordDestinationID(resolved), w.handleDestinationFailure(ctx, resolved, err)))
+				break
+			}
 		}
 	}
-	return errors.Join(deliveryErr, rows.Err())
+	return deliveryErr
+}
+
+// One delivery worker processes stream entries serially, so its emoji catalog
+// can be replaced as a whole without a lock or exposing a partial refresh.
+func (w *discordDeliveryWorker) refreshLogEmojis(now time.Time) error {
+	if w.emojis != nil && now.Before(w.nextEmojiLoad) {
+		return nil
+	}
+	load := w.loadEmojisFn
+	if load == nil {
+		load = func() (map[string]string, error) {
+			emojis, err := w.client.Rest.GetApplicationEmojis(w.client.ApplicationID)
+			if err != nil {
+				return nil, err
+			}
+			catalog := make(map[string]string, len(emojis))
+			for _, emoji := range emojis {
+				catalog[discordEmojiKey(emoji.Name)] = emoji.String()
+			}
+			return catalog, nil
+		}
+	}
+	catalog, err := load()
+	if err != nil {
+		if w.emojis == nil {
+			return fmt.Errorf("load log emoji catalog: %w", err)
+		}
+		w.nextEmojiLoad = now.Add(discordEmojiRetryInterval)
+		if w.app != nil && w.app.Logger != nil {
+			w.app.Logger.Error("refresh log emoji catalog failed; using cached IDs", "err", err)
+		}
+		return nil
+	}
+	w.emojis = catalog
+	w.nextEmojiLoad = now.Add(discordEmojiRefreshInterval)
+	return nil
 }
 
 func (w *discordDeliveryWorker) webhookTarget(ctx context.Context, serverID, webhookID, threadID string) (discordDeliveryTarget, error) {
@@ -446,65 +612,62 @@ func (w *discordDeliveryWorker) webhookTarget(ctx context.Context, serverID, web
 		return discordDeliveryTarget{}, err
 	}
 	var channelID snowflake.ID
+	var guildID snowflake.ID
+	var token string
 	switch typed := webhook.(type) {
 	case discord.IncomingWebhook:
 		channelID = typed.ChannelID
+		guildID, token = typed.GuildID, typed.Token
 	case *discord.IncomingWebhook:
 		channelID = typed.ChannelID
+		guildID, token = typed.GuildID, typed.Token
 	default:
 		return discordDeliveryTarget{}, fmt.Errorf("webhook %s is not an incoming webhook", webhookID)
 	}
-	return discordDeliveryTarget{ServerID: serverID, ChannelID: channelID.String(), ThreadID: threadID}, nil
+	if guildID.String() != serverID || token == "" {
+		return discordDeliveryTarget{}, errors.New("log webhook does not belong to the configured server or has no execution token")
+	}
+	return discordDeliveryTarget{ServerID: serverID, ChannelID: channelID.String(), ThreadID: threadID, WebhookID: webhookID, Secret: token}, nil
 }
 
-func (w *discordDeliveryWorker) deliverGiveaway(ctx context.Context, event mobileWarEvent) error {
-	giveaway, ok := mapValue(event.Value["giveaway"])
-	if !ok {
-		return errors.New("giveaway event is missing giveaway")
-	}
-	target := discordDeliveryTarget{
-		ServerID:  stringMapValue(giveaway, "server_id"),
-		ChannelID: stringMapValue(giveaway, "channel_id"),
-		Config:    "giveaway",
-		ConfigID:  stringMapValue(giveaway, "id"),
-	}
-	if target.ChannelID == "" || target.ConfigID == "" {
+func (w *discordDeliveryWorker) send(ctx context.Context, target discordDeliveryTarget, content string, users []snowflake.ID) error {
+	return w.sendMessage(ctx, target, discord.MessageCreate{Content: discordClip(content, 2000)}, users)
+}
+
+func (w *discordDeliveryWorker) sendMessage(_ context.Context, target discordDeliveryTarget, message discord.MessageCreate, users []snowflake.ID) error {
+	if !w.app.Config.AllowsDiscordGuild(target.ServerID) {
 		return nil
 	}
-	if err := w.pool.QueryRow(ctx, `SELECT updated_at FROM giveaways WHERE id = $1 AND disabled = false AND server_id = $2 AND COALESCE(channel_id, '') = $3`, target.ConfigID, target.ServerID, target.ChannelID).Scan(&target.Revision); err != nil {
-		if errors.Is(err, pgx.ErrNoRows) {
-			return nil
-		}
-		return err
-	}
-	prize := stringMapValue(giveaway, "prize")
-	kind := stringMapValue(event.Value, "type")
-	content := "🎉 Giveaway: " + prize
-	if kind == "giveaway_end" {
-		content = "🏆 Giveaway ended: " + prize
-	}
-	if err := w.send(ctx, target, content, nil); err != nil {
-		return w.handleDestinationFailure(ctx, target, err)
-	}
-	return nil
-}
-
-func (w *discordDeliveryWorker) send(_ context.Context, target discordDeliveryTarget, content string, users []snowflake.ID) error {
+	message = discordSuppressAutomaticEmbeds(message)
 	destination := discordDestinationID(target)
 	id, err := snowflake.Parse(destination)
 	if err != nil {
 		return fmt.Errorf("invalid Discord destination %q: %w", destination, err)
 	}
-	if len(content) > 2000 {
-		content = content[:1997] + "..."
+	var roles []snowflake.ID
+	if message.AllowedMentions != nil {
+		roles = message.AllowedMentions.Roles
 	}
-	_, err = w.client.Rest.CreateMessage(id, discord.MessageCreate{
-		Content: content,
-		AllowedMentions: &discord.AllowedMentions{
-			Parse: []discord.AllowedMentionType{},
-			Users: users,
-		},
-	})
+	message.AllowedMentions = &discord.AllowedMentions{
+		Parse: []discord.AllowedMentionType{},
+		Users: users,
+		Roles: roles,
+	}
+	if target.WebhookID != "" && target.Secret != "" {
+		webhookID, err := snowflake.Parse(target.WebhookID)
+		if err != nil {
+			return err
+		}
+		params := rest.CreateWebhookMessageParams{Wait: true}
+		if target.ThreadID != "" {
+			params.ThreadID = id
+		}
+		_, err = w.client.Rest.CreateWebhookMessage(webhookID, target.Secret, discord.WebhookMessageCreate{
+			Content: message.Content, Embeds: message.Embeds, Components: message.Components, Files: message.Files, AllowedMentions: message.AllowedMentions, Flags: message.Flags,
+		}, params)
+		return err
+	}
+	_, err = w.client.Rest.CreateMessage(id, message)
 	return err
 }
 
@@ -601,7 +764,7 @@ func reminderMemberTags(event mobileWarEvent) []string {
 		}
 		var tags []string
 		for _, member := range side.Members {
-			if len(member.Attacks) < attacks {
+			if war.State == "preparation" || len(member.Attacks) < attacks {
 				tags = append(tags, member.Tag)
 			}
 		}
@@ -610,44 +773,63 @@ func reminderMemberTags(event mobileWarEvent) []string {
 	return nil
 }
 
-func reminderText(event mobileWarEvent, minutes int, custom string, users []snowflake.ID) string {
-	typeName := strings.ReplaceAll(stringMapValue(event.Value, "type"), "_", " ")
-	if typeName == "war" {
-		typeName = "war attacks"
-	}
-	parts := []string{fmt.Sprintf("⏰ %s reminder", strings.Title(typeName))}
-	if minutes > 0 {
-		parts = append(parts, fmt.Sprintf("%d minutes remaining", minutes))
-	}
-	if custom != "" {
-		parts = append(parts, custom)
-	}
-	if len(users) > 0 {
-		mentions := make([]string, 0, len(users))
-		for _, user := range users {
-			mentions = append(mentions, "<@"+user.String()+">")
-		}
-		parts = append(parts, strings.Join(mentions, " "))
-	}
-	return strings.Join(parts, "\n")
-}
-
 func discordEventLogTypes(event mobileWarEvent) []string {
 	switch event.Topic {
+	case "discord_legend":
+		if stringMapValue(event.Value, "type") == "legend_attack" {
+			return []string{"legend_log_attacks"}
+		}
+		if stringMapValue(event.Value, "type") == "legend_defense" {
+			return []string{"legend_log_defenses"}
+		}
 	case "clan":
+		switch stringMapValue(event.Value, "type") {
+		case "all_member_donations":
+			// Donation events update the autoboard; never send per-event logs.
+			return nil
+		case "role_change":
+			return []string{"role_change"}
+		case "clan_description":
+			return []string{"clan_description_log"}
+		case "clan_requirements":
+			return []string{"clan_requirements_log"}
+		case "clan_achievement":
+			return []string{"clan_achievement_log"}
+		}
 		if stringMapValue(event.Value, "type") == "member_join" {
-			return []string{"join_log"}
+			return []string{"join_log", "ban_alert"}
 		}
 		if stringMapValue(event.Value, "type") == "member_leave" {
 			return []string{"leave_log"}
 		}
 	case "war":
-		return []string{"war_log"}
+		if stringMapValue(event.Value, "type") == "cwl_lineup_change" {
+			return []string{"cwl_lineup_change_log"}
+		}
+		if stringMapValue(event.Value, "type") == "new_attacks" {
+			war, _ := mapValue(event.Value["war"])
+			kind := strings.ToLower(discordWarType(event, war))
+			if kind != "cwl" && kind != "friendly" {
+				return []string{"war_panel"}
+			}
+		}
+		return []string{"war_log", "war_panel"}
 	case "capital":
 		if stringMapValue(event.Value, "type") == "raid_attacks" {
 			return []string{"capital_attacks"}
 		}
-		return []string{"capital_weekly_summary"}
+		if stringMapValue(event.Value, "type") == "raid_update" {
+			previous, _ := mapValue(event.Value["previous_raid"])
+			current, _ := mapValue(event.Value["raid"])
+			var logs []string
+			if intValue(current["totalAttacks"]) > intValue(previous["totalAttacks"]) {
+				logs = append(logs, "capital_attacks")
+			}
+			if discordCapitalSummaryReady(previous, current) {
+				logs = append(logs, "capital_weekly_summary")
+			}
+			return logs
+		}
 	case "player":
 		if values, ok := event.Value["log_types"].([]any); ok {
 			var out []string

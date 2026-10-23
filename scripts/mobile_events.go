@@ -7,8 +7,10 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
+	"math"
 	"strings"
 	"time"
+	"unicode"
 
 	"clashking_tracking/internal/platform"
 	"clashking_tracking/internal/utils"
@@ -361,7 +363,7 @@ func (w *mobileEventsWorker) processEvent(ctx context.Context, entryID string, e
 		if sub.Provider != "fcm" {
 			continue
 		}
-		if err := sendFCM(ctx, w.app, token, pushMessage{Title: title, Body: body, Data: map[string]string{"type": mobileNotificationRouteType(event), "target_tag": event.ClanTag}}); err != nil {
+		if err := sendFCM(ctx, w.app, token, pushMessage{Title: title, Body: body, Data: mobileWarNotificationData(event)}); err != nil {
 			w.logDeliveryError("mobile FCM delivery failed", "clan_tag", event.ClanTag, "err", err)
 			deliveryErrors = append(deliveryErrors, fmt.Errorf("deliver live event to device %s: %w", sub.DeviceID, err))
 		}
@@ -381,6 +383,10 @@ const legendDefenseSubscriptionsSQL = `
 `
 
 func (w *mobileEventsWorker) processLegendDefense(ctx context.Context, entryID string, event mobileWarEvent) error {
+	title, body, err := legendDefenseNotificationText(event.Value)
+	if err != nil {
+		return err
+	}
 	playerTag := stringValue(event.Value["player_tag"])
 	if playerTag == "" {
 		return errors.New("Legend defense event is missing player_tag")
@@ -402,13 +408,13 @@ func (w *mobileEventsWorker) processLegendDefense(ctx context.Context, entryID s
 	if err := rows.Err(); err != nil {
 		return err
 	}
-	data := map[string]string{"type": "legend_defense", "target_tag": playerTag}
+	data := map[string]string{"type": "legend_defense", "target_tag": playerTag, "image_url": legendNotificationImage}
 	if eventID := stringValue(event.Value["event_id"]); eventID != "" {
 		data["event_id"] = eventID
 	}
 	message := pushMessage{
-		Title: "Legend defense",
-		Body:  "A new Legend League defense is available.",
+		Title: title,
+		Body:  body,
 		Data:  data,
 	}
 	deliveryID := stringValue(event.Value["event_id"])
@@ -416,6 +422,33 @@ func (w *mobileEventsWorker) processLegendDefense(ctx context.Context, entryID s
 		deliveryID = entryID
 	}
 	return w.deliverLegendDefenseDevices(ctx, deliveryID, playerTag, devices, message)
+}
+
+func legendDefenseNotificationText(value map[string]any) (string, string, error) {
+	player := strings.TrimSpace(stringValue(value["player_name"]))
+	opponent := strings.TrimSpace(stringValue(value["opponent_name"]))
+	number := func(key string, max int) (int, bool) {
+		var n float64
+		switch v := value[key].(type) {
+		case int:
+			n = float64(v)
+		case float64:
+			n = v
+		default:
+			return 0, false
+		}
+		if n < 0 || n > float64(max) || n != float64(int(n)) {
+			return 0, false
+		}
+		return int(n), true
+	}
+	stars, starsOK := number("stars", 3)
+	destruction, destructionOK := number("destruction_percentage", 100)
+	if player == "" || opponent == "" || !starsOK || !destructionOK {
+		return "", "", errors.New("Legend defense event requires player_name, opponent_name, stars and destruction_percentage")
+	}
+	starDisplay := strings.Repeat("★", stars) + strings.Repeat("☆", 3-stars)
+	return player + " was attacked", fmt.Sprintf("%s %s (%d%%)", opponent, starDisplay, destruction), nil
 }
 
 func (w *mobileEventsWorker) deliverLegendDefenseDevices(ctx context.Context, deliveryID, playerTag string, devices []models.PushDevice, message pushMessage) error {
@@ -469,25 +502,38 @@ func (w *mobileEventsWorker) processWarReminder(ctx context.Context, event mobil
 	if err != nil {
 		return err
 	}
-	attacksPerMember := 2
+	var live *clashy.ClanWar
 	if war.WarTag != "" {
-		attacksPerMember = 1
+		wars, fetchErr := w.app.Clash.GetLeagueWars(ctx, []string{war.WarTag})
+		if fetchErr != nil {
+			return fetchErr
+		}
+		if len(wars) > 0 {
+			live = &wars[0]
+		}
+	} else {
+		live, err = w.app.Clash.GetClanWar(ctx, event.ClanTag)
+		if err != nil {
+			return err
+		}
 	}
-	type remainingAccount struct {
-		name      string
-		remaining int
+	if live == nil || live.State != "inWar" || live.EndTime == nil || !live.EndTime.Time.After(time.Now()) {
+		return nil
 	}
-	remaining := map[string]remainingAccount{}
+	// A delayed job for a previous war must not remind for a different war.
+	if war.EndTime == nil || !war.EndTime.Time.Equal(live.EndTime.Time) {
+		return nil
+	}
+	war = *live
+	remaining := unfinishedWarMembers(war, event.ClanTag)
+	clanName := ""
+	clanBadge := ""
 	for _, side := range []*clashy.WarClan{war.Clan, war.Opponent} {
-		if side == nil {
+		if side == nil || side.Tag != event.ClanTag {
 			continue
 		}
-		for _, member := range side.Members {
-			unused := attacksPerMember - len(member.Attacks)
-			if unused > 0 {
-				remaining[member.Tag] = remainingAccount{name: member.Name, remaining: unused}
-			}
-		}
+		clanName = side.Name
+		clanBadge = side.Badge.URL()
 	}
 	if len(remaining) == 0 {
 		return nil
@@ -496,21 +542,7 @@ func (w *mobileEventsWorker) processWarReminder(ctx context.Context, event mobil
 	for tag := range remaining {
 		tags = append(tags, tag)
 	}
-	rows, err := w.pool.Query(ctx, `
-		SELECT account.user_id, account.player_tag, device.device_id,
-		       device.platform, device.provider, device.environment,
-		       device.token_ciphertext, device.locale
-		FROM mobile_notification_accounts account
-		JOIN mobile_notification_preferences preference ON preference.user_id = account.user_id
-		JOIN mobile_push_devices device
-		  ON device.user_id = account.user_id
-		 AND device.enabled = true
-		 AND device.provider = 'fcm'
-		WHERE account.enabled = true
-		  AND preference.war_reminders_enabled = true
-		  AND $2 = ANY(preference.reminder_timings)
-		  AND account.player_tag = ANY($1)
-	`, tags, minutes)
+	rows, err := w.pool.Query(ctx, personalWarReminderRecipientsSQL, event.ClanTag, minutes, tags)
 	if err != nil {
 		return err
 	}
@@ -519,6 +551,7 @@ func (w *mobileEventsWorker) processWarReminder(ctx context.Context, event mobil
 		remaining int
 		devices   map[string]models.PushDevice
 		players   map[string]struct{}
+		name      string
 	}
 	recipients := map[string]*recipient{}
 	for rows.Next() {
@@ -534,8 +567,9 @@ func (w *mobileEventsWorker) processWarReminder(ctx context.Context, event mobil
 			recipients[userID] = &recipient{userID: userID, devices: make(map[string]models.PushDevice), players: make(map[string]struct{})}
 		}
 		if _, counted := recipients[userID].players[playerTag]; !counted {
-			recipients[userID].remaining += remaining[playerTag].remaining
 			recipients[userID].players[playerTag] = struct{}{}
+			recipients[userID].remaining += remaining[playerTag].remaining
+			recipients[userID].name = remaining[playerTag].name
 		}
 		deviceKey := device.DeviceID + "\x00" + device.Environment
 		recipients[userID].devices[deviceKey] = device
@@ -553,10 +587,14 @@ func (w *mobileEventsWorker) processWarReminder(ctx context.Context, event mobil
 		for _, device := range recipient.devices {
 			devices = append(devices, device)
 		}
-		_, _, err := sendPushToDevices(ctx, w.app, devices, pushMessage{
-			Title: "War attacks remaining",
-			Body:  fmt.Sprintf("%s & %d attacks left in war!", formatReminderTime(minutes), recipient.remaining),
-			Data:  map[string]string{"type": "war_reminder", "target_tag": event.ClanTag},
+		title, body, textErr := reminderNotificationText(false, isolateMobileClanName(clanName), isolateMobileClanName(recipient.name), len(recipient.players), 0, recipient.remaining, minutes)
+		if textErr != nil {
+			return textErr
+		}
+		_, _, err = sendPushToDevices(ctx, w.app, devices, pushMessage{
+			Title: title,
+			Body:  body,
+			Data:  map[string]string{"type": "war_reminder", "target_tag": event.ClanTag, "image_url": clanBadge},
 		})
 		if err != nil {
 			deliveryErrors = append(deliveryErrors, fmt.Errorf("deliver war reminder to user %s: %w", recipient.userID, err))
@@ -588,18 +626,20 @@ func decodeWarReminderEvent(event mobileWarEvent) (clashy.ClanWar, int, error) {
 func (w *mobileEventsWorker) processRaidReminder(ctx context.Context, event mobileWarEvent) error {
 	userID := stringValue(event.Value["user_id"])
 	minutes := intNumber(event.Value["minutes_remaining"])
-	remaining := intNumber(event.Value["remaining_attacks"])
-	if userID == "" || minutes <= 0 || remaining <= 0 {
+	if userID == "" || minutes <= 0 {
 		return nil
 	}
 	rows, err := w.pool.Query(ctx, `
 		SELECT device_id, platform, provider, environment, token_ciphertext, locale
 		FROM mobile_push_devices device
 		JOIN mobile_notification_preferences preference ON preference.user_id=device.user_id
+		JOIN user_bookmarks bookmark ON bookmark.user_id=device.user_id AND bookmark.entity_type='clan'
+		  AND bookmark.tag=$3 AND bookmark.raid_notifications_enabled
+		JOIN clan_notification_tracking interest ON interest.tag=bookmark.tag AND interest.raid_tracked
 		WHERE device.user_id = $1 AND device.enabled = true AND device.provider = 'fcm'
 		  AND preference.raid_reminders_enabled = true
 		  AND $2 = ANY(preference.raid_reminder_timings)
-	`, userID, minutes)
+	`, userID, minutes, event.ClanTag)
 	if err != nil {
 		return err
 	}
@@ -615,15 +655,95 @@ func (w *mobileEventsWorker) processRaidReminder(ctx context.Context, event mobi
 		devices = append(devices, device)
 	}
 	rows.Close()
+	if err := rows.Err(); err != nil {
+		return err
+	}
+	if len(devices) == 0 {
+		return nil
+	}
+	links, err := w.pool.Query(ctx, "SELECT tag FROM player_links WHERE user_id=$1 AND is_verified", userID)
+	if err != nil {
+		return err
+	}
+	var tags []string
+	for links.Next() {
+		var tag string
+		if err := links.Scan(&tag); err != nil {
+			links.Close()
+			return err
+		}
+		tags = append(tags, tag)
+	}
+	links.Close()
+	if err := links.Err(); err != nil {
+		return err
+	}
+	if len(tags) == 0 {
+		return nil
+	}
+	// Recheck live attack counts immediately before delivery, rather than
+	// trusting a queued reminder or a potentially stale capital snapshot.
+	raids, err := w.app.Clash.GetRaidLog(ctx, event.ClanTag, clashy.PageOptions{Limit: 1})
+	if err != nil {
+		return err
+	}
+	if len(raids) == 0 || raids[0].EndTime == nil || !raids[0].EndTime.Time.After(time.Now()) {
+		return nil
+	}
+	if end := stringValue(event.Value["raid_end"]); end != "" {
+		expected, parseErr := time.Parse(time.RFC3339, end)
+		if parseErr != nil || !raids[0].EndTime.Time.Equal(expected) {
+			return nil
+		}
+	}
+	clan, err := w.app.Clash.GetClan(ctx, event.ClanTag)
+	if err != nil {
+		return err
+	}
+	if clan == nil {
+		return nil
+	}
+	personal := personalRaidRemaining(tags, clan.Members, raids[0].Members)
+	if personal.Remaining == 0 {
+		return nil
+	}
+	title, body, err := reminderNotificationText(true, isolateMobileClanName(clan.Name), isolateMobileClanName(personal.Name), personal.Accounts, personal.Unstarted, personal.Remaining, minutes)
+	if err != nil {
+		return err
+	}
 	_, _, err = sendPushToDevices(ctx, w.app, devices, pushMessage{
-		Title: "Raid attacks remaining",
-		Body:  fmt.Sprintf("%s & %d attacks left in Raid Weekend!", formatReminderTime(minutes), remaining),
-		Data:  map[string]string{"type": "raid_reminder", "target_tag": event.ClanTag},
+		Title: title,
+		Body:  body,
+		Data:  map[string]string{"type": "raid_reminder", "target_tag": event.ClanTag, "image_url": stringValue(event.Value["clan_badge_url"])},
 	})
 	if err != nil {
 		return fmt.Errorf("deliver raid reminder to user %s: %w", userID, err)
 	}
 	return nil
+}
+
+func reminderNotificationText(raid bool, clan, account string, accounts, unstarted, attacks, minutes int) (string, string, error) {
+	if strings.TrimSpace(clan) == "" || accounts < 1 || attacks < 1 || minutes < 1 || (accounts == 1 && strings.TrimSpace(account) == "") {
+		return "", "", errors.New("reminder requires clan and account context")
+	}
+	kind := "War"
+	if raid {
+		kind = "Raid"
+	}
+	title := clan + ": " + kind + " reminder"
+	if raid && accounts > 1 && unstarted == accounts {
+		return title, fmt.Sprintf("You have %d accounts that haven't started raids. Ends in %s.", accounts, formatReminderTime(minutes)), nil
+	}
+	label := "attacks"
+	if attacks == 1 {
+		label = "attack"
+	}
+	body := fmt.Sprintf("%d %s %s left", attacks, strings.ToLower(kind), label)
+	if accounts == 1 {
+		body = account + " has " + body
+	}
+	body += fmt.Sprintf(". Ends in %s.", formatReminderTime(minutes))
+	return title, body, nil
 }
 
 func intNumber(value any) int {
@@ -641,33 +761,32 @@ func intNumber(value any) int {
 }
 
 func formatReminderTime(minutes int) string {
-	if minutes%60 == 0 {
-		hours := minutes / 60
-		if hours == 1 {
-			return "1 hour"
-		}
-		return fmt.Sprintf("%d hours", hours)
+	minuteUnit := "mins"
+	if minutes%60 == 1 {
+		minuteUnit = "min"
 	}
-	return fmt.Sprintf("%d minutes", minutes)
+	if minutes < 60 {
+		return fmt.Sprintf("%d %s", minutes, minuteUnit)
+	}
+	if minutes%60 == 0 {
+		return fmt.Sprintf("%d hr", minutes/60)
+	}
+	return fmt.Sprintf("%d hr %d %s", minutes/60, minutes%60, minuteUnit)
 }
 
 const mobileSubscriptionsSQL = `
 	SELECT DISTINCT d.user_id, d.device_id, d.provider, d.environment, d.token_ciphertext,
 	       preference.war_state_enabled, preference.war_attacks_enabled, preference.war_state_enabled
-	FROM mobile_notification_accounts account
+	FROM user_bookmarks account
+	JOIN clan_notification_tracking interest ON interest.tag=account.tag AND interest.war_tracked
 	JOIN mobile_notification_preferences preference ON preference.user_id = account.user_id
 	JOIN mobile_push_devices d
 	  ON d.user_id = account.user_id
 	 AND d.enabled = true
 	 AND d.provider = 'fcm'
-	JOIN player_timers timer
-	  ON timer.player_tag = account.player_tag
-	 AND timer.event_type = 'war'
-	 AND timer.expires_at > now()
-	JOIN war_schedule schedule ON schedule.schedule_key = timer.event_key
-	WHERE account.enabled = true
+	WHERE account.entity_type='clan' AND account.war_notifications_enabled
 	  AND $2 IN ('war', 'cwl')
-	  AND $1 IN (schedule.source_clan_tag, schedule.opponent_tag)
+	  AND account.tag=$1
 `
 
 func (w *mobileEventsWorker) subscriptions(ctx context.Context, targetTag, topic string) ([]mobileSubscription, error) {
@@ -710,7 +829,9 @@ func mobileEventFromEntry(entry valkey.XRangeEntry) (mobileWarEvent, bool) {
 func mobilePushEventType(event mobileWarEvent) bool {
 	eventType, _ := event.Value["type"].(string)
 	switch eventType {
-	case "new_war", "new_attacks", "war_state":
+	// Attack events still feed Discord and war tracking, but no longer produce
+	// mobile pushes, even for accounts with the legacy preference enabled.
+	case "new_war", "war_state":
 		return event.Topic == "war"
 	case "war", "raid_mobile":
 		return event.Topic == "reminder"
@@ -726,30 +847,103 @@ func subscriptionWantsEvent(sub mobileSubscription, event mobileWarEvent) bool {
 		return false
 	}
 	eventType, _ := event.Value["type"].(string)
+	war, ok := mapValue(event.Value["war"])
+	if !ok || discordWarIdentity(event) == "" {
+		return false
+	}
+	state := stringMapValue(war, "state")
 	switch eventType {
 	case "new_war":
-		return sub.WarStartEnabled
+		return sub.WarStartEnabled && (state == "preparation" || state == "inWar")
 	case "new_attacks":
-		return sub.ScoreChangeEnabled
+		return false
 	case "war_state":
-		return sub.WarEndEnabled || sub.WarStartEnabled
+		return sub.WarEndEnabled && state == "warEnded" || sub.WarStartEnabled && state == "inWar"
 	default:
 		return false
 	}
 }
 
 func mobileNotificationText(event mobileWarEvent) (string, string) {
+	war, _ := mapValue(event.Value["war"])
+	clan, opponent := discordWarSides(war, event.ClanTag)
+	name := strings.TrimSpace(stringMapValue(clan, "name"))
+	if name == "" {
+		name = event.ClanTag
+	}
+	if name == "" {
+		name = "Clan"
+	}
+	name = isolateMobileClanName(name)
+	versus := ""
+	if opponentName := strings.TrimSpace(stringMapValue(opponent, "name")); opponentName != "" {
+		versus = " against " + isolateMobileClanName(opponentName)
+	}
 	eventType, _ := event.Value["type"].(string)
 	switch eventType {
-	case "new_war":
-		return "Clan war started", "A new war is available for your selected clan."
+	case "new_war", "war_state":
+		switch stringMapValue(war, "state") {
+		case "preparation":
+			return name + " war preparation started", "War preparation" + versus + " started."
+		case "inWar":
+			body := "War" + versus + " started."
+			if end := discordWarTime(stringMapValue(war, "endTime")); end.After(time.Now()) {
+				minutes := int(math.Ceil(time.Until(end).Minutes()))
+				body += " Ends in " + formatReminderTime(minutes) + "."
+			}
+			return name + " war started", body
+		case "warEnded":
+			outcome := "Tie"
+			stars, opponentStars := intValue(clan["stars"]), intValue(opponent["stars"])
+			destruction, opponentDestruction := floatValue(clan["destructionPercentage"]), floatValue(opponent["destructionPercentage"])
+			if stars > opponentStars || (stars == opponentStars && destruction > opponentDestruction) {
+				outcome = "Win"
+			} else if stars < opponentStars || (stars == opponentStars && destruction < opponentDestruction) {
+				outcome = "Loss"
+			}
+			return name + " war ended", fmt.Sprintf("%s%s. %d ★ - %d ★", outcome, versus, stars, opponentStars)
+		default:
+			if eventType == "new_war" {
+				return name + " war started", "War" + versus + " started."
+			}
+			return name + ": War update", name + " has a war update" + versus + "."
+		}
 	case "new_attacks":
-		return "War score updated", "A new attack changed the clan war score."
-	case "war_state":
-		return "War status changed", "Your clan war status changed."
+		return name + ": War score updated", "A new attack changed " + name + "'s war score" + versus + "."
 	default:
-		return "ClashKing war update", "Your selected clan has a war update."
+		return name + ": War update", name + " has a war update" + versus + "."
 	}
+}
+
+func mobileWarNotificationData(event mobileWarEvent) map[string]string {
+	data := map[string]string{"type": mobileNotificationRouteType(event), "target_tag": event.ClanTag}
+	war, _ := mapValue(event.Value["war"])
+	clan, _ := discordWarSides(war, event.ClanTag)
+	badge, _ := mapValue(clan["badgeUrls"])
+	for _, size := range []string{"large", "medium", "small"} {
+		if url := stringMapValue(badge, size); strings.HasPrefix(url, "https://") {
+			data["image_url"] = url
+			break
+		}
+	}
+	return data
+}
+
+// Keep RTL names from pulling adjacent Latin scores and punctuation into their
+// directional run. FSI preserves the name's natural direction; PDI ends it.
+func isolateMobileClanName(name string) string {
+	name = strings.Map(func(r rune) rune {
+		if unicode.Is(unicode.Bidi_Control, r) {
+			return -1
+		}
+		return r
+	}, name)
+	for _, r := range name {
+		if unicode.Is(unicode.Arabic, r) || unicode.Is(unicode.Hebrew, r) {
+			return "\u2068" + name + "\u2069"
+		}
+	}
+	return name
 }
 
 func mobileNotificationRouteType(event mobileWarEvent) string {
