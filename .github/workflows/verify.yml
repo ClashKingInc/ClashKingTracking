@@ -21,7 +21,7 @@ jobs:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
         with:
           repository: ClashKingInc/DevKit
-          ref: 2e6b828cf91767a270fd95ca1995babc932783e9
+          ref: 66f95d52013fc19553b2cde0b7640e6c6170c081
           path: .ci-schema
           persist-credentials: false
       - uses: actions/setup-go@40f1582b2485089dde7abd97c1529aa768e1baff
@@ -48,3 +48,5 @@ jobs:
         run: bash .ci-schema/scripts/with-test-integration.sh --profile retained-api -- go run ./cmd/verify-member-warnings
       - name: Verify capital raid history collection
         run: bash .ci-schema/scripts/with-test-integration.sh --profile retained-api -- go run ./cmd/verify-raid-history
+      - name: Verify automatic Discord war events
+        run: bash .ci-schema/scripts/with-test-integration.sh --profile retained-api -- go run ./cmd/verify-war-events

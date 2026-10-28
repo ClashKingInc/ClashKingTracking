@@ -19,7 +19,7 @@ type countdownWar struct {
 	Err error
 }
 
-func (w *discordDeliveryWorker) refreshCountdownChannels(ctx context.Context, now time.Time) error {
+func (w *discordDeliveryWorker) refreshCountdownChannels(ctx context.Context, now time.Time, wars map[string]countdownWar) error {
 	rows, err := w.pool.Query(ctx, `SELECT c.server_id,COALESCE(c.clan_tag,''),c.type,c.channel_id
  FROM server_countdowns c JOIN servers s ON s.id=c.server_id
  WHERE s.left_at IS NULL AND (c.clan_tag IS NULL OR EXISTS(SELECT 1 FROM server_clans sc WHERE sc.server_id=c.server_id AND sc.tag=c.clan_tag))
@@ -41,7 +41,6 @@ func (w *discordDeliveryWorker) refreshCountdownChannels(ctx context.Context, no
 	if err != nil {
 		return err
 	}
-	wars := map[string]countdownWar{}
 	for _, c := range channels {
 		if !w.app.Config.AllowsDiscordGuild(c.Server) {
 			continue

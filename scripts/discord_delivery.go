@@ -82,7 +82,11 @@ func (d *discordDeliveryDomain) Run(ctx context.Context, app *platform.App) erro
 	for {
 		if now := time.Now(); !now.Before(worker.nextCountdownCheck) {
 			worker.nextCountdownCheck = now.Add(15 * time.Minute)
-			if err := worker.refreshCountdownChannels(ctx, now); err != nil {
+			wars := map[string]countdownWar{}
+			if err := worker.refreshWarEvents(ctx, now, wars, ""); err != nil {
+				app.Logger.Error("war event scan failed", "err", err)
+			}
+			if err := worker.refreshCountdownChannels(ctx, now, wars); err != nil {
 				app.Logger.Error("countdown scan failed", "err", err)
 			}
 		}
@@ -293,6 +297,12 @@ func discordDeliveryEventExpired(event mobileWarEvent, now time.Time, retentionS
 }
 
 func (w *discordDeliveryWorker) processEvent(ctx context.Context, event mobileWarEvent) (bool, error) {
+	if event.Topic == "war" && (stringMapValue(event.Value, "type") == "new_war" || stringMapValue(event.Value, "type") == "war_state") {
+		if err := w.refreshWarEvents(ctx, time.Now(), map[string]countdownWar{}, event.ClanTag); err != nil {
+			w.app.Logger.Warn("war event update failed", "err", err)
+		}
+	}
+
 	if event.Topic == "clan" && stringMapValue(event.Value, "type") == "member_count" {
 		return true, w.deliverMemberWarning(ctx, event)
 	}

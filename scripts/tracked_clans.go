@@ -264,6 +264,8 @@ const trackedClanTargetsSQL = `
 				  AND reminder.type_name = 'War'
 				  AND reminder.clan_tag <> ''
 				UNION
+				SELECT c.tag, 'war_event' AS kind FROM server_clans c JOIN servers s ON s.id=c.server_id WHERE c.war_events_enabled AND s.left_at IS NULL
+                UNION
 				SELECT tag, 'war_event' AS kind FROM clan_notification_tracking WHERE war_tracked
 			) targets
 			GROUP BY tag
