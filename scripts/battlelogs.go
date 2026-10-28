@@ -759,8 +759,36 @@ func (s *timescaleBattlelogStore) insertBattlelogRows(ctx context.Context, tx pg
 		return 0, err
 	}
 
-	var rankedInserted int
-	err = tx.QueryRow(ctx, `
+	// Lock summaries before inserting battles, in a stable tag order. Duplicate
+	// polls must not advance a streak, and concurrent batches for one player
+	// must not both read the same pre-update count.
+	if _, err := tx.Exec(ctx, `
+		INSERT INTO legend_attack_streaks (player_tag, observed_since)
+		SELECT stage.requested_tag, min(stage.battle_time)
+		FROM battlelog_ingest_stage stage
+		JOIN basic_player player ON player.tag = stage.requested_tag
+		WHERE stage.mode = 2 AND stage.requested_attack
+		  AND player.townhall_level BETWEEN 1 AND 20
+		GROUP BY stage.requested_tag ORDER BY stage.requested_tag
+		ON CONFLICT (player_tag) DO NOTHING
+	`); err != nil {
+		return 0, err
+	}
+	if _, err := tx.Exec(ctx, `
+		SELECT player_tag FROM legend_attack_streaks
+		WHERE player_tag IN (SELECT requested_tag FROM battlelog_ingest_stage WHERE mode = 2 AND requested_attack)
+		ORDER BY player_tag FOR UPDATE
+	`); err != nil {
+		return 0, err
+	}
+	if _, err := tx.Exec(ctx, `
+		CREATE TEMP TABLE IF NOT EXISTS battlelog_new_ranked (
+			player_tag text, battle_time timestamptz, direction smallint, battle_mode smallint, stars smallint
+		) ON COMMIT DELETE ROWS
+	`); err != nil {
+		return 0, err
+	}
+	rankedTag, err := tx.Exec(ctx, `
 		WITH observations AS (
 			SELECT stage.*, requested.townhall_level AS requested_th
 			FROM battlelog_ingest_stage stage
@@ -781,14 +809,43 @@ func (s *timescaleBattlelogStore) insertBattlelogRows(ctx context.Context, tx pg
 				NULLIF(army_share_code, '')
 			FROM observations
 			ON CONFLICT (player_tag, battle_time) DO NOTHING
-			RETURNING 1
+			RETURNING player_tag, battle_time, direction, battle_mode, stars
 		)
-		SELECT count(*)::integer FROM inserted
-	`).Scan(&rankedInserted)
+		INSERT INTO battlelog_new_ranked SELECT * FROM inserted
+	`)
 	if err != nil {
 		return 0, err
 	}
-	return int(farmingTag.RowsAffected()) + rankedInserted, nil
+	// A newly observed non-triple can arrive behind a newer attack in the same
+	// batch. Recount the suffix after that reset; otherwise add only genuinely
+	// inserted triples. The durable count is not recomputed on ordinary polls,
+	// because retention may already have removed the start of a long streak.
+	if _, err := tx.Exec(ctx, `
+		WITH incoming AS (
+			SELECT player_tag, min(battle_time) AS first_at, max(battle_time) AS last_at,
+			       max(battle_time) FILTER (WHERE stars < 3) AS reset_at
+			FROM battlelog_new_ranked WHERE battle_mode = 2 AND direction = 1 GROUP BY player_tag
+		)
+		UPDATE legend_attack_streaks state SET
+			current_streak = CASE
+				WHEN incoming.reset_at IS NOT NULL AND
+				     (state.last_non_triple_at IS NULL OR incoming.reset_at > state.last_non_triple_at)
+				THEN (SELECT count(*) FROM battles_ranked battle
+				      WHERE battle.player_tag = state.player_tag AND battle.battle_mode = 2
+				        AND battle.direction = 1 AND battle.stars = 3 AND battle.battle_time > incoming.reset_at)
+				ELSE state.current_streak + (SELECT count(*) FROM battlelog_new_ranked battle
+				      WHERE battle.player_tag = state.player_tag AND battle.battle_mode = 2
+				        AND battle.direction = 1 AND battle.stars = 3
+				        AND (state.last_non_triple_at IS NULL OR battle.battle_time > state.last_non_triple_at))
+			END,
+			observed_since = least(state.observed_since, incoming.first_at),
+			last_attack_at = greatest(state.last_attack_at, incoming.last_at),
+			last_non_triple_at = greatest(state.last_non_triple_at, incoming.reset_at)
+		FROM incoming WHERE state.player_tag = incoming.player_tag
+	`); err != nil {
+		return 0, err
+	}
+	return int(farmingTag.RowsAffected() + rankedTag.RowsAffected()), nil
 }
 
 func battlelogStorageModeCode(battleType clashy.BattleType) (int16, bool) {
