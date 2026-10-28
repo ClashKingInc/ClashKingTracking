@@ -210,10 +210,14 @@ func (s *timescaleScheduledStore) FinalizeLegendCloseout(ctx context.Context, da
 	if err != nil {
 		return 0, err
 	}
+	performance, err := rebuildLegendDayPerformanceTx(ctx, tx, day)
+	if err != nil {
+		return 0, err
+	}
 	if err = tx.Commit(ctx); err != nil {
 		return 0, err
 	}
-	return metadata + setups, nil
+	return metadata + setups + performance, nil
 }
 
 func (s *timescaleScheduledStore) finalizeLegendCloseout(ctx context.Context, tx pgx.Tx, day time.Time, static *clashy.StaticData) (int, error) {

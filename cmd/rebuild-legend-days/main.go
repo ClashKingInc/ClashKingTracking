@@ -24,6 +24,7 @@ func main() {
 func run() error {
 	_ = godotenv.Load()
 	daysFlag := flag.String("days", "", "comma-separated completed UTC day labels")
+	performanceOnly := flag.Bool("performance-only", false, "rebuild only daily performance observations and distributions")
 	flag.Parse()
 	dsn := timescaleURLFromEnvironment()
 	if err := requireLocalDevDatabase(dsn); err != nil {
@@ -36,7 +37,12 @@ func run() error {
 	if err = requireCompletedDays(days, time.Now().UTC()); err != nil {
 		return err
 	}
-	writes, err := scripts.RebuildLegendCloseouts(context.Background(), dsn, days)
+	var writes int
+	if *performanceOnly {
+		writes, err = scripts.RebuildLegendDayPerformance(context.Background(), dsn, days)
+	} else {
+		writes, err = scripts.RebuildLegendCloseouts(context.Background(), dsn, days)
+	}
 	if err != nil {
 		return err
 	}
