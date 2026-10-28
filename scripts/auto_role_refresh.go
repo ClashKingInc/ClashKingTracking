@@ -9,7 +9,7 @@ import (
 )
 
 type roleRefreshSink interface {
-	QueueRoleRefresh(context.Context, string, string, string) error
+	QueueRoleRefresh(context.Context, string, string, ...string) error
 }
 
 // Coalesce event bursts by server/member. A pending leave opens one grace
@@ -26,43 +26,64 @@ const queueAutoRoleRefreshSQL = `
    SELECT clan.server_id,subject.user_id FROM server_clans clan CROSS JOIN subject WHERE clan.tag=$2
    UNION
    SELECT member.guild_id,subject.user_id FROM discord_cache.members member
-   JOIN subject ON member.user_id=subject.user_id WHERE $3='account_update'
+   JOIN subject ON member.user_id=subject.user_id WHERE $3::text[] @> ARRAY['account_update']::text[]
  )
  INSERT INTO role_refresh_jobs(id,server_id,user_id,due_at,grace_until)
  SELECT 'auto:' || server.id || ':' || targets.user_id,server.id,targets.user_id,
-   CASE WHEN $3='member_leave' THEN now()+make_interval(mins=>server.role_leave_delay_minutes) ELSE now() END,
-   CASE WHEN $3='member_leave' THEN now()+make_interval(mins=>server.role_leave_delay_minutes) ELSE NULL END
+   CASE WHEN $3::text[] @> ARRAY['member_leave']::text[] THEN now()+make_interval(mins=>server.role_leave_delay_minutes) ELSE now() END,
+   CASE WHEN $3::text[] @> ARRAY['member_leave']::text[] THEN now()+make_interval(mins=>server.role_leave_delay_minutes) ELSE NULL END
  FROM targets JOIN servers server ON server.id=targets.server_id
  WHERE server.autoeval_enabled AND server.left_at IS NULL
+   AND (server.auto_role_triggers IS NULL OR server.auto_role_triggers && $3::text[])
  ON CONFLICT(id) DO UPDATE SET
    due_at=CASE WHEN role_refresh_jobs.completed_at IS NOT NULL THEN EXCLUDED.due_at
-     WHEN $3='member_join' THEN now()
+     WHEN $3::text[] @> ARRAY['member_join']::text[] THEN now()
      WHEN role_refresh_jobs.grace_until IS NOT NULL THEN role_refresh_jobs.grace_until
      ELSE EXCLUDED.due_at END,
    grace_until=CASE WHEN role_refresh_jobs.completed_at IS NOT NULL THEN EXCLUDED.grace_until
-     WHEN $3='member_join' THEN NULL ELSE COALESCE(role_refresh_jobs.grace_until,EXCLUDED.grace_until) END,
+     WHEN $3::text[] @> ARRAY['member_join']::text[] THEN NULL ELSE COALESCE(role_refresh_jobs.grace_until,EXCLUDED.grace_until) END,
    revision=role_refresh_jobs.revision+1,attempts=0,completed_at=NULL,result=NULL,updated_at=now()
 `
 
-func queueAutoRoleRefresh(ctx context.Context, pool *pgxpool.Pool, tag, clanTag, trigger string) error {
-	_, err := pool.Exec(ctx, queueAutoRoleRefreshSQL, tag, clanTag, trigger)
+func queueAutoRoleRefresh(ctx context.Context, pool *pgxpool.Pool, tag, clanTag string, triggers ...string) error {
+	_, err := pool.Exec(ctx, queueAutoRoleRefreshSQL, tag, clanTag, triggers)
 	if err != nil {
 		return fmt.Errorf("queue automatic role refresh: %w", err)
 	}
 	return nil
 }
-func (s *timescaleTrackedClanStore) QueueRoleRefresh(ctx context.Context, tag, clanTag, trigger string) error {
-	return queueAutoRoleRefresh(ctx, s.pool, tag, clanTag, trigger)
+func (s *timescaleTrackedClanStore) QueueRoleRefresh(ctx context.Context, tag, clanTag string, triggers ...string) error {
+	return queueAutoRoleRefresh(ctx, s.pool, tag, clanTag, triggers...)
 }
-func (s *timescaleTrackedPlayerStore) QueueRoleRefresh(ctx context.Context, tag, clanTag, trigger string) error {
-	return queueAutoRoleRefresh(ctx, s.pool, tag, clanTag, trigger)
+func (s *timescaleTrackedPlayerStore) QueueRoleRefresh(ctx context.Context, tag, clanTag string, triggers ...string) error {
+	return queueAutoRoleRefresh(ctx, s.pool, tag, clanTag, triggers...)
 }
 func queuePlayerRoleRefreshes(ctx context.Context, store trackedPlayerStore, ingest models.TrackedPlayerIngest) error {
 	sink, ok := store.(roleRefreshSink)
 	if !ok {
 		return nil
 	}
-	return sink.QueueRoleRefresh(ctx, ingest.SnapshotTag, ingest.CurrentClan, "account_update")
+	// Account updates still provide cached Discord memberships as destinations.
+	// Explicit legacy trigger selections match only the corresponding changes;
+	// ordinary donations/loot must not accidentally bypass that selection.
+	triggers := []string{"account_update"}
+	seen := map[string]bool{}
+	for _, change := range ingest.ProfileChanges {
+		var trigger string
+		switch change.ChangeType {
+		case "townHallLevel":
+			trigger = "townhall_change"
+		case "league", "leagueTier", "builderBaseLeague":
+			trigger = "league_change"
+		case "role":
+			trigger = "role_change"
+		}
+		if trigger != "" && !seen[trigger] {
+			triggers = append(triggers, trigger)
+			seen[trigger] = true
+		}
+	}
+	return sink.QueueRoleRefresh(ctx, ingest.SnapshotTag, ingest.CurrentClan, triggers...)
 }
 
 func queueClanRoleRefreshes(ctx context.Context, store trackedClanStore, previous, current clashy.Clan) error {

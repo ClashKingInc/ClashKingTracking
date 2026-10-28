@@ -63,13 +63,15 @@ func main() {
 	var currentClan atomic.Value
 	currentClan.Store("#PYL")
 	var stage atomic.Int32
+	var league atomic.Int32
+	league.Store(105000001)
 	var hall atomic.Int32
 	hall.Store(16)
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "application/json")
 		if strings.HasPrefix(r.URL.Path, "/v1/players/") {
 			tag := r.URL.Path[strings.LastIndex(r.URL.Path, "/")+1:]
-			player := map[string]any{"tag": tag, "name": "Fixture", "townHallLevel": hall.Load(), "expLevel": 200, "trophies": 5000, "role": "member", "warPreference": "in", "troops": []any{}, "heroes": []any{}, "spells": []any{}, "heroEquipment": []any{}, "achievements": []any{}}
+			player := map[string]any{"tag": tag, "name": "Fixture", "townHallLevel": hall.Load(), "expLevel": 200, "trophies": 5000, "role": "member", "warPreference": "in", "troops": []any{}, "heroes": []any{}, "spells": []any{}, "heroEquipment": []any{}, "achievements": []any{}, "leagueTier": map[string]any{"id": league.Load(), "name": "Fixture League"}}
 			if clan := currentClan.Load().(string); clan != "" {
 				player["clan"] = map[string]any{"tag": clan, "name": "Fixture"}
 			}
@@ -144,8 +146,21 @@ func main() {
 	must(db.QueryRow(ctx, "SELECT count(*) FROM role_refresh_jobs WHERE server_id=$1 OR user_id=$2", disabled, hidden).Scan(&others))
 	check(others == 0, "Disabled server or hidden link queued")
 	old := revision()
+	_, err = db.Exec(ctx, "UPDATE servers SET auto_role_triggers=ARRAY['member_join']::text[] WHERE id=$1", guild)
+	must(err)
 	stage.Store(2)
-	wait("rank change queues role refresh", func() bool { return revision() > old })
+	wait("filtered role change snapshot", func() bool {
+		raw, err := cache.Do(ctx, cache.B().Get().Key("role-fixture:clan:#PYL").Build()).ToString()
+		decoded, e := utils.Decompress([]byte(raw))
+		var clan clashy.Clan
+		return err == nil && e == nil && json.Unmarshal(decoded, &clan) == nil && len(clan.Members) > 0 && clan.Members[0].Role == "admin"
+	})
+	check(revision() == old, "Disabled role-change trigger queued work")
+	_, err = db.Exec(ctx, "UPDATE servers SET auto_role_triggers=NULL WHERE id=$1", guild)
+	must(err)
+	stage.Store(1)
+
+	wait("unrestricted rank change queues role refresh", func() bool { return revision() > old })
 	old = revision()
 	stage.Store(3)
 	wait("member leave queues role refresh", func() bool { return revision() > old })
@@ -178,6 +193,18 @@ func main() {
 		return err == nil && count == 1
 	})
 	old = revision()
+	_, err = db.Exec(ctx, "UPDATE servers SET auto_role_triggers=ARRAY['league_change']::text[] WHERE id=$1", guild)
+	must(err)
+	hall.Store(15)
+	wait("filtered Town Hall snapshot", func() bool {
+		raw, err := cache.Do(ctx, cache.B().Get().Key("ps:#PYLQ").Build()).ToString()
+		decoded, e := utils.Decompress([]byte(raw))
+		var player clashy.Player
+		return err == nil && e == nil && json.Unmarshal(decoded, &player) == nil && player.TownHall == 15
+	})
+	check(revision() == old, "Disabled Town Hall trigger queued work")
+	_, err = db.Exec(ctx, "UPDATE servers SET auto_role_triggers=ARRAY['townhall_change']::text[] WHERE id=$1", guild)
+	must(err)
 	hall.Store(17)
 	wait("player change queues refresh", func() bool { return revision() > old })
 	_, err = db.Exec(ctx, "UPDATE role_refresh_jobs SET grace_until=now()+interval '10 minutes',due_at=now()+interval '10 minutes' WHERE id=$1", job)
@@ -194,6 +221,21 @@ func main() {
 	check(grace.Equal(due) && grace.After(time.Now().Add(9*time.Minute)), "Account update bypassed leave grace")
 	must(db.QueryRow(ctx, "SELECT count(*) FROM role_refresh_jobs WHERE server_id=$1 OR user_id=$2", disabled, hidden).Scan(&others))
 	check(others == 0, "Account update queued disabled server or hidden link")
+	old = revision()
+	_, err = db.Exec(ctx, "UPDATE servers SET auto_role_triggers=ARRAY[]::text[] WHERE id=$1", guild)
+	must(err)
+	hall.Store(20)
+	wait("no-events snapshot", func() bool {
+		raw, err := cache.Do(ctx, cache.B().Get().Key("ps:#PYLQ").Build()).ToString()
+		decoded, e := utils.Decompress([]byte(raw))
+		var player clashy.Player
+		return err == nil && e == nil && json.Unmarshal(decoded, &player) == nil && player.TownHall == 20
+	})
+	check(revision() == old, "Empty selection queued game event")
+	_, err = db.Exec(ctx, "UPDATE servers SET auto_role_triggers=ARRAY['league_change']::text[] WHERE id=$1", guild)
+	must(err)
+	league.Store(105000002)
+	wait("selected league change", func() bool { return revision() > old })
 	stop()
-	fmt.Println("PASS actual tracking: join, rank, leave grace, rejoin, player/non-family/clanless changes, disabled-server and hidden-link filters; no Discord writes")
+	fmt.Println("PASS actual tracking: selected and excluded triggers, join, rank, leave grace, rejoin, player/non-family/clanless changes, disabled-server and hidden-link filters; no Discord writes")
 }
