@@ -1196,9 +1196,20 @@ func discordCacheListener(
 			}
 			guildID, member := event.GuildID.String(), event.Member
 			copy := member
-			state.enqueueMemberDelta(event.GenericEvent, guildID, discordMemberDelta{Member: &copy}, enqueue, func(meta discordMutationMeta, ctx context.Context, pool *pgxpool.Pool) error {
+			accepted := state.enqueueMemberDelta(event.GenericEvent, guildID, discordMemberDelta{Member: &copy}, enqueue, func(meta discordMutationMeta, ctx context.Context, pool *pgxpool.Pool) error {
 				return upsertDiscordMemberScoped(ctx, pool, guildID, member, meta)
 			})
+			// Only genuine joins produce welcomes. Snapshot/chunk/update events also
+			// write member cache rows and must never greet every existing member.
+			if accepted && !member.User.Bot {
+				go func() {
+					if err := app.PublishEvent(ctx, platform.Event{Topic: "discord_member_join", Value: map[string]any{
+						"guild_id": guildID, "user_id": member.User.ID.String(), "application_id": state.appID,
+					}}); err != nil && !errors.Is(err, context.Canceled) {
+						app.Logger.Error("publish Discord member-join event", "err", err)
+					}
+				}()
+			}
 		},
 		OnGuildMemberUpdate: func(event *events.GuildMemberUpdate) {
 			if !allowedGuild(event.GuildID) {

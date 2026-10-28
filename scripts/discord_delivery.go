@@ -294,6 +294,8 @@ func (w *discordDeliveryWorker) processEvent(ctx context.Context, event mobileWa
 		return true, w.deliverReminder(ctx, event)
 	case "giveaway":
 		return true, w.deliverGiveaway(ctx, event)
+	case "discord_member_join":
+		return true, w.deliverWelcomePanel(ctx, event)
 	case "discord_message_create":
 		return true, w.deliverLinkParse(ctx, event)
 	case "clan", "war", "capital", "player", "reddit", "discord_legend":
