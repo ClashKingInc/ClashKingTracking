@@ -8,8 +8,6 @@ import (
 
 	"clashking_tracking/internal/platform"
 	"clashking_tracking/models"
-
-	clashy "github.com/clashkinginc/clashy.go"
 )
 
 const mobilePushDomainName = "mobile_push"
@@ -98,6 +96,10 @@ func (d *mobilePushDomain) runCycle(ctx context.Context, app *platform.App) erro
 		return err
 	}
 	for _, campaign := range campaigns {
+		// Retired automatic season notices must not send, including already queued rows.
+		if strings.HasPrefix(campaign.Key, "game-event-season-start-") {
+			continue
+		}
 		devices, loadErr := d.store.DevicesForPlatforms(ctx, campaign.Platforms, campaign.TargetLocales, campaignNotificationPreference(campaign))
 		if loadErr != nil {
 			app.Logger.Warn("mobile_push: campaign audience failed", "campaign_id", campaign.ID, "err", loadErr)
@@ -114,7 +116,13 @@ func (d *mobilePushDomain) runCycle(ctx context.Context, app *platform.App) erro
 					body = translation.Body
 				}
 			}
-			return pushMessage{Title: title, Body: body, Data: map[string]string{"campaign_id": campaign.ID, "type": "admin_campaign", "route": route}}
+			data := map[string]string{"campaign_id": campaign.ID, "type": "admin_campaign", "route": route}
+			if campaign.Key == "monthly-support" {
+				body = strings.TrimSpace(strings.TrimSuffix(strings.TrimSpace(body), "❤️")) + " ❤️"
+			} else if image := campaignNotificationImage(campaign.Key); image != "" {
+				data["image_url"] = image
+			}
+			return pushMessage{Title: title, Body: body, Data: data}
 		})
 		status := "failed"
 		if len(devices) == 0 {
@@ -232,10 +240,9 @@ func gameEventCampaigns(now time.Time) []models.NotificationCampaign {
 		body  string
 		start time.Time
 	}{
-		{slug: "cwl", title: "Clan War League has started", body: "Clan War League is now live in game.", start: nextMonthlyEventStart(now, 1, 8)},
+		{slug: "cwl", title: "CWL signups have started", body: "Sign your clan up for Clan War League.", start: nextMonthlyEventStart(now, 1, 8)},
 		{slug: "clan-games", title: "Clan Games have started", body: "Clan Games are now live in game.", start: nextMonthlyEventStart(now, 22, 8)},
 		{slug: "raid-weekend", title: "Raid Weekend has started", body: "Raid Weekend is now live in game.", start: nextRaidWeekendStart(now)},
-		{slug: "season-start", title: "A new season has started", body: "The new Clash of Clans season is now live.", start: clashy.GetSeasonEnd(now).UTC()},
 	}
 	campaigns := make([]models.NotificationCampaign, 0, len(events))
 	for _, event := range events {

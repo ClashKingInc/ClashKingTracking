@@ -13,6 +13,7 @@ import (
 	"clashking_tracking/internal/platform"
 
 	clashy "github.com/clashkinginc/clashy.go"
+	"github.com/google/uuid"
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgxpool"
 )
@@ -21,12 +22,12 @@ const trackingWakeChannel = "clashking_tracking_wake_v1"
 const trackingWakePayloadLimit = 4096
 
 type trackingWakeEvent struct {
-	Version      int    `json:"v"`
 	Kind         string `json:"kind"`
 	ClanTag      string `json:"clanTag,omitempty"`
 	ReminderType string `json:"reminderType,omitempty"`
 	UserID       string `json:"userId,omitempty"`
 	ServerID     string `json:"serverId,omitempty"`
+	ReminderID   string `json:"reminderId,omitempty"`
 }
 
 func parseTrackingWakeEvent(payload string) (trackingWakeEvent, error) {
@@ -42,10 +43,11 @@ func parseTrackingWakeEvent(payload string) (trackingWakeEvent, error) {
 	if err := ensureJSONEnd(decoder); err != nil {
 		return trackingWakeEvent{}, err
 	}
-	if event.Version != 1 {
-		return trackingWakeEvent{}, fmt.Errorf("unsupported tracking wake version %d", event.Version)
-	}
 	switch event.Kind {
+	case "reminder_send":
+		if _, err := uuid.Parse(event.ReminderID); err != nil || !decimalIdentifier(event.ServerID) {
+			return trackingWakeEvent{}, errors.New("invalid reminder_send wake")
+		}
 	case "reminder_config":
 		if event.ClanTag == "" || clashy.CorrectTag(event.ClanTag) != event.ClanTag || event.ReminderType == "" || len(event.ReminderType) > 64 {
 			return trackingWakeEvent{}, errors.New("invalid reminder_config wake")

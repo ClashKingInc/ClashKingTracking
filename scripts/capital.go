@@ -17,7 +17,7 @@ import (
 
 const (
 	capitalDomainName = "capital"
-	capitalCacheTTL   = 6 * time.Hour
+	capitalCacheTTL   = 96 * time.Hour
 )
 
 type capitalTarget struct {
@@ -26,18 +26,21 @@ type capitalTarget struct {
 }
 
 type capitalDomain struct {
-	mu      sync.RWMutex
-	targets map[string]capitalTarget
-	pool    *pgxpool.Pool
+	mu               sync.RWMutex
+	targets          map[string]capitalTarget
+	historyRefreshed map[string]time.Time
+	pool             *pgxpool.Pool
 }
 
 func NewCapitalDomain() platform.Domain {
-	return &capitalDomain{targets: make(map[string]capitalTarget)}
+	return &capitalDomain{targets: make(map[string]capitalTarget), historyRefreshed: make(map[string]time.Time)}
 }
 
 func (d *capitalDomain) Name() string { return capitalDomainName }
 
 func (d *capitalDomain) Run(ctx context.Context, app *platform.App) error {
+	ctx, cancel := context.WithCancel(ctx)
+	defer cancel()
 	if app.Config.CapitalRequestsPerSecond <= 0 {
 		return errors.New("capital.requests_per_second must be greater than zero")
 	}
@@ -58,8 +61,9 @@ func (d *capitalDomain) Run(ctx context.Context, app *platform.App) error {
 	if err != nil {
 		return err
 	}
+	initialPass := true
 	for {
-		if !capitalWeekendActive(time.Now().UTC()) {
+		if !initialPass && !app.Config.RunOnce && !capitalPollingActive(time.Now().UTC()) {
 			if err := sleepOrDone(ctx, 15*time.Minute); err != nil {
 				return err
 			}
@@ -70,6 +74,10 @@ func (d *capitalDomain) Run(ctx context.Context, app *platform.App) error {
 			return d.pollTarget(workerCtx, app, limiter, target)
 		}); err != nil {
 			return err
+		}
+		initialPass = false
+		if app.Config.RunOnce {
+			return nil
 		}
 		if len(targets) == 0 {
 			if err := sleepOrDone(ctx, time.Minute); err != nil {
@@ -96,13 +104,20 @@ func (d *capitalDomain) runTargetRefresh(ctx context.Context, app *platform.App)
 
 func (d *capitalDomain) refreshTargets(ctx context.Context, app *platform.App) error {
 	rows, err := d.pool.Query(ctx, `
-		SELECT DISTINCT log.clan_tag
+		SELECT tag, bool_or(emit_events) FROM (
+        SELECT log.clan_tag AS tag, true AS emit_events
 		FROM server_logs log
 		JOIN servers server ON server.id = log.server_id
 		WHERE log.clan_tag IS NOT NULL
 		  AND log.disabled = false
 		  AND server.last_command_at >= now() - interval '90 days'
 		  AND log.type IN ('capital_donations', 'capital_attacks', 'raid_panel', 'capital_weekly_summary')
+		UNION
+		SELECT tag, true FROM clan_notification_tracking WHERE raid_tracked
+        UNION ALL
+        SELECT clan.tag, false FROM server_clans clan JOIN servers server ON server.id=clan.server_id
+        WHERE server.left_at IS NULL AND server.last_command_at >= now() - interval '90 days'
+        ) targets GROUP BY tag
 	`)
 	if err != nil {
 		return err
@@ -110,31 +125,16 @@ func (d *capitalDomain) refreshTargets(ctx context.Context, app *platform.App) e
 	configured := make(map[string]capitalTarget)
 	for rows.Next() {
 		var tag string
-		if err := rows.Scan(&tag); err != nil {
+		var emit bool
+		if err := rows.Scan(&tag, &emit); err != nil {
 			rows.Close()
 			return err
 		}
-		configured[tag] = capitalTarget{Tag: tag, EmitEvents: true}
+		configured[tag] = capitalTarget{Tag: tag, EmitEvents: emit}
 	}
 	rows.Close()
 	if err := rows.Err(); err != nil {
 		return err
-	}
-	values, err := app.Valkey.Do(ctx, app.Valkey.B().Hvals().Key(verifiedPlayerClanHashKey).Build()).ToArray()
-	if err != nil {
-		return err
-	}
-	for _, value := range values {
-		tag, valueErr := value.ToString()
-		if valueErr != nil || tag == "" {
-			continue
-		}
-		if existing, ok := configured[tag]; ok {
-			existing.EmitEvents = true
-			configured[tag] = existing
-		} else {
-			configured[tag] = capitalTarget{Tag: tag}
-		}
 	}
 	d.mu.Lock()
 	previous := d.targets
@@ -170,14 +170,33 @@ func (d *capitalDomain) stillTargeted(tag string) bool {
 }
 
 func (d *capitalDomain) pollTarget(ctx context.Context, app *platform.App, limiter *clashy.Limiter, target capitalTarget) error {
+	d.mu.RLock()
+	lastHistoryRefresh := d.historyRefreshed[target.Tag]
+	d.mu.RUnlock()
+	limit := 1
+	if time.Since(lastHistoryRefresh) >= 24*time.Hour {
+		limit = 10
+	}
 	raids, err := retryLimitedClashFetch(ctx, app, limiter, func(fetchCtx context.Context) ([]clashy.RaidLogEntry, error) {
 		start := time.Now()
-		entries, fetchErr := app.Clash.GetRaidLog(fetchCtx, target.Tag, clashy.PageOptions{Limit: 1})
+		entries, fetchErr := app.Clash.GetRaidLog(fetchCtx, target.Tag, clashy.PageOptions{Limit: limit})
 		app.Stats.RecordRequest(capitalDomainName, time.Since(start), fetchErr)
 		return entries, fetchErr
 	})
 	if err != nil || len(raids) == 0 {
 		return err
+	}
+	if !d.stillTargeted(target.Tag) {
+		return nil
+	}
+	if err := storeCapitalRaidHistory(ctx, d.pool, target.Tag, raids, time.Now().UTC()); err != nil {
+		return err
+	}
+	// Fetch the available backlog at startup and daily, not on every live poll.
+	if limit == 10 {
+		d.mu.Lock()
+		d.historyRefreshed[target.Tag] = time.Now()
+		d.mu.Unlock()
 	}
 	raid := raids[0]
 	if raid.EndTime == nil || raid.EndTime.Time.IsZero() || !d.stillTargeted(target.Tag) {
@@ -213,19 +232,27 @@ func (d *capitalDomain) pollTarget(ctx context.Context, app *platform.App, limit
 	if !d.stillTargeted(target.Tag) {
 		return nil
 	}
-	if err := app.Valkey.Do(ctx, app.Valkey.B().Set().Key(key).Value(string(compressed)).Ex(capitalCacheTTL).Build()).Error(); err != nil {
+	if err := commitCapitalRaidUpdate(ctx, target.Tag, previousRaid, raw, target.EmitEvents && hasPrevious, app.PublishEvent, func() error {
+		return app.Valkey.Do(ctx, app.Valkey.B().Set().Key(key).Value(string(compressed)).Ex(capitalCacheTTL).Build()).Error()
+	}); err != nil {
 		return err
 	}
 	app.Stats.RecordWrite(capitalDomainName, inserted+1)
-	if target.EmitEvents && hasPrevious {
-		event, eventErr := capitalRaidUpdateEvent(target.Tag, previousRaid, raw)
-		if eventErr != nil {
-			return eventErr
-		}
-		return app.PublishEvent(ctx, event)
-	}
 	app.Stats.RecordTrackedTarget(capitalDomainName)
 	return nil
+}
+
+func commitCapitalRaidUpdate(ctx context.Context, clanTag string, previousRaw, currentRaw []byte, emit bool, publish func(context.Context, platform.Event) error, store func() error) error {
+	if emit {
+		event, err := capitalRaidUpdateEvent(clanTag, previousRaw, currentRaw)
+		if err != nil {
+			return err
+		}
+		if err := publish(ctx, event); err != nil {
+			return err
+		}
+	}
+	return store()
 }
 
 func capitalRaidUpdateEvent(clanTag string, previousRaw, currentRaw []byte) (platform.Event, error) {
@@ -336,6 +363,19 @@ func capitalWeekendActive(now time.Time) bool {
 		return true
 	}
 	return weekday == time.Monday && now.Hour() < 7
+}
+
+// Medals can be posted after the Monday 07:00 UTC raid close. Continue the
+// existing-clan raid poll until Wednesday 07:00 UTC to observe final rewards.
+func capitalPollingActive(now time.Time) bool {
+	if capitalWeekendActive(now) {
+		return true
+	}
+	now = now.UTC()
+	if now.Weekday() == time.Monday || now.Weekday() == time.Tuesday {
+		return true
+	}
+	return now.Weekday() == time.Wednesday && now.Hour() < 7
 }
 
 func isValkeyMiss(err error) bool {

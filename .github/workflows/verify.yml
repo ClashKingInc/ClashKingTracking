@@ -1,0 +1,53 @@
+name: Verify tracking
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+
+permissions:
+  contents: read
+
+jobs:
+  verify:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+        with:
+          persist-credentials: false
+      # Pin the authoritative schema fixture so a moving branch cannot change
+      # the database under a tracking PR. Update with reviewed schema changes.
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+        with:
+          repository: ClashKingInc/DevKit
+          ref: e355973f1787c3592c3c2443c3efea1271aaf214
+          path: .ci-schema
+          persist-credentials: false
+      - uses: actions/setup-go@40f1582b2485089dde7abd97c1529aa768e1baff
+        with:
+          go-version-file: go.mod
+          cache-dependency-path: go.sum
+      - name: Validate workflow
+        run: go run github.com/rhysd/actionlint/cmd/actionlint@v1.7.7 -shellcheck= .github/workflows/verify.yml
+      - name: Build tracking and verification commands
+        run: go build ./...
+      - name: Install schema migrator
+        run: go install github.com/pressly/goose/v3/cmd/goose@v3.26.0
+      - name: Verify autoboard delivery
+        run: bash .ci-schema/scripts/with-test-integration.sh --profile retained-api -- go run ./cmd/verify-autoboards
+      - name: Verify role tracking
+        run: bash .ci-schema/scripts/with-test-integration.sh --profile retained-api -- go run ./cmd/verify-role-tracking
+      - name: Verify recorded Legend streaks
+        run: bash .ci-schema/scripts/with-test-integration.sh --profile retained-api -- go run ./cmd/verify-legend-streaks
+      - name: Verify welcome panel delivery
+        run: bash .ci-schema/scripts/with-test-integration.sh --profile retained-api -- env CLASHKING_WELCOME_E2E=1 go run ./cmd/verify-welcome-delivery
+      - name: Verify countdown channel updates
+        run: bash .ci-schema/scripts/with-test-integration.sh --profile retained-api -- go run ./cmd/verify-countdowns
+      - name: Verify capital raid history collection
+        run: bash .ci-schema/scripts/with-test-integration.sh --profile retained-api -- go run ./cmd/verify-raid-history
+      - name: Verify automatic Discord war events
+        run: bash .ci-schema/scripts/with-test-integration.sh --profile retained-api -- go run ./cmd/verify-war-events
+
+      - name: Verify Legend daily performance
+        run: bash .ci-schema/scripts/with-test-integration.sh --profile retained-api -- go run ./cmd/verify-legend-performance

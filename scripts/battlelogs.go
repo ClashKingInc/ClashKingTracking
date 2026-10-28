@@ -65,7 +65,9 @@ type battlelogsDomain struct {
 }
 
 type battlelogStore interface {
+	PlayerName(context.Context, string) (string, error)
 	LoadTargets(context.Context, string) ([]string, error)
+	LoadDiscordLegendTargets(context.Context) (map[string]discordLegendInterest, error)
 	Store(context.Context, models.BattlelogIngest) (int, error)
 	Close() error
 }
@@ -73,11 +75,14 @@ type battlelogStore interface {
 type battlelogTargetJob struct {
 	Tag        string
 	Checkpoint models.BattlelogCheckpoint
+	Discord    discordLegendInterest
 }
 
 type timescaleBattlelogStore struct {
-	pool   *pgxpool.Pool
-	static *clashy.StaticData
+	pool           *pgxpool.Pool
+	static         *clashy.StaticData
+	clanSnapshots  trackedClanSnapshotStore
+	snapshotPrefix string
 }
 
 func NewBattlelogsDomain() platform.Domain {
@@ -105,6 +110,9 @@ func (d *battlelogsDomain) Run(ctx context.Context, app *platform.App) error {
 	if !app.Config.DryRun && !app.Config.MockDB && app.Config.ValkeyAddr == "" {
 		return errors.New("valkey_addr is required for battlelogs checkpoint persistence")
 	}
+	if !app.Config.DryRun && !app.Config.MockDB && app.Config.TrackedClanSnapshotPrefix == "" {
+		return errors.New("trackedclans.snapshot_prefix is required for battlelogs targets")
+	}
 	d.checkpoint = battlelogTimestampCache{
 		client: app.Valkey,
 		ttl:    time.Duration(app.Config.BattlelogCheckpointTTLDays) * 24 * time.Hour,
@@ -115,6 +123,8 @@ func (d *battlelogsDomain) Run(ctx context.Context, app *platform.App) error {
 		if err != nil {
 			return err
 		}
+		store.clanSnapshots = newTrackedClanSnapshotStore(app)
+		store.snapshotPrefix = app.Config.TrackedClanSnapshotPrefix
 		d.sink = store
 		defer store.Close()
 	}
@@ -220,9 +230,7 @@ func (d *battlelogsDomain) runTracker(
 					if !ok {
 						return
 					}
-					ingest, err := retryLimitedClashFetch(workerCtx, app, limiter, func(fetchCtx context.Context) (models.BattlelogIngest, error) {
-						return d.do(fetchCtx, app, statsName, job.Tag, job.Checkpoint)
-					})
+					ingest, err := d.do(workerCtx, app, limiter, statsName, job)
 					if err != nil {
 						if workerCtx.Err() != nil {
 							return
@@ -252,14 +260,14 @@ func (d *battlelogsDomain) runTracker(
 		close(jobs)
 		workers.Wait()
 	}()
-	processTags := func(tags []string) error {
+	processTags := func(tags []string, discordTargets map[string]discordLegendInterest) error {
 		checkpoints, err := d.checkpoint.GetMany(workerCtx, tags)
 		if err != nil {
 			return err
 		}
 		for _, tag := range tags {
 			select {
-			case jobs <- battlelogTargetJob{Tag: tag, Checkpoint: checkpoints[tag]}:
+			case jobs <- battlelogTargetJob{Tag: tag, Checkpoint: checkpoints[tag], Discord: discordTargets[tag]}:
 			case err := <-errCh:
 				return err
 			case <-workerCtx.Done():
@@ -278,10 +286,17 @@ func (d *battlelogsDomain) runTracker(
 		if err != nil {
 			return err
 		}
+		var discordTargets map[string]discordLegendInterest
+		if group == "legend" {
+			discordTargets, err = d.sink.LoadDiscordLegendTargets(ctx)
+			if err != nil {
+				return err
+			}
+		}
 		app.Stats.SetTrackingTargets(statsName, len(tags))
 		for start := 0; start < len(tags); start += battlelogTargetPageSize {
 			end := min(start+battlelogTargetPageSize, len(tags))
-			if err := processTags(tags[start:end]); err != nil {
+			if err := processTags(tags[start:end], discordTargets); err != nil {
 				return err
 			}
 		}
@@ -346,15 +361,50 @@ func mergeBattlelogIngests(values []models.BattlelogIngest) models.BattlelogInge
 func (d *battlelogsDomain) do(
 	ctx context.Context,
 	app *platform.App,
+	limiter *clashy.Limiter,
 	statsName string,
-	playerTag string,
-	checkpoint models.BattlelogCheckpoint,
+	job battlelogTargetJob,
 ) (models.BattlelogIngest, error) {
-	entries, err := d.fetchBattleLog(ctx, app, statsName, playerTag)
+	entries, err := retryLimitedClashFetch(ctx, app, limiter, func(fetchCtx context.Context) ([]clashy.BattleLogEntry, error) {
+		return d.fetchBattleLog(fetchCtx, app, statsName, job.Tag)
+	})
 	if err != nil {
 		return models.BattlelogIngest{}, err
 	}
-	return battlelogIngestFromEntries(entries, playerTag, checkpoint, time.Now().UTC(), app.Config.BattlelogFirstSeenLookbackDays)
+	if job.Discord.clanTag != "" {
+		player, err := retryLimitedClashFetch(ctx, app, limiter, func(fetchCtx context.Context) (*clashy.Player, error) {
+			return app.Clash.GetPlayer(fetchCtx, job.Tag)
+		})
+		if err != nil {
+			return models.BattlelogIngest{}, err
+		}
+		if player != nil && player.Clan != nil && player.Clan.Tag == job.Discord.clanTag {
+			if err := pollDiscordLegendLogs(ctx, app, *player, job.Discord.types, limiter); err != nil {
+				return models.BattlelogIngest{}, err
+			}
+		}
+	}
+	ingest, err := battlelogIngestFromEntries(entries, job.Tag, job.Checkpoint, time.Now().UTC(), app.Config.BattlelogFirstSeenLookbackDays)
+	if err != nil || len(ingest.Notifications) == 0 {
+		return ingest, err
+	}
+	name, err := d.sink.PlayerName(ctx, job.Tag)
+	if err != nil {
+		return models.BattlelogIngest{}, err
+	}
+	if strings.TrimSpace(name) == "" {
+		return models.BattlelogIngest{}, errors.New("Legend defense player name is missing")
+	}
+	for i := range ingest.Notifications {
+		ingest.Notifications[i].PlayerName = name
+	}
+	return ingest, nil
+}
+
+func (s *timescaleBattlelogStore) PlayerName(ctx context.Context, tag string) (string, error) {
+	var name string
+	err := s.pool.QueryRow(ctx, "SELECT name FROM basic_player WHERE tag=$1", tag).Scan(&name)
+	return name, err
 }
 
 func battlelogIngestFromEntries(entries []clashy.BattleLogEntry, playerTag string, checkpoint models.BattlelogCheckpoint, now time.Time, firstSeenLookbackDays int) (models.BattlelogIngest, error) {
@@ -470,19 +520,22 @@ func (d *battlelogsDomain) store(ctx context.Context, app *platform.App, ingest 
 }
 
 func publishLegendDefenseEvent(ctx context.Context, app *platform.App, row models.BattlelogRow) error {
+	value := legendDefenseEventValue(row)
+	if _, _, err := legendDefenseNotificationText(value); err != nil {
+		return err
+	}
 	eventID := legendDefenseEventID(row)
 	ttl := time.Duration(app.Config.BattlelogCheckpointTTLDays) * 24 * time.Hour
 	_, err := platform.AppendEventOnce(ctx, app.Valkey, app.Config, eventID, ttl, platform.Event{
 		Topic:     "legend",
 		Timestamp: row.Timestamp,
-		Value: map[string]any{
-			"type":        "legend_defense",
-			"event_id":    eventID,
-			"player_tag":  clashy.CorrectTag(row.PlayerTag),
-			"battle_time": row.Timestamp.UTC().Format(time.RFC3339Nano),
-		},
+		Value:     value,
 	})
 	return err
+}
+
+func legendDefenseEventValue(row models.BattlelogRow) map[string]any {
+	return map[string]any{"type": "legend_defense", "event_id": legendDefenseEventID(row), "player_tag": clashy.CorrectTag(row.PlayerTag), "battle_time": row.Timestamp.UTC().Format(time.RFC3339Nano), "player_name": row.PlayerName, "opponent_name": row.OpponentName, "stars": int(row.Stars), "destruction_percentage": int(row.DestructionPercentage)}
 }
 
 func legendDefenseEventID(row models.BattlelogRow) string {
@@ -519,21 +572,55 @@ func (s *timescaleBattlelogStore) Close() error {
 }
 
 func (s *timescaleBattlelogStore) LoadTargets(ctx context.Context, group string) ([]string, error) {
-	query := `
-		SELECT DISTINCT player.tag
-		FROM (` + trackedPlayerTargetSetSQL + `) target
-		JOIN basic_player player ON player.tag = target.tag
-		WHERE player.league_id IS DISTINCT FROM 105000036
-		ORDER BY player.tag
-	`
 	if group == "legend" {
-		query = `
+		return s.queryTargetTags(ctx, `
 			SELECT tag
 			FROM basic_player
 			WHERE league_id = 105000036
 			ORDER BY tag
-		`
+		`)
 	}
+	targets, err := loadTrackedPlayerTargets(ctx, s.pool, s.clanSnapshots, s.snapshotPrefix)
+	if err != nil {
+		return nil, err
+	}
+	tags := make([]string, 0, len(targets))
+	for _, target := range targets {
+		tags = append(tags, target.Tag)
+	}
+	if len(tags) == 0 {
+		return nil, nil
+	}
+	rows, err := s.pool.Query(ctx, `SELECT tag FROM basic_player WHERE tag = ANY($1) AND league_id = 105000036`, tags)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	legend := make(map[string]struct{})
+	for rows.Next() {
+		var tag string
+		if err := rows.Scan(&tag); err != nil {
+			return nil, err
+		}
+		legend[tag] = struct{}{}
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	return standardBattlelogTags(targets, legend), nil
+}
+
+func standardBattlelogTags(targets []models.TrackedPlayerTarget, legend map[string]struct{}) []string {
+	tags := make([]string, 0, len(targets))
+	for _, target := range targets {
+		if _, isLegend := legend[target.Tag]; !isLegend {
+			tags = append(tags, target.Tag)
+		}
+	}
+	return tags
+}
+
+func (s *timescaleBattlelogStore) queryTargetTags(ctx context.Context, query string) ([]string, error) {
 	rows, err := s.pool.Query(ctx, query)
 	if err != nil {
 		return nil, err
@@ -569,6 +656,16 @@ func (s *timescaleBattlelogStore) Store(ctx context.Context, ingest models.Battl
 
 	insertedRows, err := s.insertBattlelogRows(ctx, tx, ingest.Rows)
 	if err != nil {
+		return 0, err
+	}
+	activity := make(map[string]time.Time)
+	for _, row := range ingest.Rows {
+		mode := battlelogStorageMode(clashy.BattleType(row.BattleType))
+		if row.Attack && (mode == "legend" || mode == "ranked") && row.Timestamp.After(activity[row.PlayerTag]) {
+			activity[row.PlayerTag] = row.Timestamp
+		}
+	}
+	if err := advancePlayerActivity(ctx, tx, activity); err != nil {
 		return 0, err
 	}
 	if err := tx.Commit(ctx); err != nil {
@@ -662,8 +759,36 @@ func (s *timescaleBattlelogStore) insertBattlelogRows(ctx context.Context, tx pg
 		return 0, err
 	}
 
-	var rankedInserted int
-	err = tx.QueryRow(ctx, `
+	// Lock summaries before inserting battles, in a stable tag order. Duplicate
+	// polls must not advance a streak, and concurrent batches for one player
+	// must not both read the same pre-update count.
+	if _, err := tx.Exec(ctx, `
+		INSERT INTO legend_attack_streaks (player_tag, observed_since)
+		SELECT stage.requested_tag, min(stage.battle_time)
+		FROM battlelog_ingest_stage stage
+		JOIN basic_player player ON player.tag = stage.requested_tag
+		WHERE stage.mode = 2 AND stage.requested_attack
+		  AND player.townhall_level BETWEEN 1 AND 20
+		GROUP BY stage.requested_tag ORDER BY stage.requested_tag
+		ON CONFLICT (player_tag) DO NOTHING
+	`); err != nil {
+		return 0, err
+	}
+	if _, err := tx.Exec(ctx, `
+		SELECT player_tag FROM legend_attack_streaks
+		WHERE player_tag IN (SELECT requested_tag FROM battlelog_ingest_stage WHERE mode = 2 AND requested_attack)
+		ORDER BY player_tag FOR UPDATE
+	`); err != nil {
+		return 0, err
+	}
+	if _, err := tx.Exec(ctx, `
+		CREATE TEMP TABLE IF NOT EXISTS battlelog_new_ranked (
+			player_tag text, battle_time timestamptz, direction smallint, battle_mode smallint, stars smallint
+		) ON COMMIT DELETE ROWS
+	`); err != nil {
+		return 0, err
+	}
+	rankedTag, err := tx.Exec(ctx, `
 		WITH observations AS (
 			SELECT stage.*, requested.townhall_level AS requested_th
 			FROM battlelog_ingest_stage stage
@@ -684,14 +809,43 @@ func (s *timescaleBattlelogStore) insertBattlelogRows(ctx context.Context, tx pg
 				NULLIF(army_share_code, '')
 			FROM observations
 			ON CONFLICT (player_tag, battle_time) DO NOTHING
-			RETURNING 1
+			RETURNING player_tag, battle_time, direction, battle_mode, stars
 		)
-		SELECT count(*)::integer FROM inserted
-	`).Scan(&rankedInserted)
+		INSERT INTO battlelog_new_ranked SELECT * FROM inserted
+	`)
 	if err != nil {
 		return 0, err
 	}
-	return int(farmingTag.RowsAffected()) + rankedInserted, nil
+	// A newly observed non-triple can arrive behind a newer attack in the same
+	// batch. Recount the suffix after that reset; otherwise add only genuinely
+	// inserted triples. The durable count is not recomputed on ordinary polls,
+	// because retention may already have removed the start of a long streak.
+	if _, err := tx.Exec(ctx, `
+		WITH incoming AS (
+			SELECT player_tag, min(battle_time) AS first_at, max(battle_time) AS last_at,
+			       max(battle_time) FILTER (WHERE stars < 3) AS reset_at
+			FROM battlelog_new_ranked WHERE battle_mode = 2 AND direction = 1 GROUP BY player_tag
+		)
+		UPDATE legend_attack_streaks state SET
+			current_streak = CASE
+				WHEN incoming.reset_at IS NOT NULL AND
+				     (state.last_non_triple_at IS NULL OR incoming.reset_at > state.last_non_triple_at)
+				THEN (SELECT count(*) FROM battles_ranked battle
+				      WHERE battle.player_tag = state.player_tag AND battle.battle_mode = 2
+				        AND battle.direction = 1 AND battle.stars = 3 AND battle.battle_time > incoming.reset_at)
+				ELSE state.current_streak + (SELECT count(*) FROM battlelog_new_ranked battle
+				      WHERE battle.player_tag = state.player_tag AND battle.battle_mode = 2
+				        AND battle.direction = 1 AND battle.stars = 3
+				        AND (state.last_non_triple_at IS NULL OR battle.battle_time > state.last_non_triple_at))
+			END,
+			observed_since = least(state.observed_since, incoming.first_at),
+			last_attack_at = greatest(state.last_attack_at, incoming.last_at),
+			last_non_triple_at = greatest(state.last_non_triple_at, incoming.reset_at)
+		FROM incoming WHERE state.player_tag = incoming.player_tag
+	`); err != nil {
+		return 0, err
+	}
+	return int(farmingTag.RowsAffected() + rankedTag.RowsAffected()), nil
 }
 
 func battlelogStorageModeCode(battleType clashy.BattleType) (int16, bool) {
@@ -1008,6 +1162,7 @@ func battlelogRowFromEntry(playerTag string, entry clashy.BattleLogEntry) (model
 		ArmyShareCode:         armyShareCode,
 		PlayerTag:             playerTag,
 		OpponentTag:           entry.OpponentPlayerTag,
+		OpponentName:          entry.OpponentName,
 		OpponentTH:            uint8(entry.OpponentTownHallLevel + 1),
 		BattleType:            battlelogStorageMode(entry.BattleType),
 		Attack:                entry.Attack,

@@ -9,6 +9,7 @@ import (
 	"time"
 
 	"clashking_tracking/internal/utils"
+	"clashking_tracking/internal/wararchive"
 	"clashking_tracking/models"
 
 	"github.com/jackc/pgx/v5"
@@ -100,8 +101,28 @@ func (s *timescaleWarStore) DeleteSchedule(ctx context.Context, scheduleKey stri
 	if _, err := tx.Exec(ctx, `DELETE FROM player_timers WHERE event_type = 'war' AND event_key = $1`, scheduleKey); err != nil {
 		return warStoreError("delete schedule player timers", err)
 	}
-	if _, err := tx.Exec(ctx, `DELETE FROM war_schedule WHERE schedule_key = $1`, scheduleKey); err != nil {
+	var source, opponent string
+	var prep time.Time
+	err = tx.QueryRow(ctx, `
+		DELETE FROM war_schedule WHERE schedule_key = $1
+		RETURNING source_clan_tag, opponent_tag, prep_time
+	`, scheduleKey).Scan(&source, &opponent, &prep)
+	if err != nil && !errors.Is(err, pgx.ErrNoRows) {
 		return warStoreError("delete schedule", err)
+	}
+	if err == nil {
+		// Terminal abandonment is the only fallback activity write. DELETE
+		// RETURNING claims the stored schedule once, even with two finalizers.
+		// Use its original preparation time; use the clock only for legacy rows
+		// without a usable preparation time. Retries and reschedules do not write
+		// activity, and rollback keeps this claim and both clan updates atomic.
+		now := time.Now().UTC()
+		if prep.IsZero() || prep.After(now) {
+			prep = now
+		}
+		if err := advanceClanActivity(ctx, tx, map[string]time.Time{source: prep, opponent: prep}); err != nil {
+			return warStoreError("abandoned war clan activity", err)
+		}
 	}
 	return tx.Commit(ctx)
 }
@@ -285,6 +306,13 @@ func (s *timescaleWarStore) Store(ctx context.Context, ingest models.WarIngest) 
 		if err := upsertPlayerWarHistory(ctx, tx, ingest); err != nil {
 			return err
 		}
+		var war wararchive.War
+		if err := json.Unmarshal(ingest.ArchivePayload, &war); err != nil {
+			return err
+		}
+		if err := RecordWarTripleStreaks(ctx, tx, ingest.FinishedWarID, ingest.IndexRows[0].EndTime, war, ingest.IndexRows[0].WarType); err != nil {
+			return err
+		}
 	}
 	if err := upsertWarSchedules(ctx, tx, ingest.Schedules); err != nil {
 		return err
@@ -292,7 +320,43 @@ func (s *timescaleWarStore) Store(ctx context.Context, ingest models.WarIngest) 
 	if err := upsertPlayerTimers(ctx, tx, ingest.PlayerTimers); err != nil {
 		return err
 	}
+	if err := advancePlayerActivity(ctx, tx, ingest.PlayerActivity); err != nil {
+		return err
+	}
+	if err := advanceClanActivity(ctx, tx, ingest.ClanActivity); err != nil {
+		return err
+	}
 	if err := upsertCWLGroups(ctx, tx, ingest.CWLGroups); err != nil {
+		return err
+	}
+	groupIDs := make([]string, 0, len(ingest.CWLGroups))
+	for _, group := range ingest.CWLGroups {
+		groupIDs = append(groupIDs, group.CWLID)
+	}
+	for _, war := range ingest.IndexRows {
+		if war.WarTag == "" || war.WarTag == "#0" {
+			continue
+		}
+		rows, err := tx.Query(ctx, `SELECT cwl_id FROM cwl_groups WHERE state <> 'ended'
+			AND (rounds @> jsonb_build_array(jsonb_build_array($1::text))
+			OR rounds @> jsonb_build_array(jsonb_build_object('warTags', jsonb_build_array($1::text))))`, war.WarTag)
+		if err != nil {
+			return err
+		}
+		for rows.Next() {
+			var id string
+			if err := rows.Scan(&id); err != nil {
+				rows.Close()
+				return err
+			}
+			groupIDs = append(groupIDs, id)
+		}
+		rows.Close()
+		if err := rows.Err(); err != nil {
+			return err
+		}
+	}
+	if err := completeCWLGroups(ctx, tx, groupIDs); err != nil {
 		return err
 	}
 	if ingest.FinishedWarID == 0 {
@@ -516,15 +580,15 @@ const upsertCWLGroupsSQLShape = `
 	ON CONFLICT (cwl_id) DO UPDATE SET
 		season = EXCLUDED.season,
 		cwl_league_id = COALESCE(EXCLUDED.cwl_league_id, cwl_groups.cwl_league_id),
-		state = EXCLUDED.state,
+		state = CASE WHEN cwl_groups.state = 'ended' THEN 'ended' ELSE EXCLUDED.state END,
 		war_size = COALESCE(EXCLUDED.war_size, cwl_groups.war_size),
-		rounds = EXCLUDED.rounds
+		rounds = CASE WHEN cwl_groups.state = 'ended' THEN cwl_groups.rounds ELSE EXCLUDED.rounds END
 	WHERE
 		cwl_groups.season IS DISTINCT FROM EXCLUDED.season OR
 		cwl_groups.cwl_league_id IS DISTINCT FROM COALESCE(EXCLUDED.cwl_league_id, cwl_groups.cwl_league_id) OR
-		cwl_groups.state IS DISTINCT FROM EXCLUDED.state OR
+		(cwl_groups.state <> 'ended' AND cwl_groups.state IS DISTINCT FROM EXCLUDED.state) OR
 		cwl_groups.war_size IS DISTINCT FROM COALESCE(EXCLUDED.war_size, cwl_groups.war_size) OR
-		cwl_groups.rounds IS DISTINCT FROM EXCLUDED.rounds
+		(cwl_groups.state <> 'ended' AND cwl_groups.rounds IS DISTINCT FROM EXCLUDED.rounds)
 `
 
 func upsertCWLGroups(ctx context.Context, tx pgx.Tx, rows []models.CWLGroupRow) error {
@@ -534,6 +598,11 @@ func upsertCWLGroups(ctx context.Context, tx pgx.Tx, rows []models.CWLGroupRow) 
 	for _, row := range rows {
 		if row.CWLID == "" || row.Season == "" {
 			continue
+		}
+		// The official group can end before its final wars are stored locally.
+		// Completion is derived from the full stored round set below.
+		if row.State == "ended" {
+			row.State = "inWar"
 		}
 		rounds, err := json.Marshal(row.Rounds)
 		if err != nil {

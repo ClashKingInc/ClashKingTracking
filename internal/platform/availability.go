@@ -29,6 +29,8 @@ type AvailabilityGate struct {
 	mu         sync.RWMutex
 	paused     bool
 	observedAt time.Time
+	pausedAt   time.Time
+	pausedTime time.Duration
 }
 
 func NewAvailabilityGate(client valkey.Client) *AvailabilityGate {
@@ -77,7 +79,7 @@ func (g *AvailabilityGate) Observe(err error) bool {
 		return false
 	}
 	g.mu.Lock()
-	g.paused = true
+	g.setPausedLocked(true)
 	g.observedAt = time.Now().UTC()
 	g.mu.Unlock()
 	return true
@@ -95,13 +97,40 @@ func (g *AvailabilityGate) refresh(ctx context.Context) error {
 	g.mu.Lock()
 	defer g.mu.Unlock()
 	if !state.Available {
-		g.paused = true
+		g.setPausedLocked(true)
 		return nil
 	}
 	if g.observedAt.IsZero() || state.ChangedAt.After(g.observedAt) {
-		g.paused = false
+		g.setPausedLocked(false)
 	}
 	return nil
+}
+
+// PausedDuration counts wall time once per gate, not once per waiting worker.
+// Consumers can take deltas to distinguish outage time from slow HTTP or SQL.
+func (g *AvailabilityGate) PausedDuration() time.Duration {
+	if g == nil {
+		return 0
+	}
+	g.mu.RLock()
+	defer g.mu.RUnlock()
+	total := g.pausedTime
+	if g.paused {
+		total += time.Since(g.pausedAt)
+	}
+	return total
+}
+
+func (g *AvailabilityGate) setPausedLocked(paused bool) {
+	if paused == g.paused {
+		return
+	}
+	if paused {
+		g.pausedAt = time.Now()
+	} else {
+		g.pausedTime += time.Since(g.pausedAt)
+	}
+	g.paused = paused
 }
 
 func IsClashUnavailable(err error) bool {
