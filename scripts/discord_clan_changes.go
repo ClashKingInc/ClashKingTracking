@@ -19,6 +19,10 @@ func trackedClanLogChanges(previous, current clashy.Clan) []platform.Event {
 		}
 		events = append(events, platform.Event{Topic: "clan", ClanTag: current.Tag, Value: value})
 	}
+	// One event per count change, not one per joining/leaving member.
+	if previous.MemberCount != current.MemberCount {
+		add("member_count", map[string]any{"previous_count": previous.MemberCount, "current_count": current.MemberCount})
+	}
 	oldMembers := make(map[string]clashy.ClanMember, len(previous.Members))
 	for _, member := range previous.Members {
 		oldMembers[member.Tag] = member
