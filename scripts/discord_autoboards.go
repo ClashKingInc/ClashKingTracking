@@ -2,6 +2,7 @@ package scripts
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	clashy "github.com/clashkinginc/clashy.go"
 	"sort"
@@ -195,7 +196,15 @@ func (w *discordDeliveryWorker) deliverDonationBoard(ctx context.Context, board 
 			return parseErr
 		}
 		_, err = w.client.Rest.UpdateWebhookMessage(webhookID, target.Secret, id, discord.WebhookMessageUpdate{Embeds: &embeds, AllowedMentions: mentions}, rest.UpdateWebhookMessageParams{ThreadID: threadID})
-	} else {
+		// Only a confirmed missing message permits recreation. Permission and
+		// rate errors retain the original ID, avoiding duplicate boards.
+		var providerErr *rest.Error
+		if errors.As(err, &providerErr) && providerErr.Response != nil && providerErr.Response.StatusCode == 404 && providerErr.Code == rest.JSONErrorCodeUnknownMessage {
+			messageID = ""
+			err = nil
+		}
+	}
+	if (board.Mode == "send" || messageID == "") && err == nil {
 		var message *discord.Message
 		message, err = w.client.Rest.CreateWebhookMessage(webhookID, target.Secret, discord.WebhookMessageCreate{Embeds: embeds, AllowedMentions: mentions}, rest.CreateWebhookMessageParams{Wait: true, ThreadID: threadID})
 		if err == nil && message != nil {

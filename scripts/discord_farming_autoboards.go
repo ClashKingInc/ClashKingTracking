@@ -166,7 +166,7 @@ func (w *discordDeliveryWorker) deliverFarmingBoard(ctx context.Context, b farmi
 		// Only a missing message permits recreation; permission/rate errors must not
 		// generate a second board. Next tick retries all other failures.
 		var providerErr *rest.Error
-		if errors.As(err, &providerErr) && providerErr.Response != nil && providerErr.Response.StatusCode == 404 {
+		if errors.As(err, &providerErr) && providerErr.Response != nil && providerErr.Response.StatusCode == 404 && providerErr.Code == rest.JSONErrorCodeUnknownMessage {
 			messageID = ""
 			err = nil
 		}
