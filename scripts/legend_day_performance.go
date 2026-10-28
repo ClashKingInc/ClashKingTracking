@@ -50,9 +50,8 @@ func rebuildLegendDayPerformanceTx(ctx context.Context, tx pgx.Tx, day time.Time
 	if !exists {
 		return 0, fmt.Errorf("ranking snapshot unavailable")
 	}
-	// Use the same explicit source window as existing Legend statistics. Store
-	// its timestamps with the result; closeout scheduling and day attribution
-	// are separate concerns and must not be silently changed during a rebuild.
+	// Persist the game-day window so readers can reject summaries from the
+	// previous 05:10 implementation until those days are rebuilt at 05:00.
 	start, end := legendDayWindow(day)
 	_, err := tx.Exec(ctx, `
         WITH observed AS (

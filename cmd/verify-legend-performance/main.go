@@ -33,7 +33,7 @@ func main() {
 	must(err)
 	defer db.Close()
 	day := time.Now().UTC().Truncate(24 * time.Hour).Add(-4 * 24 * time.Hour)
-	start := day.Add(5*time.Hour + 10*time.Minute)
+	start := day.Add(5 * time.Hour)
 	tags := []string{"#PYP", "#PYQ", "#PYL", "#PYR", "#PYJ", "#PYC", "#PYG", "#PYV", "#PYU"}
 	ranks := []int{1, 201, 1001, 2, 3, 4, 5, 6, 7}
 	for i, tag := range tags {

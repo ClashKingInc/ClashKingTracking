@@ -314,8 +314,12 @@ func upsertDecodedArmyCompositions(ctx context.Context, tx pgx.Tx, decoded map[s
 	}
 	return nil
 }
+
+// Legend battles belong to the game day starting at 05:00 UTC. The scheduler
+// waits until 05:12 for ingestion; that delay must never shift battle attribution.
+// https://support.supercell.com/clash-of-clans/en/articles/legend-league-4.html
 func legendDayWindow(day time.Time) (time.Time, time.Time) {
-	s := dayStart(day).Add(5*time.Hour + 10*time.Minute)
+	s := dayStart(day).Add(5 * time.Hour)
 	return s, s.Add(24 * time.Hour)
 }
 func readLegendAttacks(ctx context.Context, tx pgx.Tx, start, end time.Time, includeTop100 bool) ([]legendAttack, map[string]int64, error) {

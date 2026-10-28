@@ -51,7 +51,7 @@ func run() error {
 }
 
 func requireCompletedDays(days []time.Time, now time.Time) error {
-	latest := now.UTC().Add(-(5*time.Hour + 10*time.Minute)).Truncate(24 * time.Hour).Add(-24 * time.Hour)
+	latest := now.UTC().Add(-(5 * time.Hour)).Truncate(24 * time.Hour).Add(-24 * time.Hour)
 	for _, day := range days {
 		if day.After(latest) {
 			return fmt.Errorf("day %s is not complete; latest completed Legend day is %s", day.Format("2006-01-02"), latest.Format("2006-01-02"))

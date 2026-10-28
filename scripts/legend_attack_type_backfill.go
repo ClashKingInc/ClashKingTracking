@@ -157,7 +157,7 @@ func validateLegendBackfillDays(days []time.Time, now time.Time) error {
 	if len(days) == 0 || len(days) > 14 {
 		return errors.New("specify between 1 and 14 finalized Legend days")
 	}
-	latest := now.UTC().Add(-(5*time.Hour + 10*time.Minute)).Truncate(24 * time.Hour).Add(-24 * time.Hour)
+	latest := now.UTC().Add(-(5 * time.Hour)).Truncate(24 * time.Hour).Add(-24 * time.Hour)
 	for index, day := range days {
 		if !day.Equal(dayStart(day)) || day.After(latest) {
 			return fmt.Errorf("Legend day %s is not a finalized UTC day", day.Format("2006-01-02"))
