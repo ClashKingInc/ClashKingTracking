@@ -21,7 +21,7 @@ jobs:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
         with:
           repository: ClashKingInc/DevKit
-          ref: a9d113b855b62a0d04021f57a74bdc4e394f2a4d
+          ref: e355973f1787c3592c3c2443c3efea1271aaf214
           path: .ci-schema
           persist-credentials: false
       - uses: actions/setup-go@40f1582b2485089dde7abd97c1529aa768e1baff
@@ -44,8 +44,6 @@ jobs:
         run: bash .ci-schema/scripts/with-test-integration.sh --profile retained-api -- env CLASHKING_WELCOME_E2E=1 go run ./cmd/verify-welcome-delivery
       - name: Verify countdown channel updates
         run: bash .ci-schema/scripts/with-test-integration.sh --profile retained-api -- go run ./cmd/verify-countdowns
-      - name: Verify member-count warning delivery
-        run: bash .ci-schema/scripts/with-test-integration.sh --profile retained-api -- go run ./cmd/verify-member-warnings
       - name: Verify capital raid history collection
         run: bash .ci-schema/scripts/with-test-integration.sh --profile retained-api -- go run ./cmd/verify-raid-history
       - name: Verify automatic Discord war events

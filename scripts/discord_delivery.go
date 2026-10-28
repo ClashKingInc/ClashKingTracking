@@ -303,9 +303,6 @@ func (w *discordDeliveryWorker) processEvent(ctx context.Context, event mobileWa
 		}
 	}
 
-	if event.Topic == "clan" && stringMapValue(event.Value, "type") == "member_count" {
-		return true, w.deliverMemberWarning(ctx, event)
-	}
 	if event.Topic == "clan" && stringMapValue(event.Value, "type") == "all_member_donations" {
 		return true, w.markDonationBoardsDirty(ctx, event)
 	}
