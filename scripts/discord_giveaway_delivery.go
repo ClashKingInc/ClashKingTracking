@@ -22,6 +22,7 @@ type giveawayPublication struct {
 	OccurredAt  time.Time `json:"occurred_at"`
 	ReplacedIDs []string  `json:"replaced_user_ids"`
 	ActorLabel  string    `json:"actor_label"`
+	Reason      string    `json:"reason"`
 	Giveaway    struct {
 		ID         string    `json:"id"`
 		ServerID   string    `json:"server_id"`
@@ -95,7 +96,11 @@ func giveawayMessage(payload giveawayPublication, kind string) discord.MessageCr
 				oldWinners = append(oldWinners, "<@"+id+">")
 			}
 			embed.Title = discordClip("🎉 Reroll Winner(s) for "+g.Prize+" 🎉", 256)
-			embed.Description = discordClip(fmt.Sprintf("**Replaced Winner(s):** %s\n**New Winner(s):** %s\n\n**Total Participants:** %d", strings.Join(oldWinners, ", "), strings.Join(winners, ", "), g.EntryCount), 4096)
+			reason := strings.TrimSpace(payload.Reason)
+			if reason == "" {
+				reason = "No reason provided"
+			}
+			embed.Description = discordClip(fmt.Sprintf("**Replaced Winner(s):** %s\n**New Winner(s):** %s\n**Reason:** %s\n\n**Total Participants:** %d", strings.Join(oldWinners, ", "), strings.Join(winners, ", "), discordClip(reason, 1000), g.EntryCount), 4096)
 			embed.Color = 0xe67e22
 			embed.Image = nil
 			embed.Timestamp = &payload.OccurredAt
