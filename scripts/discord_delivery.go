@@ -80,6 +80,12 @@ func (d *discordDeliveryDomain) Run(ctx context.Context, app *platform.App) erro
 	}
 	app.Stats.SetReady(discordDeliveryDomainName, true, "")
 	for {
+		if now := time.Now(); !now.Before(worker.nextCountdownCheck) {
+			worker.nextCountdownCheck = now.Add(15 * time.Minute)
+			if err := worker.refreshCountdownChannels(ctx, now); err != nil {
+				app.Logger.Error("countdown scan failed", "err", err)
+			}
+		}
 		if now := time.Now(); !now.Before(worker.nextBoardCheck) {
 			worker.nextBoardCheck = now.Add(5 * time.Second)
 			if err := worker.refreshDueDonationBoards(ctx); err != nil {
@@ -136,16 +142,17 @@ func validateDiscordDeliveryConfig(cfg platform.Config, client valkey.Client) er
 }
 
 type discordDeliveryWorker struct {
-	emojis         map[string]string
-	nextEmojiLoad  time.Time
-	nextBoardCheck time.Time
-	loadEmojisFn   func() (map[string]string, error)
-	app            *platform.App
-	client         *bot.Client
-	pool           *pgxpool.Pool
-	processEventFn func(context.Context, mobileWarEvent) (bool, error)
-	ackFn          func(context.Context, string) error
-	disableFn      func(context.Context, discordDeliveryTarget, string) (int64, error)
+	emojis             map[string]string
+	nextEmojiLoad      time.Time
+	nextBoardCheck     time.Time
+	nextCountdownCheck time.Time
+	loadEmojisFn       func() (map[string]string, error)
+	app                *platform.App
+	client             *bot.Client
+	pool               *pgxpool.Pool
+	processEventFn     func(context.Context, mobileWarEvent) (bool, error)
+	ackFn              func(context.Context, string) error
+	disableFn          func(context.Context, discordDeliveryTarget, string) (int64, error)
 }
 
 func (w *discordDeliveryWorker) group() string { return "discord-delivery" }
