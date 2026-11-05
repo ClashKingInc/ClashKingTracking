@@ -34,19 +34,20 @@ const (
 type discordDeliveryDomain struct{}
 
 type discordDeliveryTarget struct {
-	ServerID    string
-	ChannelID   string
-	ThreadID    string
-	Custom      string
-	Config      string
-	ConfigID    string
-	WebhookID   string
-	LogType     string
-	ClanTag     string
-	ActiveWarID string
-	MessageID   string
-	Revision    time.Time
-	Secret      string
+	ServerID     string
+	ChannelID    string
+	ThreadID     string
+	Custom       string
+	Config       string
+	ConfigID     string
+	WebhookID    string
+	LogType      string
+	ClanTag      string
+	ActiveWarID  string
+	MessageID    string
+	RedditRoleID string
+	Revision     time.Time
+	Secret       string
 }
 
 func NewDiscordDeliveryDomain() platform.Domain { return &discordDeliveryDomain{} }
@@ -496,11 +497,22 @@ func (w *discordDeliveryWorker) deliverLogEvent(ctx context.Context, event mobil
 	}
 	query := `
 		SELECT server_id, COALESCE(clan_tag, ''), type, webhook_id, COALESCE(thread_id, ''), updated_at,
-		       COALESCE(active_war_id, ''), COALESCE(message_id, '')
+		       COALESCE(active_war_id, ''), COALESCE(message_id, ''), COALESCE(reddit_role_id, '')
 		FROM server_logs
 		WHERE disabled = false AND type = ANY($1)
 	`
 	args := []any{logTypes}
+	if event.Topic == "reddit" && stringMapValue(event.Value, "type") == "redditcomment" {
+		data, _ := mapValue(event.Value["data"])
+		author := stringMapValue(data, "submission_author")
+		if author == "" {
+			return nil
+		}
+		// Reddit usernames are case-insensitive. Keep stored spelling but match
+		// the original post author exactly; never send every comment to every feed.
+		query += ` AND EXISTS (SELECT 1 FROM unnest(reddit_accounts) account WHERE lower(account)=lower($2))`
+		args = append(args, author)
+	}
 	if event.Topic != "reddit" && event.Topic != "maintenance" {
 		query += ` AND clan_tag = $2`
 		args = append(args, event.ClanTag)
@@ -512,7 +524,7 @@ func (w *discordDeliveryWorker) deliverLogEvent(ctx context.Context, event mobil
 	var targets []discordDeliveryTarget
 	for rows.Next() {
 		var target discordDeliveryTarget
-		if err := rows.Scan(&target.ServerID, &target.ClanTag, &target.LogType, &target.WebhookID, &target.ThreadID, &target.Revision, &target.ActiveWarID, &target.MessageID); err != nil {
+		if err := rows.Scan(&target.ServerID, &target.ClanTag, &target.LogType, &target.WebhookID, &target.ThreadID, &target.Revision, &target.ActiveWarID, &target.MessageID, &target.RedditRoleID); err != nil {
 			rows.Close()
 			return err
 		}
@@ -580,6 +592,15 @@ func (w *discordDeliveryWorker) deliverLogEvent(ctx context.Context, event mobil
 			continue
 		}
 		for _, message := range discordLogMessages(event, target.LogType, w.emojis) {
+			if target.LogType == "reddit_feed" && target.RedditRoleID != "" {
+				role, err := snowflake.Parse(target.RedditRoleID)
+				if err != nil {
+					deliveryErr = errors.Join(deliveryErr, fmt.Errorf("invalid Reddit role for server %s", target.ServerID))
+					continue
+				}
+				message.Content = "<@&" + role.String() + ">"
+				message.AllowedMentions = &discord.AllowedMentions{Roles: []snowflake.ID{role}}
+			}
 			if err := w.sendMessage(ctx, resolved, message, nil); err != nil {
 				deliveryErr = errors.Join(deliveryErr, fmt.Errorf("send Discord log destination %s: %w", discordDestinationID(resolved), w.handleDestinationFailure(ctx, resolved, err)))
 				break

@@ -67,6 +67,21 @@ func discordLogMessages(event mobileWarEvent, logType string, catalogs ...map[st
 		return discordFieldMessages(embed)
 	case "reddit_feed":
 		data, _ := mapValue(event.Value["data"])
+		if stringMapValue(event.Value, "type") == "redditcomment" {
+			permalink := stringMapValue(data, "url")
+			if !strings.HasPrefix(permalink, "/r/") {
+				return nil
+			}
+			link := "https://www.reddit.com" + permalink
+			embed := discord.Embed{
+				Title:       discordClip("New Comment on post by u/"+stringMapValue(data, "submission_author"), 256),
+				Description: discordClip(stringMapValue(data, "body"), 3500) + " | [link](" + link + ")",
+				Color:       0x2ecc71,
+				Footer:      &discord.EmbedFooter{Text: discordClip(fmt.Sprintf("u/%s | %d upvotes", stringMapValue(data, "author"), intValue(data["score"])), 2048)},
+			}
+			embed.Description = discordClip(embed.Description, 4096)
+			return []discord.MessageCreate{{Embeds: []discord.Embed{embed}}}
+		}
 		postURL := stringMapValue(data, "url")
 		commentsURL := stringMapValue(data, "comments_link")
 		embed := discord.Embed{Title: discordClip(stringMapValue(data, "title"), 256), Color: 0x2ecc71,
