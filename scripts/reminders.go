@@ -228,9 +228,21 @@ func (d *remindersDomain) reconcileAllWars(ctx context.Context) error {
 	const batchSize = 500
 	after := ""
 	for {
-		rows, err := d.pool.Query(ctx, `SELECT schedule_key FROM war_schedule
-			WHERE end_time > now() AND schedule_key > $1
-			ORDER BY schedule_key LIMIT $2`, after, batchSize)
+		// Wars without any audience or existing job cannot change reminder state.
+		// Keep existing jobs in scope so removed subscriptions still get cleaned up.
+		rows, err := d.pool.Query(ctx, `WITH interested_clans AS MATERIALIZED (
+			SELECT clan_tag AS tag FROM reminders
+			WHERE NOT disabled AND type_name = 'War' AND clan_tag IS NOT NULL
+			UNION
+			SELECT tag FROM user_bookmarks WHERE entity_type = 'clan' AND war_notifications_enabled
+		)
+		SELECT schedule_key FROM war_schedule
+		WHERE end_time > now() AND schedule_key > $1 AND (
+			source_clan_tag IN (SELECT tag FROM interested_clans)
+			OR opponent_tag IN (SELECT tag FROM interested_clans)
+			OR schedule_key IN (SELECT schedule_key FROM war_reminder_jobs)
+		)
+		ORDER BY schedule_key LIMIT $2`, after, batchSize)
 		if err != nil {
 			return err
 		}
