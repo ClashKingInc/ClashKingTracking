@@ -20,6 +20,15 @@ func discordLogMessages(event mobileWarEvent, logType string, catalogs ...map[st
 	badge, _ := mapValue(clan["badgeUrls"])
 	badgeURL := firstDiscordString(stringMapValue(badge, "large"), stringMapValue(badge, "medium"))
 	switch logType {
+	case "clash_maintenance":
+		embed := discord.Embed{Title: icons.icon("builder", "🔨") + " Clash of Clans maintenance", Description: "Maintenance has started.", Color: 0xf5a623}
+		if stringMapValue(event.Value, "status") == "recovered" {
+			seconds := max(0, intValue(event.Value["duration_seconds"]))
+			elapsed := fmt.Sprintf("%dm %ds", seconds/60, seconds%60)
+			embed.Description = "Maintenance ended after " + elapsed + ". Get back to clashing!"
+			embed.Color = 0x2ecc71
+		}
+		return []discord.MessageCreate{{Embeds: []discord.Embed{embed}}}
 	case "capital_weekly_summary":
 		return discordCapitalWeeklySummaryMessages(event, icons)
 	case "clan_achievement_log":

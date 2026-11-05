@@ -17,8 +17,8 @@ const armyFamilyCloseoutLockID int64 = 636413279150006789
 var legendCloseoutCohorts = [...]string{"legend_i", "top_1000", "top_200"}
 
 // RebuildLegendCloseouts reruns only the requested finalized Legend days. The
-// caller owns environment safety checks; each day still requires an imported
-// ranking snapshot and is rebuilt transactionally.
+// caller owns environment safety checks. Full Legends I uses raw observations;
+// only ranked subsets require a historical snapshot. Each day is transactional.
 func RebuildLegendCloseouts(ctx context.Context, dsn string, days []time.Time) (int, error) {
 	store, err := newTimescaleScheduledStore(ctx, dsn)
 	if err != nil {
@@ -27,6 +27,11 @@ func RebuildLegendCloseouts(ctx context.Context, dsn string, days []time.Time) (
 	defer store.pool.Close()
 	writes := 0
 	for _, day := range days {
+		observed, rebuildErr := store.FinalizeObservedLegendDay(ctx, day)
+		if rebuildErr != nil {
+			return writes, rebuildErr
+		}
+		writes += observed
 		count, rebuildErr := store.FinalizeLegendCloseout(ctx, day)
 		if rebuildErr != nil {
 			return writes, fmt.Errorf("rebuild Legend closeout %s: %w", day.Format("2006-01-02"), rebuildErr)
@@ -193,6 +198,7 @@ func (s *timescaleScheduledStore) FinalizeLegendCloseout(ctx context.Context, da
 	if err != nil {
 		return 0, err
 	}
+
 	tx, err := s.pool.Begin(ctx)
 	if err != nil {
 		return 0, err
@@ -227,9 +233,6 @@ func (s *timescaleScheduledStore) finalizeLegendCloseout(ctx context.Context, tx
 	if err = tx.QueryRow(ctx, `SELECT EXISTS(SELECT 1 FROM legend_rankings_history WHERE day=$1)`, day).Scan(&snapshotExists); err != nil {
 		return 0, err
 	}
-	if !snapshotExists {
-		return 0, fmt.Errorf("Legend ranking snapshot is unavailable for %s", day.Format("2006-01-02"))
-	}
 	attacks, usage, err := readLegendAttacks(ctx, tx, start, end, false)
 	if err != nil {
 		return 0, err
@@ -250,6 +253,11 @@ func (s *timescaleScheduledStore) finalizeLegendCloseout(ctx context.Context, tx
 		byCohort[attack.cohort] = append(byCohort[attack.cohort], attack)
 	}
 	cohorts := legendCloseoutCohorts[:]
+	if !snapshotExists {
+		// Absence is not a measured zero for ranked subsets. The full cohort
+		// still includes every retained Legend attack in this game-day window.
+		cohorts = cohorts[:1]
+	}
 	for _, cohort := range cohorts {
 		g, metadata := aggregateLegend(byCohort[cohort], decoded, static)
 		hj, _ := json.Marshal(itemStats(metadata.heroes))
@@ -331,7 +339,8 @@ func readLegendAttacks(ctx context.Context, tx pgx.Tx, start, end time.Time, inc
 	}
 	r, e := tx.Query(ctx, `
 		WITH cohort_members AS (
-			SELECT tag AS player_tag,'legend_i'::text AS cohort FROM legend_rankings_history WHERE day=$3
+			SELECT DISTINCT player_tag,'legend_i'::text AS cohort FROM battles_ranked
+			WHERE battle_mode=2 AND direction=1 AND battle_time >= $1 AND battle_time < $2
 			UNION ALL
 			SELECT tag,'top_1000'::text FROM legend_rankings_history WHERE day=$3 AND global_rank <= 1000
 			UNION ALL

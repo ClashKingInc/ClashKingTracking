@@ -39,10 +39,15 @@ type donationBoard struct {
 }
 
 func (w *discordDeliveryWorker) refreshDueDonationBoards(ctx context.Context) error {
+	guilds := make([]string, 0, len(w.app.Config.DiscordGuildAllowlist))
+	for id := range w.app.Config.DiscordGuildAllowlist {
+		guilds = append(guilds, id)
+	}
 	rows, err := w.pool.Query(ctx, `SELECT id::text,server_id,webhook_id,COALESCE(thread_id,''),COALESCE(message_id,''),
 		delivery_mode,target_scope,row_limit,COALESCE(interval_minutes,1),COALESCE(schedule_kind,''),
 		COALESCE(to_char(schedule_time,'HH24:MI'),''),COALESCE(schedule_weekdays,'{}'),COALESCE(schedule_day_of_month,1),updated_at
-		FROM autoboards WHERE enabled AND board_type='donations' AND next_run_at<=now() ORDER BY next_run_at,id LIMIT 20`)
+		FROM autoboards WHERE enabled AND board_type='donations' AND next_run_at<=now()
+        AND (cardinality($1::text[])=0 OR server_id=ANY($1::text[])) ORDER BY next_run_at,id LIMIT 20`, guilds)
 	if err != nil {
 		return err
 	}

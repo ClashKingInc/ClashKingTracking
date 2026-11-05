@@ -57,7 +57,7 @@ const cwlFinalizedWarsSQL = `
     SELECT DISTINCT g.cwl_league_id,g.war_size,w.war_id,w.archive_pack_id,w.archive_offset,w.archive_compressed_bytes
     FROM cwl_groups g
     CROSS JOIN LATERAL jsonb_array_elements(g.rounds) AS round(value)
-    CROSS JOIN LATERAL jsonb_array_elements_text(round.value) AS tag(value)
+    CROSS JOIN LATERAL jsonb_array_elements_text(CASE WHEN jsonb_typeof(round.value)='array' THEN round.value ELSE COALESCE(round.value->'warTags','[]'::jsonb) END) AS tag(value)
     JOIN wars w ON w.war_tag=tag.value AND w.war_type='cwl' AND lower(w.state) IN ('warended','ended')
     WHERE g.season >= $1 AND g.season < $2 AND g.cwl_league_id > 48000000 AND g.war_size BETWEEN 1 AND 50
     AND w.end_time >= ($1::text || '-01')::date - interval '7 days' AND w.end_time < ($2::text || '-01')::date + interval '7 days'`

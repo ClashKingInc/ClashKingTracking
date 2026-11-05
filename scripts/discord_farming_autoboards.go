@@ -16,13 +16,14 @@ import (
 
 type farmingBoard struct {
 	ID, ServerID, WebhookID, ThreadID, MessageID, ClanTag, Window, Zone string
+	Days                                                                int
 	Limit, Seconds                                                      int
 	Started, Revision                                                   time.Time
 }
 
 func (w *discordDeliveryWorker) refreshDueFarmingBoards(ctx context.Context) error {
 	rows, err := w.pool.Query(ctx, `SELECT a.id::text,a.server_id,a.webhook_id,COALESCE(a.thread_id,''),COALESCE(a.message_id,''),
- t.target,f.window_mode,f.time_zone,a.row_limit,COALESCE(a.interval_seconds,a.interval_minutes*60,30),f.counting_from,a.updated_at
+ t.target,f.window_mode,f.time_zone,a.row_limit,COALESCE(a.interval_seconds,a.interval_minutes*60,30),f.counting_from,a.updated_at,f.rolling_days
  FROM autoboards a JOIN autoboard_farming_settings f ON f.autoboard_id=a.id
  JOIN autoboard_targets t ON t.autoboard_id=a.id AND t.position=0
  WHERE a.enabled AND a.board_type='farming' AND a.delivery_mode='refresh' AND a.next_run_at<=now()
@@ -33,7 +34,7 @@ func (w *discordDeliveryWorker) refreshDueFarmingBoards(ctx context.Context) err
 	var boards []farmingBoard
 	for rows.Next() {
 		var b farmingBoard
-		if err = rows.Scan(&b.ID, &b.ServerID, &b.WebhookID, &b.ThreadID, &b.MessageID, &b.ClanTag, &b.Window, &b.Zone, &b.Limit, &b.Seconds, &b.Started, &b.Revision); err != nil {
+		if err = rows.Scan(&b.ID, &b.ServerID, &b.WebhookID, &b.ThreadID, &b.MessageID, &b.ClanTag, &b.Window, &b.Zone, &b.Limit, &b.Seconds, &b.Started, &b.Revision, &b.Days); err != nil {
 			rows.Close()
 			return err
 		}
@@ -78,6 +79,8 @@ func (w *discordDeliveryWorker) deliverFarmingBoard(ctx context.Context, b farmi
 		return err
 	}
 	switch b.Window {
+	case "rolling_days":
+		start = now.AddDate(0, 0, -max(1, min(180, b.Days)))
 	case "calendar_month":
 		local := now.In(zone)
 		start = time.Date(local.Year(), local.Month(), 1, 0, 0, 0, 0, zone).UTC()

@@ -98,6 +98,9 @@ func (d *mobilePushDomain) runCycle(ctx context.Context, app *platform.App) erro
 	for _, campaign := range campaigns {
 		// Retired automatic season notices must not send, including already queued rows.
 		if strings.HasPrefix(campaign.Key, "game-event-season-start-") {
+			if err := d.store.RecordCampaignDelivery(ctx, campaign, now, 0, 0, 0, "no_audience"); err != nil {
+				return err
+			}
 			continue
 		}
 		devices, loadErr := d.store.DevicesForPlatforms(ctx, campaign.Platforms, campaign.TargetLocales, campaignNotificationPreference(campaign))

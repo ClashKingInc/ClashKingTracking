@@ -350,15 +350,17 @@ func (d *leaderboardsDomain) fetchLeagues(ctx context.Context, app *platform.App
 	return out, nil
 }
 
-func (d *leaderboardsDomain) fetchPlayers(ctx context.Context, app *platform.App, limiter *clashy.Limiter, tags []string, leagues map[int]leaderboardLeaguePayload) ([]leaderboardPlayerRow, []string, error) {
+func (d *leaderboardsDomain) fetchPlayers(ctx context.Context, app *platform.App, limiter *clashy.Limiter, tags []string, leagues map[int]leaderboardLeaguePayload) ([]leaderboardPlayerRow, []models.PlayerDeletion, error) {
 	var mu sync.Mutex
 	players := make([]leaderboardPlayerRow, 0, len(tags))
-	deleteTags := make([]string, 0)
+	deleteTags := make([]models.PlayerDeletion, 0)
 	skipped := 0
 	notFound := 0
 	err := runBounded(ctx, platform.RequestConcurrency(app.Config.ScheduledRequestsPerSecond), tags, func(workerCtx context.Context, tag string) error {
+		var observedAt time.Time
 		player, err := retryLimitedClashFetch(workerCtx, app, limiter, func(fetchCtx context.Context) (*clashy.Player, error) {
 			start := time.Now()
+			observedAt = start.UTC()
 			player, err := app.Clash.GetPlayer(fetchCtx, tag)
 			app.Stats.RecordRequest(leaderboardsDomainName, time.Since(start), err)
 			return player, err
@@ -369,7 +371,7 @@ func (d *leaderboardsDomain) fetchPlayers(ctx context.Context, app *platform.App
 			skipped++
 			if errors.As(err, &missing) {
 				notFound++
-				deleteTags = append(deleteTags, tag)
+				deleteTags = append(deleteTags, models.PlayerDeletion{Tag: tag, ObservedAt: observedAt})
 			}
 			mu.Unlock()
 			return nil
@@ -379,6 +381,7 @@ func (d *leaderboardsDomain) fetchPlayers(ctx context.Context, app *platform.App
 			return nil
 		}
 		mu.Lock()
+		row.ObservedAt = observedAt
 		players = append(players, row)
 		mu.Unlock()
 		return nil
@@ -393,7 +396,7 @@ func (d *leaderboardsDomain) fetchPlayers(ctx context.Context, app *platform.App
 		app.Logger.Warn("leaderboards player refresh skipped players", "skipped", skipped, "not_found", notFound, "candidates", len(tags))
 	}
 	sort.Slice(players, func(i, j int) bool { return players[i].Tag < players[j].Tag })
-	sort.Strings(deleteTags)
+	sort.Slice(deleteTags, func(i, j int) bool { return deleteTags[i].Tag < deleteTags[j].Tag })
 	return players, deleteTags, nil
 }
 
@@ -693,12 +696,20 @@ func (s *timescaleLeaderboardStore) updatePlayersOnce(ctx context.Context, playe
 	return tx.Commit(ctx)
 }
 
-func (s *timescaleLeaderboardStore) DeletePlayers(ctx context.Context, tags []string) (int, error) {
-	if len(tags) == 0 {
+func (s *timescaleLeaderboardStore) DeletePlayers(ctx context.Context, deletions []models.PlayerDeletion) (int, error) {
+	if len(deletions) == 0 {
 		return 0, nil
 	}
-	tag, err := s.pool.Exec(ctx, `DELETE FROM basic_player WHERE tag = ANY($1::text[])`, tags)
-	return int(tag.RowsAffected()), err
+	tx, err := s.pool.Begin(ctx)
+	if err != nil {
+		return 0, err
+	}
+	defer tx.Rollback(ctx)
+	count, err := utils.DeletePlayersCount(ctx, tx, deletions)
+	if err != nil {
+		return 0, err
+	}
+	return count, tx.Commit(ctx)
 }
 
 func (s *timescaleLeaderboardStore) LoadClanMetadata(ctx context.Context, clanTags []string) (map[string]leaderboardClanMetadata, error) {

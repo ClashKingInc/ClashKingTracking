@@ -18,6 +18,7 @@ import (
 
 	"clashking_tracking/internal/platform"
 	"clashking_tracking/scripts"
+	clashy "github.com/clashkinginc/clashy.go"
 	"github.com/jackc/pgx/v5/pgxpool"
 	"github.com/valkey-io/valkey-go"
 )
@@ -112,7 +113,16 @@ func run() error {
 	defer cache.Close()
 	stream := fmt.Sprintf("welcome-e2e:%d", os.Getpid())
 	defer cache.Do(context.Background(), cache.B().Del().Key(stream).Build())
-	app := &platform.App{Config: platform.Config{TimescaleURL: dsn, DiscordBotToken: base64.RawStdEncoding.EncodeToString([]byte(application)) + ".local.local", DiscordAPIURL: provider.URL, DiscordGuildAllowlist: map[string]struct{}{guild: {}}, DiscordDeliveryBatchSize: 10, EventStreamName: stream, EventStreamReclaimIdleSeconds: 1}, Valkey: cache, Logger: slog.New(slog.NewTextHandler(os.Stderr, nil)), Stats: platform.NewTracker(), Availability: platform.NewAvailabilityGate(nil)}
+	cfg := clashy.DefaultClientConfig()
+	cfg.BaseURL = provider.URL + "/v1"
+	cfg.LookupCache = false
+	cfg.UpdateCache = false
+	clash, err := clashy.NewClient(cfg)
+	if err != nil {
+		return err
+	}
+	defer clash.Close()
+	app := &platform.App{Config: platform.Config{TimescaleURL: dsn, DiscordBotToken: base64.RawStdEncoding.EncodeToString([]byte(application)) + ".local.local", DiscordAPIURL: provider.URL, ClashKingAPIURL: provider.URL, ClashKingAPIToken: "local-only", DiscordGuildAllowlist: map[string]struct{}{guild: {}}, DiscordDeliveryBatchSize: 10, EventStreamName: stream, EventStreamReclaimIdleSeconds: 1}, Clash: clash, Valkey: cache, Logger: slog.New(slog.NewTextHandler(os.Stderr, nil)), Stats: platform.NewTracker(), Availability: platform.NewAvailabilityGate(nil)}
 	done := make(chan error, 1)
 	go func() { done <- scripts.NewDiscordDeliveryDomain().Run(ctx, app) }()
 	defer func() { cancel(); <-done }()

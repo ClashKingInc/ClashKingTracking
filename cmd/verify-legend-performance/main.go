@@ -6,6 +6,7 @@ import (
 	"context"
 	"fmt"
 	"os"
+	"os/exec"
 	"strings"
 	"time"
 
@@ -100,8 +101,9 @@ func main() {
 		must(db.QueryRow(ctx, `SELECT complete_player_count FROM legend_day_performance WHERE day=$1 AND cohort='top_200' AND direction=1`, day).Scan(&complete))
 		assert(complete == 4, "Snapshot top-200 membership")
 	}
-	_, err = scripts.RebuildLegendDayPerformance(ctx, dsn, []time.Time{day.Add(-24 * time.Hour)})
-	assert(err != nil, "Absent snapshot must not fabricate a day")
+	absentWrites, err := scripts.RebuildLegendDayPerformance(ctx, dsn, []time.Time{day.Add(-24 * time.Hour)})
+	must(err)
+	assert(absentWrites == 0, "Absent snapshot must not fabricate ranked performance")
 	// A second real snapshot moves this player out of the top 200. Historical
 	// cohort membership must stay tied to each day's saved rank.
 	next := day.Add(24 * time.Hour)
@@ -117,5 +119,70 @@ func main() {
 	must(db.QueryRow(ctx, `SELECT global_rank FROM legend_rankings_history WHERE day=$1 AND tag=$2`, day, tags[0]).Scan(&oldRank))
 	must(db.QueryRow(ctx, `SELECT global_rank FROM legend_rankings_history WHERE day=$1 AND tag=$2`, next, tags[0]).Scan(&newRank))
 	assert(oldRank == 1 && newRank == 1200, "Historical rank must remain immutable")
+	for run := 0; run < 2; run++ {
+		written, err := scripts.RebuildObservedLegendDays(ctx, dsn, []time.Time{day})
+		must(err)
+		assert(written == 2, "Observed rebuild writes both directions")
+		var battles int64
+		var complete, invalid int
+		must(db.QueryRow(ctx, `SELECT observed_battle_count,complete_player_count,invalid_player_count FROM legend_observed_daily_stats WHERE day=$1 AND direction=1`, day).Scan(&battles, &complete, &invalid))
+		assert(battles == 55 && complete == 6 && invalid == 1, "Observed rows exclude the invalid >8-battle day")
+	}
+	// Without a rank snapshot, observed statistics still rebuild from raw data.
+	written, err := scripts.RebuildObservedLegendDays(ctx, dsn, []time.Time{day.Add(-24 * time.Hour)})
+	must(err)
+	assert(written == 2, "Observed closeout does not require rankings")
+	// Full army/item closeouts must work without any historical rank snapshot.
+	missingDay := day.Add(-48 * time.Hour)
+	for i := 0; i < 8; i++ {
+		_, err = db.Exec(ctx, `INSERT INTO battles_ranked(player_tag,opponent_tag,battle_time,direction,battle_mode,player_town_hall,opponent_town_hall,stars,destruction_percentage,duration_seconds,looted_resources,share_code)
+		VALUES('#QYQ','#QQQ',$1,1,2,18,18,3,100,120,'{}','u10x8')`, missingDay.Add(5*time.Hour+time.Duration(i)*time.Minute))
+		must(err)
+	}
+	for i := 0; i < 2; i++ {
+		_, err = scripts.RebuildLegendCloseouts(ctx, dsn, []time.Time{missingDay})
+		must(err)
+		var attacks, ranked, setups, performance int
+		must(db.QueryRow(ctx, `SELECT attack_count FROM legend_daily_stats WHERE day=$1 AND cohort='legend_i'`, missingDay).Scan(&attacks))
+		must(db.QueryRow(ctx, `SELECT count(*) FROM legend_daily_stats WHERE day=$1 AND cohort<>'legend_i'`, missingDay).Scan(&ranked))
+		must(db.QueryRow(ctx, `SELECT count(*) FROM army_setup_daily_stats WHERE day=$1 AND rank_limit IS NULL`, missingDay).Scan(&setups))
+		must(db.QueryRow(ctx, `SELECT count(*) FROM legend_day_performance WHERE day=$1`, missingDay).Scan(&performance))
+		assert(attacks == 8 && ranked == 0 && setups > 0 && performance == 0, "Missing ranks must retain full-cohort totals/setups without fabricated ranked output")
+	}
+	// Even with a rank snapshot, an observed Legend player missing from that
+	// snapshot belongs to All, never to either ranked subset.
+	_, err = db.Exec(ctx, `INSERT INTO battles_ranked(player_tag,opponent_tag,battle_time,direction,battle_mode,player_town_hall,opponent_town_hall,stars,destruction_percentage,duration_seconds,looted_resources,share_code)
+	VALUES('#QYV','#QQQ',$1,1,2,18,18,3,100,120,'{}','u10x8')`, start.Add(3*time.Hour))
+	must(err)
+	_, err = scripts.RebuildLegendCloseouts(ctx, dsn, []time.Time{day})
+	must(err)
+	var allAttacks, top1000Attacks, top200Attacks int
+	must(db.QueryRow(ctx, `SELECT attack_count FROM legend_daily_stats WHERE day=$1 AND cohort='legend_i'`, day).Scan(&allAttacks))
+	must(db.QueryRow(ctx, `SELECT attack_count FROM legend_daily_stats WHERE day=$1 AND cohort='top_1000'`, day).Scan(&top1000Attacks))
+	must(db.QueryRow(ctx, `SELECT attack_count FROM legend_daily_stats WHERE day=$1 AND cohort='top_200'`, day).Scan(&top200Attacks))
+	assert(allAttacks == 65 && top1000Attacks == 56 && top200Attacks == 48, "All must include unranked observations without contaminating rank cohorts")
+
+	// Exercise the operator command through the actual disposable database.
+	var previewBefore, previewAfter string
+	snapshot := `SELECT coalesce(jsonb_agg(to_jsonb(s) ORDER BY cohort),'[]'::jsonb)::text FROM legend_daily_stats s WHERE day=$1`
+	must(db.QueryRow(ctx, snapshot, day).Scan(&previewBefore))
+	runCLI := func(args ...string) {
+		command := exec.CommandContext(ctx, "go", append([]string{"run", "./cmd/rebuild-legend-days"}, args...)...)
+		command.Env = append(os.Environ(), "TIMESCALE_HOST=", "TIMESCALE_URL="+dsn)
+		output, err := command.CombinedOutput()
+		if err != nil {
+			panic(fmt.Errorf("operator command: %w: %s", err, output))
+		}
+	}
+	runCLI("--days", day.Format("2006-01-02"))
+	must(db.QueryRow(ctx, snapshot, day).Scan(&previewAfter))
+	assert(previewBefore == previewAfter, "Operator preview changed derived rows")
+	var rawBefore, rawAfter int
+	must(db.QueryRow(ctx, "SELECT count(*) FROM battles_ranked").Scan(&rawBefore))
+	runCLI("--from", missingDay.Format("2006-01-02"), "--through", day.Format("2006-01-02"), "--apply")
+	must(db.QueryRow(ctx, "SELECT count(*) FROM battles_ranked").Scan(&rawAfter))
+	assert(rawBefore == rawAfter, "Operator rebuild deleted raw battles")
+	fmt.Println("PASS operator CLI: preview leaves rows unchanged; bounded multi-day apply retains raw battles")
+	fmt.Println("PASS full Legends I without ranks: totals, army setups, no fabricated ranked rows, repeatable rebuild")
 	fmt.Println("PASS: actual Timescale Legend performance closeout; bucket boundaries, both sides, coverage, invalid observations, replay, and snapshot isolation")
 }

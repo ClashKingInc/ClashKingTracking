@@ -13,6 +13,7 @@ It runs continuously as `trackedclans`. A clan loop, a regular current-war loop,
 The registry is built in one SQL query from active-server configuration:
 
 - Join or leave logs enable clan polling and member events.
+- Active configured server clans also enable clan polling, supplying full cached member lists and town hall levels to `trackedplayers`, even without a clan-level log.
 - War logs or war panels enable war polling and live war events.
 - Discord war reminders enable war polling so a new war can be scheduled, but do not by themselves enable attack/state event publication.
 

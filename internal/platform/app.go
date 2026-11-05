@@ -134,11 +134,16 @@ func (a *App) Close(ctx context.Context) error {
 func Run(ctx context.Context, app *App, domains []Domain) error {
 	runCtx, cancel := context.WithCancel(ctx)
 	defer cancel()
+	// Background users of shared clients must exit before App.Close releases them.
+	var background sync.WaitGroup
+	defer func() { cancel(); background.Wait() }()
 	if app.StatsWriter != nil {
-		go app.StatsWriter.Run(runCtx, app.Logger)
+		background.Add(1)
+		go func() { defer background.Done(); app.StatsWriter.Run(runCtx, app.Logger) }()
 	}
 	if app.Availability != nil {
-		go app.Availability.Run(runCtx)
+		background.Add(1)
+		go func() { defer background.Done(); app.Availability.Run(runCtx) }()
 	}
 	var wg sync.WaitGroup
 	errCh := make(chan error, len(domains))
@@ -199,7 +204,7 @@ func proxyConnectionLimit(cfg Config) int {
 func needsClashClient(cfg Config) bool {
 	switch cfg.Script {
 	case "discord-delivery":
-		return cfg.ProxyURL != ""
+		return true
 	case "globalclans", "trackedplayers", "basicplayers", "trackedclans", "war-discovery", "cwl", "war-archiver", "capital", "reminders", "availability", "scheduled", "battlelogs", "leaderboards", "notifications":
 		return true
 	default:

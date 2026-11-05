@@ -98,7 +98,9 @@ func (d *trackedClansDomain) Run(ctx context.Context, app *platform.App) error {
 	go func() {
 		errCh <- d.runCWLLoop(trackerCtx, app, limiter)
 	}()
-	go d.runTargetRefreshLoop(trackerCtx, app, store)
+	refreshDone := make(chan struct{})
+	go func() { defer close(refreshDone); d.runTargetRefreshLoop(trackerCtx, app, store) }()
+	defer func() { stopTrackers(); <-refreshDone }()
 	firstErr := <-errCh
 	stopTrackers()
 	for range 2 {
@@ -265,6 +267,12 @@ const trackedClanTargetsSQL = `
 				  AND reminder.clan_tag <> ''
 				UNION
 				SELECT c.tag, 'war_event' AS kind FROM server_clans c JOIN servers s ON s.id=c.server_id WHERE c.war_events_enabled AND s.left_at IS NULL
+                UNION
+                SELECT target.target, 'clan' AS kind
+                FROM autoboard_targets target JOIN autoboards board ON board.id=target.autoboard_id
+                JOIN servers server ON server.id=board.server_id
+                WHERE board.enabled AND board.board_type='donations' AND board.target_scope='custom'
+                  AND server.left_at IS NULL AND server.last_command_at >= now() - interval '90 days'
                 UNION
 				SELECT tag, 'war_event' AS kind FROM clan_notification_tracking WHERE war_tracked
 			) targets

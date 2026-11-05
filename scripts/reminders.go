@@ -62,7 +62,9 @@ func (d *remindersDomain) Run(ctx context.Context, app *platform.App) error {
 	if err := d.reconcileAllWars(ctx); err != nil {
 		return err
 	}
+	runCtx, cancel := context.WithCancel(ctx)
 	var wg sync.WaitGroup
+	defer func() { cancel(); wg.Wait() }()
 	errCh := make(chan error, 6)
 	for _, run := range []func(context.Context, *platform.App) error{
 		d.runEventLoop,
@@ -75,7 +77,7 @@ func (d *remindersDomain) Run(ctx context.Context, app *platform.App) error {
 		wg.Add(1)
 		go func(run func(context.Context, *platform.App) error) {
 			defer wg.Done()
-			errCh <- run(ctx, app)
+			errCh <- run(runCtx, app)
 		}(run)
 	}
 	select {
@@ -565,11 +567,20 @@ func finishDueWarJob(ctx context.Context, job dueWarJob, war *clashy.ClanWar, fe
 		if err != nil {
 			return err
 		}
-		if err := publish(ctx, platform.Event{Topic: "reminder", ClanTag: job.clanTag, Value: map[string]any{
-			"type": "war", "schedule_key": job.key, "minutes_remaining": job.minutes,
-			"data": json.RawMessage(raw),
-		}}); err != nil {
-			return err
+		// A single schedule can have subscribers on either side of the war.
+		// Recipient selection still checks each user's own clan and preferences.
+		clans := map[string]bool{}
+		for _, side := range []*clashy.WarClan{war.Clan, war.Opponent} {
+			if side == nil || side.Tag == "" || clans[side.Tag] {
+				continue
+			}
+			clans[side.Tag] = true
+			if err := publish(ctx, platform.Event{Topic: "reminder", ClanTag: side.Tag, Value: map[string]any{
+				"type": "war", "schedule_key": job.key, "minutes_remaining": job.minutes,
+				"data": json.RawMessage(raw),
+			}}); err != nil {
+				return err
+			}
 		}
 	}
 	return remove()
@@ -795,6 +806,11 @@ func loadCachedRaid(ctx context.Context, app *platform.App, clanTag string) (cla
 	}
 	var raid clashy.RaidLogEntry
 	if json.Unmarshal(decoded, &raid) != nil {
+		return clashy.RaidLogEntry{}, false
+	}
+	// The 96-hour cache can outlive a weekend. A prior-week snapshot must
+	// never supply early-weekend attack counts for the current reminder.
+	if raid.EndTime == nil || !raid.EndTime.Time.Equal(raidWeekendEnd(time.Now())) {
 		return clashy.RaidLogEntry{}, false
 	}
 	return raid, true

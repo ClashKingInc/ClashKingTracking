@@ -233,7 +233,14 @@ const loadActivePlayerTimersSQL = `
 	ORDER BY expires_at, event_type, event_key
 `
 
-const deleteExpiredPlayerTimersSQL = `DELETE FROM player_timers WHERE expires_at <= now()`
+// A scheduled war may be extended by official maintenance after its old end.
+// Keep its participants until finalization/abandonment removes the schedule;
+// deleting by wall-clock expiry would leave recovery with nothing to extend.
+const deleteExpiredPlayerTimersSQL = `DELETE FROM player_timers timer
+WHERE timer.expires_at <= now()
+  AND (timer.event_type <> 'war' OR NOT EXISTS (
+    SELECT 1 FROM war_schedule schedule WHERE schedule.schedule_key = timer.event_key
+  ))`
 
 func (s *timescaleWarStore) LoadActivePlayerTimers(ctx context.Context, playerTag string) ([]models.PlayerTimerRow, error) {
 	rows, err := s.pool.Query(ctx, loadActivePlayerTimersSQL, playerTag)

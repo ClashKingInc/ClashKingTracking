@@ -25,6 +25,9 @@ const (
 	playerHistoryExperience    int16 = 10
 	playerHistoryWarPreference int16 = 11
 	playerHistoryName          int16 = 12
+	playerHistoryLeagueTier    int16 = 13
+	playerHistoryWarStars      int16 = 14
+	playerHistoryCapital       int16 = 15
 )
 
 type normalizedPlayerHistoryRow struct {
@@ -74,11 +77,23 @@ func normalizePlayerProfileChange(change models.PlayerProfileChangeRow, static *
 		scalarType = playerHistoryBestBuilder
 	case "expLevel":
 		scalarType = playerHistoryExperience
+	case "leagueTier":
+		scalarType = playerHistoryLeagueTier
+	case "warStars":
+		scalarType = playerHistoryWarStars
+	case "clanCapitalContributions":
+		scalarType = playerHistoryCapital
 	}
 	if scalarType != 0 {
-		previous, previousOK := historyNumber(change.PreviousValue)
-		current, currentOK := historyNumber(change.CurrentValue)
-		if previousOK && currentOK && current > previous {
+		previousValue, currentValue := change.PreviousValue, change.CurrentValue
+		if scalarType == playerHistoryLeagueTier {
+			// Tier movement is bidirectional; store the official ID, not a name
+			// that can change with localization. Nil denotes no league (ID 0).
+			previousValue, currentValue = historyLeagueTier(previousValue), historyLeagueTier(currentValue)
+		}
+		previous, previousOK := historyNumber(previousValue)
+		current, currentOK := historyNumber(currentValue)
+		if previousOK && currentOK && (current > previous || scalarType == playerHistoryLeagueTier && current != previous) {
 			base.ChangeType = scalarType
 			base.PreviousValue, base.CurrentValue = strconv.FormatInt(previous, 10), strconv.FormatInt(current, 10)
 			return []normalizedPlayerHistoryRow{base}
@@ -212,4 +227,14 @@ func historyWarPreference(value any) (string, bool) {
 	default:
 		return "", false
 	}
+}
+
+func historyLeagueTier(value any) any {
+	if value == nil {
+		return 0
+	}
+	if object, ok := value.(map[string]any); ok {
+		return object["id"]
+	}
+	return value
 }

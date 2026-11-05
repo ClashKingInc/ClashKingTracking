@@ -517,7 +517,7 @@ func (w *mobileEventsWorker) processWarReminder(ctx context.Context, event mobil
 			return err
 		}
 	}
-	if live == nil || live.State != "inWar" || live.EndTime == nil || !live.EndTime.Time.After(time.Now()) {
+	if !warReminderAvailable(live, time.Now()) {
 		return nil
 	}
 	// A delayed job for a previous war must not remind for a different war.

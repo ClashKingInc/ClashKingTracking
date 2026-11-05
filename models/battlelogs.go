@@ -5,6 +5,7 @@ import (
 )
 
 type BasicPlayerRow struct {
+	ObservedAt       time.Time
 	Tag              string
 	Name             string
 	LeagueID         int

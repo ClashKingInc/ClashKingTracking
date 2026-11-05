@@ -2,6 +2,7 @@ package scripts
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
 	"math"
 	"time"
@@ -29,7 +30,7 @@ const discordCWLPromotionWarsSQL = `
 	       w.clan_destruction_percentage, w.opponent_destruction_percentage
 	FROM cwl_groups g
 	CROSS JOIN LATERAL jsonb_array_elements(g.rounds) WITH ORDINALITY AS round(value, ordinality)
-	CROSS JOIN LATERAL jsonb_array_elements_text(round.value) AS tag(value)
+	CROSS JOIN LATERAL jsonb_array_elements_text(CASE WHEN jsonb_typeof(round.value)='array' THEN round.value ELSE COALESCE(round.value->'warTags','[]'::jsonb) END) AS tag(value)
 	JOIN wars w ON w.war_tag = tag.value AND w.war_type = 'cwl'
 	  AND lower(w.state) IN ('warended', 'ended')
 	  AND (w.clan_tag = $2 OR w.opponent_tag = $2)
@@ -123,9 +124,32 @@ func loadDiscordCWLPromotionDetails(ctx context.Context, pool *pgxpool.Pool, eve
 	var groups []group
 	for rows.Next() {
 		var candidate group
-		if err := rows.Scan(&candidate.id, &candidate.season, &candidate.rounds); err != nil {
+		var raw json.RawMessage
+		if err := rows.Scan(&candidate.id, &candidate.season, &raw); err != nil {
 			rows.Close()
 			return nil, err
+		}
+		var rounds []json.RawMessage
+		if err := json.Unmarshal(raw, &rounds); err != nil {
+			rows.Close()
+			return nil, err
+		}
+		for _, rawRound := range rounds {
+			var tags []string
+			if len(rawRound) > 0 && rawRound[0] == '{' {
+				var round struct {
+					WarTags []string `json:"warTags"`
+				}
+				if err := json.Unmarshal(rawRound, &round); err != nil {
+					rows.Close()
+					return nil, err
+				}
+				tags = round.WarTags
+			} else if err := json.Unmarshal(rawRound, &tags); err != nil {
+				rows.Close()
+				return nil, err
+			}
+			candidate.rounds = append(candidate.rounds, tags)
 		}
 		groups = append(groups, candidate)
 	}

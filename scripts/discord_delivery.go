@@ -78,18 +78,16 @@ func (d *discordDeliveryDomain) Run(ctx context.Context, app *platform.App) erro
 	if err := worker.ensureGroup(ctx); err != nil {
 		return err
 	}
+	periodicCtx, stopPeriodic := context.WithCancel(ctx)
+	periodicDone := make(chan struct{})
+	periodic := &discordDeliveryWorker{app: app, client: client, pool: pool}
+	go func() {
+		defer close(periodicDone)
+		periodic.runPeriodicChannels(periodicCtx)
+	}()
+	defer func() { stopPeriodic(); <-periodicDone }()
 	app.Stats.SetReady(discordDeliveryDomainName, true, "")
 	for {
-		if now := time.Now(); !now.Before(worker.nextCountdownCheck) {
-			worker.nextCountdownCheck = now.Add(15 * time.Minute)
-			wars := map[string]countdownWar{}
-			if err := worker.refreshWarEvents(ctx, now, wars, ""); err != nil {
-				app.Logger.Error("war event scan failed", "err", err)
-			}
-			if err := worker.refreshCountdownChannels(ctx, now, wars); err != nil {
-				app.Logger.Error("countdown scan failed", "err", err)
-			}
-		}
 		if now := time.Now(); !now.Before(worker.nextBoardCheck) {
 			worker.nextBoardCheck = now.Add(5 * time.Second)
 			if err := worker.refreshDueDonationBoards(ctx); err != nil {
@@ -139,24 +137,23 @@ func validateDiscordDeliveryConfig(cfg platform.Config, client valkey.Client) er
 	if cfg.EventStreamReclaimIdleSeconds <= 0 {
 		return errors.New("events.reclaim_idle_seconds must be greater than zero for discord-delivery")
 	}
-	if cfg.DiscordMessageCreateEnabled && (cfg.ClashKingAPIURL == "" || cfg.ClashKingAPIToken == "") {
-		return errors.New("CLASHKING_API_ORIGIN and CLASHKING_API_TOKEN are required when Discord link parsing is enabled")
+	if cfg.ClashKingAPIURL == "" || cfg.ClashKingAPIToken == "" {
+		return errors.New("CLASHKING_API_ORIGIN and CLASHKING_API_TOKEN are required for giveaway recovery and Discord link parsing")
 	}
 	return nil
 }
 
 type discordDeliveryWorker struct {
-	emojis             map[string]string
-	nextEmojiLoad      time.Time
-	nextBoardCheck     time.Time
-	nextCountdownCheck time.Time
-	loadEmojisFn       func() (map[string]string, error)
-	app                *platform.App
-	client             *bot.Client
-	pool               *pgxpool.Pool
-	processEventFn     func(context.Context, mobileWarEvent) (bool, error)
-	ackFn              func(context.Context, string) error
-	disableFn          func(context.Context, discordDeliveryTarget, string) (int64, error)
+	emojis         map[string]string
+	nextEmojiLoad  time.Time
+	nextBoardCheck time.Time
+	loadEmojisFn   func() (map[string]string, error)
+	app            *platform.App
+	client         *bot.Client
+	pool           *pgxpool.Pool
+	processEventFn func(context.Context, mobileWarEvent) (bool, error)
+	ackFn          func(context.Context, string) error
+	disableFn      func(context.Context, discordDeliveryTarget, string) (int64, error)
 }
 
 func (w *discordDeliveryWorker) group() string { return "discord-delivery" }
@@ -315,7 +312,7 @@ func (w *discordDeliveryWorker) processEvent(ctx context.Context, event mobileWa
 		return true, w.deliverWelcomePanel(ctx, event)
 	case "discord_message_create":
 		return true, w.deliverLinkParse(ctx, event)
-	case "clan", "war", "capital", "player", "reddit", "discord_legend":
+	case "clan", "war", "capital", "player", "reddit", "discord_legend", "maintenance":
 		return true, w.deliverLogEvent(ctx, event)
 	default:
 		return false, nil
@@ -377,7 +374,7 @@ func (w *discordDeliveryWorker) reminderTargets(ctx context.Context, event mobil
 		if target.ConfigID == "" {
 			return nil, nil
 		}
-		if err := w.pool.QueryRow(ctx, `SELECT updated_at, webhook_token FROM reminders WHERE id::text = $1 AND disabled = false AND server_id = $2 AND COALESCE(channel_id, '') = $3 AND COALESCE(thread_id, '') = $4`, target.ConfigID, target.ServerID, target.ChannelID, target.ThreadID).Scan(&target.Revision, &target.Secret); err != nil {
+		if err := w.pool.QueryRow(ctx, `SELECT updated_at, COALESCE(webhook_id,'') FROM reminders WHERE id::text = $1 AND disabled = false AND server_id = $2 AND COALESCE(channel_id, '') = $3 AND COALESCE(thread_id, '') = $4`, target.ConfigID, target.ServerID, target.ChannelID, target.ThreadID).Scan(&target.Revision, &target.WebhookID); err != nil {
 			if errors.Is(err, pgx.ErrNoRows) {
 				return nil, nil
 			}
@@ -389,7 +386,7 @@ func (w *discordDeliveryWorker) reminderTargets(ctx context.Context, event mobil
 		return nil, nil
 	}
 	rows, err := w.pool.Query(ctx, `
-		SELECT server_id, COALESCE(channel_id, ''), COALESCE(thread_id, ''), custom_text, id::text, updated_at, webhook_token
+		SELECT server_id, COALESCE(channel_id, ''), COALESCE(thread_id, ''), custom_text, id::text, updated_at, COALESCE(webhook_id,'')
 		FROM reminders
 		WHERE disabled = false AND type_name = 'War' AND clan_tag = $1 AND minutes_remaining = $2
 		ORDER BY id
@@ -401,7 +398,7 @@ func (w *discordDeliveryWorker) reminderTargets(ctx context.Context, event mobil
 	var targets []discordDeliveryTarget
 	for rows.Next() {
 		var target discordDeliveryTarget
-		if err := rows.Scan(&target.ServerID, &target.ChannelID, &target.ThreadID, &target.Custom, &target.ConfigID, &target.Revision, &target.Secret); err != nil {
+		if err := rows.Scan(&target.ServerID, &target.ChannelID, &target.ThreadID, &target.Custom, &target.ConfigID, &target.Revision, &target.WebhookID); err != nil {
 			return nil, err
 		}
 		target.Config = "reminder"
@@ -497,7 +494,7 @@ func (w *discordDeliveryWorker) deliverLogEvent(ctx context.Context, event mobil
 		WHERE disabled = false AND type = ANY($1)
 	`
 	args := []any{logTypes}
-	if event.Topic != "reddit" {
+	if event.Topic != "reddit" && event.Topic != "maintenance" {
 		query += ` AND clan_tag = $2`
 		args = append(args, event.ClanTag)
 	}
@@ -649,15 +646,65 @@ func (w *discordDeliveryWorker) webhookTarget(ctx context.Context, serverID, web
 	return discordDeliveryTarget{ServerID: serverID, ChannelID: channelID.String(), ThreadID: threadID, WebhookID: webhookID, Secret: token}, nil
 }
 
+// Resolve credentials at delivery time; only the webhook ID is stored in SQL.
+// The destination and owner are rechecked so a moved or foreign hook cannot
+// redirect a reminder after its configuration was saved.
+func (w *discordDeliveryWorker) resolveReminderWebhook(ctx context.Context, target discordDeliveryTarget) (discordDeliveryTarget, error) {
+	id, err := snowflake.Parse(target.WebhookID)
+	if err != nil {
+		return target, errors.New("reminder webhook migration is required")
+	}
+	raw, err := w.client.Rest.GetWebhook(id, rest.WithCtx(ctx))
+	if err != nil {
+		return target, err
+	}
+	var hook *discord.IncomingWebhook
+	switch value := raw.(type) {
+	case discord.IncomingWebhook:
+		hook = &value
+	case *discord.IncomingWebhook:
+		hook = value
+	}
+	if hook == nil || hook.GuildID.String() != target.ServerID || hook.ChannelID.String() != target.ChannelID || hook.Token == "" ||
+		!((hook.ApplicationID != nil && *hook.ApplicationID == w.client.ApplicationID) || hook.User.ID == w.client.ApplicationID) {
+		return target, errors.New("reminder webhook must belong to this bot and destination")
+	}
+	if target.ThreadID != "" {
+		threadID, err := snowflake.Parse(target.ThreadID)
+		if err != nil {
+			return target, err
+		}
+		rawThread, err := w.client.Rest.GetChannel(threadID, rest.WithCtx(ctx))
+		if err != nil {
+			return target, err
+		}
+		thread, ok := rawThread.(discord.GuildThread)
+		if !ok || thread.GuildID().String() != target.ServerID || thread.ParentID() == nil || thread.ParentID().String() != target.ChannelID {
+			return target, errors.New("reminder thread must belong to its webhook channel")
+		}
+	}
+	target.Secret = hook.Token
+	return target, nil
+}
+
 func (w *discordDeliveryWorker) send(ctx context.Context, target discordDeliveryTarget, content string, users []snowflake.ID) error {
 	return w.sendMessage(ctx, target, discord.MessageCreate{Content: discordClip(content, 2000)}, users)
 }
 
-func (w *discordDeliveryWorker) sendMessage(_ context.Context, target discordDeliveryTarget, message discord.MessageCreate, users []snowflake.ID) error {
+func (w *discordDeliveryWorker) sendMessage(ctx context.Context, target discordDeliveryTarget, message discord.MessageCreate, users []snowflake.ID) error {
 	if !w.app.Config.AllowsDiscordGuild(target.ServerID) {
 		return nil
 	}
 	message = discordSuppressAutomaticEmbeds(message)
+	// Reminder delivery is webhook-only. Missing migration state is an error,
+	// never a silent fallback to bot messages or per-send webhook creation.
+	if target.Config == "reminder" {
+		var err error
+		target, err = w.resolveReminderWebhook(ctx, target)
+		if err != nil {
+			return err
+		}
+	}
 	destination := discordDestinationID(target)
 	id, err := snowflake.Parse(destination)
 	if err != nil {
@@ -710,7 +757,7 @@ func (w *discordDeliveryWorker) disableDestination(ctx context.Context, target d
 	var err error
 	switch target.Config {
 	case "reminder":
-		result, err = w.pool.Exec(ctx, `UPDATE reminders SET disabled = true, disabled_reason = $2, updated_at = now() WHERE id::text = $1 AND disabled = false AND server_id = $3 AND COALESCE(channel_id, '') = $4 AND COALESCE(thread_id, '') = $5 AND updated_at = $6 AND webhook_token = $7`, target.ConfigID, reason, target.ServerID, target.ChannelID, target.ThreadID, target.Revision, target.Secret)
+		result, err = w.pool.Exec(ctx, `UPDATE reminders SET disabled = true, disabled_reason = $2, updated_at = now() WHERE id::text = $1 AND disabled = false AND server_id = $3 AND COALESCE(channel_id, '') = $4 AND COALESCE(thread_id, '') = $5 AND updated_at = $6 AND COALESCE(webhook_id, '') = $7`, target.ConfigID, reason, target.ServerID, target.ChannelID, target.ThreadID, target.Revision, target.WebhookID)
 	case "giveaway":
 		result, err = w.pool.Exec(ctx, `UPDATE giveaways SET disabled = true, disabled_reason = $2, updated_at = now() WHERE id = $1 AND disabled = false AND server_id = $3 AND COALESCE(channel_id, '') = $4 AND updated_at = $5`, target.ConfigID, reason, target.ServerID, target.ChannelID, target.Revision)
 	case "server_log":
@@ -794,6 +841,8 @@ func reminderMemberTags(event mobileWarEvent) []string {
 
 func discordEventLogTypes(event mobileWarEvent) []string {
 	switch event.Topic {
+	case "maintenance":
+		return []string{"clash_maintenance"}
 	case "discord_legend":
 		if stringMapValue(event.Value, "type") == "legend_attack" {
 			return []string{"legend_log_attacks"}

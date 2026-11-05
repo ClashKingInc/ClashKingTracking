@@ -17,7 +17,7 @@ import (
 func (d *remindersDomain) processManualReminder(ctx context.Context, app *platform.App, serverID, reminderID string) error {
 	var reminderRaw []byte
 	var typ, clanTag, rosterID string
-	err := d.pool.QueryRow(ctx, `SELECT `+discordReminderPayloadSQL+`, reminder.type_name, reminder.clan_tag, COALESCE(reminder.roster_id, '')
+	err := d.pool.QueryRow(ctx, `SELECT `+discordReminderPayloadSQL+`, reminder.type_name, COALESCE(reminder.clan_tag, ''), COALESCE(reminder.roster_id, '')
 		FROM reminders reminder
 		WHERE reminder.id=$1::uuid AND reminder.server_id=$2 AND reminder.disabled=false
           AND reminder.type<>4
@@ -29,11 +29,17 @@ func (d *remindersDomain) processManualReminder(ctx context.Context, app *platfo
 	if err := json.Unmarshal(reminderRaw, &reminder); err != nil {
 		return err
 	}
-	clan, err := fetchReminderClan(ctx, app, d.limiter, clanTag)
-	if err != nil || clan == nil {
-		return fmt.Errorf("fetch reminder clan: %w", err)
+	var clan *clashy.Clan
+	if typ != "roster" {
+		clan, err = fetchReminderClan(ctx, app, d.limiter, clanTag)
+		if err != nil || clan == nil {
+			return fmt.Errorf("fetch reminder clan: %w", err)
+		}
 	}
-	value := map[string]any{"manual": true, "clan": clan, "reminder": reminder}
+	value := map[string]any{"manual": true, "reminder": reminder}
+	if clan != nil {
+		value["clan"] = clan
+	}
 	roles, halls := reminderStringList(reminder["roles"]), reminderIntList(reminder["town_halls"])
 	switch typ {
 	case "War":

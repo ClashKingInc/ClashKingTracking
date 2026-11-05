@@ -348,6 +348,14 @@ func (d *trackedPlayersDomain) fetchAndPreparePlayer(
 		return models.TrackedPlayerIngest{}, nil
 	}
 	ingest, err := d.doPlayer(ctx, target.Tag, *player)
+	if err == nil {
+		if len(ingest.Players) == 0 {
+			ingest.Players = []models.BasicPlayerRow{trackedPlayerRow(*player)}
+		}
+		for i := range ingest.Players {
+			ingest.Players[i].ObservedAt = start.UTC()
+		}
+	}
 	ingest.VerifiedTracking = target.Verified
 	if player.Clan != nil {
 		ingest.CurrentClan = player.Clan.Tag

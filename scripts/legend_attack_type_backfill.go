@@ -174,9 +174,6 @@ func legendAttackTypeBackfillDay(ctx context.Context, tx pgx.Tx, static *clashy.
 	if err := tx.QueryRow(ctx, `SELECT EXISTS(SELECT 1 FROM public.legend_rankings_history WHERE day=$1::date)`, day).Scan(&snapshot); err != nil {
 		return nil, err
 	}
-	if !snapshot {
-		return nil, errors.New("ranking snapshot is missing")
-	}
 	rows, err := tx.Query(ctx, `SELECT cohort,attack_count,air_attack_count,ground_attack_count,mixed_attack_count,unknown_attack_count
 		FROM public.legend_daily_stats WHERE day=$1::date ORDER BY cohort`, day)
 	if err != nil {
@@ -197,7 +194,16 @@ func legendAttackTypeBackfillDay(ctx context.Context, tx pgx.Tx, static *clashy.
 	if err != nil {
 		return nil, err
 	}
-	for _, cohort := range legendCloseoutCohorts {
+	requiredCohorts := legendCloseoutCohorts[:]
+	if !snapshot {
+		requiredCohorts = requiredCohorts[:1]
+		for cohort := range stored {
+			if cohort != "legend_i" {
+				return nil, errors.New("ranked aggregates exist without a historical snapshot; run a full day rebuild first")
+			}
+		}
+	}
+	for _, cohort := range requiredCohorts {
 		if _, exists := stored[cohort]; !exists {
 			return nil, fmt.Errorf("stored %s aggregate is missing", cohort)
 		}

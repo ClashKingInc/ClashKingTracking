@@ -46,7 +46,7 @@ basic_player
 
 The SQL snapshots include ranked players with zero trophies. Unranked and unknown leagues are excluded. Snapshots use existing `basic_player` observations; there is no separate Town Hall/league candidate-fetch pass. Clan display metadata is still joined from `basic_clan` by the API.
 
-Leaderboard writes to `basic_player` are accepted because volume is bounded and the shared SQL upsert writes only changed columns.
+Leaderboard writes to `basic_player` are accepted because volume is bounded and the shared SQL upsert rejects older observations.
 
 ## Configuration
 
@@ -69,7 +69,7 @@ On Monday between 16:30 and 17:00 UTC only, maintenance resets nonzero `basic_pl
 
 Each transaction changes at most 5,000 players and saves its last tag. A process restart resumes that cursor inside the same safe window. Completed jobs never repeat for that Monday; a missed or partial job is not caught up outside the window. Completion forces both player snapshots to refresh, regardless of the six-hour timer. No historical trophy records are changed, no Legend season reset is performed, and normal profile writers remain free to record later observations.
 
-The maintenance session holds a PostgreSQL advisory lock to prevent overlapping scheduled processes from running it simultaneously. There is deliberately no cross-writer stale-response coordination.
+The maintenance session holds a PostgreSQL advisory lock to prevent overlapping scheduled processes from running it simultaneously. The reset stamps the same observation fence used by profile writers, so an already in-flight older response cannot undo it. Later requests can record new observations normally.
 
 ## Rollout order
 

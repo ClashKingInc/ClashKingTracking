@@ -147,7 +147,7 @@ func main() {
 		}
 		mu.Unlock()
 		stream := fmt.Sprintf("countdown-e2e:%d:%d", os.Getpid(), phase)
-		app := &platform.App{Config: platform.Config{TimescaleURL: dsn, DiscordBotToken: base64.RawStdEncoding.EncodeToString([]byte(appID)) + ".local.local", DiscordAPIURL: provider.URL, DiscordGuildAllowlist: map[string]struct{}{guild: {}, "999999999999998800": {}, "999999999999998801": {}}, DiscordDeliveryBatchSize: 10, EventStreamName: stream, EventStreamReclaimIdleSeconds: 1}, Clash: clash, Valkey: cache, Logger: slog.New(slog.NewTextHandler(os.Stderr, nil)), Stats: platform.NewTracker(), Availability: platform.NewAvailabilityGate(nil)}
+		app := &platform.App{Config: platform.Config{TimescaleURL: dsn, DiscordBotToken: base64.RawStdEncoding.EncodeToString([]byte(appID)) + ".local.local", DiscordAPIURL: provider.URL, ClashKingAPIURL: provider.URL, ClashKingAPIToken: "local-only", DiscordGuildAllowlist: map[string]struct{}{guild: {}, "999999999999998800": {}, "999999999999998801": {}}, DiscordDeliveryBatchSize: 10, EventStreamName: stream, EventStreamReclaimIdleSeconds: 1}, Clash: clash, Valkey: cache, Logger: slog.New(slog.NewTextHandler(os.Stderr, nil)), Stats: platform.NewTracker(), Availability: platform.NewAvailabilityGate(nil)}
 		runCtx, stop := context.WithCancel(ctx)
 		done := make(chan error, 1)
 		go func() { done <- scripts.NewDiscordDeliveryDomain().Run(runCtx, app) }()

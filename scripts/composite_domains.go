@@ -17,9 +17,10 @@ func (d *compositeDomain) Name() string { return d.name }
 
 func (d *compositeDomain) Run(ctx context.Context, app *platform.App) error {
 	runCtx, cancel := context.WithCancel(ctx)
-	defer cancel()
+
 	errCh := make(chan error, len(d.children))
 	var wg sync.WaitGroup
+	defer func() { cancel(); wg.Wait() }()
 	for _, child := range d.children {
 		child := child
 		wg.Add(1)

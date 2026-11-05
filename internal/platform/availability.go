@@ -14,6 +14,7 @@ import (
 const AvailabilityStateKey = "tracking:clash_availability"
 
 type AvailabilityState struct {
+	Revision  int64     `json:"revision,omitempty"`
 	Available bool      `json:"available"`
 	Official  bool      `json:"official_maintenance"`
 	ChangedAt time.Time `json:"changed_at"`
@@ -31,6 +32,7 @@ type AvailabilityGate struct {
 	observedAt time.Time
 	pausedAt   time.Time
 	pausedTime time.Duration
+	revision   int64
 }
 
 func NewAvailabilityGate(client valkey.Client) *AvailabilityGate {
@@ -96,6 +98,10 @@ func (g *AvailabilityGate) refresh(ctx context.Context) error {
 	}
 	g.mu.Lock()
 	defer g.mu.Unlock()
+	if state.Revision < g.revision {
+		return nil
+	}
+	g.revision = state.Revision
 	if !state.Available {
 		g.setPausedLocked(true)
 		return nil

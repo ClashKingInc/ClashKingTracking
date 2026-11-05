@@ -48,7 +48,10 @@ func rebuildLegendDayPerformanceTx(ctx context.Context, tx pgx.Tx, day time.Time
 		return 0, err
 	}
 	if !exists {
-		return 0, fmt.Errorf("ranking snapshot unavailable")
+		// This table describes rank-snapshot coverage. Full raw observations
+		// live in legend_observed_daily_stats; never invent ranked eligibility.
+		_, err := tx.Exec(ctx, `DELETE FROM legend_day_performance WHERE day=$1`, day)
+		return 0, err
 	}
 	// Persist the game-day window so readers can reject summaries from the
 	// previous 05:10 implementation until those days are rebuilt at 05:00.

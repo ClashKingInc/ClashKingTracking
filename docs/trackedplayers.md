@@ -6,16 +6,16 @@ Priority player tracking keeps a smaller useful set of players fresh, detects me
 
 ## When it runs
 
-It runs continuously as `trackedplayers` at `trackedplayers.requests_per_second`. SQL targets are paged into one small in-memory cycle and fed through one bounded worker pool. This prevents one slow retry at a page boundary from idling the remaining request budget.
+It runs continuously as `trackedplayers` at `trackedplayers.requests_per_second`. Each cycle merges cached clan members with eligible SQL account links, then pages the stable sorted union into one bounded worker pool. This prevents one slow retry at a page boundary from idling the remaining request budget.
 
 ## How a player becomes a target
 
 The target union is:
 
-1. Town Hall 9 or higher members stored on server clans whose server used ClashKing within 90 days.
+1. Town Hall 9 or higher members in the full Valkey clan snapshots maintained by `trackedclans`, for configured server clans whose server used ClashKing within 90 days. The compact SQL member list is not used for town hall filtering.
 2. Verified app accounts whose `player_links.last_login` is within seven days. These are accepted without a Town Hall filter because their current profile is not known until it is fetched.
 
-The SQL source groups duplicate tags and marks a target verified when any current `player_links` row qualifies, so an account that is also in a configured clan is polled once per cycle while still updating its verified player-to-clan mapping. Bookmarked players are not targets merely because they are bookmarked.
+The selector merges and sorts both sources, marking a target verified when a qualifying `player_links` row exists. An account in both sources is polled once per cycle while still updating its verified player-to-clan mapping. Missing clan snapshots contribute no members until `trackedclans` fills them on a subsequent cycle; there is no fallback to the compact SQL member list. Bookmarked players are not targets merely because they are bookmarked.
 
 ## Decision flow
 
@@ -119,3 +119,11 @@ The availability gate pauses requests. The previous snapshot remains intact unti
 - It does not write `battlelogs_tracking_ttl`.
 - It does not create war timers or write war data.
 - It does not target bookmarked players or send mobile Legend notifications.
+
+## Shared player freshness
+
+Every successful profile request carries its request-start UTC time into the
+shared `basic_player` write, including unchanged snapshots. Older queued or
+concurrent observations cannot replace a newer row. Existing change-history and
+snapshot/event ordering is retained; the timestamp is not an upstream game
+revision and assumes synchronized writer clocks.

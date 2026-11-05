@@ -19,6 +19,8 @@ Both pools require `basic_clan.public_war_log = true`. They are separated by `ba
 
 Finding a war updates `last_war_at`, which naturally promotes a dormant clan into the active pool.
 
+Only global war finalization advances `basic_clan.last_active`. Storing a completed regular, friendly, or CWL war advances both known clans to its valid, non-future `endTime` inside the same transaction. Discovery leaves this timestamp unchanged. If the finalizer permanently abandons an unavailable/private war, its schedule deletion advances both known clans using the stored `prep_time`, or the deletion time once when the stored time is missing/invalid. The delete and activity update commit atomically, so duplicate finalizers cannot repeat the fallback. Retry and reschedule paths do not change activity. All updates remain monotonic and affect existing clans only. This timestamp controls global-clan polling priority independently of `last_war_at`.
+
 New regular-war discovery only schedules `preparation` or `inWar` responses with valid identities and an end time strictly in the future. It ignores ended, past-end, and `notInWar` responses so stale API results cannot recreate schedules that the finalizer already removed. Existing scheduled wars still finish normally; CWL tagged-war catch-up is separate and still stores past completed rounds.
 
 ## Discovery decision flow

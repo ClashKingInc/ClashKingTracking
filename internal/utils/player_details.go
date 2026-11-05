@@ -3,7 +3,9 @@ package utils
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"sort"
+	"time"
 
 	"clashking_tracking/models"
 
@@ -11,7 +13,7 @@ import (
 	"github.com/jackc/pgx/v5"
 )
 
-func PlayerProfileFromClashy(player clashy.Player) models.PlayerProfileIngest {
+func PlayerProfileFromClashy(player clashy.Player, observedAt time.Time) models.PlayerProfileIngest {
 	clanTag := ""
 	clanTagKnown := true
 	if player.Clan != nil {
@@ -19,6 +21,7 @@ func PlayerProfileFromClashy(player clashy.Player) models.PlayerProfileIngest {
 	}
 	ingest := models.PlayerProfileIngest{
 		Player: models.BasicPlayerRow{
+			ObservedAt:       observedAt,
 			Tag:              player.Tag,
 			Name:             player.Name,
 			LeagueID:         player.LeagueTier.ID,
@@ -124,14 +127,15 @@ func upsertPlayerDetails(ctx context.Context, tx pgx.Tx, ingests []models.Player
 			INSERT INTO player_profile_details (
 				player_tag, townhall_level, heroes, equipment, achievements, observed_at
 			)
-			VALUES ($1, $2, $3::jsonb, $4::jsonb, $5::jsonb, now())
+			VALUES ($1, $2, $3::jsonb, $4::jsonb, $5::jsonb, $6)
 			ON CONFLICT (player_tag) DO UPDATE SET
 				townhall_level = EXCLUDED.townhall_level,
 				heroes = EXCLUDED.heroes,
 				equipment = EXCLUDED.equipment,
 				achievements = EXCLUDED.achievements,
 				observed_at = EXCLUDED.observed_at
-		`, ingest.Player.Tag, ingest.Player.TownHall, heroes, equipment, achievements)
+			WHERE player_profile_details.observed_at < EXCLUDED.observed_at
+		`, ingest.Player.Tag, ingest.Player.TownHall, heroes, equipment, achievements, ingest.Player.ObservedAt)
 	}
 	if batch.Len() == 0 {
 		return nil
@@ -139,14 +143,27 @@ func upsertPlayerDetails(ctx context.Context, tx pgx.Tx, ingests []models.Player
 	return SendBatch(ctx, tx, batch)
 }
 
-func DeletePlayers(ctx context.Context, tx pgx.Tx, tags []string) error {
-	tags = nonEmptyTags(tags)
-	if len(tags) == 0 {
-		return nil
-	}
-	// player_profile_details is removed by its ON DELETE CASCADE constraint.
-	_, err := tx.Exec(ctx, `DELETE FROM basic_player WHERE tag = ANY($1::text[])`, tags)
+// A delayed not-found response must not delete a more recent observation.
+func DeletePlayers(ctx context.Context, tx pgx.Tx, deletions []models.PlayerDeletion) error {
+	_, err := DeletePlayersCount(ctx, tx, deletions)
 	return err
+}
+
+func DeletePlayersCount(ctx context.Context, tx pgx.Tx, deletions []models.PlayerDeletion) (int, error) {
+	batch := &pgx.Batch{}
+	for _, deletion := range deletions {
+		if deletion.Tag == "" {
+			continue
+		}
+		if deletion.ObservedAt.IsZero() {
+			return 0, errors.New("player deletion observation time is required")
+		}
+		batch.Queue(`DELETE FROM basic_player WHERE tag=$1 AND observed_at < $2`, deletion.Tag, deletion.ObservedAt)
+	}
+	if batch.Len() == 0 {
+		return 0, nil
+	}
+	return SendBatchCount(ctx, tx, batch)
 }
 
 func marshalPlayerDetails(ingest models.PlayerProfileIngest) ([]byte, []byte, []byte, error) {

@@ -121,9 +121,6 @@ func rebuildDailyArmySetupsTx(ctx context.Context, tx pgx.Tx, day time.Time, sta
 	if err := tx.QueryRow(ctx, `SELECT EXISTS(SELECT 1 FROM legend_rankings_history WHERE day=$1)`, day).Scan(&snapshot); err != nil {
 		return 0, err
 	}
-	if !snapshot {
-		return 0, fmt.Errorf("Legend ranking snapshot is unavailable for %s", day.Format("2006-01-02"))
-	}
 	attacks, err := readSetupAttacks(ctx, tx, day, static)
 	if err != nil {
 		return 0, err
@@ -131,6 +128,11 @@ func rebuildDailyArmySetupsTx(ctx context.Context, tx pgx.Tx, day time.Time, sta
 	cohorts, result, err := calculateDailySetups(attacks, static)
 	if err != nil {
 		return 0, err
+	}
+	if !snapshot {
+		// Keep full-cohort setup discovery when ranks are missing, but do not
+		// publish empty ranked-subset rows as if a rank snapshot existed.
+		cohorts = cohorts[:1]
 	}
 	if err = verifySetupPopulation(ctx, tx, day, cohorts); err != nil {
 		return 0, err
@@ -185,7 +187,7 @@ func readSetupAttacks(ctx context.Context, tx pgx.Tx, day time.Time, static *cla
 	rows, err := tx.Query(ctx, `SELECT battle.player_tag,coalesce(battle.share_code,''),history.global_rank,
 		battle.stars,battle.destruction_percentage
 		FROM battles_ranked battle
-		JOIN legend_rankings_history history ON history.day=$3 AND history.tag=battle.player_tag
+		LEFT JOIN legend_rankings_history history ON history.day=$3 AND history.tag=battle.player_tag
 		WHERE battle.direction=1 AND battle.battle_mode=2 AND battle.battle_time >= $1 AND battle.battle_time < $2
 		ORDER BY battle.player_tag,battle.battle_time`, start, end, day)
 	if err != nil {

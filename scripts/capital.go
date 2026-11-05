@@ -56,7 +56,9 @@ func (d *capitalDomain) Run(ctx context.Context, app *platform.App) error {
 	if err := d.refreshTargets(ctx, app); err != nil {
 		return err
 	}
-	go d.runTargetRefresh(ctx, app)
+	refreshDone := make(chan struct{})
+	go func() { defer close(refreshDone); d.runTargetRefresh(ctx, app) }()
+	defer func() { cancel(); <-refreshDone }()
 	limiter, err := newTrackingLimiter(app.Config.CapitalRequestsPerSecond)
 	if err != nil {
 		return err
@@ -117,6 +119,11 @@ func (d *capitalDomain) refreshTargets(ctx context.Context, app *platform.App) e
         UNION ALL
         SELECT clan.tag, false FROM server_clans clan JOIN servers server ON server.id=clan.server_id
         WHERE server.left_at IS NULL AND server.last_command_at >= now() - interval '90 days'
+        UNION
+        SELECT player.clan_tag, false FROM player_links link
+        JOIN basic_player player ON player.tag=link.tag
+        WHERE link.is_verified AND link.last_login >= now()-interval '7 days'
+          AND player.clan_tag IS NOT NULL AND player.clan_tag<>''
         ) targets GROUP BY tag
 	`)
 	if err != nil {

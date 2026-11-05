@@ -442,7 +442,9 @@ func (d *globalClansDomain) runGroup(
 				case tag = <-jobs:
 				}
 
+				var observedAt time.Time
 				clan, err := retryGlobalClanFetch(groupCtx, app, limiter, func(fetchCtx context.Context) (*clashy.Clan, error) {
+					observedAt = time.Now().UTC()
 					return fetchGlobalClan(fetchCtx, app, group.Name, tag)
 				})
 				app.Stats.RecordTrackedTarget(statsName)
@@ -481,7 +483,7 @@ func (d *globalClansDomain) runGroup(
 				snapshot := globalClanSnapshot{
 					Clan:      *clan,
 					Row:       basicClanRow(*clan),
-					FetchedAt: time.Now().UTC(),
+					FetchedAt: observedAt,
 				}
 				select {
 				case <-groupCtx.Done():
@@ -666,7 +668,7 @@ func buildGlobalClanIngest(current globalClanSnapshot, previous *globalClanSnaps
 	}
 	ingest := models.GlobalClanIngest{
 		Clans:       []models.BasicClanRow{current.Row},
-		Players:     basicPlayerRows(current.Clan.Tag, current.Clan.Members),
+		Players:     basicPlayerRows(current.Clan.Tag, current.Clan.Members, current.FetchedAt),
 		ClanRecords: clanRecordRows(current.Clan, previousRow, current.FetchedAt),
 	}
 	if previous != nil && !isGlobalClanFirstHydration(previous.Row, current.Clan) {
@@ -930,7 +932,7 @@ func clanRecordRows(clan clashy.Clan, previous models.BasicClanRow, now time.Tim
 	return []models.ClanRecordRow{row}
 }
 
-func basicPlayerRows(clanTag string, members []clashy.ClanMember) []models.BasicPlayerRow {
+func basicPlayerRows(clanTag string, members []clashy.ClanMember, observedAt time.Time) []models.BasicPlayerRow {
 	out := make([]models.BasicPlayerRow, 0, len(members))
 	seen := make(map[string]struct{}, len(members))
 	for _, member := range members {
@@ -942,6 +944,7 @@ func basicPlayerRows(clanTag string, members []clashy.ClanMember) []models.Basic
 		}
 		seen[member.Tag] = struct{}{}
 		out = append(out, models.BasicPlayerRow{
+			ObservedAt:   observedAt,
 			Tag:          member.Tag,
 			Name:         member.Name,
 			LeagueID:     member.LeagueTier.ID,
@@ -1444,7 +1447,8 @@ func upsertGlobalClanBasicPlayers(ctx context.Context, tx pgx.Tx, players []mode
 			league_id integer NOT NULL,
 			clan_tag text NOT NULL,
 			townhall_level integer NOT NULL,
-			trophies integer NOT NULL
+			trophies integer NOT NULL,
+			observed_at timestamptz NOT NULL
 		) ON COMMIT DELETE ROWS
 	`); err != nil {
 		return 0, err
@@ -1452,7 +1456,7 @@ func upsertGlobalClanBasicPlayers(ctx context.Context, tx pgx.Tx, players []mode
 	_, err := tx.CopyFrom(
 		ctx,
 		pgx.Identifier{"global_clan_basic_player_stage"},
-		[]string{"tag", "name", "league_id", "clan_tag", "townhall_level", "trophies"},
+		[]string{"tag", "name", "league_id", "clan_tag", "townhall_level", "trophies", "observed_at"},
 		pgx.CopyFromSlice(len(players), func(i int) ([]any, error) {
 			player := players[i]
 			return []any{
@@ -1462,6 +1466,7 @@ func upsertGlobalClanBasicPlayers(ctx context.Context, tx pgx.Tx, players []mode
 				player.ClanTag,
 				player.TownHall,
 				player.Trophies,
+				player.ObservedAt,
 			}, nil
 		}),
 	)
@@ -1470,7 +1475,7 @@ func upsertGlobalClanBasicPlayers(ctx context.Context, tx pgx.Tx, players []mode
 	}
 	tag, err := tx.Exec(ctx, `
 		INSERT INTO basic_player (
-			tag, name, league_id, clan_tag, townhall_level, trophies
+			tag, name, league_id, clan_tag, townhall_level, trophies, observed_at
 		)
 		SELECT DISTINCT ON (tag)
 			tag,
@@ -1478,24 +1483,21 @@ func upsertGlobalClanBasicPlayers(ctx context.Context, tx pgx.Tx, players []mode
 			NULLIF(league_id, 0),
 			clan_tag,
 			townhall_level,
-			trophies
+			trophies,
+			observed_at
 		FROM global_clan_basic_player_stage
 		WHERE tag <> ''
 		  AND name <> ''
 		  AND townhall_level > 0
-		ORDER BY tag
+		ORDER BY tag, observed_at DESC
 		ON CONFLICT (tag) DO UPDATE SET
+			observed_at = EXCLUDED.observed_at,
 			name = EXCLUDED.name,
 			league_id = COALESCE(EXCLUDED.league_id, basic_player.league_id),
 			clan_tag = EXCLUDED.clan_tag,
 			townhall_level = EXCLUDED.townhall_level,
 			trophies = CASE WHEN EXCLUDED.trophies > 0 THEN EXCLUDED.trophies ELSE basic_player.trophies END
-		WHERE
-			basic_player.name IS DISTINCT FROM EXCLUDED.name OR
-			basic_player.league_id IS DISTINCT FROM COALESCE(EXCLUDED.league_id, basic_player.league_id) OR
-			basic_player.clan_tag IS DISTINCT FROM EXCLUDED.clan_tag OR
-			basic_player.townhall_level IS DISTINCT FROM EXCLUDED.townhall_level OR
-			(EXCLUDED.trophies > 0 AND basic_player.trophies IS DISTINCT FROM EXCLUDED.trophies)
+		WHERE basic_player.observed_at < EXCLUDED.observed_at
 	`)
 	return int(tag.RowsAffected()), err
 }

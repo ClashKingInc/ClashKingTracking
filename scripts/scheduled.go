@@ -221,10 +221,11 @@ type scheduledStore interface {
 	ReplaceCurrentClanRankingGroup(context.Context, currentClanRankingGroup) (int, error)
 	ListRankedGroupTargets(context.Context, int64) ([]string, error)
 	StorePlayerProfiles(context.Context, []models.PlayerProfileIngest) (int, error)
-	DeletePlayers(context.Context, []string) error
+	DeletePlayers(context.Context, []models.PlayerDeletion) error
 	StoreRankedLeagueGroup(context.Context, []models.RankedLeagueGroupMemberRow) (int, error)
 	MissingRankedGroupPlayers(context.Context, int64) ([]string, error)
 	FinalizeRankedTournament(context.Context, int64) (int, error)
+	FinalizeObservedLegendDay(context.Context, time.Time) (int, error)
 	CaptureLegendSnapshot(context.Context, time.Time) (int, error)
 	FinalizeLegendCloseout(context.Context, time.Time) (int, error)
 	ScheduledJobCompleted(context.Context, string, time.Time) (bool, error)
@@ -339,16 +340,26 @@ func (d *scheduledDomain) runLegendCloseout(ctx context.Context, app *platform.A
 	if err != nil || completed {
 		return err
 	}
-	snapshotWrites, err := d.store.CaptureLegendSnapshot(ctx, day)
+	// Observed summaries require only battle logs. Compute them before the
+	// optional rank-dependent work so a failed snapshot cannot starve All.
+	observedWrites, err := d.store.FinalizeObservedLegendDay(ctx, day)
 	if err != nil {
 		return err
 	}
-	app.Stats.RecordWrite(trackingProgressName(scheduledDomainName, "legend-snapshot"), snapshotWrites)
-	writes, err := d.store.FinalizeLegendCloseout(ctx, day)
-	if err != nil {
+	app.Stats.RecordWrite(trackingProgressName(scheduledDomainName, "legend-observed"), observedWrites)
+	snapshotWrites, snapshotErr := d.store.CaptureLegendSnapshot(ctx, day)
+	if snapshotErr == nil {
+		app.Stats.RecordWrite(trackingProgressName(scheduledDomainName, "legend-snapshot"), snapshotWrites)
+	}
+	// A failed leaderboard refresh must not starve full-cohort army/item
+	// statistics. Keep the job retryable so ranked subsets can catch up later.
+	writes, closeoutErr := d.store.FinalizeLegendCloseout(ctx, day)
+	if closeoutErr == nil {
+		app.Stats.RecordWrite(trackingProgressName(scheduledDomainName, "legend-closeout"), writes)
+	}
+	if err := errors.Join(snapshotErr, closeoutErr); err != nil {
 		return err
 	}
-	app.Stats.RecordWrite(trackingProgressName(scheduledDomainName, "legend-closeout"), writes)
 	return d.store.MarkScheduledJobCompleted(ctx, "legend_closeout", day)
 }
 
@@ -462,14 +473,14 @@ func (d *scheduledDomain) doRankedGroupDiscovery(ctx context.Context, app *platf
 	seenGroups := make(map[string]struct{})
 	seasons := make(map[int64]struct{})
 	for _, tag := range targets {
-		player, ok, err := d.fetchRankedSeedPlayer(ctx, app, tag)
+		player, observedAt, ok, err := d.fetchRankedSeedPlayer(ctx, app, tag)
 		if err != nil {
 			return writes, err
 		}
 		if !ok {
 			continue
 		}
-		affected, err := d.store.StorePlayerProfiles(ctx, []models.PlayerProfileIngest{utils.PlayerProfileFromClashy(*player)})
+		affected, err := d.store.StorePlayerProfiles(ctx, []models.PlayerProfileIngest{utils.PlayerProfileFromClashy(*player, observedAt)})
 		if err != nil {
 			return writes, err
 		}
@@ -522,23 +533,25 @@ func (d *scheduledDomain) doRankedGroupDiscovery(ctx context.Context, app *platf
 	return writes, nil
 }
 
-func (d *scheduledDomain) fetchRankedSeedPlayer(ctx context.Context, app *platform.App, tag string) (*clashy.Player, bool, error) {
+func (d *scheduledDomain) fetchRankedSeedPlayer(ctx context.Context, app *platform.App, tag string) (*clashy.Player, time.Time, bool, error) {
+	var observedAt time.Time
 	player, err := retryLimitedClashFetch(ctx, app, d.limiter, func(fetchCtx context.Context) (*clashy.Player, error) {
 		start := time.Now()
+		observedAt = start.UTC()
 		player, err := app.Clash.GetPlayer(fetchCtx, tag)
 		app.Stats.RecordRequest(scheduledDomainName, time.Since(start), err)
 		return player, err
 	})
 	if isClashNotFound(err) {
-		if err := d.store.DeletePlayers(ctx, []string{tag}); err != nil {
-			return nil, false, err
+		if err := d.store.DeletePlayers(ctx, []models.PlayerDeletion{{Tag: tag, ObservedAt: observedAt}}); err != nil {
+			return nil, observedAt, false, err
 		}
-		return nil, false, nil
+		return nil, observedAt, false, nil
 	}
 	if err != nil {
-		return nil, false, err
+		return nil, observedAt, false, err
 	}
-	return player, true, nil
+	return player, observedAt, true, nil
 }
 
 func (d *scheduledDomain) matchingLeagueHistory(ctx context.Context, app *platform.App, tag string, seasonID int64) (clashy.LeagueHistoryEntry, bool, error) {
@@ -623,14 +636,14 @@ func (d *scheduledDomain) fetchAndStoreMissingRankedPlayers(ctx context.Context,
 		return nil
 	}
 	for _, tag := range tags {
-		player, ok, err := d.fetchRankedSeedPlayer(ctx, app, tag)
+		player, observedAt, ok, err := d.fetchRankedSeedPlayer(ctx, app, tag)
 		if err != nil {
 			return writes, err
 		}
 		if !ok {
 			continue
 		}
-		profiles = append(profiles, utils.PlayerProfileFromClashy(*player))
+		profiles = append(profiles, utils.PlayerProfileFromClashy(*player, observedAt))
 		if len(profiles) >= 500 {
 			if err := flush(); err != nil {
 				return writes, err
@@ -2405,7 +2418,7 @@ func (s *timescaleScheduledStore) StorePlayerProfiles(ctx context.Context, profi
 	return affected, nil
 }
 
-func (s *timescaleScheduledStore) DeletePlayers(ctx context.Context, tags []string) error {
+func (s *timescaleScheduledStore) DeletePlayers(ctx context.Context, tags []models.PlayerDeletion) error {
 	if len(tags) == 0 {
 		return nil
 	}
@@ -2574,6 +2587,10 @@ func newMemoryScheduledStore() *memoryScheduledStore {
 
 func (*memoryScheduledStore) Close() {}
 
+func (*memoryScheduledStore) FinalizeObservedLegendDay(context.Context, time.Time) (int, error) {
+	return 0, nil
+}
+
 func (s *memoryScheduledStore) CaptureLegendSnapshot(context.Context, time.Time) (int, error) {
 	s.legendSnapshotCalls++
 	return 0, nil
@@ -2710,7 +2727,7 @@ func (*memoryScheduledStore) StorePlayerProfiles(context.Context, []models.Playe
 	return 0, nil
 }
 
-func (*memoryScheduledStore) DeletePlayers(context.Context, []string) error {
+func (*memoryScheduledStore) DeletePlayers(context.Context, []models.PlayerDeletion) error {
 	return nil
 }
 

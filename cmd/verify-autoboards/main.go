@@ -112,7 +112,7 @@ func main() {
 	must(tx.Commit(ctx))
 	_, err = db.Exec(ctx, `INSERT INTO battles_farming(player_tag,battle_time,stars,destruction_percentage,duration_seconds,looted_resources) VALUES('#PYLQ',now()-interval '1 hour',3,100,90,'{"gold":1234,"elixir":500,"darkElixir":5}')`)
 	must(err)
-	app := &platform.App{Config: platform.Config{TimescaleURL: dsn, ValkeyAddr: os.Getenv("TEST_VALKEY_ADDR"), DiscordBotToken: base64.RawStdEncoding.EncodeToString([]byte(application)) + ".local.local", DiscordAPIURL: provider.URL, DiscordDeliveryBatchSize: 20, EventStreamName: "board-fixture-events", EventStreamReclaimIdleSeconds: 1, TrackedClanSnapshotPrefix: "board-fixture:"}, Clash: clash, Valkey: cache, Logger: slog.New(slog.NewTextHandler(os.Stderr, nil)), Stats: platform.NewTracker(), Availability: platform.NewAvailabilityGate(nil)}
+	app := &platform.App{Config: platform.Config{TimescaleURL: dsn, ValkeyAddr: os.Getenv("TEST_VALKEY_ADDR"), DiscordBotToken: base64.RawStdEncoding.EncodeToString([]byte(application)) + ".local.local", DiscordAPIURL: provider.URL, ClashKingAPIURL: provider.URL, ClashKingAPIToken: "local-only", DiscordDeliveryBatchSize: 20, EventStreamName: "board-fixture-events", EventStreamReclaimIdleSeconds: 1, TrackedClanSnapshotPrefix: "board-fixture:"}, Clash: clash, Valkey: cache, Logger: slog.New(slog.NewTextHandler(os.Stderr, nil)), Stats: platform.NewTracker(), Availability: platform.NewAvailabilityGate(nil)}
 	runCtx, cancel := context.WithCancel(ctx)
 	defer cancel()
 	done := make(chan error, 1)
