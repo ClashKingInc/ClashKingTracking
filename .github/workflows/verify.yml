@@ -70,3 +70,6 @@ jobs:
 
       - name: Verify notification scan and retry timing
         run: bash .ci-schema/scripts/with-test-integration.sh --profile retained-api -- go run ./cmd/verify-mobile-scan
+
+      - name: Verify reminder startup releases SQL reads
+        run: bash .ci-schema/scripts/with-test-integration.sh --profile retained-api -- go run ./cmd/verify-reminder-startup
