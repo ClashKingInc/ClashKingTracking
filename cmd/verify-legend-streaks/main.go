@@ -12,6 +12,7 @@ import (
 	"os"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"clashking_tracking/internal/platform"
@@ -43,9 +44,30 @@ func main() {
 	defer cache.Close()
 	_, err = db.Exec(ctx, "INSERT INTO basic_player(tag,name,league_id,townhall_level) VALUES('#PYLQ','Streak fixture',105000036,18)")
 	must(err)
+	_, err = db.Exec(ctx, `INSERT INTO servers(id,name,last_command_at) VALUES('100000000000000001','Fixture',now());
+ INSERT INTO basic_clan(tag,name,public_war_log,war_wins,member_count,badge_token,troops_donated,troops_received) VALUES('#PYLC','Fixture',true,0,1,'',0,0);
+ INSERT INTO server_clans(tag,server_id) VALUES('#PYLC','100000000000000001');
+ UPDATE basic_player SET clan_tag='#PYLC' WHERE tag='#PYLQ';
+ INSERT INTO server_logs(server_id,clan_tag,type,webhook_id) VALUES('100000000000000001','#PYLC','legend_log_attacks','100000000000000002')`)
+	must(err)
+	var groupRequests atomic.Int32
+	var groupTag atomic.Value
+	groupTag.Store("#PYLG")
 	var mu sync.RWMutex
 	var entries []clashy.BattleLogEntry
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if strings.Contains(r.URL.Path, "/leaguegroup/") {
+			groupRequests.Add(1)
+			w.Header().Set("Content-Type", "application/json")
+			w.WriteHeader(404)
+			fmt.Fprint(w, `{"reason":"notFound","message":"unavailable fixture group"}`)
+			return
+		}
+		if strings.HasSuffix(r.URL.Path, "/players/#PYLQ") {
+			w.Header().Set("Content-Type", "application/json")
+			must(json.NewEncoder(w).Encode(map[string]any{"tag": "#PYLQ", "name": "Streak fixture", "clan": map[string]any{"tag": "#PYLC"}, "leagueTier": map[string]any{"id": 105000036}, "currentLeagueGroupTag": groupTag.Load(), "currentLeagueSeasonId": 1}))
+			return
+		}
 		if !strings.HasSuffix(r.URL.Path, "/players/#PYLQ/battlelog") {
 			http.Error(w, "Unexpected request", 500)
 			return
@@ -123,12 +145,20 @@ func main() {
 		}
 	}
 	run([]clashy.BattleLogEntry{triple(1), hit(2, 2, true, clashy.BattleTypeLegend), triple(3)}, 1, 3, false)
+	if groupRequests.Load() == 0 {
+		panic("fixture did not exercise unavailable group enrichment")
+	}
+	groupTag.Store("#0")
+	beforeSentinel := groupRequests.Load()
 	batch := []clashy.BattleLogEntry{triple(1), hit(2, 2, true, clashy.BattleTypeLegend), triple(3), triple(5), hit(6, 1, false, clashy.BattleTypeLegend), hit(7, 1, true, clashy.BattleTypeRanked)}
 	run(batch, 2, 5, true)
 	run(append(batch, hit(4, 1, true, clashy.BattleTypeLegend)), 1, 5, false)
+	if groupRequests.Load() != beforeSentinel {
+		panic("unassigned #0 group was fetched")
+	}
 	// Raw-retention simulation must not erase the durable ongoing counter.
 	_, err = db.Exec(ctx, "DELETE FROM battles_ranked WHERE player_tag='#PYLQ'")
 	must(err)
 	run([]clashy.BattleLogEntry{triple(8)}, 2, 8, false)
-	fmt.Println("Legend streak E2E passed: actual domain, duplicate/concurrent polls, non-triple reset, defense/Ranked excluded, delayed reset, raw-retention continuation")
+	fmt.Println("Legend streak E2E passed: actual domain, duplicate/concurrent polls, non-triple reset, defense/Ranked excluded, delayed reset, raw-retention continuation, unavailable group isolation and #0 sentinel")
 }

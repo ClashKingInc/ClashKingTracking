@@ -75,7 +75,8 @@ func discordLegendEventValue(player clashy.Player, kind, id string, battle clash
 func pollDiscordLegendLogs(ctx context.Context, app *platform.App, player clashy.Player, interests map[string]struct{}, limiter *clashy.Limiter) error {
 	_, attacks := interests["legend_log_attacks"]
 	_, defenses := interests["legend_log_defenses"]
-	if (!attacks && !defenses) || player.Clan == nil || player.CurrentLeagueGroupTag == "" || player.CurrentLeagueSeasonID == 0 || !discordLegendTier(player.LeagueTier.ID) || app.Valkey == nil {
+	// The upstream #0 group is an unassigned sentinel, not a fetchable group.
+	if (!attacks && !defenses) || player.Clan == nil || (player.CurrentLeagueGroupTag == "" || player.CurrentLeagueGroupTag == "#0") || player.CurrentLeagueSeasonID == 0 || !discordLegendTier(player.LeagueTier.ID) || app.Valkey == nil {
 		return nil
 	}
 	key := app.Config.EventStreamName + ":discord-legend-snapshot:" + player.Tag + ":" + player.CurrentLeagueGroupTag + ":" + strconv.Itoa(player.CurrentLeagueSeasonID)
