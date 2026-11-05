@@ -881,13 +881,9 @@ func discordEventLogTypes(event mobileWarEvent) []string {
 		if stringMapValue(event.Value, "type") == "cwl_lineup_change" {
 			return []string{"cwl_lineup_change_log"}
 		}
-		if stringMapValue(event.Value, "type") == "new_attacks" {
-			war, _ := mapValue(event.Value["war"])
-			kind := strings.ToLower(discordWarType(event, war))
-			if kind != "cwl" && kind != "friendly" {
-				return []string{"war_panel"}
-			}
-		}
+		// Every war type keeps its attack/defense log. The panel is a separate
+		// configured destination; routing regular attacks only to it silently
+		// drops messages for servers that use the log without a panel.
 		return []string{"war_log", "war_panel"}
 	case "capital":
 		if stringMapValue(event.Value, "type") == "raid_attacks" {
