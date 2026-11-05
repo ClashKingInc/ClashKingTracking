@@ -75,7 +75,7 @@ func (d *redditDomain) runStream(ctx context.Context, app *platform.App) error {
 		return err
 	}
 	handler := newRedditPostHandler(ctx, app)
-	stop, wait, err := graw.Run(handler, bot, graw.Config{Subreddits: []string{redditSubreddit}})
+	stop, wait, err := graw.Run(handler, bot, graw.Config{Subreddits: []string{redditSubreddit}, SubredditComments: []string{redditSubreddit}})
 	if err != nil {
 		return err
 	}
@@ -136,6 +136,31 @@ func (h *redditPostHandler) Post(post *grawreddit.Post) error {
 	})
 	if err != nil {
 		return errors.Join(err, h.unmarkSeen(event.ID))
+	}
+	h.app.Stats.RecordWrite(redditDomainName, 1)
+	return nil
+}
+
+// Comment subscriptions match the submission author, not the commenter.
+// A namespaced seen key keeps comment and post IDs from suppressing each other.
+func (h *redditPostHandler) Comment(comment *grawreddit.Comment) error {
+	if comment == nil || comment.ID == "" || comment.LinkAuthor == "" || comment.Deleted {
+		return nil
+	}
+	key := "comment:" + comment.ID
+	fresh, err := h.markSeen(key)
+	if err != nil || !fresh {
+		return err
+	}
+	err = h.publish(h.ctx, platform.Event{Topic: "reddit", Value: map[string]any{
+		"type": "redditcomment", "data": map[string]any{
+			"id": comment.ID, "submission_author": comment.LinkAuthor,
+			"author": comment.Author, "body": comment.Body,
+			"url": comment.Permalink, "score": comment.Ups - comment.Downs,
+		},
+	}})
+	if err != nil {
+		return errors.Join(err, h.unmarkSeen(key))
 	}
 	h.app.Stats.RecordWrite(redditDomainName, 1)
 	return nil

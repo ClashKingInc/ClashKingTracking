@@ -6,7 +6,7 @@
 
 ## Child workloads
 
-- Reddit polls configured feeds at `reddit.poll_seconds`, stores/publishes unseen posts, and advances its per-feed state.
+- Reddit reads recruit posts/comments at `reddit.poll_seconds`, deduplicates seen IDs in Valkey, and publishes events for configured feed delivery.
 - Giveaways scans at `giveaways.scan_seconds`, closes or advances due giveaway state, and publishes required bot work.
 - Roster automation scans exact `scheduled_at` rules as described in [roster-automations.md](roster-automations.md).
 

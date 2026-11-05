@@ -114,7 +114,13 @@ func main() {
 	run := func(domain platform.Domain) func() {
 		runCtx, cancel := context.WithCancel(ctx)
 		done := make(chan error, 1)
-		go func() { done <- domain.Run(runCtx, app) }()
+		go func() {
+			err := domain.Run(runCtx, app)
+			if err != nil && runCtx.Err() == nil {
+				fmt.Fprintf(os.Stderr, "Domain %s exited before cancellation: %v\n", domain.Name(), err)
+			}
+			done <- err
+		}()
 		var once sync.Once
 		return func() {
 			once.Do(func() {

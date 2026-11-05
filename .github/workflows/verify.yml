@@ -21,7 +21,7 @@ jobs:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
         with:
           repository: ClashKingInc/DevKit
-          ref: f7baccc68890fae9c133daec3038afb274251600
+          ref: 1721f9dbc16a003d62d763e78e8c2ad7ed8a7053
           path: .ci-schema
           persist-credentials: false
       - uses: actions/setup-go@40f1582b2485089dde7abd97c1529aa768e1baff
@@ -62,3 +62,5 @@ jobs:
 
       - name: Verify all war types reach configured log threads
         run: bash .ci-schema/scripts/with-test-integration.sh --profile retained-api -- go run ./cmd/verify-war-logs
+      - name: Verify Reddit post and subscribed comment delivery
+        run: bash .ci-schema/scripts/with-test-integration.sh --profile retained-api -- go run ./cmd/verify-reddit-logs
