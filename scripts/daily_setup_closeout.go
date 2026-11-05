@@ -101,7 +101,7 @@ func (s *timescaleScheduledStore) rebuildDailyArmySetups(ctx context.Context, da
 		return 0, err
 	}
 	defer tx.Rollback(ctx)
-	if _, err = tx.Exec(ctx, `SELECT pg_advisory_xact_lock($1)`, armyFamilyCloseoutLockID); err != nil {
+	if _, err = tx.Exec(ctx, `SELECT pg_advisory_xact_lock($1)`, legendCloseoutLockID); err != nil {
 		return 0, err
 	}
 	writes, err := rebuildDailyArmySetupsTx(ctx, tx, day, static)

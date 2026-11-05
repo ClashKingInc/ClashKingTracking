@@ -25,7 +25,7 @@ func RebuildLegendDayPerformance(ctx context.Context, dsn string, days []time.Ti
 		}
 		n, err := func() (int, error) {
 			defer tx.Rollback(ctx)
-			if _, err := tx.Exec(ctx, `SELECT pg_advisory_xact_lock($1)`, armyFamilyCloseoutLockID); err != nil {
+			if _, err := tx.Exec(ctx, `SELECT pg_advisory_xact_lock($1)`, legendCloseoutLockID); err != nil {
 				return 0, err
 			}
 			n, err := rebuildLegendDayPerformanceTx(ctx, tx, dayStart(day))

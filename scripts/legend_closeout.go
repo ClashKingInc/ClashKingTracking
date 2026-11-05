@@ -12,7 +12,7 @@ import (
 	"github.com/jackc/pgx/v5"
 )
 
-const armyFamilyCloseoutLockID int64 = 636413279150006789
+const legendCloseoutLockID int64 = 636413279150006789
 
 var legendCloseoutCohorts = [...]string{"legend_i", "top_1000", "top_200"}
 
@@ -158,7 +158,7 @@ func (s *timescaleScheduledStore) CaptureLegendSnapshot(ctx context.Context, day
 		return 0, err
 	}
 	defer tx.Rollback(ctx)
-	if _, err = tx.Exec(ctx, `SELECT pg_advisory_xact_lock($1)`, armyFamilyCloseoutLockID); err != nil {
+	if _, err = tx.Exec(ctx, `SELECT pg_advisory_xact_lock($1)`, legendCloseoutLockID); err != nil {
 		return 0, err
 	}
 	day = dayStart(day)
@@ -204,7 +204,7 @@ func (s *timescaleScheduledStore) FinalizeLegendCloseout(ctx context.Context, da
 		return 0, err
 	}
 	defer tx.Rollback(ctx)
-	if _, err = tx.Exec(ctx, `SELECT pg_advisory_xact_lock($1)`, armyFamilyCloseoutLockID); err != nil {
+	if _, err = tx.Exec(ctx, `SELECT pg_advisory_xact_lock($1)`, legendCloseoutLockID); err != nil {
 		return 0, err
 	}
 	day = dayStart(day)

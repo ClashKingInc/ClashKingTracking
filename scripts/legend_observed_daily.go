@@ -63,7 +63,7 @@ func (s *timescaleScheduledStore) rebuildObservedLegendDay(ctx context.Context, 
 		return 0, err
 	}
 	defer tx.Rollback(ctx)
-	if _, err = tx.Exec(ctx, `SELECT pg_advisory_xact_lock($1)`, armyFamilyCloseoutLockID); err != nil {
+	if _, err = tx.Exec(ctx, `SELECT pg_advisory_xact_lock($1)`, legendCloseoutLockID); err != nil {
 		return 0, err
 	}
 	rows, err := tx.Query(ctx, `SELECT player_tag,direction,stars,destruction_percentage,duration_seconds,coalesce(share_code,'')

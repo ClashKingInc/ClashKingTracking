@@ -88,7 +88,7 @@ func BackfillLegendAttackTypes(ctx context.Context, dsn string, target LegendAtt
 		return nil, errors.New("migration 045 is not applied; refusing Legend attack-type backfill")
 	}
 	if apply {
-		if _, err = tx.Exec(ctx, `SELECT pg_advisory_xact_lock($1)`, armyFamilyCloseoutLockID); err != nil {
+		if _, err = tx.Exec(ctx, `SELECT pg_advisory_xact_lock($1)`, legendCloseoutLockID); err != nil {
 			return nil, err
 		}
 	}

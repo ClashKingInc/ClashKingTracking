@@ -66,13 +66,13 @@ Reads target tables and the requested player's current Town Hall from `basic_pla
 
 Ranked and Legend rows retain the normalized share code directly. The hot writer inserts each distinct code into `army_compositions`, keyed only by `share_code`; there is no army hash or parser-version identity. The daily Legend closeout reuses those compositions for troop-group/setup and item aggregation.
 
-Hero mode segments such as `h2m1p16e5_41` are accepted and preserved in canonical share codes. Mode is not a composition column and does not participate in army-family similarity; `m0` and `m1` can remain distinct exact codes in the same family. The earlier rejection came from Tracking's share-code validator, not clashy.go.
+Hero mode segments such as `h2m1p16e5_41` are accepted and preserved in canonical share codes. Mode is not a composition column and does not participate in troop-group identity; `m0` and `m1` can remain distinct exact codes in the same group. The earlier rejection came from Tracking's share-code validator, not clashy.go.
 
 The battle identity is `(player_tag, battle_time)`. Deploy this writer only with the final DevKit migration 017 contract. Existing raw rows remain intact.
 
 The scheduled closeout rebuilds completed 05:00 UTC Legend-day and Ranked-season aggregates from raw attack perspectives. Current public statistics use the daily troop-group/setup classifier and item aggregates; historical family tables remain available to historical admin tooling and no longer receive current daily writes. Farming and Ranked/Legend raw rows retain one year.
 
-The Army Lab troop-overlap classifier remains a frozen candidate rather than a live replacement. Its import must first land in a forward schema migration with a durable model/version record, imported prototype IDs, and a separate versioned membership table; the existing `army_family_members` assignments and family IDs must remain unchanged. A later explicitly selected backfill can classify historical share codes into that new version and compare coverage/stability before an API cohort opts into it. This prevents a model import from silently reassigning the immutable IDs currently used by daily history.
+The active daily troop-group/setup classifier is specified in [its durable contract](../internal/armyfamily/DAILY_CLASSIFIER.md). It derives group keys and setup conditions from each completed day's observed attacks; it does not assign permanent numeric family IDs.
 
 Valkey checkpoint keys remember the newest battle time seen for each player. `battlelogs.checkpoint_ttl_days` controls their lifetime. The checkpoint is comparison state, not target membership.
 
