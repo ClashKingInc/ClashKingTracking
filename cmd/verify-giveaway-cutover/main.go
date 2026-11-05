@@ -52,10 +52,11 @@ func main() {
 	must(err)
 	for _, id := range []string{old, current} {
 		ended := boundary.Add(time.Minute)
+		// Schema 058 already normalizes absent legacy collections before this
+		// service runs. The delivery boundary must preserve that stored array.
 		entries := "[]"
 		if id == old {
 			ended = boundary.Add(-24 * time.Hour)
-			entries = "null"
 		}
 		_, err = db.Exec(ctx, `INSERT INTO giveaways(id,server_id,prize,channel_id,status,start_time,end_time,winners,message_id,entries) VALUES($1,$2,'Fixture','999999999999992803','ended',$3,$4,1,'999999999999992804',$5::jsonb)`, id, guild, ended.Add(-time.Hour), ended, entries)
 		must(err)
@@ -102,7 +103,7 @@ func main() {
 	check(oldCalls.Load() == 0, "historical ending reached API")
 	check(discordWrites.Load() == 0, "unexpected Discord message")
 	var preserved bool
-	must(db.QueryRow(ctx, `SELECT entries='null'::jsonb AND status='ended' FROM giveaways WHERE id=$1`, old).Scan(&preserved))
+	must(db.QueryRow(ctx, `SELECT entries='[]'::jsonb AND status='ended' FROM giveaways WHERE id=$1`, old).Scan(&preserved))
 	check(preserved, "historical data changed")
 	stop()
 	select {
