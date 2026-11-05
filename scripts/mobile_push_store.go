@@ -680,6 +680,8 @@ func (s *timescaleMobilePushStore) ListDeliveryAttempts(ctx context.Context, id 
 }
 
 func (s *timescaleMobilePushStore) ClaimDuePushRetries(ctx context.Context, now time.Time) ([]models.AdminPost, error) {
+	// Cast the scan instant before interval subtraction. Otherwise PostgreSQL
+	// can infer the unknown bind parameter as interval and reject the comparison.
 	tx, err := s.pool.Begin(ctx)
 	if err != nil {
 		return nil, err
@@ -693,8 +695,8 @@ func (s *timescaleMobilePushStore) ClaimDuePushRetries(ctx context.Context, now 
 			  AND a.status IN ('queued', 'processing', 'failed', 'partial') AND a.attempt_number < 4
 			  AND (
 				a.status = 'queued'
-				OR (a.status IN ('failed', 'partial') AND a.attempted_at <= $1 - interval '2 minutes')
-				OR (a.status = 'processing' AND a.attempted_at <= $1 - interval '5 minutes')
+				OR (a.status IN ('failed', 'partial') AND a.attempted_at <= $1::timestamptz - interval '2 minutes')
+				OR (a.status = 'processing' AND a.attempted_at <= $1::timestamptz - interval '5 minutes')
 			  )
 			  ) FOR UPDATE SKIP LOCKED`, now)
 	if err != nil {
@@ -964,7 +966,7 @@ func (s *timescaleMobilePushStore) ClaimDueCampaigns(ctx context.Context, now ti
 			VALUES ($1, $2::date, 0, 0, 0, 'processing', $3)
 			ON CONFLICT (campaign_id, scheduled_for) DO UPDATE SET status='processing', attempted_at=$3
 			WHERE admin_campaign_delivery_attempts.status = 'processing'
-			  AND admin_campaign_delivery_attempts.attempted_at <= $3 - interval '5 minutes'`,
+			  AND admin_campaign_delivery_attempts.attempted_at <= $3::timestamptz - interval '5 minutes'`,
 			campaign.ID, campaignScheduledFor(campaign, now), now)
 		if err != nil {
 			return nil, err
