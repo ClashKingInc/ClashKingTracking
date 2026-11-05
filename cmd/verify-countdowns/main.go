@@ -60,6 +60,8 @@ func main() {
 	types := map[string]int{}
 	owners := map[string]string{}
 	writes := 0
+	duplicateWrites := 0
+	writesByChannel := map[string]int{}
 	warReads := 0
 	state := "inWar"
 	for i, kind := range kinds {
@@ -121,6 +123,10 @@ func main() {
 				Name string `json:"name"`
 			}
 			must(json.NewDecoder(r.Body).Decode(&body))
+			if name == body.Name {
+				duplicateWrites++
+			}
+			writesByChannel[id]++
 			names[id] = body.Name
 			name = body.Name
 			writes++
@@ -138,6 +144,7 @@ func main() {
 	for phase := 0; phase < 4; phase++ {
 		mu.Lock()
 		before := writes
+		beforeScore, beforeTimer := writesByChannel["999999999999998605"], writesByChannel["999999999999998606"]
 		warReads = 0
 		if phase == 2 {
 			state = "preparation"
@@ -189,15 +196,18 @@ func main() {
 			check(strings.Contains(names["999999999999998606"], "Ends in"), "war timer wrong")
 		}
 		if phase == 1 {
-			check(delta == 0, "unchanged channel names were renamed")
+			// Real clocks may cross a minute between process restarts. Timers
+			// should then change, while identical names must never be sent.
+			check(duplicateWrites == 0, "unchanged channel names were renamed")
+			check(writesByChannel["999999999999998605"] == beforeScore, "unchanged war score was renamed")
 		}
 		if phase == 2 {
-			check(delta == 2, "preparation did not update both war channels")
+			check(writesByChannel["999999999999998605"]-beforeScore == 1 && writesByChannel["999999999999998606"]-beforeTimer == 1, "preparation did not update both war channels")
 			check(strings.Contains(names["999999999999998605"], "Starts in"), "preparation score misleading")
 		}
 		expectedReads := 1
 		if phase == 3 {
-			check(delta == 2, "missing war did not update both channels")
+			check(writesByChannel["999999999999998605"]-beforeScore == 1 && writesByChannel["999999999999998606"]-beforeTimer == 1, "missing war did not update both channels")
 			check(strings.Contains(names["999999999999998605"], "No visible war"), "missing war was asserted idle")
 			expectedReads = 2
 		}

@@ -96,9 +96,11 @@ func (d *discordDeliveryDomain) Run(ctx context.Context, app *platform.App) erro
 			if err := worker.refreshDueFarmingBoards(ctx); err != nil {
 				app.Logger.Error("farming autoboard scan failed", "err", err)
 			}
-		}
-		if err := worker.recoverGiveawayPublications(ctx); err != nil {
-			app.Logger.Error("giveaway publication recovery failed", "err", err)
+			// Recovery scans follow a fixed cadence, independent of stream traffic.
+			// A failing historical row must not hammer the API on every event.
+			if err := worker.recoverGiveawayPublications(ctx); err != nil {
+				app.Logger.Error("giveaway publication recovery failed", "err", err)
+			}
 		}
 		entries, err := worker.claimPending(ctx)
 		if err == nil && len(entries) == 0 {
@@ -122,6 +124,11 @@ func (d *discordDeliveryDomain) Run(ctx context.Context, app *platform.App) erro
 }
 
 func validateDiscordDeliveryConfig(cfg platform.Config, client valkey.Client) error {
+	if cfg.GiveawayRecoverySince != "" {
+		if _, err := time.Parse(time.RFC3339Nano, cfg.GiveawayRecoverySince); err != nil {
+			return errors.New("GIVEAWAY_RECOVERY_SINCE must be an RFC3339 timestamp")
+		}
+	}
 	if cfg.DiscordBotToken == "" {
 		return errors.New("DISCORD_BOT_TOKEN is required for discord-delivery")
 	}
