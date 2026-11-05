@@ -222,21 +222,42 @@ func reminderIntList(value any) []int {
 }
 
 func (d *remindersDomain) reconcileAllWars(ctx context.Context) error {
-	rows, err := d.pool.Query(ctx, `SELECT schedule_key FROM war_schedule WHERE end_time > now()`)
-	if err != nil {
-		return err
-	}
-	defer rows.Close()
-	for rows.Next() {
-		var key string
-		if err := rows.Scan(&key); err != nil {
+	// Close each bounded read before reconciling. Holding one cursor across all
+	// wars pins an old snapshot (and logical replication WAL) for the entire
+	// startup sweep, and can exhaust the pool when reconciliation needs a write.
+	const batchSize = 500
+	after := ""
+	for {
+		rows, err := d.pool.Query(ctx, `SELECT schedule_key FROM war_schedule
+			WHERE end_time > now() AND schedule_key > $1
+			ORDER BY schedule_key LIMIT $2`, after, batchSize)
+		if err != nil {
 			return err
 		}
-		if err := d.reconcileWar(ctx, key); err != nil {
+		keys := make([]string, 0, batchSize)
+		for rows.Next() {
+			var key string
+			if err := rows.Scan(&key); err != nil {
+				rows.Close()
+				return err
+			}
+			keys = append(keys, key)
+		}
+		err = rows.Err()
+		rows.Close()
+		if err != nil {
 			return err
 		}
+		for _, key := range keys {
+			if err := d.reconcileWar(ctx, key); err != nil {
+				return err
+			}
+		}
+		if len(keys) < batchSize {
+			return nil
+		}
+		after = keys[len(keys)-1]
 	}
-	return rows.Err()
 }
 
 func (d *remindersDomain) reconcileWar(ctx context.Context, scheduleKey string) error {
