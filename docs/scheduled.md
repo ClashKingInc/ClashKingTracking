@@ -13,7 +13,7 @@ The main scheduled cycle uses `scheduled.interval_seconds`. The Legend player re
 - Current and historical player/clan leaderboard snapshots.
 - Forward-only Legend history completion for recent completed seasons. Already stored season IDs are skipped before parsing; routine discovery never backfills beyond a 35-day lookback or the newest stored completion, whichever is later. Older repairs require an explicit separate operation.
 - Ranked league member snapshots and season tier aggregates.
-- Legend daily hit-rate, usage, and immutable army-family aggregates.
+- Legend daily hit-rate, usage, troop-group and setup aggregates.
 - Scheduled broad statistics and date-bound maintenance already implemented in `scripts/scheduled.go`.
 - The leaderboards workload described separately in [leaderboards.md](leaderboards.md).
 
@@ -38,9 +38,9 @@ Depending on the due subjob: player profile, locations, player/clan ranking endp
 
 ## Data read and written
 
-Writes typed leaderboard history/current tables, `legend_history`, `legend_rankings_current`, `leaderboard_history_player_home`, Ranked league members, `league_hitrate_stats`, `ranked_league_tier_stats`, `legend_daily_stats`, immutable army families and memberships, daily family outcomes, and changed basic profile facts learned from rankings. Legend and Ranked closeouts delete and rebuild only their completed day or season, and every battle aggregate reads numeric attack direction `1` so the stored defense perspective cannot double-count it. Legend closeout writes the exact `legend_i`, `top_1000`, and `top_200` cohorts, with higher-ranked players intentionally represented in each applicable cohort.
+Writes typed leaderboard history/current tables, `legend_history`, `legend_rankings_current`, `leaderboard_history_player_home`, Ranked league members, `league_hitrate_stats`, `ranked_league_tier_stats`, `legend_daily_stats`, daily troop-group/setup observations in `army_setup_daily_stats`, and changed basic profile facts learned from rankings. Legend and Ranked closeouts delete and rebuild only their completed day or season, and every battle aggregate reads numeric attack direction `1` so the stored defense perspective cannot double-count it. Legend closeout writes the exact `legend_i`, `top_1000`, and `top_200` cohorts, with higher-ranked players intentionally represented in each applicable cohort.
 
-Army-family matching compares each exact army directly with immutable anchors. Troop housing similarity must be at least 0.86, spell-capacity similarity at least 0.80, heroes must match exactly, and equipment similarity must be at least 0.75 with no more than two differing equipment IDs. New families retain an immutable representative share code and an optional name.
+The active daily classifier groups armies by core fighting troops using weighted housing overlap, then discovers supported spell/equipment setups inside each troop group. Group and setup keys describe the observed composition rather than a permanent numeric family ID. See [the classifier contract](../internal/armyfamily/DAILY_CLASSIFIER.md) for thresholds and review coverage. The older immutable `army_families`, `army_family_members`, and `army_family_daily_stats` remain historical data; closeout does not reassign them or resume their retired writer. The API army-setup endpoints and current App Armies screen consume the new daily observations.
 
 ## Events and Valkey
 
