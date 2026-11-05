@@ -56,3 +56,6 @@ jobs:
         run: bash .ci-schema/scripts/with-test-integration.sh --profile retained-api -- go run -race ./cmd/verify-tracking-state
       - name: Verify retained reminder webhook delivery
         run: bash .ci-schema/scripts/with-test-integration.sh --profile retained-api -- go run ./cmd/verify-reminder-webhooks
+
+      - name: Verify giveaway migration cutover
+        run: bash .ci-schema/scripts/with-test-integration.sh --profile retained-api -- go run ./cmd/verify-giveaway-cutover
