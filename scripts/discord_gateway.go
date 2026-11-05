@@ -734,6 +734,18 @@ func safeDiscordLibraryErrorAttrs(err error) []slog.Attr {
 		rootError = errors.Unwrap(rootError)
 	}
 	attrs := []slog.Attr{slog.String("error_kind", kind), slog.String("error_type", fmt.Sprintf("%T", rootError))}
+	// These library errors contain only a numeric enum. Require an exact
+	// reconstructed match so no arbitrary payload suffix can reach the log.
+	for _, label := range []string{"channel", "permission overwrite", "application command", "webhook", "application command option"} {
+		pattern := "unknown " + label + " with type %d received"
+		var value int
+		if n, _ := fmt.Sscanf(rootError.Error(), pattern, &value); n == 1 && fmt.Sprintf(pattern, value) == rootError.Error() {
+			return []slog.Attr{slog.String("error_kind", "unknown_enum"), slog.String("enum", label), slog.Int("enum_value", value)}
+		}
+	}
+	if errors.Is(err, discord.ErrNoTimestampMatch) {
+		return []slog.Attr{slog.String("error_kind", "timestamp_format")}
+	}
 	var opErr *net.OpError
 	if errors.As(err, &opErr) {
 		if kind == "other" {
