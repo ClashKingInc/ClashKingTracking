@@ -699,6 +699,17 @@ func safeDiscordLibraryAttrs(attr slog.Attr) []slog.Attr {
 }
 
 func safeDiscordLibraryErrorAttrs(err error) []slog.Attr {
+	// Disgo wraps decode errors with the entire gateway payload. Report typed
+	// structure metadata only; never log Error(), which can expose member data
+	// or the READY session token while diagnosing a reconnect loop.
+	var typeErr *json.UnmarshalTypeError
+	if errors.As(err, &typeErr) {
+		return []slog.Attr{slog.String("error_kind", "json_type"), slog.String("json_field", typeErr.Field), slog.String("json_target", typeErr.Type.String())}
+	}
+	var syntaxErr *json.SyntaxError
+	if errors.As(err, &syntaxErr) {
+		return []slog.Attr{slog.String("error_kind", "json_syntax"), slog.Int64("json_offset", syntaxErr.Offset)}
+	}
 	var closeErr *websocket.CloseError
 	if errors.As(err, &closeErr) {
 		return []slog.Attr{slog.Int("close_code", closeErr.Code), slog.String("error_kind", "websocket_close")}
@@ -718,7 +729,11 @@ func safeDiscordLibraryErrorAttrs(err error) []slog.Attr {
 		kind = "eof"
 	}
 
-	attrs := []slog.Attr{slog.String("error_kind", kind)}
+	rootError := err
+	for depth := 0; depth < 8 && errors.Unwrap(rootError) != nil; depth++ {
+		rootError = errors.Unwrap(rootError)
+	}
+	attrs := []slog.Attr{slog.String("error_kind", kind), slog.String("error_type", fmt.Sprintf("%T", rootError))}
 	var opErr *net.OpError
 	if errors.As(err, &opErr) {
 		if kind == "other" {
