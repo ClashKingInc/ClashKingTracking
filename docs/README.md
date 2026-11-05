@@ -29,3 +29,18 @@ The processes remain separate so each workload can be enabled, stopped, and obse
 | Error reporting | [observability.md](observability.md) |
 
 All Clash requests pass through the shared request gate. A short proxy outage pauses work without changing game clocks. Confirmed Clash maintenance pauses work and, at recovery, shifts the durable war clocks by the measured duration.
+
+## Runtime ordering verification
+
+After DevKit migration 053, run the real-domain local checks with:
+
+```sh
+/path/to/clashking_schemas/scripts/with-test-integration.sh --profile retained-api -- \
+  go run -race ./cmd/verify-tracking-state
+```
+
+The command requires the disposable fixture markers and a loopback database. It
+uses real Tracking domains, PostgreSQL, Valkey and local HTTP responses, not unit
+or mocked helper tests. It covers maintenance recovery after a post-commit
+heartbeat failure, expired clocks, proxy classification, and reversed profile
+and clan-member response order. It never contacts Discord or the public Clash API.

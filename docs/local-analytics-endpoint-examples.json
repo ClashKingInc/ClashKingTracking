@@ -1,0 +1,2417 @@
+{
+  "overview": {
+    "firstDay": "2026-09-15",
+    "lastDay": "2026-09-20",
+    "completedDays": [
+      "2026-09-15",
+      "2026-09-16",
+      "2026-09-17",
+      "2026-09-18",
+      "2026-09-19",
+      "2026-09-20"
+    ],
+    "totalAttacks": 470192,
+    "classifiedAttacks": 469396,
+    "leagueTierId": 105000036,
+    "rankLimit": null,
+    "items": [
+      {
+        "groupKey": "[4000132]",
+        "variantKey": "",
+        "coreTroops": [
+          4000132
+        ],
+        "conditions": [],
+        "shareCode": "h0p9e14_32-1p3e39_48-2p16e5_24-7p4e52_60i1x5-2x10-2x57-2x58-1x135d1x5-1x9-2x109u2x5-5x7-1x23-3x28-3x109-1x123-9x132s1x70-3x98-3x120",
+        "attacks": 188529,
+        "starCounts": {
+          "zero": 205,
+          "one": 24664,
+          "two": 63523,
+          "three": 100137
+        },
+        "usageRate": 0.40096173478068536,
+        "threeStarRate": 0.5311490539916935,
+        "averageDestruction": 92.95512096282269,
+        "observedDays": 6
+      },
+      {
+        "groupKey": "[4000008,4000065]",
+        "variantKey": "",
+        "coreTroops": [
+          4000008,
+          4000065
+        ],
+        "conditions": [],
+        "shareCode": "h1p9e17_48-2m1p16e4_34-6p17e43_49-7p4e52_53i1x63-1x76-1x188d1x70-1x98u1x0-2x1-8x8-3x57-5x65-1x76s1x2-2x5-3x10-4x120",
+        "attacks": 94562,
+        "starCounts": {
+          "zero": 12,
+          "one": 6716,
+          "two": 41227,
+          "three": 46607
+        },
+        "usageRate": 0.20111358764079354,
+        "threeStarRate": 0.49287240117594805,
+        "averageDestruction": 92.88097755969629,
+        "observedDays": 6
+      },
+      {
+        "groupKey": "[4000080]",
+        "variantKey": "",
+        "coreTroops": [
+          4000080
+        ],
+        "conditions": [],
+        "shareCode": "h0p9e14_32-1p11e16_48-2p7e4_19-7p10e56_59i1x5-1x64-1x80-1x135d1x9-1x53-1x120u3x1-3x5-3x6-5x7-2x12-1x23-3x28-2x58-4x80-1x82-1x97-1x109s3x2-2x5-3x35",
+        "attacks": 90984,
+        "starCounts": {
+          "zero": 39,
+          "one": 6279,
+          "two": 44913,
+          "three": 39753
+        },
+        "usageRate": 0.19350393030932045,
+        "threeStarRate": 0.4369229754682142,
+        "averageDestruction": 91.69379231513233,
+        "observedDays": 6
+      },
+      {
+        "groupKey": "[4000057]",
+        "variantKey": "",
+        "coreTroops": [
+          4000057
+        ],
+        "conditions": [],
+        "shareCode": "h0p10e14_51-1p9e17_48-2p17e22_24-7p4e53_60i1x64-1x91-1x147d1x53-1x98u4x1-6x4-5x7-2x10-1x53-9x57-2x58-2x82-5x84-1x123-3x150s1x9-5x10-3x35-2x120",
+        "attacks": 28317,
+        "starCounts": {
+          "zero": 3,
+          "one": 1848,
+          "two": 12449,
+          "three": 14017
+        },
+        "usageRate": 0.06022433388913465,
+        "threeStarRate": 0.4950030017304093,
+        "averageDestruction": 94.91411519581877,
+        "observedDays": 6
+      },
+      {
+        "groupKey": "[4000065]",
+        "variantKey": "",
+        "coreTroops": [
+          4000065
+        ],
+        "conditions": [],
+        "shareCode": "h2m1p16e4_34-4p4e6_13-6p17e35_43-7p10e52_59i1x5-2x65-1x188d1x70-1x98u1x0-3x1-1x6-1x10-1x17-1x23-4x57-3x63-9x65s2x5-1x9-6x35-2x120",
+        "attacks": 13818,
+        "starCounts": {
+          "zero": 2,
+          "one": 1358,
+          "two": 4991,
+          "three": 7467
+        },
+        "usageRate": 0.029387994691530268,
+        "threeStarRate": 0.5403821102909249,
+        "averageDestruction": 93.95433492545955,
+        "observedDays": 6
+      },
+      {
+        "groupKey": "[4000147]",
+        "variantKey": "",
+        "coreTroops": [
+          4000147
+        ],
+        "conditions": [],
+        "shareCode": "h0p8e8_14-1p3e17_48-2p7e19_24-7p4e52_60i1x9-2x58-1x188d2x98u2x1-1x10-1x28-1x58-2x82-1x97-3x123-7x147s1x2-2x5-1x9-1x17-3x109-2x120",
+        "attacks": 11724,
+        "starCounts": {
+          "zero": 2,
+          "one": 1149,
+          "two": 5035,
+          "three": 5538
+        },
+        "usageRate": 0.0249344948446592,
+        "threeStarRate": 0.47236438075742065,
+        "averageDestruction": 92.5568065506653,
+        "observedDays": 6
+      },
+      {
+        "groupKey": "[4000109]",
+        "variantKey": "",
+        "coreTroops": [
+          4000109
+        ],
+        "conditions": [],
+        "shareCode": "h0p11e10_51-1p9e39_48-2p17e22_24-7p4e52_60i1x64-1x135-1x147d1x70-1x98u3x1-2x5-1x6-5x7-1x10-2x28-4x57-1x58-1x82-1x97-6x109-1x150s2x5-1x9-2x10-3x35-1x109-2x120",
+        "attacks": 6947,
+        "starCounts": {
+          "zero": 19,
+          "one": 963,
+          "two": 2709,
+          "three": 3256
+        },
+        "usageRate": 0.014774815394562222,
+        "threeStarRate": 0.4686915215200806,
+        "averageDestruction": 91.97696847560098,
+        "observedDays": 6
+      },
+      {
+        "groupKey": "[4000066,4000109]",
+        "variantKey": "",
+        "coreTroops": [
+          4000066,
+          4000109
+        ],
+        "conditions": [],
+        "shareCode": "h0p11e10_51-1p9e17_48-2p16e22_24-7p4e53_60i5x28-1x58-1x188d2x5-1x98u2x1-3x5-5x7-3x26-3x66-1x82-1x97-4x109s5x10-4x35-1x109-1x120",
+        "attacks": 6460,
+        "starCounts": {
+          "zero": 18,
+          "one": 1425,
+          "two": 2392,
+          "three": 2625
+        },
+        "usageRate": 0.013739068295504815,
+        "threeStarRate": 0.40634674922600617,
+        "averageDestruction": 89.92631578947369,
+        "observedDays": 6
+      },
+      {
+        "groupKey": "[4000109,4000132]",
+        "variantKey": "",
+        "coreTroops": [
+          4000109,
+          4000132
+        ],
+        "conditions": [],
+        "shareCode": "h0p10e14_32-1p9e20_48-2p16e5_24-7p4e53_60i1x64-1x135-1x147d2x98u5x7-1x28-1x82-4x109-8x132-2x150s6x0-1x9-2x10-2x120",
+        "attacks": 5765,
+        "starCounts": {
+          "zero": 7,
+          "one": 888,
+          "two": 1830,
+          "three": 3040
+        },
+        "usageRate": 0.012260948718821248,
+        "threeStarRate": 0.5273200346921075,
+        "averageDestruction": 92.51708586296617,
+        "observedDays": 6
+      },
+      {
+        "groupKey": "[4000027,4000109]",
+        "variantKey": "",
+        "coreTroops": [
+          4000027,
+          4000109
+        ],
+        "conditions": [],
+        "shareCode": "h0p9e14_32-1p3e39_48-2p16e5_24-7p4e52_60i2x5-3x58-1x135d1x70-2x109u3x1-3x5-5x7-10x27-2x28-1x53-1x82-4x109s2x5-1x9-2x98-4x120",
+        "attacks": 4775,
+        "starCounts": {
+          "zero": 9,
+          "one": 1125,
+          "two": 1417,
+          "three": 2224
+        },
+        "usageRate": 0.010155425868581345,
+        "threeStarRate": 0.46575916230366493,
+        "averageDestruction": 90.81026178010471,
+        "observedDays": 6
+      },
+      {
+        "groupKey": "[4000084]",
+        "variantKey": "",
+        "coreTroops": [
+          4000084
+        ],
+        "conditions": [],
+        "shareCode": "h1p9e17_48-2p17e22_24-4p4e6_13-7p10e52_53i1x64-1x91-1x147d1x9-1x53-1x120u1x0-5x1-6x4-5x7-3x10-1x11-12x57-1x58-3x82-9x84-1x123s5x10-4x35-1x98",
+        "attacks": 3864,
+        "starCounts": {
+          "zero": 0,
+          "one": 271,
+          "two": 1558,
+          "three": 2035
+        },
+        "usageRate": 0.008217919488209073,
+        "threeStarRate": 0.526656314699793,
+        "averageDestruction": 95.31237060041408,
+        "observedDays": 6
+      },
+      {
+        "groupKey": "[4000005,4000076]",
+        "variantKey": "",
+        "coreTroops": [
+          4000005,
+          4000076
+        ],
+        "conditions": [],
+        "shareCode": "h2m1p16e5_41-4p4e6_13-6p17e43_49-7p11e52_60i1x63-1x76-1x188d1x70-1x98u1x0-4x1-29x5-2x10-1x12-1x23-4x63-3x76s2x5-1x9-1x10-1x11-4x109-2x120",
+        "attacks": 3018,
+        "starCounts": {
+          "zero": 1,
+          "one": 359,
+          "two": 875,
+          "three": 1783
+        },
+        "usageRate": 0.006418654507094974,
+        "threeStarRate": 0.5907886017229954,
+        "averageDestruction": 95.1235917826375,
+        "observedDays": 6
+      },
+      {
+        "groupKey": "[4000110]",
+        "variantKey": "",
+        "coreTroops": [
+          4000110
+        ],
+        "conditions": [],
+        "shareCode": "h1p9e17_48-2p16e4_24-4p10e13_40-7p4e52_53i1x64-1x147-1x188d1x53-1x70u3x1-3x5-5x7-1x10-4x12-1x23-6x26-6x57-2x58-2x82-1x97-4x110s1x9-3x10-5x35-2x120",
+        "attacks": 1979,
+        "starCounts": {
+          "zero": 1,
+          "one": 234,
+          "two": 829,
+          "three": 915
+        },
+        "usageRate": 0.004208918909721986,
+        "threeStarRate": 0.46235472460838806,
+        "averageDestruction": 92.211217786761,
+        "observedDays": 6
+      },
+      {
+        "groupKey": "[4000080,4000147]",
+        "variantKey": "",
+        "coreTroops": [
+          4000080,
+          4000147
+        ],
+        "conditions": [],
+        "shareCode": "h0p4e8_14-1p9e39_48-2p16e19_24-7p11e52_60i1x9-2x58-1x188d2x98u1x1-5x7-1x23-1x58-3x80-1x82-1x97-4x147s1x2-1x5-1x9-1x10-4x109-2x120",
+        "attacks": 1847,
+        "starCounts": {
+          "zero": 1,
+          "one": 171,
+          "two": 992,
+          "three": 683
+        },
+        "usageRate": 0.003928182529689999,
+        "threeStarRate": 0.36978884677855983,
+        "averageDestruction": 90.52950730914998,
+        "observedDays": 6
+      },
+      {
+        "groupKey": "[4000027]",
+        "variantKey": "",
+        "coreTroops": [
+          4000027
+        ],
+        "conditions": [],
+        "shareCode": "h0p10e14_32-1p9e39_48-2p17e5_24-7p4e52_60i1x5-2x58-1x110-1x135d2x5-2x120u2x1-1x5-5x7-3x12-11x27-2x28-1x58-2x109-2x150s3x16-1x98",
+        "attacks": 1491,
+        "starCounts": {
+          "zero": 11,
+          "one": 377,
+          "two": 455,
+          "three": 648
+        },
+        "usageRate": 0.0031710450199067615,
+        "threeStarRate": 0.4346076458752515,
+        "averageDestruction": 89.31857813547954,
+        "observedDays": 5
+      },
+      {
+        "groupKey": "[4000005,4000008]",
+        "variantKey": "",
+        "coreTroops": [
+          4000005,
+          4000008
+        ],
+        "conditions": [],
+        "shareCode": "h2m1p16e4_5-4p4e6_13-6p17e43_49-7p11e52_60i1x63-1x76-1x188d1x70-1x98u1x0-3x1-20x5-1x6-5x8-2x10-2x23-5x57-2x76s1x2-2x5-1x9-1x10-3x109-2x120",
+        "attacks": 1139,
+        "starCounts": {
+          "zero": 0,
+          "one": 127,
+          "two": 379,
+          "three": 633
+        },
+        "usageRate": 0.002422414673154796,
+        "threeStarRate": 0.5557506584723442,
+        "averageDestruction": 94.32133450395084,
+        "observedDays": 6
+      },
+      {
+        "groupKey": "[4000066]",
+        "variantKey": "",
+        "coreTroops": [
+          4000066
+        ],
+        "conditions": [],
+        "shareCode": "h0p10e14_51-1p9e17_48-2p17e22_24-7p4e52_53i1x1-1x5-1x57-1x58-1x109-1x135d1x5-1x9-1x70u4x1-4x4-2x5-5x7-1x12-3x57-2x58-3x66-1x82-1x97-2x109s5x10-3x35-1x98-1x120",
+        "attacks": 825,
+        "starCounts": {
+          "zero": 6,
+          "one": 115,
+          "two": 316,
+          "three": 388
+        },
+        "usageRate": 0.0017546023751999183,
+        "threeStarRate": 0.4703030303030303,
+        "averageDestruction": 91.62666666666667,
+        "observedDays": 6
+      },
+      {
+        "groupKey": "[4000177]",
+        "variantKey": "",
+        "coreTroops": [
+          4000177
+        ],
+        "conditions": [],
+        "shareCode": "h0p9e14_32-1p3e17_48-2p16e22_24-7p4e52_60i2x0-1x53-1x135-1x147d1x98-2x120u4x1-2x5-5x7-4x26-4x57-2x82-1x97-4x132-3x177s1x9-2x10-4x35-1x70-1x98",
+        "attacks": 625,
+        "starCounts": {
+          "zero": 2,
+          "one": 89,
+          "two": 298,
+          "three": 236
+        },
+        "usageRate": 0.0013292442236363018,
+        "threeStarRate": 0.3776,
+        "averageDestruction": 89.7952,
+        "observedDays": 6
+      },
+      {
+        "groupKey": "[4000081]",
+        "variantKey": "",
+        "coreTroops": [
+          4000081
+        ],
+        "conditions": [],
+        "shareCode": "h1p9e17_48-2m1p16e4_34-6p17e43_49-7p4e52_53i1x63-1x76-1x188d1x70-1x98u4x57-8x81s1x2-2x5-1x9-6x120",
+        "attacks": 428,
+        "starCounts": {
+          "zero": 0,
+          "one": 33,
+          "two": 228,
+          "three": 167
+        },
+        "usageRate": 0.0009102664443461395,
+        "threeStarRate": 0.3901869158878505,
+        "averageDestruction": 90.65186915887851,
+        "observedDays": 6
+      },
+      {
+        "groupKey": "[4000132,4000150]",
+        "variantKey": "",
+        "coreTroops": [
+          4000132,
+          4000150
+        ],
+        "conditions": [],
+        "shareCode": "h0p10e14_32-1p9e20_48-2p16e5_24-7p4e52_60i1x26-1x58-1x135-1x147d1x70-1x98u1x6-5x7-3x28-2x109-7x132-5x150s1x9-3x98-2x109-2x120",
+        "attacks": 403,
+        "starCounts": {
+          "zero": 0,
+          "one": 16,
+          "two": 155,
+          "three": 232
+        },
+        "usageRate": 0.0008570966754006874,
+        "threeStarRate": 0.575682382133995,
+        "averageDestruction": 95.96277915632754,
+        "observedDays": 5
+      },
+      {
+        "groupKey": "[4000080,4000150]",
+        "variantKey": "",
+        "coreTroops": [
+          4000080,
+          4000150
+        ],
+        "conditions": [],
+        "shareCode": "h1p9e17_20-2p17e5_24-4p16e13_50-7p4e52_56i1x64-1x135-1x147d1x16-1x120u1x1-2x4-5x7-4x10-3x15-1x28-1x58-4x80-5x150s1x2-3x16",
+        "attacks": 371,
+        "starCounts": {
+          "zero": 0,
+          "one": 4,
+          "two": 186,
+          "three": 181
+        },
+        "usageRate": 0.0007890393711505087,
+        "threeStarRate": 0.48787061994609165,
+        "averageDestruction": 93.7654986522911,
+        "observedDays": 4
+      },
+      {
+        "groupKey": "[4000059]",
+        "variantKey": "",
+        "coreTroops": [
+          4000059
+        ],
+        "conditions": [],
+        "shareCode": "h1p9e17_48-2m1p16e4_34-6p17e43_49-7p4e52_60i1x63-1x81-1x188d1x2-1x98u2x1-1x10-6x57-10x59s1x2-1x5-1x9-1x17-2x109-4x120",
+        "attacks": 306,
+        "starCounts": {
+          "zero": 0,
+          "one": 36,
+          "two": 156,
+          "three": 114
+        },
+        "usageRate": 0.0006507979718923334,
+        "threeStarRate": 0.37254901960784315,
+        "averageDestruction": 89.93464052287581,
+        "observedDays": 6
+      },
+      {
+        "groupKey": "[4000150]",
+        "variantKey": "",
+        "coreTroops": [
+          4000150
+        ],
+        "conditions": [],
+        "shareCode": "h0p17e8_14-1p9e17_48-2p16e22_24-7p4e52_53i1x64-1x87-1x147d1x35-1x98-1x120u2x0-3x1-1x5-5x7-3x10-2x28-4x53-5x57-2x58-3x82-5x150s1x5-1x9-5x10-2x35-1x53",
+        "attacks": 280,
+        "starCounts": {
+          "zero": 1,
+          "one": 24,
+          "two": 129,
+          "three": 126
+        },
+        "usageRate": 0.0005955014121890632,
+        "threeStarRate": 0.45,
+        "averageDestruction": 93.00357142857143,
+        "observedDays": 6
+      },
+      {
+        "groupKey": "[4000095]",
+        "variantKey": "",
+        "coreTroops": [
+          4000095
+        ],
+        "conditions": [],
+        "shareCode": "h0p11e10_51-1p9e17_48-2p16e22_24-7p4e52_53i3x5-2x110-1x135d1x9-1x98-1x120u1x1-2x5-5x7-1x10-2x28-1x58-1x82-4x95-1x97-3x132-2x150s1x5-5x10-4x35-1x109",
+        "attacks": 236,
+        "starCounts": {
+          "zero": 1,
+          "one": 34,
+          "two": 109,
+          "three": 92
+        },
+        "usageRate": 0.0005019226188450676,
+        "threeStarRate": 0.3898305084745763,
+        "averageDestruction": 89.86440677966101,
+        "observedDays": 6
+      },
+      {
+        "groupKey": "[4000008]",
+        "variantKey": "",
+        "coreTroops": [
+          4000008
+        ],
+        "conditions": [],
+        "shareCode": "h1p9e39_48-2m1p16e4_34-6p4e43_49-7p17e52_59i1x5-1x10-6x57-1x188d1x2-1x98u2x1-17x8-1x10-1x28s1x5-2x70-6x120",
+        "attacks": 176,
+        "starCounts": {
+          "zero": 2,
+          "one": 26,
+          "two": 90,
+          "three": 58
+        },
+        "usageRate": 0.0003743151733759826,
+        "threeStarRate": 0.32954545454545453,
+        "averageDestruction": 88.27272727272727,
+        "observedDays": 6
+      },
+      {
+        "groupKey": "[4000057,4000081]",
+        "variantKey": "",
+        "coreTroops": [
+          4000057,
+          4000081
+        ],
+        "conditions": [],
+        "shareCode": "h1p3e17_48-2m1p16e4_34-6p17e35_43-7p4e52_60i1x5-2x65-1x188d2x98u4x1-2x23-21x57-4x81s1x2-1x5-2x70-4x109",
+        "attacks": 96,
+        "starCounts": {
+          "zero": 0,
+          "one": 0,
+          "two": 58,
+          "three": 38
+        },
+        "usageRate": 0.00020417191275053594,
+        "threeStarRate": 0.3958333333333333,
+        "averageDestruction": 92.4375,
+        "observedDays": 6
+      },
+      {
+        "groupKey": "[4000063]",
+        "variantKey": "",
+        "coreTroops": [
+          4000063
+        ],
+        "conditions": [],
+        "shareCode": "h2m1p16e5_34-4p4e6_13-6p17e43_49-7p11e52_60i1x63-1x76-1x188d1x70-1x98u2x1-1x6-1x10-1x17-1x23-8x57-11x63-3x65s3x5-1x9-1x10-4x109-2x120",
+        "attacks": 86,
+        "starCounts": {
+          "zero": 0,
+          "one": 11,
+          "two": 34,
+          "three": 41
+        },
+        "usageRate": 0.00018290400517235512,
+        "threeStarRate": 0.47674418604651164,
+        "averageDestruction": 92.76744186046511,
+        "observedDays": 6
+      },
+      {
+        "groupKey": "[4000063,4000065]",
+        "variantKey": "",
+        "coreTroops": [
+          4000063,
+          4000065
+        ],
+        "conditions": [],
+        "shareCode": "h1p9e17_48-2m1p16e4_41-6p17e43_49-7p11e52_60i1x63-1x76-1x188d1x2-1x70u1x23-4x57-1x59-7x63-7x65s2x5-1x98-4x109-3x120",
+        "attacks": 49,
+        "starCounts": {
+          "zero": 0,
+          "one": 15,
+          "two": 14,
+          "three": 20
+        },
+        "usageRate": 0.00010421274713308605,
+        "threeStarRate": 0.40816326530612246,
+        "averageDestruction": 89.9795918367347,
+        "observedDays": 6
+      },
+      {
+        "groupKey": "[4000053]",
+        "variantKey": "",
+        "coreTroops": [
+          4000053
+        ],
+        "conditions": [],
+        "shareCode": "h0p9e14_32-1p11e16_48-2p7e4_19-7p10e52_56i2x5-3x58-1x135d1x53-2x120u1x1-2x5-2x6-5x7-3x28-5x53-3x58-1x82-1x97-3x109s3x2-2x5-1x9-2x35",
+        "attacks": 40,
+        "starCounts": {
+          "zero": 0,
+          "one": 11,
+          "two": 11,
+          "three": 18
+        },
+        "usageRate": 0.0000850716303127233,
+        "threeStarRate": 0.45,
+        "averageDestruction": 93.4,
+        "observedDays": 4
+      },
+      {
+        "groupKey": "[4000012]",
+        "variantKey": "",
+        "coreTroops": [
+          4000012
+        ],
+        "conditions": [],
+        "shareCode": "h0p10e8_14-1p9e17_48-2p16e19_22-7p17e53_57u44x12s11x10",
+        "attacks": 30,
+        "starCounts": {
+          "zero": 0,
+          "one": 5,
+          "two": 23,
+          "three": 2
+        },
+        "usageRate": 0.00006380372273454249,
+        "threeStarRate": 0.06666666666666667,
+        "averageDestruction": 71.76666666666667,
+        "observedDays": 6
+      },
+      {
+        "groupKey": "[4000066,4000132]",
+        "variantKey": "",
+        "coreTroops": [
+          4000066,
+          4000132
+        ],
+        "conditions": [],
+        "shareCode": "h0p9e14_32-1p3e39_48-2p16e5_24-7p4e59_60i1x64-1x135-1x147d1x70-2x109u1x1-1x5-5x7-1x10-1x28-2x66-1x82-1x123-8x132-2x150s1x9-1x17-3x98-3x120",
+        "attacks": 30,
+        "starCounts": {
+          "zero": 0,
+          "one": 6,
+          "two": 19,
+          "three": 5
+        },
+        "usageRate": 0.00006380372273454249,
+        "threeStarRate": 0.16666666666666666,
+        "averageDestruction": 84.73333333333333,
+        "observedDays": 3
+      },
+      {
+        "groupKey": "[4000109,4000147]",
+        "variantKey": "",
+        "coreTroops": [
+          4000109,
+          4000147
+        ],
+        "conditions": [],
+        "shareCode": "h0p10e8_14-1p9e39_48-2p16e19_24-7p4e52_60i1x58-2x64-1x135d1x70-1x98u2x1-2x5-4x7-1x28-1x58-1x82-1x97-5x109-3x147s1x2-2x5-1x9-1x35-1x98-1x109-2x120",
+        "attacks": 28,
+        "starCounts": {
+          "zero": 0,
+          "one": 3,
+          "two": 11,
+          "three": 14
+        },
+        "usageRate": 0.00005955014121890632,
+        "threeStarRate": 0.5,
+        "averageDestruction": 89.32142857142857,
+        "observedDays": 3
+      },
+      {
+        "groupKey": "[4000057,4000084]",
+        "variantKey": "",
+        "coreTroops": [
+          4000057,
+          4000084
+        ],
+        "conditions": [],
+        "shareCode": "h0p11e10_51-1p9e39_48-2m1p16e22_41-7p4e52_60i1x63-1x81-1x188d2x98u2x1-1x5-1x6-16x57-1x58-1x82-16x84s2x5-2x10-4x35-3x109",
+        "attacks": 26,
+        "starCounts": {
+          "zero": 0,
+          "one": 3,
+          "two": 8,
+          "three": 15
+        },
+        "usageRate": 0.000055296559703270155,
+        "threeStarRate": 0.5769230769230769,
+        "averageDestruction": 96.76923076923077,
+        "observedDays": 3
+      },
+      {
+        "groupKey": "[4000057,4000059]",
+        "variantKey": "",
+        "coreTroops": [
+          4000057,
+          4000059
+        ],
+        "conditions": [],
+        "shareCode": "h0p4e8_14-1p9e17_48-2p16e22_24-7p11e52_53i1x0-3x53-1x87d1x2-2x120u2x1-1x5-5x7-4x10-1x12-1x23-1x28-13x57-1x58-3x59-2x82-1x97s1x5-1x9-5x10-2x35-1x98",
+        "attacks": 23,
+        "starCounts": {
+          "zero": 0,
+          "one": 1,
+          "two": 15,
+          "three": 7
+        },
+        "usageRate": 0.00004891618742981591,
+        "threeStarRate": 0.30434782608695654,
+        "averageDestruction": 93.82608695652173,
+        "observedDays": 3
+      },
+      {
+        "groupKey": "[4000132,4000147]",
+        "variantKey": "",
+        "coreTroops": [
+          4000132,
+          4000147
+        ],
+        "conditions": [],
+        "shareCode": "h0p9e14_32-1p16e17_48-2p7e19_24-7p4e59_60i1x64-1x135-1x147d1x70-1x109-1x120u3x1-5x7-1x10-1x23-2x28-2x58-1x97-6x132-3x147s2x2-3x98-1x109",
+        "attacks": 22,
+        "starCounts": {
+          "zero": 0,
+          "one": 1,
+          "two": 14,
+          "three": 7
+        },
+        "usageRate": 0.00004678939667199782,
+        "threeStarRate": 0.3181818181818182,
+        "averageDestruction": 88.5909090909091,
+        "observedDays": 4
+      },
+      {
+        "groupKey": "[4000109,4000177]",
+        "variantKey": "",
+        "coreTroops": [
+          4000109,
+          4000177
+        ],
+        "conditions": [],
+        "shareCode": "h0p10e14_32-1p9e39_48-2p16e4_24-7p4e52_60i1x58-1x135-1x177d1x98-2x120u2x1-1x5-5x7-2x28-1x58-1x97-4x109-3x177s1x5-1x70-2x98-3x109-1x120",
+        "attacks": 16,
+        "starCounts": {
+          "zero": 0,
+          "one": 3,
+          "two": 6,
+          "three": 7
+        },
+        "usageRate": 0.00003402865212508933,
+        "threeStarRate": 0.4375,
+        "averageDestruction": 92.4375,
+        "observedDays": 2
+      },
+      {
+        "groupKey": "[4000080,4000109]",
+        "variantKey": "",
+        "coreTroops": [
+          4000080,
+          4000109
+        ],
+        "conditions": [],
+        "shareCode": "h0p9e14_32-1p16e39_48-2p7e4_19-7p4e52_60i4x5-1x95-1x135d1x17-2x120-1x123u5x1-2x5-5x7-2x28-1x58-4x80-2x82-4x109s1x2-1x5-1x9-2x98-3x109",
+        "attacks": 14,
+        "starCounts": {
+          "zero": 0,
+          "one": 3,
+          "two": 7,
+          "three": 4
+        },
+        "usageRate": 0.00002977507060945316,
+        "threeStarRate": 0.2857142857142857,
+        "averageDestruction": 88.35714285714286,
+        "observedDays": 1
+      },
+      {
+        "groupKey": "[4000065,4000081]",
+        "variantKey": "",
+        "coreTroops": [
+          4000065,
+          4000081
+        ],
+        "conditions": [],
+        "shareCode": "h1p9e17_48-2m1p16e4_34-6p17e43_49-7p4e52_53i1x63-1x76-1x188d1x2-2x5u1x10-1x23-4x65-6x81s2x70-2x98-3x120",
+        "attacks": 12,
+        "starCounts": {
+          "zero": 0,
+          "one": 4,
+          "two": 4,
+          "three": 4
+        },
+        "usageRate": 0.000025521489093816993,
+        "threeStarRate": 0.3333333333333333,
+        "averageDestruction": 84.58333333333333,
+        "observedDays": 3
+      },
+      {
+        "groupKey": "[4000005]",
+        "variantKey": "",
+        "coreTroops": [
+          4000005
+        ],
+        "conditions": [],
+        "shareCode": "h1p11e15_16-2m1p16e4_5-4p4e6_13-6p17e35_43i1x63-1x76-1x188d1x53-1x70u3x1-7x4-26x5-1x6-5x7-1x23-1x53-3x63-1x76-3x82s3x5-1x9-1x10-2x35-2x120",
+        "attacks": 10,
+        "starCounts": {
+          "zero": 0,
+          "one": 1,
+          "two": 7,
+          "three": 2
+        },
+        "usageRate": 0.000021267907578180827,
+        "threeStarRate": 0.2,
+        "averageDestruction": 86.4,
+        "observedDays": 3
+      },
+      {
+        "groupKey": "[4000080,4000132]",
+        "variantKey": "",
+        "coreTroops": [
+          4000080,
+          4000132
+        ],
+        "conditions": [],
+        "shareCode": "h0p10e14_32-1p3e16_48-2p17e4_19-7p4e52_60i1x64-1x135-1x147d4x109u5x7-2x28-2x58-4x80-1x97-6x132s2x2-1x5-1x70-2x98",
+        "attacks": 7,
+        "starCounts": {
+          "zero": 0,
+          "one": 5,
+          "two": 2,
+          "three": 0
+        },
+        "usageRate": 0.00001488753530472658,
+        "threeStarRate": 0,
+        "averageDestruction": 65.28571428571429,
+        "observedDays": 3
+      },
+      {
+        "groupKey": "[4000008,4000063]",
+        "variantKey": "",
+        "coreTroops": [
+          4000008,
+          4000063
+        ],
+        "conditions": [],
+        "shareCode": "h2m1p16e5_34-4p4e6_13-6p17e43_49-7p11e52_60i1x63-1x76-1x188d1x70-1x98u2x1-9x8-1x10-1x12-1x17-1x23-8x63s2x5-1x10-1x70-4x109-2x120",
+        "attacks": 6,
+        "starCounts": {
+          "zero": 0,
+          "one": 1,
+          "two": 2,
+          "three": 3
+        },
+        "usageRate": 0.000012760744546908496,
+        "threeStarRate": 0.5,
+        "averageDestruction": 93.83333333333333,
+        "observedDays": 1
+      },
+      {
+        "groupKey": "[4000013,4000109]",
+        "variantKey": "",
+        "coreTroops": [
+          4000013,
+          4000109
+        ],
+        "conditions": [],
+        "shareCode": "h0p9e14_32-1p3e17_48-2p17e22_24-7p4e52_53i3x5-1x10-1x57-2x58-1x135d1x5-1x98u3x1-4x5-5x7-1x10-3x13-2x28-1x58-2x82-1x97-4x109s1x9-5x10-2x35-1x120",
+        "attacks": 4,
+        "starCounts": {
+          "zero": 0,
+          "one": 0,
+          "two": 2,
+          "three": 2
+        },
+        "usageRate": 0.000008507163031272332,
+        "threeStarRate": 0.5,
+        "averageDestruction": 87.5,
+        "observedDays": 1
+      },
+      {
+        "groupKey": "[4000027,4000053]",
+        "variantKey": "",
+        "coreTroops": [
+          4000027,
+          4000053
+        ],
+        "conditions": [],
+        "shareCode": "h0p9e14_32-1p16e39_48-2p8e5_24-7p4e59_60i2x10-2x57-1x58-1x87-1x110d2x5-2x109u2x5-10x7-8x27-2x28-5x53s1x9-4x98-2x120",
+        "attacks": 4,
+        "starCounts": {
+          "zero": 0,
+          "one": 3,
+          "two": 0,
+          "three": 1
+        },
+        "usageRate": 0.000008507163031272332,
+        "threeStarRate": 0.25,
+        "averageDestruction": 84.5,
+        "observedDays": 1
+      },
+      {
+        "groupKey": "[4000012,4000109]",
+        "variantKey": "",
+        "coreTroops": [
+          4000012,
+          4000109
+        ],
+        "conditions": [],
+        "shareCode": "h0p9e8_14-1p10e17_48-2p17e4_19-7p4e52_56i4x27-1x52d1x2-1x5-1x120u3x1-12x12-1x17-4x28-1x58-1x97-6x109s2x16-5x35",
+        "attacks": 3,
+        "starCounts": {
+          "zero": 0,
+          "one": 1,
+          "two": 2,
+          "three": 0
+        },
+        "usageRate": 0.000006380372273454248,
+        "threeStarRate": 0,
+        "averageDestruction": 80,
+        "observedDays": 1
+      },
+      {
+        "groupKey": "[4000056]",
+        "variantKey": "",
+        "coreTroops": [
+          4000056
+        ],
+        "conditions": [],
+        "shareCode": "h0p11e10_51-1p9e39_48-2p7e4_24-7p4e52_60i1x9-2x58-1x188d2x98u1x1-1x12-1x28-10x56-1x58-2x82-1x97-3x123s1x2-2x5-1x9-1x17-3x109-2x120",
+        "attacks": 3,
+        "starCounts": {
+          "zero": 0,
+          "one": 0,
+          "two": 3,
+          "three": 0
+        },
+        "usageRate": 0.000006380372273454248,
+        "threeStarRate": 0,
+        "averageDestruction": 82.66666666666667,
+        "observedDays": 3
+      },
+      {
+        "groupKey": "[4000064]",
+        "variantKey": "",
+        "coreTroops": [
+          4000064
+        ],
+        "conditions": [],
+        "shareCode": "h0p9e8_14-2p17e4_19-4p10e6_13-7p4e52_56i4x27-1x52d1x2-1x5-1x120u3x1-1x17-1x23-1x28-1x58-10x64-1x97-1x109-2x110s2x16-5x35",
+        "attacks": 3,
+        "starCounts": {
+          "zero": 0,
+          "one": 1,
+          "two": 2,
+          "three": 0
+        },
+        "usageRate": 0.000006380372273454248,
+        "threeStarRate": 0,
+        "averageDestruction": 75,
+        "observedDays": 1
+      },
+      {
+        "groupKey": "[4000005,4000063]",
+        "variantKey": "",
+        "coreTroops": [
+          4000005,
+          4000063
+        ],
+        "conditions": [],
+        "shareCode": "h2m1p16e4_5-4p4e6_13-6p17e43_49-7p11e52_60i1x63-1x76-1x188d1x70-1x98u5x1-29x5-2x10-1x12-1x23-4x63s2x5-1x9-1x10-1x11-3x109-3x120",
+        "attacks": 2,
+        "starCounts": {
+          "zero": 0,
+          "one": 1,
+          "two": 1,
+          "three": 0
+        },
+        "usageRate": 0.000004253581515636166,
+        "threeStarRate": 0,
+        "averageDestruction": 73.5,
+        "observedDays": 2
+      },
+      {
+        "groupKey": "[4000009,4000109]",
+        "variantKey": "",
+        "coreTroops": [
+          4000009,
+          4000109
+        ],
+        "conditions": [],
+        "shareCode": "h0p9e14_32-1p3e17_48-2p17e22_24-7p4e52_53i3x5-1x10-1x57-2x58-1x135d1x70-1x98u3x1-4x5-5x7-4x9-2x10-2x28-1x58-1x97-4x109s1x9-5x10-3x35-2x120",
+        "attacks": 2,
+        "starCounts": {
+          "zero": 0,
+          "one": 2,
+          "two": 0,
+          "three": 0
+        },
+        "usageRate": 0.000004253581515636166,
+        "threeStarRate": 0,
+        "averageDestruction": 77,
+        "observedDays": 1
+      },
+      {
+        "groupKey": "[4000015]",
+        "variantKey": "",
+        "coreTroops": [
+          4000015
+        ],
+        "conditions": [],
+        "shareCode": "h1p9e16_17-2m1p16e4_34-4p3e6_13-7p11e52_60i7x1-4x15-1x135d4x17u2x1-1x10-29x15s11x17",
+        "attacks": 2,
+        "starCounts": {
+          "zero": 0,
+          "one": 2,
+          "two": 0,
+          "three": 0
+        },
+        "usageRate": 0.000004253581515636166,
+        "threeStarRate": 0,
+        "averageDestruction": 53,
+        "observedDays": 1
+      },
+      {
+        "groupKey": "[4000024]",
+        "variantKey": "",
+        "coreTroops": [
+          4000024
+        ],
+        "conditions": [],
+        "shareCode": "h0p8e10_14-1p9e17_39-2p1e4_24-7p7e52_60i1x3-1x58-1x87-1x147d1x2-2x5u1x5-5x7-11x22-30x24-2x28-1x58s2x1-2x2-1x98",
+        "attacks": 2,
+        "starCounts": {
+          "zero": 1,
+          "one": 1,
+          "two": 0,
+          "three": 0
+        },
+        "usageRate": 0.000004253581515636166,
+        "threeStarRate": 0,
+        "averageDestruction": 61,
+        "observedDays": 2
+      },
+      {
+        "groupKey": "[4000005,4000017]",
+        "variantKey": "",
+        "coreTroops": [
+          4000005,
+          4000017
+        ],
+        "conditions": [],
+        "shareCode": "h1p9e17_48-2m1p16e4_5-6p4e35_43-7p11e52_53i2x63-1x65-1x188d2x5-1x70u5x1-33x5-2x10-3x17-1x23-1x58-3x63-3x82s1x9-6x10-1x98-2x120",
+        "attacks": 1,
+        "starCounts": {
+          "zero": 0,
+          "one": 0,
+          "two": 0,
+          "three": 1
+        },
+        "usageRate": 0.000002126790757818083,
+        "threeStarRate": 1,
+        "averageDestruction": 100,
+        "observedDays": 1
+      },
+      {
+        "groupKey": "[4000013]",
+        "variantKey": "",
+        "coreTroops": [
+          4000013
+        ],
+        "conditions": [],
+        "shareCode": "h0p9e14_32-1p8e39_48-2p16e22_24-7p4e56_59i1x64-1x87-1x147d1x9-1x109-2x120u1x1-1x5-5x7-2x10-3x13-2x28-4x57-3x82-2x150-2x177s1x2-1x5-2x10-4x35-1x70",
+        "attacks": 1,
+        "starCounts": {
+          "zero": 0,
+          "one": 1,
+          "two": 0,
+          "three": 0
+        },
+        "usageRate": 0.000002126790757818083,
+        "threeStarRate": 0,
+        "averageDestruction": 91,
+        "observedDays": 1
+      },
+      {
+        "groupKey": "[4000022,4000080]",
+        "variantKey": "",
+        "coreTroops": [
+          4000022,
+          4000080
+        ],
+        "conditions": [],
+        "shareCode": "h0p4e8_14-1p9e17_39-2p16e4_24-7p7e52_60i1x3-1x51-1x58-1x147d1x2-2x5u5x7-1x10-16x22-1x28-5x80-1x109s2x2-1x3-1x5-1x9-1x70-1x109",
+        "attacks": 1,
+        "starCounts": {
+          "zero": 1,
+          "one": 0,
+          "two": 0,
+          "three": 0
+        },
+        "usageRate": 0.000002126790757818083,
+        "threeStarRate": 0,
+        "averageDestruction": 48,
+        "observedDays": 1
+      },
+      {
+        "groupKey": "[4000022]",
+        "variantKey": "",
+        "coreTroops": [
+          4000022
+        ],
+        "conditions": [],
+        "shareCode": "h0p10e14_32-1p17e16_48-2p7e4_19-7p4e52_59i1x5-1x58-1x147-1x188d1x2-2x5u1x4-1x5-4x7-1x11-26x22-1x28-2x59-2x80s2x2-1x3-1x5",
+        "attacks": 1,
+        "starCounts": {
+          "zero": 0,
+          "one": 1,
+          "two": 0,
+          "three": 0
+        },
+        "usageRate": 0.000002126790757818083,
+        "threeStarRate": 0,
+        "averageDestruction": 45,
+        "observedDays": 1
+      },
+      {
+        "groupKey": "[4000057,4000150]",
+        "variantKey": "",
+        "coreTroops": [
+          4000057,
+          4000150
+        ],
+        "conditions": [],
+        "shareCode": "h0p9e14_32-2p16e22_24-4p4e6_13-7p11e52_60i2x63-1x65-1x75d2x35-1x98u3x1-3x5-5x7-2x10-2x23-15x57-2x82-6x150s3x10-1x53-1x98-3x109-1x120",
+        "attacks": 1,
+        "starCounts": {
+          "zero": 0,
+          "one": 1,
+          "two": 0,
+          "three": 0
+        },
+        "usageRate": 0.000002126790757818083,
+        "threeStarRate": 0,
+        "averageDestruction": 82,
+        "observedDays": 1
+      },
+      {
+        "groupKey": "[4000059,4000065]",
+        "variantKey": "",
+        "coreTroops": [
+          4000059,
+          4000065
+        ],
+        "conditions": [],
+        "shareCode": "h1p3e17_20-2m1p17e24_34-4p10e13_40-7p4e59_60i1x59-1x65-1x188d2x98u1x10-2x26-6x59-4x63-4x65s1x98-9x120",
+        "attacks": 1,
+        "starCounts": {
+          "zero": 0,
+          "one": 0,
+          "two": 1,
+          "three": 0
+        },
+        "usageRate": 0.000002126790757818083,
+        "threeStarRate": 0,
+        "averageDestruction": 78,
+        "observedDays": 1
+      },
+      {
+        "groupKey": "[4000066,4000080]",
+        "variantKey": "",
+        "coreTroops": [
+          4000066,
+          4000080
+        ],
+        "conditions": [],
+        "shareCode": "h0p10e14_32-1p9e17_48-2p7e4_19-7p4e52_60i1x4-1x53-1x58-1x64-1x188d1x70u3x1-2x5-4x7-1x10-1x58-3x66-4x80-1x82-1x97s3x2-1x98-3x120",
+        "attacks": 1,
+        "starCounts": {
+          "zero": 0,
+          "one": 0,
+          "two": 0,
+          "three": 1
+        },
+        "usageRate": 0.000002126790757818083,
+        "threeStarRate": 1,
+        "averageDestruction": 100,
+        "observedDays": 1
+      }
+    ]
+  },
+  "variants": {
+    "firstDay": "2026-09-15",
+    "lastDay": "2026-09-20",
+    "completedDays": [
+      "2026-09-15",
+      "2026-09-16",
+      "2026-09-17",
+      "2026-09-18",
+      "2026-09-19",
+      "2026-09-20"
+    ],
+    "totalAttacks": 470192,
+    "classifiedAttacks": 469396,
+    "leagueTierId": 105000036,
+    "rankLimit": null,
+    "items": [
+      {
+        "groupKey": "[4000132]",
+        "variantKey": "[{\"kind\":\"equipment\",\"heroId\":28000000,\"id\":90000010,\"minimum\":1},{\"kind\":\"equipment\",\"heroId\":28000000,\"id\":90000051,\"minimum\":1}]",
+        "coreTroops": [
+          4000132
+        ],
+        "conditions": [
+          {
+            "kind": "equipment",
+            "id": 90000010,
+            "heroId": 28000000,
+            "minimum": 1
+          },
+          {
+            "kind": "equipment",
+            "id": 90000051,
+            "heroId": 28000000,
+            "minimum": 1
+          }
+        ],
+        "shareCode": "h0p11e10_51-1p9e39_48-2p3e5_24-7p4e52_60i1x0-3x5-1x57-1x58-1x123-1x135d1x5-1x70-1x120u2x5-5x7-4x26-3x28-1x82-3x109-9x132s1x9-3x98-2x109-2x120",
+        "attacks": 26094,
+        "starCounts": {
+          "zero": 28,
+          "one": 3085,
+          "two": 8749,
+          "three": 14232
+        },
+        "usageRate": 0.05549647803450505,
+        "threeStarRate": 0.5454127385605887,
+        "averageDestruction": 93.07315858051659,
+        "observedDays": 6
+      },
+      {
+        "groupKey": "[4000132]",
+        "variantKey": "[{\"kind\":\"equipment\",\"heroId\":28000007,\"id\":90000053,\"minimum\":1},{\"kind\":\"spell\",\"id\":26000010,\"minimum\":2}]",
+        "coreTroops": [
+          4000132
+        ],
+        "conditions": [
+          {
+            "kind": "equipment",
+            "id": 90000053,
+            "heroId": 28000007,
+            "minimum": 1
+          },
+          {
+            "kind": "spell",
+            "id": 26000010,
+            "minimum": 2
+          }
+        ],
+        "shareCode": "h0p9e14_32-1p3e17_48-2p16e5_24-7p4e52_53i1x64-1x135-1x147d1x70-1x98u4x1-2x5-5x7-3x26-2x28-1x58-3x109-9x132s1x5-1x9-3x10-1x17-1x35-4x120",
+        "attacks": 22721,
+        "starCounts": {
+          "zero": 14,
+          "one": 2282,
+          "two": 7264,
+          "three": 13161
+        },
+        "usageRate": 0.04832281280838466,
+        "threeStarRate": 0.5792438713084811,
+        "averageDestruction": 94.172219532591,
+        "observedDays": 6
+      },
+      {
+        "groupKey": "[4000132]",
+        "variantKey": "[{\"kind\":\"equipment\",\"heroId\":28000001,\"id\":90000017,\"minimum\":1},{\"kind\":\"spell\",\"id\":26000010,\"minimum\":3}]",
+        "coreTroops": [
+          4000132
+        ],
+        "conditions": [
+          {
+            "kind": "equipment",
+            "id": 90000017,
+            "heroId": 28000001,
+            "minimum": 1
+          },
+          {
+            "kind": "spell",
+            "id": 26000010,
+            "minimum": 3
+          }
+        ],
+        "shareCode": "h0p9e14_32-1p3e17_48-2p16e5_24-7p4e52_53i1x64-1x135-1x147d1x70-1x98u4x1-2x5-5x7-3x26-2x28-1x58-3x109-9x132s1x5-1x9-3x10-1x17-1x35-4x120",
+        "attacks": 17497,
+        "starCounts": {
+          "zero": 8,
+          "one": 1774,
+          "two": 5304,
+          "three": 10411
+        },
+        "usageRate": 0.03721245788954299,
+        "threeStarRate": 0.5950162885066012,
+        "averageDestruction": 94.3891524261302,
+        "observedDays": 6
+      }
+    ]
+  },
+  "timeline": {
+    "firstDay": "2026-09-15",
+    "lastDay": "2026-09-20",
+    "completedDays": [
+      "2026-09-15",
+      "2026-09-16",
+      "2026-09-17",
+      "2026-09-18",
+      "2026-09-19",
+      "2026-09-20"
+    ],
+    "totalAttacks": 470192,
+    "classifiedAttacks": 469396,
+    "leagueTierId": 105000036,
+    "rankLimit": null,
+    "items": [
+      {
+        "day": "2026-09-15",
+        "totalAttacks": 72296,
+        "observation": {
+          "groupKey": "[4000132]",
+          "variantKey": "",
+          "coreTroops": [
+            4000132
+          ],
+          "conditions": [],
+          "shareCode": "h0p9e14_32-1p3e39_48-2p16e5_24-7p4e52_60i1x5-2x10-2x57-2x58-1x135d1x5-1x9-2x109u2x5-5x7-1x23-3x28-3x109-1x123-9x132s1x70-3x98-3x120",
+          "attacks": 32378,
+          "starCounts": {
+            "zero": 37,
+            "one": 4279,
+            "two": 11001,
+            "three": 17061
+          },
+          "usageRate": 0.4478532698904504,
+          "threeStarRate": 0.5269318673173142,
+          "averageDestruction": 92.88427327197479,
+          "observedDays": 1
+        }
+      },
+      {
+        "day": "2026-09-16",
+        "totalAttacks": 80902,
+        "observation": {
+          "groupKey": "[4000132]",
+          "variantKey": "",
+          "coreTroops": [
+            4000132
+          ],
+          "conditions": [],
+          "shareCode": "h0p9e14_32-1p3e39_48-2p16e5_24-7p4e52_60i2x10-2x57-1x58-1x110-1x135d1x70-2x109u1x1-2x5-5x7-1x23-2x26-3x28-1x58-2x109-10x132s1x5-1x9-3x98-3x120",
+          "attacks": 35320,
+          "starCounts": {
+            "zero": 44,
+            "one": 4676,
+            "two": 11956,
+            "three": 18644
+          },
+          "usageRate": 0.4365775876986972,
+          "threeStarRate": 0.5278595696489241,
+          "averageDestruction": 92.89977349943375,
+          "observedDays": 1
+        }
+      },
+      {
+        "day": "2026-09-17",
+        "totalAttacks": 80738,
+        "observation": {
+          "groupKey": "[4000132]",
+          "variantKey": "",
+          "coreTroops": [
+            4000132
+          ],
+          "conditions": [],
+          "shareCode": "h0p9e14_32-1p3e39_48-2p16e5_24-7p4e52_60i1x5-2x10-2x57-2x58-1x135d1x5-1x9-2x109u2x5-5x7-1x23-3x28-3x109-1x123-9x132s1x70-3x98-3x120",
+          "attacks": 32756,
+          "starCounts": {
+            "zero": 37,
+            "one": 4410,
+            "two": 11021,
+            "three": 17288
+          },
+          "usageRate": 0.4057073496990265,
+          "threeStarRate": 0.5277811698620101,
+          "averageDestruction": 92.94883380144095,
+          "observedDays": 1
+        }
+      },
+      {
+        "day": "2026-09-18",
+        "totalAttacks": 79956,
+        "observation": {
+          "groupKey": "[4000132]",
+          "variantKey": "",
+          "coreTroops": [
+            4000132
+          ],
+          "conditions": [],
+          "shareCode": "h0p9e14_32-1p3e39_48-2p16e5_24-7p4e52_60i1x5-2x10-2x57-2x58-1x135d1x5-1x9-2x109u2x5-5x7-1x23-3x28-3x109-1x123-9x132s1x70-3x98-3x120",
+          "attacks": 30548,
+          "starCounts": {
+            "zero": 38,
+            "one": 4056,
+            "two": 10199,
+            "three": 16255
+          },
+          "usageRate": 0.38206013307319026,
+          "threeStarRate": 0.5321133953122954,
+          "averageDestruction": 92.8295469425167,
+          "observedDays": 1
+        }
+      },
+      {
+        "day": "2026-09-19",
+        "totalAttacks": 78283,
+        "observation": {
+          "groupKey": "[4000132]",
+          "variantKey": "",
+          "coreTroops": [
+            4000132
+          ],
+          "conditions": [],
+          "shareCode": "h0p9e14_32-1p3e39_48-2p16e5_24-7p4e52_60i1x5-2x10-2x57-2x58-1x135d1x5-1x9-2x109u2x5-5x7-1x23-3x28-3x109-1x123-9x132s1x70-3x98-3x120",
+          "attacks": 28927,
+          "starCounts": {
+            "zero": 26,
+            "one": 3741,
+            "two": 9678,
+            "three": 15482
+          },
+          "usageRate": 0.3695182862179528,
+          "threeStarRate": 0.5352093200124451,
+          "averageDestruction": 93.05005704013551,
+          "observedDays": 1
+        }
+      },
+      {
+        "day": "2026-09-20",
+        "totalAttacks": 78017,
+        "observation": {
+          "groupKey": "[4000132]",
+          "variantKey": "",
+          "coreTroops": [
+            4000132
+          ],
+          "conditions": [],
+          "shareCode": "h0p9e14_32-1p3e39_48-2p16e5_24-7p4e52_60i1x5-2x10-2x57-2x58-1x135d1x5-1x9-2x109u2x5-5x7-1x23-3x28-3x109-1x123-9x132s1x70-3x98-3x120",
+          "attacks": 28600,
+          "starCounts": {
+            "zero": 23,
+            "one": 3502,
+            "two": 9668,
+            "three": 15407
+          },
+          "usageRate": 0.36658676955022623,
+          "threeStarRate": 0.5387062937062937,
+          "averageDestruction": 93.14898601398602,
+          "observedDays": 1
+        }
+      }
+    ]
+  },
+  "cwl": {
+    "season": "2026-09",
+    "clanCount": 364,
+    "registeredPlayerCount": 9701,
+    "groupCount": 46,
+    "items": [
+      {
+        "leagueId": 48000022,
+        "warSize": 15,
+        "clanCount": 12,
+        "registeredPlayerCount": 281,
+        "groupCount": 2,
+        "townHallDistribution": [
+          {
+            "count": 234,
+            "level": 18
+          },
+          {
+            "count": 5,
+            "level": 17
+          },
+          {
+            "count": 2,
+            "level": 16
+          },
+          {
+            "count": 3,
+            "level": 15
+          },
+          {
+            "count": 4,
+            "level": 14
+          },
+          {
+            "count": 3,
+            "level": 13
+          },
+          {
+            "count": 3,
+            "level": 12
+          },
+          {
+            "count": 4,
+            "level": 11
+          },
+          {
+            "count": 1,
+            "level": 9
+          },
+          {
+            "count": 2,
+            "level": 8
+          },
+          {
+            "count": 5,
+            "level": 7
+          },
+          {
+            "count": 6,
+            "level": 6
+          },
+          {
+            "count": 3,
+            "level": 5
+          },
+          {
+            "count": 1,
+            "level": 4
+          },
+          {
+            "count": 3,
+            "level": 3
+          },
+          {
+            "count": 2,
+            "level": 2
+          }
+        ],
+        "sameTownHallHitRates": null,
+        "finalizedWars": 10,
+        "archivedWars": 0,
+        "calculatedAt": "2026-09-23T00:35:46.212Z"
+      },
+      {
+        "leagueId": 48000021,
+        "warSize": 15,
+        "clanCount": 24,
+        "registeredPlayerCount": 607,
+        "groupCount": 3,
+        "townHallDistribution": [
+          {
+            "count": 439,
+            "level": 18
+          },
+          {
+            "count": 17,
+            "level": 17
+          },
+          {
+            "count": 18,
+            "level": 16
+          },
+          {
+            "count": 15,
+            "level": 15
+          },
+          {
+            "count": 12,
+            "level": 14
+          },
+          {
+            "count": 23,
+            "level": 13
+          },
+          {
+            "count": 12,
+            "level": 12
+          },
+          {
+            "count": 12,
+            "level": 11
+          },
+          {
+            "count": 9,
+            "level": 10
+          },
+          {
+            "count": 7,
+            "level": 9
+          },
+          {
+            "count": 9,
+            "level": 8
+          },
+          {
+            "count": 22,
+            "level": 6
+          },
+          {
+            "count": 1,
+            "level": 5
+          },
+          {
+            "count": 3,
+            "level": 4
+          },
+          {
+            "count": 6,
+            "level": 3
+          },
+          {
+            "count": 2,
+            "level": 2
+          }
+        ],
+        "sameTownHallHitRates": null,
+        "finalizedWars": 21,
+        "archivedWars": 0,
+        "calculatedAt": "2026-09-23T00:35:46.212Z"
+      },
+      {
+        "leagueId": 48000020,
+        "warSize": 15,
+        "clanCount": 32,
+        "registeredPlayerCount": 719,
+        "groupCount": 4,
+        "townHallDistribution": [
+          {
+            "count": 612,
+            "level": 18
+          },
+          {
+            "count": 13,
+            "level": 17
+          },
+          {
+            "count": 18,
+            "level": 16
+          },
+          {
+            "count": 7,
+            "level": 15
+          },
+          {
+            "count": 11,
+            "level": 14
+          },
+          {
+            "count": 11,
+            "level": 13
+          },
+          {
+            "count": 11,
+            "level": 12
+          },
+          {
+            "count": 7,
+            "level": 11
+          },
+          {
+            "count": 3,
+            "level": 10
+          },
+          {
+            "count": 4,
+            "level": 9
+          },
+          {
+            "count": 7,
+            "level": 8
+          },
+          {
+            "count": 5,
+            "level": 7
+          },
+          {
+            "count": 2,
+            "level": 6
+          },
+          {
+            "count": 7,
+            "level": 3
+          },
+          {
+            "count": 1,
+            "level": 2
+          }
+        ],
+        "sameTownHallHitRates": null,
+        "finalizedWars": 27,
+        "archivedWars": 0,
+        "calculatedAt": "2026-09-23T00:35:46.212Z"
+      },
+      {
+        "leagueId": 48000019,
+        "warSize": 15,
+        "clanCount": 48,
+        "registeredPlayerCount": 1073,
+        "groupCount": 6,
+        "townHallDistribution": [
+          {
+            "count": 935,
+            "level": 18
+          },
+          {
+            "count": 22,
+            "level": 17
+          },
+          {
+            "count": 16,
+            "level": 16
+          },
+          {
+            "count": 14,
+            "level": 15
+          },
+          {
+            "count": 22,
+            "level": 14
+          },
+          {
+            "count": 20,
+            "level": 13
+          },
+          {
+            "count": 11,
+            "level": 12
+          },
+          {
+            "count": 9,
+            "level": 11
+          },
+          {
+            "count": 7,
+            "level": 10
+          },
+          {
+            "count": 4,
+            "level": 9
+          },
+          {
+            "count": 4,
+            "level": 8
+          },
+          {
+            "count": 2,
+            "level": 6
+          },
+          {
+            "count": 2,
+            "level": 4
+          },
+          {
+            "count": 3,
+            "level": 3
+          },
+          {
+            "count": 2,
+            "level": 2
+          }
+        ],
+        "sameTownHallHitRates": null,
+        "finalizedWars": 42,
+        "archivedWars": 0,
+        "calculatedAt": "2026-09-23T00:35:46.212Z"
+      },
+      {
+        "leagueId": 48000018,
+        "warSize": 15,
+        "clanCount": 32,
+        "registeredPlayerCount": 718,
+        "groupCount": 4,
+        "townHallDistribution": [
+          {
+            "count": 569,
+            "level": 18
+          },
+          {
+            "count": 30,
+            "level": 17
+          },
+          {
+            "count": 18,
+            "level": 16
+          },
+          {
+            "count": 7,
+            "level": 15
+          },
+          {
+            "count": 11,
+            "level": 14
+          },
+          {
+            "count": 9,
+            "level": 13
+          },
+          {
+            "count": 16,
+            "level": 12
+          },
+          {
+            "count": 7,
+            "level": 11
+          },
+          {
+            "count": 5,
+            "level": 10
+          },
+          {
+            "count": 12,
+            "level": 9
+          },
+          {
+            "count": 16,
+            "level": 8
+          },
+          {
+            "count": 2,
+            "level": 7
+          },
+          {
+            "count": 4,
+            "level": 6
+          },
+          {
+            "count": 7,
+            "level": 3
+          },
+          {
+            "count": 4,
+            "level": 2
+          },
+          {
+            "count": 1,
+            "level": 1
+          }
+        ],
+        "sameTownHallHitRates": null,
+        "finalizedWars": 27,
+        "archivedWars": 0,
+        "calculatedAt": "2026-09-23T00:35:46.212Z"
+      },
+      {
+        "leagueId": 48000017,
+        "warSize": 15,
+        "clanCount": 32,
+        "registeredPlayerCount": 768,
+        "groupCount": 4,
+        "townHallDistribution": [
+          {
+            "count": 625,
+            "level": 18
+          },
+          {
+            "count": 21,
+            "level": 17
+          },
+          {
+            "count": 11,
+            "level": 16
+          },
+          {
+            "count": 18,
+            "level": 15
+          },
+          {
+            "count": 10,
+            "level": 14
+          },
+          {
+            "count": 10,
+            "level": 13
+          },
+          {
+            "count": 13,
+            "level": 12
+          },
+          {
+            "count": 5,
+            "level": 11
+          },
+          {
+            "count": 9,
+            "level": 10
+          },
+          {
+            "count": 9,
+            "level": 9
+          },
+          {
+            "count": 3,
+            "level": 8
+          },
+          {
+            "count": 4,
+            "level": 7
+          },
+          {
+            "count": 28,
+            "level": 6
+          },
+          {
+            "count": 1,
+            "level": 4
+          },
+          {
+            "count": 1,
+            "level": 2
+          }
+        ],
+        "sameTownHallHitRates": null,
+        "finalizedWars": 28,
+        "archivedWars": 0,
+        "calculatedAt": "2026-09-23T00:35:46.212Z"
+      },
+      {
+        "leagueId": 48000016,
+        "warSize": 15,
+        "clanCount": 40,
+        "registeredPlayerCount": 1051,
+        "groupCount": 5,
+        "townHallDistribution": [
+          {
+            "count": 826,
+            "level": 18
+          },
+          {
+            "count": 41,
+            "level": 17
+          },
+          {
+            "count": 28,
+            "level": 16
+          },
+          {
+            "count": 40,
+            "level": 15
+          },
+          {
+            "count": 37,
+            "level": 14
+          },
+          {
+            "count": 17,
+            "level": 13
+          },
+          {
+            "count": 18,
+            "level": 12
+          },
+          {
+            "count": 10,
+            "level": 11
+          },
+          {
+            "count": 5,
+            "level": 10
+          },
+          {
+            "count": 6,
+            "level": 9
+          },
+          {
+            "count": 2,
+            "level": 8
+          },
+          {
+            "count": 5,
+            "level": 7
+          },
+          {
+            "count": 9,
+            "level": 6
+          },
+          {
+            "count": 7,
+            "level": 3
+          }
+        ],
+        "sameTownHallHitRates": null,
+        "finalizedWars": 28,
+        "archivedWars": 0,
+        "calculatedAt": "2026-09-23T00:35:46.212Z"
+      },
+      {
+        "leagueId": 48000015,
+        "warSize": 15,
+        "clanCount": 48,
+        "registeredPlayerCount": 1459,
+        "groupCount": 6,
+        "townHallDistribution": [
+          {
+            "count": 940,
+            "level": 18
+          },
+          {
+            "count": 153,
+            "level": 17
+          },
+          {
+            "count": 68,
+            "level": 16
+          },
+          {
+            "count": 75,
+            "level": 15
+          },
+          {
+            "count": 52,
+            "level": 14
+          },
+          {
+            "count": 50,
+            "level": 13
+          },
+          {
+            "count": 28,
+            "level": 12
+          },
+          {
+            "count": 20,
+            "level": 11
+          },
+          {
+            "count": 14,
+            "level": 10
+          },
+          {
+            "count": 16,
+            "level": 9
+          },
+          {
+            "count": 19,
+            "level": 8
+          },
+          {
+            "count": 7,
+            "level": 7
+          },
+          {
+            "count": 11,
+            "level": 6
+          },
+          {
+            "count": 3,
+            "level": 5
+          },
+          {
+            "count": 1,
+            "level": 4
+          },
+          {
+            "count": 2,
+            "level": 3
+          }
+        ],
+        "sameTownHallHitRates": null,
+        "finalizedWars": 33,
+        "archivedWars": 0,
+        "calculatedAt": "2026-09-23T00:35:46.212Z"
+      },
+      {
+        "leagueId": 48000015,
+        "warSize": 30,
+        "clanCount": 8,
+        "registeredPlayerCount": 327,
+        "groupCount": 1,
+        "townHallDistribution": [
+          {
+            "count": 236,
+            "level": 18
+          },
+          {
+            "count": 28,
+            "level": 17
+          },
+          {
+            "count": 24,
+            "level": 16
+          },
+          {
+            "count": 13,
+            "level": 15
+          },
+          {
+            "count": 8,
+            "level": 14
+          },
+          {
+            "count": 6,
+            "level": 13
+          },
+          {
+            "count": 5,
+            "level": 12
+          },
+          {
+            "count": 4,
+            "level": 11
+          },
+          {
+            "count": 1,
+            "level": 7
+          },
+          {
+            "count": 2,
+            "level": 3
+          }
+        ],
+        "sameTownHallHitRates": null,
+        "finalizedWars": 7,
+        "archivedWars": 0,
+        "calculatedAt": "2026-09-23T00:35:46.212Z"
+      },
+      {
+        "leagueId": 48000014,
+        "warSize": 15,
+        "clanCount": 32,
+        "registeredPlayerCount": 1011,
+        "groupCount": 4,
+        "townHallDistribution": [
+          {
+            "count": 577,
+            "level": 18
+          },
+          {
+            "count": 134,
+            "level": 17
+          },
+          {
+            "count": 86,
+            "level": 16
+          },
+          {
+            "count": 67,
+            "level": 15
+          },
+          {
+            "count": 51,
+            "level": 14
+          },
+          {
+            "count": 38,
+            "level": 13
+          },
+          {
+            "count": 19,
+            "level": 12
+          },
+          {
+            "count": 12,
+            "level": 11
+          },
+          {
+            "count": 7,
+            "level": 10
+          },
+          {
+            "count": 5,
+            "level": 9
+          },
+          {
+            "count": 4,
+            "level": 8
+          },
+          {
+            "count": 3,
+            "level": 7
+          },
+          {
+            "count": 1,
+            "level": 5
+          },
+          {
+            "count": 3,
+            "level": 4
+          },
+          {
+            "count": 3,
+            "level": 3
+          },
+          {
+            "count": 1,
+            "level": 2
+          }
+        ],
+        "sameTownHallHitRates": null,
+        "finalizedWars": 18,
+        "archivedWars": 0,
+        "calculatedAt": "2026-09-23T00:35:46.212Z"
+      },
+      {
+        "leagueId": 48000013,
+        "warSize": 15,
+        "clanCount": 40,
+        "registeredPlayerCount": 1324,
+        "groupCount": 5,
+        "townHallDistribution": [
+          {
+            "count": 478,
+            "level": 18
+          },
+          {
+            "count": 266,
+            "level": 17
+          },
+          {
+            "count": 183,
+            "level": 16
+          },
+          {
+            "count": 134,
+            "level": 15
+          },
+          {
+            "count": 107,
+            "level": 14
+          },
+          {
+            "count": 61,
+            "level": 13
+          },
+          {
+            "count": 38,
+            "level": 12
+          },
+          {
+            "count": 25,
+            "level": 11
+          },
+          {
+            "count": 8,
+            "level": 10
+          },
+          {
+            "count": 6,
+            "level": 9
+          },
+          {
+            "count": 7,
+            "level": 8
+          },
+          {
+            "count": 2,
+            "level": 7
+          },
+          {
+            "count": 3,
+            "level": 6
+          },
+          {
+            "count": 1,
+            "level": 5
+          },
+          {
+            "count": 2,
+            "level": 4
+          },
+          {
+            "count": 2,
+            "level": 3
+          },
+          {
+            "count": 1,
+            "level": 2
+          }
+        ],
+        "sameTownHallHitRates": null,
+        "finalizedWars": 25,
+        "archivedWars": 0,
+        "calculatedAt": "2026-09-23T00:35:46.212Z"
+      },
+      {
+        "leagueId": 48000009,
+        "warSize": 15,
+        "clanCount": 8,
+        "registeredPlayerCount": 199,
+        "groupCount": 1,
+        "townHallDistribution": [
+          {
+            "count": 18,
+            "level": 18
+          },
+          {
+            "count": 15,
+            "level": 17
+          },
+          {
+            "count": 27,
+            "level": 16
+          },
+          {
+            "count": 38,
+            "level": 15
+          },
+          {
+            "count": 45,
+            "level": 14
+          },
+          {
+            "count": 27,
+            "level": 13
+          },
+          {
+            "count": 11,
+            "level": 12
+          },
+          {
+            "count": 5,
+            "level": 11
+          },
+          {
+            "count": 8,
+            "level": 10
+          },
+          {
+            "count": 3,
+            "level": 9
+          },
+          {
+            "count": 1,
+            "level": 7
+          },
+          {
+            "count": 1,
+            "level": 6
+          }
+        ],
+        "sameTownHallHitRates": null,
+        "finalizedWars": 7,
+        "archivedWars": 0,
+        "calculatedAt": "2026-09-23T00:35:46.212Z"
+      },
+      {
+        "leagueId": 48000005,
+        "warSize": 15,
+        "clanCount": 8,
+        "registeredPlayerCount": 164,
+        "groupCount": 1,
+        "townHallDistribution": [
+          {
+            "count": 6,
+            "level": 18
+          },
+          {
+            "count": 2,
+            "level": 17
+          },
+          {
+            "count": 9,
+            "level": 16
+          },
+          {
+            "count": 14,
+            "level": 15
+          },
+          {
+            "count": 9,
+            "level": 14
+          },
+          {
+            "count": 17,
+            "level": 13
+          },
+          {
+            "count": 19,
+            "level": 12
+          },
+          {
+            "count": 24,
+            "level": 11
+          },
+          {
+            "count": 31,
+            "level": 10
+          },
+          {
+            "count": 21,
+            "level": 9
+          },
+          {
+            "count": 5,
+            "level": 8
+          },
+          {
+            "count": 2,
+            "level": 7
+          },
+          {
+            "count": 3,
+            "level": 5
+          },
+          {
+            "count": 1,
+            "level": 4
+          },
+          {
+            "count": 1,
+            "level": 3
+          }
+        ],
+        "sameTownHallHitRates": null,
+        "finalizedWars": 7,
+        "archivedWars": 0,
+        "calculatedAt": "2026-09-23T00:35:46.212Z"
+      }
+    ]
+  }
+}

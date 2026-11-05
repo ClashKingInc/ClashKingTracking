@@ -5,6 +5,7 @@ import (
 )
 
 type BasicPlayerRow struct {
+	ObservedAt       time.Time
 	Tag              string
 	Name             string
 	LeagueID         int
@@ -29,6 +30,8 @@ type BattlelogIngest struct {
 }
 
 type BattlelogRow struct {
+	PlayerName            string // Event display metadata; not a battle table column.
+	OpponentName          string
 	ArmyShareCode         string
 	PlayerTag             string
 	OpponentTag           string

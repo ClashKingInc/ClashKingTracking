@@ -13,11 +13,13 @@ It runs continuously as the `globalclans` script. Two loops run at the same time
 
 Each loop has its own cursor. A large inactive population therefore cannot stop active clans from being revisited.
 The two configured rates are a shared proxy load. Request starts are spaced evenly instead of being released in one-second bursts. `write_workers` controls tag-sharded SQL writers, so first-time player hydration can use database concurrency without allowing two workers to update the same clan concurrently.
-Clan requests flow continuously rather than waiting for every request in a SQL page to finish. A request that still returns a gateway timeout, truncated response, or rate-limit response after its bounded retries is left in the target table and tried again on the next full scan. This keeps one unusually slow or briefly throttled clan from pausing thousands of unrelated clans.
+Clan requests flow continuously rather than waiting for every request in a SQL page to finish. A request that still returns a 502, gateway timeout, truncated response, or rate-limit response after its bounded retries is left in the target table and tried again on the next full scan. A bulk clan 502 gets at most four attempts, with 500 ms between attempts, and does not close the shared availability gate. Each retry still uses the pool's rate limiter. Other unavailable errors, official maintenance, and outages reported by the availability controller retain the shared pause behavior.
 
 ## How a clan becomes a target
 
 Targets come from `basic_clan`. The database query assigns each clan to exactly one pool using its stored activity state. Pages are ordered by clan tag and resume after the last tag read. `target_page_multiplier` controls how many seconds of work are loaded in one page.
+
+Priority means more than five members and `last_active` within seven days. The global war finalizer advances `last_active` for both known sides when it stores a completed regular, friendly, or CWL war, using the game's `endTime`. Discovery does not change clan activity. When finalization permanently abandons an unavailable or private war, deleting its schedule advances both known sides using the stored `prep_time`. A missing/invalid preparation time falls back to the deletion time once. Retry and reschedule paths never advance activity. Joins and leaves remain membership history and do not change this timestamp. Existing activity values are retained; this change does not rewrite historical join-based values.
 
 ## Decision flow
 
@@ -58,13 +60,13 @@ Reads:
 
 Writes:
 
-- `basic_clan`: current profile, public-war-log flag, members, activity fields, known Clash IDs, and the clan's cumulative Capital Gold deposits.
+- `basic_clan`: current profile, public-war-log flag, members, known Clash IDs, and the clan's cumulative Capital Gold deposits. This process preserves `last_active`; the war pipeline advances it.
 - `clan_records`: best clan points and war streak records.
 - `basic_player`: inexpensive member facts learned from the clan response.
 - `join_leave_history`: durable join and leave rows.
 - `clan_change_history`: durable description, level, league, and other supported profile changes.
 
-Only columns whose incoming values are different are updated. This reduces database writes when a clan response is unchanged.
+Clan columns retain their changed-value checks. Member writes also advance the player observation timestamp so older responses cannot overwrite newer player facts.
 Member summaries are copied into a connection-local temporary staging table before the set-based `basic_player` upsert. The table clears at transaction commit and is reused by that database connection, avoiding one temporary-table create/drop cycle for every write batch.
 
 An imported clan can already have `member_count` without having its first `members` snapshot. The empty snapshot is treated as first hydration: the current members seed `basic_clan` and `basic_player`, but they are not recorded as joins and do not promote the clan into priority tracking. Join/leave comparison starts with the following successful poll.
@@ -101,6 +103,17 @@ flowchart LR
 
 Operational request and progress metrics are split into `globalclans.priority` and `globalclans.non_priority`. Each pool therefore shows its own observed RPS, errors, latency, target count, loop progress, and completion estimate instead of combining both configured rates into one opaque number.
 
+Each pool also records the following names in the existing `tracking_domain_stats` table:
+
+| Suffix | Field | Meaning |
+| --- | --- | --- |
+| `.fetch-success` | `processing_count` | Successful, nonempty clan responses; SQL may still be queued. |
+| `.fetch-deferred` | `requests`, `errors` | Exhausted transient fetches or unexpected 404s left for the next sweep. |
+| `.availability-paused` | `total_process_time_ms / 1000` | Wall seconds paused by the shared gate, sampled each second, counted once per pool rather than once per worker. Do not sum the two pools to measure process outage time. |
+| `.scan-wrap` | `processing_count`, `total_process_time_ms` | Full ordered SQL sweep dispatches and accumulated dispatch duration. HTTP tails and queued writes can still be pending. |
+
+Use the existing `globalclans` store affected-row and duration metrics alongside successful responses when assessing durable refresh throughput. Startup target totals can drift as clans change pools. Scan-wrap logs include the actual dispatched target count. At the previously observed non-priority population of 3,163,494 clans, a 12-hour sweep requires at least 73.23 completed clans/second; 50 configured RPS cannot achieve that. Measure the revised duty cycle and SQL throughput before proposing a rate allocation. This change does not alter configured rates.
+
 ## Outages and restarts
 
 Every request waits at the shared availability gate. A proxy outage pauses without changing game time. Official Clash maintenance also pauses; this process needs no clock shifting because clan snapshots have no scheduled end time. A process restart begins each ordered target pool from the first tag again; unchanged-row checks make that safe, though a future durable cursor could avoid the repeated prefix.
@@ -111,3 +124,8 @@ Every request waits at the shared availability gate. A proxy outage pauses witho
 - It does not poll wars, CWL, Raid Weekend, battle logs, or full player profiles.
 - It does not own notification configuration.
 - It does not infer live event interest per response.
+
+Member summaries carry the original clan request-start timestamp into the
+`basic_player` upsert. The bulk staging table orders duplicate tags by this time
+and only replaces an older player observation. The metadata fence is updated
+even when player display fields match.

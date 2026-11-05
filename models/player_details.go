@@ -1,5 +1,12 @@
 package models
 
+import "time"
+
+type PlayerDeletion struct {
+	Tag        string
+	ObservedAt time.Time
+}
+
 type PlayerProfileIngest struct {
 	Player       BasicPlayerRow
 	Heroes       []PlayerHeroRow

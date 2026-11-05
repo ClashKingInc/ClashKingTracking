@@ -46,7 +46,9 @@ func (w *TimescaleStatsWriter) Run(ctx context.Context, logger *slog.Logger) {
 	for {
 		select {
 		case <-ctx.Done():
-			w.flush(context.WithoutCancel(ctx), logger)
+			flushCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), 10*time.Second)
+			w.flush(flushCtx, logger)
+			cancel()
 			return
 		case <-ticker.C:
 			w.flush(ctx, logger)

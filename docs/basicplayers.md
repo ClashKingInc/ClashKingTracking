@@ -18,7 +18,7 @@ Every eligible row already present in `basic_player` can be selected. This proce
 Load a page of basic_player tags
   -> GET current player
   -> turn the response into basic profile columns
-  -> update basic profile columns only if at least one differs
+  -> conditionally update basic profile columns when the request started after the stored observation
   -> replace the player's compact profile-detail JSON
   -> continue from the page cursor
 ```
@@ -29,7 +29,7 @@ Pseudocode:
 page = load_basic_player_tags_after(cursor)
 for tag in page, with bounded concurrency:
   player = GET /players/{tag}
-  write tag, name, league, clan, town hall, and trophies if changed
+  write tag, name, league, clan, town hall, and trophies with the original request-start time
   write heroes, hero equipment, and achievements as three JSON arrays
 advance or wrap cursor
 ```
@@ -40,7 +40,7 @@ advance or wrap cursor
 
 ## Data read and written
 
-Reads `basic_player` for paging. It writes current `basic_player` profile columns through the shared changed-row upsert and one `player_profile_details` row for every successfully fetched full profile. It does not write `player_change_history`, `player_stat_changes`, `player_online_events`, `player_timers`, or battle logs.
+Reads `basic_player` for paging. It writes current `basic_player` profile columns through the shared observation-ordered upsert and one `player_profile_details` row for every successfully fetched full profile. It does not write `player_change_history`, `player_stat_changes`, `player_online_events`, `player_timers`, or battle logs.
 
 `player_profile_details` deliberately has one row per player rather than one row per hero, item, or achievement:
 
@@ -125,3 +125,14 @@ Requests pause at the shared availability gate. The database paging cursor allow
 - No stat deltas or upgrade events.
 - No troop or spell storage.
 - No battle-log, war, clan, Raid Weekend, or notification work.
+
+## Observation ordering
+
+`basic_player.observed_at` and `player_profile_details.observed_at` record the
+original request start in UTC, not queue flush time. Newer observations update the
+freshness fence even when the facts match; older/equal observations cannot replace
+them. This adds a small SQL metadata write for unchanged successful polls.
+Global clan member hydration, tracked players, scheduled profile work and Legend
+leaderboards use the same ordering contract. Keep writer host clocks synchronized.
+A stale not-found response cannot delete a newer existing player row. This is not
+a permanent tombstone system for deleted players.

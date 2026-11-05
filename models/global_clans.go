@@ -64,7 +64,6 @@ type GlobalClanIngest struct {
 	Clans           []BasicClanRow
 	Players         []BasicPlayerRow
 	ClanRecords     []ClanRecordRow
-	ActiveClanTags  []string
 	DeletedClanTags []string
 	ClanChanges     []ClanChangeRow
 	JoinLeaves      []JoinLeaveRow

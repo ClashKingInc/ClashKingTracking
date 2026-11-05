@@ -48,6 +48,20 @@ FCM is the only provider; Android and iOS both use it. Provider is still stored 
 
 ## War and Raid grouping
 
+Legend-defense events require `player_name`, `opponent_name`, integer `stars`
+(0–3), and integer `destruction_percentage` (0–100), alongside `player_tag`,
+`event_id`, and `battle_time`. The producer loads the defending account name
+from `basic_player` and retains the opponent name from the battle-log response.
+Missing display metadata prevents publication/checkpoint advancement. The
+consumer rejects incomplete events rather than sending generic text; old
+incomplete stream entries require explicit repair or retirement before replay.
+No SQL schema change is needed: these names are event metadata.
+
+The notification title is `<player_name> was attacked`; its body is
+`<opponent_name> ★★☆ (<destruction_percentage>%)`, with three stars total:
+filled for earned stars and outlined for unearned stars.
+The mobile payload still uses `target_tag` for the defending account's Legends page.
+
 For war reminders, every verified account belonging to one user and the same war is combined. Five accounts do not create five pushes; remaining attacks are totalled into one message.
 
 An overlapping CWL preparation event is not treated as a live “war started” mobile push. Its schedule can still produce the user's configured future reminders, while live start/score/end preferences apply only to the battle-role war.

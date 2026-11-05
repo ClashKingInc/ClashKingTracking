@@ -221,12 +221,15 @@ type scheduledStore interface {
 	ReplaceCurrentClanRankingGroup(context.Context, currentClanRankingGroup) (int, error)
 	ListRankedGroupTargets(context.Context, int64) ([]string, error)
 	StorePlayerProfiles(context.Context, []models.PlayerProfileIngest) (int, error)
-	DeletePlayers(context.Context, []string) error
+	DeletePlayers(context.Context, []models.PlayerDeletion) error
 	StoreRankedLeagueGroup(context.Context, []models.RankedLeagueGroupMemberRow) (int, error)
 	MissingRankedGroupPlayers(context.Context, int64) ([]string, error)
 	FinalizeRankedTournament(context.Context, int64) (int, error)
+	FinalizeObservedLegendDay(context.Context, time.Time) (int, error)
 	CaptureLegendSnapshot(context.Context, time.Time) (int, error)
 	FinalizeLegendCloseout(context.Context, time.Time) (int, error)
+	ScheduledJobCompleted(context.Context, string, time.Time) (bool, error)
+	MarkScheduledJobCompleted(context.Context, string, time.Time) error
 }
 
 func NewScheduledDomain() platform.Domain { return &scheduledDomain{} }
@@ -317,31 +320,61 @@ func (d *scheduledDomain) runLeagueCloseoutLoop(ctx context.Context, app *platfo
 		}
 		day := latestEligibleLegendDay(now)
 		started := time.Now()
-		snapshotWrites, err := d.store.CaptureLegendSnapshot(ctx, day)
-		if err != nil {
+		legendErr := d.runLegendCloseout(ctx, app, day)
+		if err := ctx.Err(); err != nil {
 			return err
 		}
-		app.Stats.RecordWrite(trackingProgressName(scheduledDomainName, "legend-snapshot"), snapshotWrites)
-		writes, err := d.store.FinalizeLegendCloseout(ctx, day)
-		if err != nil {
-			return err
-		}
-		app.Stats.RecordWrite(trackingProgressName(scheduledDomainName, "legend-closeout"), writes)
-		app.Stats.RecordProcess(trackingProgressName(scheduledDomainName, "league-closeout"), time.Since(started))
+		var rankedErr error
 		if rankedCloseoutDue(now) {
-			rankedWrites, err := d.doRankedGroupDiscovery(ctx, app, now)
-			if err != nil {
-				return err
-			}
-			app.Stats.RecordWrite(trackingProgressName(scheduledDomainName, "ranked-closeout"), rankedWrites)
-			if store, ok := d.store.(*timescaleScheduledStore); ok {
-				if _, err := store.pool.Exec(ctx, `INSERT INTO tracking_scheduled_jobs(job,period,completed_at)
-				VALUES('ranked_closeout',$1,clock_timestamp()) ON CONFLICT(job,period) DO UPDATE SET completed_at=EXCLUDED.completed_at`, dayStart(now)); err != nil {
-					return err
-				}
-			}
+			rankedErr = d.runRankedCloseout(ctx, app, now)
+		}
+		app.Stats.RecordProcess(trackingProgressName(scheduledDomainName, "league-closeout"), time.Since(started))
+		if err := errors.Join(legendErr, rankedErr); err != nil {
+			return err
 		}
 	}
+}
+
+func (d *scheduledDomain) runLegendCloseout(ctx context.Context, app *platform.App, day time.Time) error {
+	completed, err := d.store.ScheduledJobCompleted(ctx, "legend_closeout", day)
+	if err != nil || completed {
+		return err
+	}
+	// Observed summaries require only battle logs. Compute them before the
+	// optional rank-dependent work so a failed snapshot cannot starve All.
+	observedWrites, err := d.store.FinalizeObservedLegendDay(ctx, day)
+	if err != nil {
+		return err
+	}
+	app.Stats.RecordWrite(trackingProgressName(scheduledDomainName, "legend-observed"), observedWrites)
+	snapshotWrites, snapshotErr := d.store.CaptureLegendSnapshot(ctx, day)
+	if snapshotErr == nil {
+		app.Stats.RecordWrite(trackingProgressName(scheduledDomainName, "legend-snapshot"), snapshotWrites)
+	}
+	// A failed leaderboard refresh must not starve full-cohort army/item
+	// statistics. Keep the job retryable so ranked subsets can catch up later.
+	writes, closeoutErr := d.store.FinalizeLegendCloseout(ctx, day)
+	if closeoutErr == nil {
+		app.Stats.RecordWrite(trackingProgressName(scheduledDomainName, "legend-closeout"), writes)
+	}
+	if err := errors.Join(snapshotErr, closeoutErr); err != nil {
+		return err
+	}
+	return d.store.MarkScheduledJobCompleted(ctx, "legend_closeout", day)
+}
+
+func (d *scheduledDomain) runRankedCloseout(ctx context.Context, app *platform.App, now time.Time) error {
+	period := dayStart(now)
+	completed, err := d.store.ScheduledJobCompleted(ctx, "ranked_closeout", period)
+	if err != nil || completed {
+		return err
+	}
+	writes, err := d.doRankedGroupDiscovery(ctx, app, now)
+	if err != nil {
+		return err
+	}
+	app.Stats.RecordWrite(trackingProgressName(scheduledDomainName, "ranked-closeout"), writes)
+	return d.store.MarkScheduledJobCompleted(ctx, "ranked_closeout", period)
 }
 
 func waitUntilContext(ctx context.Context, deadline time.Time) error {
@@ -440,14 +473,14 @@ func (d *scheduledDomain) doRankedGroupDiscovery(ctx context.Context, app *platf
 	seenGroups := make(map[string]struct{})
 	seasons := make(map[int64]struct{})
 	for _, tag := range targets {
-		player, ok, err := d.fetchRankedSeedPlayer(ctx, app, tag)
+		player, observedAt, ok, err := d.fetchRankedSeedPlayer(ctx, app, tag)
 		if err != nil {
 			return writes, err
 		}
 		if !ok {
 			continue
 		}
-		affected, err := d.store.StorePlayerProfiles(ctx, []models.PlayerProfileIngest{utils.PlayerProfileFromClashy(*player)})
+		affected, err := d.store.StorePlayerProfiles(ctx, []models.PlayerProfileIngest{utils.PlayerProfileFromClashy(*player, observedAt)})
 		if err != nil {
 			return writes, err
 		}
@@ -500,23 +533,25 @@ func (d *scheduledDomain) doRankedGroupDiscovery(ctx context.Context, app *platf
 	return writes, nil
 }
 
-func (d *scheduledDomain) fetchRankedSeedPlayer(ctx context.Context, app *platform.App, tag string) (*clashy.Player, bool, error) {
+func (d *scheduledDomain) fetchRankedSeedPlayer(ctx context.Context, app *platform.App, tag string) (*clashy.Player, time.Time, bool, error) {
+	var observedAt time.Time
 	player, err := retryLimitedClashFetch(ctx, app, d.limiter, func(fetchCtx context.Context) (*clashy.Player, error) {
 		start := time.Now()
+		observedAt = start.UTC()
 		player, err := app.Clash.GetPlayer(fetchCtx, tag)
 		app.Stats.RecordRequest(scheduledDomainName, time.Since(start), err)
 		return player, err
 	})
 	if isClashNotFound(err) {
-		if err := d.store.DeletePlayers(ctx, []string{tag}); err != nil {
-			return nil, false, err
+		if err := d.store.DeletePlayers(ctx, []models.PlayerDeletion{{Tag: tag, ObservedAt: observedAt}}); err != nil {
+			return nil, observedAt, false, err
 		}
-		return nil, false, nil
+		return nil, observedAt, false, nil
 	}
 	if err != nil {
-		return nil, false, err
+		return nil, observedAt, false, err
 	}
-	return player, true, nil
+	return player, observedAt, true, nil
 }
 
 func (d *scheduledDomain) matchingLeagueHistory(ctx context.Context, app *platform.App, tag string, seasonID int64) (clashy.LeagueHistoryEntry, bool, error) {
@@ -601,14 +636,14 @@ func (d *scheduledDomain) fetchAndStoreMissingRankedPlayers(ctx context.Context,
 		return nil
 	}
 	for _, tag := range tags {
-		player, ok, err := d.fetchRankedSeedPlayer(ctx, app, tag)
+		player, observedAt, ok, err := d.fetchRankedSeedPlayer(ctx, app, tag)
 		if err != nil {
 			return writes, err
 		}
 		if !ok {
 			continue
 		}
-		profiles = append(profiles, utils.PlayerProfileFromClashy(*player))
+		profiles = append(profiles, utils.PlayerProfileFromClashy(*player, observedAt))
 		if len(profiles) >= 500 {
 			if err := flush(); err != nil {
 				return writes, err
@@ -2350,6 +2385,20 @@ func (s *timescaleScheduledStore) ListRankedGroupTargets(ctx context.Context, _ 
 	return tags, rows.Err()
 }
 
+func (s *timescaleScheduledStore) ScheduledJobCompleted(ctx context.Context, job string, period time.Time) (bool, error) {
+	var completed bool
+	err := s.pool.QueryRow(ctx, `SELECT EXISTS(
+		SELECT 1 FROM tracking_scheduled_jobs WHERE job=$1 AND period=$2 AND completed_at IS NOT NULL
+	)`, job, dayStart(period)).Scan(&completed)
+	return completed, err
+}
+
+func (s *timescaleScheduledStore) MarkScheduledJobCompleted(ctx context.Context, job string, period time.Time) error {
+	_, err := s.pool.Exec(ctx, `INSERT INTO tracking_scheduled_jobs(job,period,completed_at)
+		VALUES($1,$2,clock_timestamp()) ON CONFLICT(job,period) DO UPDATE SET completed_at=EXCLUDED.completed_at`, job, dayStart(period))
+	return err
+}
+
 func (s *timescaleScheduledStore) StorePlayerProfiles(ctx context.Context, profiles []models.PlayerProfileIngest) (int, error) {
 	if len(profiles) == 0 {
 		return 0, nil
@@ -2369,7 +2418,7 @@ func (s *timescaleScheduledStore) StorePlayerProfiles(ctx context.Context, profi
 	return affected, nil
 }
 
-func (s *timescaleScheduledStore) DeletePlayers(ctx context.Context, tags []string) error {
+func (s *timescaleScheduledStore) DeletePlayers(ctx context.Context, tags []models.PlayerDeletion) error {
 	if len(tags) == 0 {
 		return nil
 	}
@@ -2524,6 +2573,7 @@ type memoryScheduledStore struct {
 	legendHistory       map[string]map[string]models.LegendHistoryRow
 	legendSnapshotCalls int
 	legendCloseoutCalls int
+	completedJobs       map[string]bool
 }
 
 func newMemoryScheduledStore() *memoryScheduledStore {
@@ -2531,10 +2581,15 @@ func newMemoryScheduledStore() *memoryScheduledStore {
 		currentClanRankings: make(map[string]map[string]currentClanRankingRow),
 		leaderboardHistory:  make(map[string]map[string]any),
 		legendHistory:       make(map[string]map[string]models.LegendHistoryRow),
+		completedJobs:       make(map[string]bool),
 	}
 }
 
 func (*memoryScheduledStore) Close() {}
+
+func (*memoryScheduledStore) FinalizeObservedLegendDay(context.Context, time.Time) (int, error) {
+	return 0, nil
+}
 
 func (s *memoryScheduledStore) CaptureLegendSnapshot(context.Context, time.Time) (int, error) {
 	s.legendSnapshotCalls++
@@ -2544,6 +2599,15 @@ func (s *memoryScheduledStore) CaptureLegendSnapshot(context.Context, time.Time)
 func (s *memoryScheduledStore) FinalizeLegendCloseout(context.Context, time.Time) (int, error) {
 	s.legendCloseoutCalls++
 	return 0, nil
+}
+
+func (s *memoryScheduledStore) ScheduledJobCompleted(_ context.Context, job string, period time.Time) (bool, error) {
+	return s.completedJobs[job+":"+dayStart(period).Format("2006-01-02")], nil
+}
+
+func (s *memoryScheduledStore) MarkScheduledJobCompleted(_ context.Context, job string, period time.Time) error {
+	s.completedJobs[job+":"+dayStart(period).Format("2006-01-02")] = true
+	return nil
 }
 
 func (s *memoryScheduledStore) ReplaceLeaderboardHistory(
@@ -2663,7 +2727,7 @@ func (*memoryScheduledStore) StorePlayerProfiles(context.Context, []models.Playe
 	return 0, nil
 }
 
-func (*memoryScheduledStore) DeletePlayers(context.Context, []string) error {
+func (*memoryScheduledStore) DeletePlayers(context.Context, []models.PlayerDeletion) error {
 	return nil
 }
 

@@ -7,6 +7,7 @@ import (
 	"errors"
 	"fmt"
 	"net/http"
+	"strings"
 	"sync"
 	"time"
 
@@ -151,6 +152,11 @@ func sendFCM(ctx context.Context, app *platform.App, token string, msg pushMessa
 			},
 			"data": msg.Data,
 		},
+	}
+	if image := msg.Data["image_url"]; strings.HasPrefix(image, "https://") {
+		message := payload["message"].(map[string]any)
+		message["apns"] = map[string]any{"payload": map[string]any{"aps": map[string]any{"mutable-content": 1}}, "fcm_options": map[string]string{"image": image}}
+		message["android"] = map[string]any{"notification": map[string]string{"image": image}}
 	}
 	body, err := json.Marshal(payload)
 	if err != nil {

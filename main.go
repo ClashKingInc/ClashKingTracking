@@ -43,6 +43,7 @@ func run() error {
 		scriptdomains.NewScheduledDomain(),
 		scriptdomains.NewNotificationsDomain(),
 		scriptdomains.NewBotAutomationsDomain(),
+		scriptdomains.NewGiveawaysDomain(),
 		scriptdomains.NewDiscordGatewayDomain(),
 		scriptdomains.NewDiscordDeliveryDomain(),
 	}

@@ -139,9 +139,9 @@ func resetRankedTrophyBatchTx(ctx context.Context, tx pgx.Tx, period, now time.T
 	var count int
 	err = tx.QueryRow(ctx, `WITH batch AS MATERIALIZED (
  SELECT tag FROM basic_player WHERE tag>$1 AND league_id BETWEEN 105000000 AND 105000035 AND trophies<>0 ORDER BY tag LIMIT 5000
- ), changed AS (UPDATE basic_player p SET trophies=0 FROM batch b WHERE p.tag=b.tag
+ ), changed AS (UPDATE basic_player p SET trophies=0, observed_at=$2 FROM batch b WHERE p.tag=b.tag AND p.observed_at < $2
  AND p.league_id BETWEEN 105000000 AND 105000035 AND p.trophies<>0 RETURNING p.tag)
- SELECT COALESCE((SELECT max(tag) FROM batch),$1),(SELECT count(*) FROM changed)`, lastTag).Scan(&next, &count)
+ SELECT COALESCE((SELECT max(tag) FROM batch),$1),(SELECT count(*) FROM changed)`, lastTag, now.UTC()).Scan(&next, &count)
 	if err != nil {
 		return false, err
 	}

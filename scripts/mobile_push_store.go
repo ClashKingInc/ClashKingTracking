@@ -1219,7 +1219,7 @@ func newMemoryMobilePushStore() *memoryMobilePushStore {
 	day := 1
 	sendTime := "09:00"
 	route := "/settings/support"
-	store.campaigns["monthly-support"] = models.NotificationCampaign{ID: "monthly-support", Key: "monthly-support", Title: "New Season is Live", Body: "A new season has started. If you're getting the Gold Pass, consider using creator code ClashKing.", TargetRoute: &route, Platforms: []string{"ios", "android", "web"}, Status: "scheduled", TriggerType: "monthly", DayOfMonth: &day, SendTime: &sendTime, LastSentAt: &now, CreatedAt: now, UpdatedAt: now}
+	store.campaigns["monthly-support"] = models.NotificationCampaign{ID: "monthly-support", Key: "monthly-support", Title: "New Season is Live", Body: "A new season has started. If you're getting the Gold Pass, consider using our creator code ClashKing.", TargetRoute: &route, Platforms: []string{"ios", "android", "web"}, Status: "scheduled", TriggerType: "monthly", DayOfMonth: &day, SendTime: &sendTime, LastSentAt: &now, CreatedAt: now, UpdatedAt: now}
 	return store
 }
 

@@ -48,6 +48,7 @@ func (d *giveawaysDomain) Run(ctx context.Context, app *platform.App) error {
 		app.Stats.RecordProcess(giveawaysDomainName, time.Since(start))
 		if err != nil {
 			app.Stats.SetReady(giveawaysDomainName, false, err.Error())
+			app.Logger.Error("giveaway scan failed", "err", err)
 		}
 		if err := sleepOrDone(ctx, interval); err != nil {
 			return err
@@ -78,6 +79,9 @@ func (d *giveawaysDomain) runCycle(ctx context.Context, app *platform.App) error
 		return err
 	}
 	for _, transition := range transitions {
+		if !app.Config.AllowsDiscordGuild(transition.Row.ServerID) {
+			continue
+		}
 		stored, ok, err := d.store.MarkTransition(ctx, transition)
 		if err != nil {
 			return err
@@ -211,26 +215,26 @@ const dueGiveawaysSQL = `
 			id, server_id, status, updated, start_time, end_time, ` + giveawayEventPayloadSQL + ` AS data,
 			true AS event_due
 		FROM giveaways
-		WHERE event_pending IS NOT NULL
+		WHERE event_pending IS NOT NULL AND NOT disabled
 	),
 	due AS (
 		SELECT 'giveaway_start' AS kind, 'scheduled' AS from_status, 'ongoing' AS to_status,
 			id, server_id, status, updated, start_time, end_time, ` + giveawayEventPayloadSQL + ` AS data,
 			false AS event_due
 		FROM giveaways
-		WHERE start_time <= $1 AND status = 'scheduled' AND event_pending IS NULL
+		WHERE start_time <= $1 AND status = 'scheduled' AND event_pending IS NULL AND NOT disabled
 		UNION ALL
 		SELECT 'giveaway_end' AS kind, 'ongoing' AS from_status, 'ended' AS to_status,
 			id, server_id, status, updated, start_time, end_time, ` + giveawayEventPayloadSQL + ` AS data,
 			false AS event_due
 		FROM giveaways
-		WHERE end_time <= $1 AND status = 'ongoing' AND event_pending IS NULL
+		WHERE end_time <= $1 AND status = 'ongoing' AND event_pending IS NULL AND NOT disabled AND message_id IS NOT NULL
 		UNION ALL
 		SELECT 'giveaway_update' AS kind, 'ongoing' AS from_status, 'ongoing' AS to_status,
 			id, server_id, status, updated, start_time, end_time, ` + giveawayEventPayloadSQL + ` AS data,
 			false AS event_due
 		FROM giveaways
-		WHERE status = 'ongoing' AND updated = true AND event_pending IS NULL
+		WHERE status = 'ongoing' AND updated = true AND event_pending IS NULL AND NOT disabled AND message_id IS NOT NULL AND end_time > $1
 	)
 	SELECT * FROM pending
 	UNION ALL
@@ -246,7 +250,11 @@ const markGiveawayTransitionSQL = `
 		event_pending = $4,
 		event_pending_at = now(),
 		updated_at = now()
-	WHERE id = $1 AND status = $2 AND event_pending IS NULL
+	WHERE id = $1 AND status = $2 AND event_pending IS NULL AND NOT disabled
+		AND ($4 = 'giveaway_start' OR message_id IS NOT NULL)
+		AND (($4 = 'giveaway_start' AND start_time <= clock_timestamp())
+			OR ($4 = 'giveaway_end' AND end_time <= clock_timestamp())
+			OR ($4 = 'giveaway_update' AND updated AND end_time > clock_timestamp()))
 	RETURNING $4 AS kind, $2 AS from_status, $3 AS to_status,
 		id, server_id, status, updated, start_time, end_time, ` + giveawayEventPayloadSQL + ` AS data,
 		true AS event_due
@@ -254,7 +262,7 @@ const markGiveawayTransitionSQL = `
 
 const clearGiveawayPendingSQL = `
 	UPDATE giveaways
-	SET event_pending = NULL, event_pending_at = NULL, updated_at = now()
+	SET event_pending = NULL, event_pending_at = NULL
 	WHERE id = $1
 `
 

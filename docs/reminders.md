@@ -2,7 +2,7 @@
 
 ## What this process is for
 
-The reminder process owns clock decisions: which future war offsets must exist, when a shared clock is due, and when fixed-calendar Capital, Clan Games, and inactivity checks should run. It publishes delivery-ready events but does not send FCM or Discord webhooks itself.
+The reminder process owns clock decisions: which future war offsets must exist, when a shared clock is due, and when fixed-calendar Capital and Clan Games checks should run. It publishes delivery-ready events but does not send FCM or Discord webhooks itself.
 
 ## Work running inside this process
 
@@ -12,7 +12,7 @@ Five loops run together:
 2. Due war-job checks every 15 seconds.
 3. Mobile war reconciliation every five minutes.
 4. Raid Weekend checks on quarter-hour boundaries.
-5. Clan Games and inactivity checks on quarter-hour boundaries.
+5. Clan Games checks on quarter-hour boundaries.
 
 At startup, every active `war_schedule` is reconciled once.
 
@@ -53,17 +53,24 @@ Load due clock
 
 The event uses one v2 contract: `minutes_remaining` is an integer and `data` is the current war object. It does not duplicate the offset as a formatted legacy string. The notification consumer groups all of one user's participating verified accounts and totals their remaining attacks. The intended mobile text is `45 minutes & 7 attacks left in war!`.
 
+Discord war reminders accept both preparation and battle day. Offsets remain
+relative to war end, so a 30-hour reminder for a normal 24-hour battle falls
+during preparation. No extra start-relative clocks are created. Preparation
+messages say "War preparation" and show the relative battle-start time;
+roster members have their full battle-day attack allowance. The dashboard's
+send-now action accepts preparation too. Existing role, Town Hall, war-type,
+and threshold filters remain in effect. This does not change mobile push timing.
+
 ## Raid Weekend reminders
 
 Raid Weekend ends at the same time for everyone, so there are no individual future rows. On each quarter-hour during the weekend, the process selects Discord/mobile preferences whose configured remaining minutes equal the current remaining minutes. It uses the compressed Capital cache first, falls back to the raid endpoint, totals mobile attacks per user and clan, and publishes only when attacks remain.
 
 Discord member reminders use one v2 shape: `clan` is the current clan, `reminder` is a typed configuration built from SQL columns, and `members` is the filtered list that still needs the reminder. Raid reminders additionally include the current response as `raid`. Old `_data` names, Mongo-style `_id`, and opaque `reminder.data` blobs are not published.
 
-## Clan Games and inactivity reminders
+## Clan Games reminders
 
 Clan Games checks run only from the 22nd through the 28th. They combine current clan members with positive `clan_games` deltas observed since the event began, then apply threshold, town hall, and role filters.
 
-Inactivity checks find members as their most recent `player_online_events` time crosses the configured threshold. A 15-minute window prevents the same crossing from being selected on every quarter-hour forever. Current clan data supplies accurate role/town hall filtering before publication.
 
 ## Clash API used
 
@@ -74,7 +81,7 @@ Inactivity checks find members as their most recent `player_online_events` time 
 
 ## Data and Valkey used
 
-Reads `war_schedule`, `player_timers`, `reminders`, verified and enabled `mobile_notification_accounts`, `mobile_notification_preferences`, `mobile_push_devices`, `basic_clan.members`, `player_stat_changes`, and `player_online_events`. Writes only `war_reminder_jobs` and deletes a job after it fires.
+Reads `war_schedule`, `player_timers`, `reminders`, verified and enabled `mobile_notification_accounts`, `mobile_notification_preferences`, `mobile_push_devices`, `basic_clan.members`, and `player_stat_changes`. Writes only `war_reminder_jobs` and deletes a job after it fires. Shared activity history remains owned by tracking and is not used by reminders.
 
 Consumes `war_schedule` and `reminder_config` events from its own Valkey consumer group. Publishes `reminder` events containing the shared current snapshot and enough identity for downstream recipients.
 
@@ -106,6 +113,30 @@ War jobs survive restarts in SQL. Official maintenance shifts the schedule, play
 ## What it deliberately does not do
 
 - It does not send webhooks or FCM directly.
-- It does not create per-recipient Raid/Clan Games/inactivity jobs.
+- It does not create per-recipient Raid/Clan Games jobs.
 - It does not continuously scan Discord war configuration every five minutes.
 - It does not maintain an in-memory copy of all future jobs.
+
+## Webhook delivery and migration
+
+Discord reminders use incoming webhooks, like logs. The API stores only
+`reminders.webhook_id`; the delivery worker resolves the token with the bot and
+checks owner, server, parent channel and optional thread before sending. Missing
+or mismatched webhook configuration fails delivery; it never falls back to a bot
+message or creates a webhook while sending.
+
+Apply DevKit migration 054 before the new API or delivery worker. Run DevKit's
+`database/migrations/reminder_webhooks.go` in its default preview mode, then with
+`REMINDER_WEBHOOKS_APPLY=1` after reviewing the destination. Run it after importing
+legacy reminders and before enabling delivery. The backfill normalizes a legacy
+thread destination into parent channel plus thread ID. It includes disabled
+reminders without enabling them. It lists incoming hooks in each parent channel,
+reuses a hook owned by the configured bot, and creates one only if none exists.
+It uses the same server-row lock as API log/reminder writes. Repeat runs reuse
+existing hooks. Failed requests stop the backfill; repeat it after resolving the
+error. No webhook is deleted, including after an uncertain write outcome.
+
+The old `webhook_token` column remains temporarily for upgrade compatibility,
+but the new delivery path ignores it. The backfill and API saves clear its value.
+Downgrade the API/delivery binaries before dropping the new column. A database
+rollback does not remove Discord webhooks, which can be shared with logs.

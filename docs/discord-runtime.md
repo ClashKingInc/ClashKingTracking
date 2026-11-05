@@ -32,7 +32,7 @@ Clan, player, war, capital, and Reddit events map to configured `server_logs` ty
 
 ## Configuration
 
-Both processes use `DISCORD_BOT_TOKEN` (with `BOT_TOKEN` as a migration fallback) and the Timescale settings. The gateway uses `discord_gateway.queue_size` as the mutation backlog's initial allocation and warning threshold; exceeding it emits one warning but does not block the Discord receive loop. Delivery uses `discord_delivery.batch_size` plus the common event stream and Valkey settings. When link parsing is enabled, delivery also requires `CLASHKING_API_ORIGIN` and `CLASHKING_API_TOKEN`. Dev and production run as separate processes with separate application tokens against the intended environment database.
+Both processes use `DISCORD_BOT_TOKEN` (with `BOT_TOKEN` as a migration fallback) and the Timescale settings. `DISCORD_GUILD_ALLOWLIST` can restrict gateway persistence and member synchronization to a comma-separated set of guild IDs; an empty value retains all guilds. The gateway uses `discord_gateway.queue_size` as the mutation backlog's initial allocation and warning threshold; exceeding it emits one warning but does not block the Discord receive loop. Delivery uses `discord_delivery.batch_size` plus the common event stream and Valkey settings. When link parsing is enabled, delivery also requires `CLASHKING_API_ORIGIN` and `CLASHKING_API_TOKEN`. Dev and production run as separate processes with separate application tokens against the intended environment database.
 
 Neither process registers commands. Command registration and interaction handling belong to the TypeScript Worker.
 

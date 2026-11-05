@@ -56,7 +56,7 @@ type basicPlayerTargetPage struct {
 
 type basicPlayerIngest struct {
 	Profile *models.PlayerProfileIngest
-	Delete  string
+	Delete  models.PlayerDeletion
 }
 
 type timescaleBasicPlayerStore struct {
@@ -225,7 +225,7 @@ func (d *basicPlayersDomain) do(ctx context.Context, app *platform.App, tag stri
 	player, err := app.Clash.GetPlayer(ctx, tag)
 	app.Stats.RecordRequest(basicPlayersDomainName, time.Since(start), err)
 	if isClashNotFound(err) {
-		return basicPlayerIngest{Delete: tag}, nil
+		return basicPlayerIngest{Delete: models.PlayerDeletion{Tag: tag, ObservedAt: start.UTC()}}, nil
 	}
 	if err != nil {
 		return basicPlayerIngest{}, err
@@ -233,7 +233,7 @@ func (d *basicPlayersDomain) do(ctx context.Context, app *platform.App, tag stri
 	if player == nil {
 		return basicPlayerIngest{}, errors.New("player fetch returned no player")
 	}
-	profile := utils.PlayerProfileFromClashy(*player)
+	profile := utils.PlayerProfileFromClashy(*player, start.UTC())
 	return basicPlayerIngest{Profile: &profile}, nil
 }
 
@@ -301,13 +301,13 @@ func (s *timescaleBasicPlayerStore) Store(ctx context.Context, ingests []basicPl
 	}
 	requestedRows := 0
 	profiles := make([]models.PlayerProfileIngest, 0, len(ingests))
-	deletes := make([]string, 0)
+	deletes := make([]models.PlayerDeletion, 0)
 	for _, ingest := range ingests {
 		if ingest.Profile != nil {
 			requestedRows++
 			profiles = append(profiles, *ingest.Profile)
 		}
-		if ingest.Delete != "" {
+		if ingest.Delete.Tag != "" {
 			requestedRows++
 			deletes = append(deletes, ingest.Delete)
 		}

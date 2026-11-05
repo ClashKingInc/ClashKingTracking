@@ -2,6 +2,7 @@ package utils
 
 import (
 	"context"
+	"fmt"
 
 	"clashking_tracking/models"
 
@@ -10,10 +11,11 @@ import (
 
 const UpsertBasicPlayerSQL = `
 	INSERT INTO basic_player (
-		tag, name, league_id, league_group_tag, league_season_id, clan_tag, townhall_level, trophies
+		tag, name, league_id, league_group_tag, league_season_id, clan_tag, townhall_level, trophies, observed_at
 	)
-	VALUES ($1, $2, NULLIF($3, 0), NULLIF($4, ''), NULLIF($5, 0), $6, $7, $8)
+	VALUES ($1, $2, NULLIF($3, 0), NULLIF($4, ''), NULLIF($5, 0), $6, $7, $8, $11)
 	ON CONFLICT (tag) DO UPDATE SET
+		observed_at = EXCLUDED.observed_at,
 		name = EXCLUDED.name,
 		league_id = COALESCE(EXCLUDED.league_id, basic_player.league_id),
 		league_group_tag = CASE WHEN $9 THEN EXCLUDED.league_group_tag ELSE basic_player.league_group_tag END,
@@ -21,16 +23,12 @@ const UpsertBasicPlayerSQL = `
 		clan_tag = CASE WHEN $10 THEN EXCLUDED.clan_tag ELSE basic_player.clan_tag END,
 		townhall_level = EXCLUDED.townhall_level,
 		trophies = CASE WHEN EXCLUDED.trophies > 0 THEN EXCLUDED.trophies ELSE basic_player.trophies END
-	WHERE
-		basic_player.name IS DISTINCT FROM EXCLUDED.name OR
-		basic_player.league_id IS DISTINCT FROM COALESCE(EXCLUDED.league_id, basic_player.league_id) OR
-		($9 AND basic_player.league_group_tag IS DISTINCT FROM EXCLUDED.league_group_tag) OR
-		($9 AND basic_player.league_season_id IS DISTINCT FROM EXCLUDED.league_season_id) OR
-		($10 AND basic_player.clan_tag IS DISTINCT FROM EXCLUDED.clan_tag) OR
-		basic_player.townhall_level IS DISTINCT FROM EXCLUDED.townhall_level OR
-		(EXCLUDED.trophies > 0 AND basic_player.trophies IS DISTINCT FROM EXCLUDED.trophies)
+	WHERE basic_player.observed_at < EXCLUDED.observed_at
 `
 
+// observed_at is the request start, not response/queue completion. Every newer
+// observation advances it, even when values match, so a delayed older response
+// cannot win later. This requires synchronized clocks across writer processes.
 // UpsertBasicPlayers is shared by ingesters that learn basic player facts
 // while processing player, clan, battlelog, leaderboard, or scheduled data.
 func UpsertBasicPlayers(ctx context.Context, tx pgx.Tx, players []models.BasicPlayerRow, domain string) error {
@@ -50,6 +48,9 @@ func UpsertBasicPlayersCount(ctx context.Context, tx pgx.Tx, players []models.Ba
 		if player.Tag == "" || player.Name == "" || player.TownHall <= 0 {
 			continue
 		}
+		if player.ObservedAt.IsZero() {
+			return 0, fmt.Errorf("%s: player observation time is required", domain)
+		}
 		clanTagKnown := player.ClanTagKnown || player.ClanTag != ""
 		batch.Queue(UpsertBasicPlayerSQL,
 			player.Tag,
@@ -62,6 +63,7 @@ func UpsertBasicPlayersCount(ctx context.Context, tx pgx.Tx, players []models.Ba
 			player.Trophies,
 			player.LeagueGroupKnown,
 			clanTagKnown,
+			player.ObservedAt,
 		)
 	}
 	return SendBatchCount(ctx, tx, batch)

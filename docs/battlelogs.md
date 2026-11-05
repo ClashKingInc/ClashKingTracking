@@ -2,7 +2,7 @@
 
 ## What this process is for
 
-Battle-log tracking stores newly observed multiplayer battles for players whose history is worth polling. It also publishes a deduplicated mobile event for each newly observed Legend defense after the raw battle is durable.
+Battle-log tracking stores newly observed multiplayer battles for players whose history is worth polling. It also publishes a deduplicated mobile event for each newly observed Legend defense after the raw battle is durable, and produces subscribed Discord Legend attack and defense events from the league-group API.
 
 ## When it runs
 
@@ -15,7 +15,7 @@ Each group has its own progress statistics. Its target tags are loaded once per 
 
 ## How a player becomes a target
 
-Legend targets are players whose stored league is Legend League. Standard SQL targets are Town Hall 9 or higher members of recently active configured server clans, matching `trackedplayers`. Active verified app accounts are selected from `player_links` when `last_login` is within seven days, without a Town Hall filter, and use the same standard request budget. Verified players already in Legend League are removed from the standard pool so the two workers cannot publish the same newly observed battle twice.
+Legend targets are players whose stored league is Legend League. Standard targets share `trackedplayers` eligibility: Town Hall 9 or higher members of the cached snapshots for recently active configured server clans, plus verified app accounts whose `last_login` is within seven days regardless of Town Hall. Players whose stored league is Legend League are removed from the standard pool so the two workers cannot publish the same newly observed battle twice.
 
 Bookmarks and war participation do not create battle-log targets. There is no `battlelogs_tracking_ttl`.
 
@@ -57,19 +57,22 @@ Checkpoint batches feed one long-lived pool rather than waiting for every retry 
 
 ## Clash API used
 
-- `GET /v1/players/{playerTag}/battlelog`.
+- `GET /v1/players/{playerTag}/battlelog` for every target.
+- `GET /v1/players/{playerTag}` and its league group only for stored Legend players whose current clan has an active Discord Legend log subscription. Each request uses the battlelogs request limiter.
 
 ## Data read and written
 
 Reads target tables and the requested player's current Town Hall from `basic_player`. Farming attacks go to `battles_farming` with the player, time, result, duration, loot object, and share code; farming defenses and opponent metadata are discarded. The opponent Town Hall is zero-indexed in the wire response and is converted with `+1` exactly once during ingestion. Each Ranked or Legend response contributes only the requested player's own attack or defense perspective to `battles_ranked`. When both players are tracked, their separate responses supply the two perspectives without synthesizing either one. The database contract uses numeric `battle_mode` values `1` for Ranked and `2` for Legend, numeric `direction` values `1` for attack and `2` for defense, and `0` when duration is absent. Aggregate readers use only `direction=1`, so a battle observed from both players is counted once.
 
-Ranked and Legend rows retain the normalized share code directly. The hot writer inserts each distinct code into `army_compositions`, keyed only by `share_code`; there is no army hash or parser-version identity. The daily Legend closeout reuses those compositions for family and item aggregation.
+Ranked and Legend rows retain the normalized share code directly. The hot writer inserts each distinct code into `army_compositions`, keyed only by `share_code`; there is no army hash or parser-version identity. The daily Legend closeout reuses those compositions for troop-group/setup and item aggregation.
 
-Hero mode segments such as `h2m1p16e5_41` are accepted and preserved in canonical share codes. Mode is not a composition column and does not participate in army-family similarity; `m0` and `m1` can remain distinct exact codes in the same family. The earlier rejection came from Tracking's share-code validator, not clashy.go.
+Hero mode segments such as `h2m1p16e5_41` are accepted and preserved in canonical share codes. Mode is not a composition column and does not participate in troop-group identity; `m0` and `m1` can remain distinct exact codes in the same group. The earlier rejection came from Tracking's share-code validator, not clashy.go.
 
 The battle identity is `(player_tag, battle_time)`. Deploy this writer only with the final DevKit migration 017 contract. Existing raw rows remain intact.
 
-The scheduled closeout rebuilds completed Legend-day and Ranked-season aggregates from raw attack perspectives. It groups newly observed Legend armies into immutable direct-anchor families and writes daily family outcomes. Farming and Ranked/Legend raw rows retain one year.
+The scheduled closeout rebuilds completed 05:00 UTC Legend-day and Ranked-season aggregates from raw attack perspectives. Current public statistics use the daily troop-group/setup classifier and item aggregates; historical family tables remain available to historical admin tooling and no longer receive current daily writes. Farming and Ranked/Legend raw rows retain one year.
+
+The active daily troop-group/setup classifier is specified in [its durable contract](../internal/armyfamily/DAILY_CLASSIFIER.md). It derives group keys and setup conditions from each completed day's observed attacks; it does not assign permanent numeric family IDs.
 
 Valkey checkpoint keys remember the newest battle time seen for each player. `battlelogs.checkpoint_ttl_days` controls their lifetime. The checkpoint is comparison state, not target membership.
 
@@ -77,7 +80,7 @@ Every target is fetched on every pass whether it has a checkpoint or not, so an 
 
 ## Events and interaction
 
-After SQL succeeds, each newly observed Legend defense publishes a `legend` stream entry whose value has `type=legend_defense`, `event_id`, normalized `player_tag`, and RFC3339-nanosecond `battle_time`. The event ID is deterministic for the player and battle time, and the Valkey append is atomically deduplicated. First-seen checkpoint seeding publishes no historical notifications. `trackedplayers` decides who belongs to the standard fast-player set; wars do not write player rows to opt people in.
+After SQL succeeds, each newly observed Legend defense publishes a `legend` stream entry for mobile delivery. Its event ID is deterministic for the player and battle time, and the Valkey append is atomically deduplicated. First-seen checkpoint seeding publishes no historical mobile notifications. Subscribed Discord Legend attacks and defenses use a separate `discord_legend` topic with each league-group battle's own trophy delta; their snapshot and event IDs suppress replay and keep the mobile defense event separate. `trackedplayers` and standard battlelogs share target eligibility; wars do not write player rows to opt people in.
 
 ```mermaid
 flowchart LR
@@ -110,3 +113,41 @@ Requests pause at the availability gate. Storage ordering is SQL, then the atomi
 - No stored trophy deltas or synthetic automatic defenses; API responses derive them from real results.
 - No war-derived TTL.
 - No search through every player's bookmarked accounts per attack.
+
+### Missing historical rank snapshots
+
+Full Legends I daily totals, item usage and army setup observations use all
+retained raw Legend attack perspectives in the 05:00-to-05:00 UTC window. They
+never require historical rank membership. Top 1,000 and Top 200 still use the
+saved rank snapshot for that day. When it is absent, a full-day rebuild omits
+those ranked aggregate rows rather than publishing zeros or estimating ranks.
+The separate rank-coverage performance table remains unavailable without a
+snapshot; observed-player performance remains available independently.
+
+If live ranking capture fails, the scheduled closeout still calculates the full
+cohort. It keeps the job retryable and reports the ranking error so this fallback
+does not conceal a broken ranking collector. Historical ranking gaps are an
+accepted data limitation, not permission to leave future ranking capture broken.
+
+### Bounded historical rebuild
+
+`go run ./cmd/rebuild-legend-days --days YYYY-MM-DD` previews source counts by
+default. Add `--apply` to rebuild derived rows. Use `--from` and `--through` for
+an inclusive range of at most seven completed days. Each game day is 05:00 UTC
+to the next 05:00 UTC. Future or incomplete days are rejected.
+
+Local use remains restricted to the loopback development database. Production
+requires `--target production --expect-host HOST --expect-system-id ID`, with
+`TIMESCALE_DATABASE=clashking`. Read the PostgreSQL system identifier with
+`SELECT system_identifier FROM pg_control_system()` on the approved target.
+Credentials stay in the existing environment, never command-line arguments.
+Preview the exact batch, then repeat it with `--apply` through the approved
+operational connection.
+
+The command checks the connected database and cluster before writes. It previews
+raw attack/defense and saved-rank counts for every requested day. One day runs at
+a time with a ten-minute timeout, configurable up to one hour. Interrupted
+batches can be retried: derived updates are transactional and raw battles are
+never deleted. `--observed-only` and `--performance-only` select narrower repairs.
+Full rebuilds include All observations without ranks but never fabricate
+Top 1,000/200 membership.
