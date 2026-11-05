@@ -37,3 +37,11 @@ Both processes use `DISCORD_BOT_TOKEN` (with `BOT_TOKEN` as a migration fallback
 Neither process registers commands. Command registration and interaction handling belong to the TypeScript Worker.
 
 With `dry_run` enabled, `discord-gateway` skips PostgreSQL and Valkey entirely, opens the real recommended shard set, validates READY or RESUMED evidence, and requests a bounded number of member chunks per shard before discarding the results. This mode is intended for local lifecycle diagnostics and performs no database writes.
+
+Automatic giveaway recovery accepts an optional fixed `GIVEAWAY_RECOVERY_SINCE`
+RFC3339 timestamp. Ended giveaways before that migration boundary retain their
+records and winners but are not re-announced just because the new publication
+journal is empty. Explicit rerolls and existing publication effects remain
+deliverable. Keep the same boundary across restarts; do not advance it to the
+current time, which would skip genuinely missed new endings. Recovery scans
+run at most once per five seconds, independent of incoming stream traffic.

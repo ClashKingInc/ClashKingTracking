@@ -18,6 +18,7 @@ type Config struct {
 	ProxyURL                               string
 	ClashKingAPIURL                        string
 	ClashKingAPIToken                      string
+	GiveawayRecoverySince                  string
 	TimescaleURL                           string
 	DatabasePools                          DatabasePoolConfig
 	ValkeyAddr                             string
@@ -323,6 +324,7 @@ func applyEnvironment(cfg *Config) {
 	cfg.ProxyURL = appendOriginPath(os.Getenv("CLASHKING_PROXY_INTERNAL_ORIGIN"), "/v1")
 	cfg.ClashKingAPIURL = normalizeOrigin(firstNonEmpty(os.Getenv("CLASHKING_API_ORIGIN"), os.Getenv("CLASHKING_API_URL")))
 	cfg.ClashKingAPIToken = os.Getenv("CLASHKING_API_TOKEN")
+	cfg.GiveawayRecoverySince = strings.TrimSpace(os.Getenv("GIVEAWAY_RECOVERY_SINCE"))
 	cfg.TimescaleURL = buildTimescaleURL(os.Getenv)
 	cfg.ValkeyAddr = buildValkeyAddress(os.Getenv)
 	cfg.ValkeyPassword = os.Getenv("VALKEY_PASSWORD")

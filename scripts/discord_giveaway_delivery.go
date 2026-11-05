@@ -167,7 +167,8 @@ func (w *discordDeliveryWorker) deliverGiveaway(ctx context.Context, event mobil
 
 func (w *discordDeliveryWorker) prepareGiveaway(ctx context.Context, id, kind string) error {
 	var server string
-	if err := w.pool.QueryRow(ctx, `SELECT server_id FROM giveaways WHERE id=$1 AND NOT disabled`, id).Scan(&server); err != nil {
+	if err := w.pool.QueryRow(ctx, `SELECT server_id FROM giveaways WHERE id=$1 AND NOT disabled
+      AND ($2 <> 'end' OR end_time >= COALESCE(NULLIF($3,'')::timestamptz,'-infinity'::timestamptz))`, id, kind, w.app.Config.GiveawayRecoverySince).Scan(&server); err != nil {
 		if errors.Is(err, pgx.ErrNoRows) {
 			return nil
 		}
@@ -190,6 +191,10 @@ func (w *discordDeliveryWorker) prepareGiveaway(ctx context.Context, id, kind st
 }
 
 // Both unprocessed stream hints and pending journals survive delivery restarts.
+// Imported ended giveaways predate the new publication journal. Their absence
+// from that journal is not evidence that they need another winner announcement.
+// The operator's fixed cutover applies only to automatic end preparation; an
+// explicit reroll and already recorded publication effects remain deliverable.
 func (w *discordDeliveryWorker) recoverGiveawayPublications(ctx context.Context) error {
 	if w.app.Config.ClashKingAPIURL == "" || w.app.Config.ClashKingAPIToken == "" {
 		return nil
@@ -200,9 +205,9 @@ func (w *discordDeliveryWorker) recoverGiveawayPublications(ctx context.Context)
 	}
 	rows, err := w.pool.Query(ctx, `SELECT g.id,g.server_id,CASE WHEN g.message_id IS NULL THEN 'start' ELSE 'end' END
   FROM giveaways g WHERE NOT g.disabled AND (cardinality($1::text[])=0 OR g.server_id=ANY($1::text[])) AND ((g.status='ongoing' AND g.message_id IS NULL) OR
-  (g.status='ended' AND g.message_id IS NOT NULL)) AND NOT EXISTS(SELECT 1 FROM giveaway_publication_effects p
+  (g.status='ended' AND g.message_id IS NOT NULL AND g.end_time >= COALESCE(NULLIF($2,'')::timestamptz,'-infinity'::timestamptz))) AND NOT EXISTS(SELECT 1 FROM giveaway_publication_effects p
    WHERE p.giveaway_id=g.id AND p.kind=CASE WHEN g.message_id IS NULL THEN 'start' ELSE 'end' END)
-  ORDER BY g.start_time LIMIT 10`, guilds)
+  ORDER BY g.start_time LIMIT 10`, guilds, w.app.Config.GiveawayRecoverySince)
 	if err != nil {
 		return err
 	}
