@@ -65,13 +65,17 @@ func main() {
 	var stage atomic.Int32
 	var league atomic.Int32
 	league.Store(105000001)
+	var donations atomic.Int32
+	var trophies atomic.Int32
+	trophies.Store(5000)
+	var warStars atomic.Int32
 	var hall atomic.Int32
 	hall.Store(16)
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "application/json")
 		if strings.HasPrefix(r.URL.Path, "/v1/players/") {
 			tag := r.URL.Path[strings.LastIndex(r.URL.Path, "/")+1:]
-			player := map[string]any{"tag": tag, "name": "Fixture", "townHallLevel": hall.Load(), "expLevel": 200, "trophies": 5000, "role": "member", "warPreference": "in", "troops": []any{}, "heroes": []any{}, "spells": []any{}, "heroEquipment": []any{}, "achievements": []any{}, "leagueTier": map[string]any{"id": league.Load(), "name": "Fixture League"}}
+			player := map[string]any{"tag": tag, "name": "Fixture", "townHallLevel": hall.Load(), "expLevel": 200, "trophies": trophies.Load(), "warStars": warStars.Load(), "role": "member", "warPreference": "in", "donations": donations.Load(), "troops": []any{}, "heroes": []any{}, "spells": []any{}, "heroEquipment": []any{}, "achievements": []any{}, "leagueTier": map[string]any{"id": league.Load(), "name": "Fixture League"}}
 			if clan := currentClan.Load().(string); clan != "" {
 				player["clan"] = map[string]any{"tag": clan, "name": "Fixture"}
 			}
@@ -201,6 +205,19 @@ func main() {
 	unchangedRevision := revision()
 	time.Sleep(1500 * time.Millisecond)
 	check(revision() == unchangedRevision, "Identical profile polls reopened automatic work")
+	donations.Store(11)
+	wait("donation change persisted without Discord work", func() bool {
+		raw, err := cache.Do(ctx, cache.B().Get().Key("ps:#PYLQ").Build()).ToString()
+		decoded, decodeErr := utils.Decompress([]byte(raw))
+		var value map[string]any
+		return err == nil && decodeErr == nil && json.Unmarshal(decoded, &value) == nil && value["donations"] == float64(11)
+	})
+	check(revision() == unchangedRevision, "Donation-only change queued role work")
+	warStars.Store(1)
+	wait("war-star nickname input queues refresh", func() bool { return revision() > unchangedRevision })
+	trophyRevision := revision()
+	trophies.Add(1)
+	wait("trophy main-account input queues refresh", func() bool { return revision() > trophyRevision })
 	// Drain the initial unrestricted polls before measuring the disabled
 	// trigger. A poll already in SQL can legitimately use the old selection.
 	stop()
@@ -250,5 +267,5 @@ func main() {
 	league.Store(105000002)
 	wait("selected league change", func() bool { return revision() > old })
 	stop()
-	fmt.Println("PASS actual tracking: selected and excluded triggers, join, rank, leave grace, rejoin, player/non-family/clanless changes, disabled-server and hidden-link filters; no Discord writes")
+	fmt.Println("PASS actual tracking: unchanged/donation-only suppression, trophy and war-star inputs retained, selected and excluded triggers, join, rank, leave grace, rejoin, player/non-family/clanless changes, disabled-server and hidden-link filters; no Discord writes")
 }

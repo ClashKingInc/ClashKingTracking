@@ -28,14 +28,14 @@ type PlayerStatChangeRow struct {
 }
 
 type TrackedPlayerIngest struct {
-	AccountChanged   bool
-	Players          []BasicPlayerRow
-	ProfileChanges   []PlayerProfileChangeRow
-	StatChanges      []PlayerStatChangeRow
-	LastOnlineAt     *time.Time
-	Event            Event
-	SnapshotTag      string
-	SnapshotRaw      []byte
-	VerifiedTracking bool
-	CurrentClan      string
+	RoleInputsChanged bool
+	Players           []BasicPlayerRow
+	ProfileChanges    []PlayerProfileChangeRow
+	StatChanges       []PlayerStatChangeRow
+	LastOnlineAt      *time.Time
+	Event             Event
+	SnapshotTag       string
+	SnapshotRaw       []byte
+	VerifiedTracking  bool
+	CurrentClan       string
 }

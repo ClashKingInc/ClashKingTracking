@@ -485,13 +485,13 @@ func (d *trackedPlayersDomain) doPlayer(
 		lastOnline = &now
 	}
 	ingest := models.TrackedPlayerIngest{
-		AccountChanged: true,
-		Players:        []models.BasicPlayerRow{trackedPlayerRow(player)},
-		ProfileChanges: changes,
-		StatChanges:    statChanges,
-		LastOnlineAt:   lastOnline,
-		SnapshotTag:    tag,
-		SnapshotRaw:    raw,
+		RoleInputsChanged: roleRefreshInputsChanged(previous, current),
+		Players:           []models.BasicPlayerRow{trackedPlayerRow(player)},
+		ProfileChanges:    changes,
+		StatChanges:       statChanges,
+		LastOnlineAt:      lastOnline,
+		SnapshotTag:       tag,
+		SnapshotRaw:       raw,
 	}
 	eventChanges, eventLogTypes := d.interestedPlayerChanges(clan, changes)
 	if len(eventChanges) > 0 {
