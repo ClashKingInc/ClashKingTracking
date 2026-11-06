@@ -93,6 +93,7 @@ func equalBytes(a, b []byte) bool {
 type trackedPlayersDomain struct {
 	snapshots              trackedPlayerSnapshotStore
 	store                  trackedPlayerStore
+	writer                 *platform.AsyncBatchWriter[trackedPlayerWrite]
 	eventInterests         map[string]map[string]struct{}
 	eventInterestsLoadedAt time.Time
 }
@@ -101,7 +102,12 @@ type trackedPlayerStore interface {
 	Close()
 	NextTargetPage(context.Context, string, int) (trackedPlayerTargetPage, error)
 	ListEventInterests(context.Context) (map[string]map[string]struct{}, error)
-	StoreIngest(context.Context, models.TrackedPlayerIngest) error
+	StoreBatch(context.Context, []models.TrackedPlayerIngest) (int, error)
+}
+
+type trackedPlayerWrite struct {
+	ingest    models.TrackedPlayerIngest
+	committed chan struct{}
 }
 
 type trackedPlayerTargetPage struct {
@@ -124,6 +130,33 @@ func (d *trackedPlayersDomain) Run(ctx context.Context, app *platform.App) error
 	defer store.Close()
 	d.snapshots = newTrackedPlayerSnapshotStore(app.Valkey)
 	d.store = store
+	// Each fetch waits for its batch commit before publishing or advancing its
+	// comparison snapshot. A full scan therefore cannot lap pending writes.
+	d.writer = platform.NewAsyncBatchWriter(app, platform.AsyncBatchWriterConfig[trackedPlayerWrite]{
+		Domain: trackedPlayersDomainName, BatchSize: 250, QueueSize: 1000, FlushInterval: 100 * time.Millisecond,
+		WriteBatch: func(writeCtx context.Context, batch []trackedPlayerWrite) error {
+			ingests := make([]models.TrackedPlayerIngest, len(batch))
+			rows := 0
+			for i, job := range batch {
+				ingests[i] = job.ingest
+				rows += len(job.ingest.Players)
+			}
+			started := time.Now()
+			affected, err := d.store.StoreBatch(writeCtx, ingests)
+			if err != nil {
+				return err
+			}
+			app.Stats.RecordStore(trackedPlayersDomainName, time.Since(started), rows, affected)
+			for _, job := range batch {
+				close(job.committed)
+			}
+			return nil
+		},
+	})
+	writerCtx, stopWriter := context.WithCancel(ctx)
+	writerDone := make(chan struct{})
+	go func() { defer close(writerDone); d.writer.Run(writerCtx) }()
+	defer func() { stopWriter(); <-writerDone }()
 	if err := d.reloadEventInterests(ctx); err != nil {
 		return err
 	}
@@ -372,8 +405,14 @@ func (d *trackedPlayersDomain) storePlayerIngest(ctx context.Context, app *platf
 	if len(ingest.Players) == 0 && len(ingest.ProfileChanges) == 0 && len(ingest.StatChanges) == 0 {
 		return d.savePlayerSnapshot(ctx, ingest.SnapshotTag, ingest.SnapshotRaw)
 	}
-	if err := d.store.StoreIngest(ctx, ingest); err != nil {
+	committed := make(chan struct{})
+	if err := d.writer.Enqueue(ctx, trackedPlayerWrite{ingest: ingest, committed: committed}); err != nil {
 		return err
+	}
+	select {
+	case <-committed:
+	case <-ctx.Done():
+		return ctx.Err()
 	}
 	if err := queuePlayerRoleRefreshes(ctx, d.store, ingest); err != nil {
 		return err
@@ -991,36 +1030,65 @@ func (s *timescaleTrackedPlayerStore) ListEventInterests(
 	return interests, rows.Err()
 }
 
-func (s *timescaleTrackedPlayerStore) StoreIngest(
-	ctx context.Context,
-	ingest models.TrackedPlayerIngest,
-) error {
+func (s *timescaleTrackedPlayerStore) StoreBatch(ctx context.Context, ingests []models.TrackedPlayerIngest) (int, error) {
+	if len(ingests) == 0 {
+		return 0, nil
+	}
 	tx, err := s.pool.Begin(ctx)
 	if err != nil {
-		return err
+		return 0, err
 	}
 	defer tx.Rollback(ctx)
-	if len(ingest.StatChanges) > 0 || ingest.LastOnlineAt != nil {
-		if _, err := tx.Exec(ctx, lockPlayerStatChangesSQL, ingest.SnapshotTag); err != nil {
-			return err
+	// Lock every affected player in tag order before writing shared counters.
+	// This preserves replay identity and avoids reversed lock order between batches.
+	lockTags := make([]string, 0, len(ingests))
+	seen := map[string]bool{}
+	var players []models.BasicPlayerRow
+	var profiles []models.PlayerProfileChangeRow
+	var stats []models.PlayerStatChangeRow
+	for _, ingest := range ingests {
+		if (len(ingest.StatChanges) > 0 || ingest.LastOnlineAt != nil) && !seen[ingest.SnapshotTag] {
+			seen[ingest.SnapshotTag] = true
+			lockTags = append(lockTags, ingest.SnapshotTag)
+		}
+		players = append(players, ingest.Players...)
+		profiles = append(profiles, ingest.ProfileChanges...)
+		stats = append(stats, ingest.StatChanges...)
+	}
+	sort.Strings(lockTags)
+	// Match the ordered bulk writers when acquiring basic-player row locks.
+	sort.Slice(players, func(i, j int) bool { return players[i].Tag < players[j].Tag })
+	locks := &pgx.Batch{}
+	for _, tag := range lockTags {
+		locks.Queue(lockPlayerStatChangesSQL, tag)
+	}
+	if locks.Len() > 0 {
+		if err := utils.SendBatch(ctx, tx, locks); err != nil {
+			return 0, err
 		}
 	}
-	if err := utils.UpsertBasicPlayers(ctx, tx, ingest.Players, trackedPlayersDomainName); err != nil {
-		return err
+	affected, err := utils.UpsertBasicPlayersCount(ctx, tx, players, trackedPlayersDomainName)
+	if err != nil {
+		return 0, err
 	}
-	if err := insertPlayerProfileChanges(ctx, tx, ingest.ProfileChanges); err != nil {
-		return err
+	if err := insertPlayerProfileChanges(ctx, tx, profiles); err != nil {
+		return 0, err
 	}
-	if err := insertPlayerStatChanges(ctx, tx, ingest.StatChanges); err != nil {
-		return err
+	if err := insertPlayerStatChanges(ctx, tx, stats); err != nil {
+		return 0, err
 	}
-	if ingest.LastOnlineAt != nil && len(ingest.Players) > 0 && ingest.Players[0].ClanTag != "" {
-		if _, err := tx.Exec(ctx, insertPlayerOnlineEventSQL,
-			*ingest.LastOnlineAt, ingest.SnapshotTag, ingest.Players[0].ClanTag); err != nil {
-			return err
+	online := &pgx.Batch{}
+	for _, ingest := range ingests {
+		if ingest.LastOnlineAt != nil && len(ingest.Players) > 0 && ingest.Players[0].ClanTag != "" {
+			online.Queue(insertPlayerOnlineEventSQL, *ingest.LastOnlineAt, ingest.SnapshotTag, ingest.Players[0].ClanTag)
 		}
 	}
-	return tx.Commit(ctx)
+	if online.Len() > 0 {
+		if err := utils.SendBatch(ctx, tx, online); err != nil {
+			return 0, err
+		}
+	}
+	return affected, tx.Commit(ctx)
 }
 
 const trackedPlayerTargetSetSQL = `
@@ -1236,6 +1304,6 @@ func (s *memoryTrackedPlayerStore) ListEventInterests(
 	return map[string]map[string]struct{}{}, nil
 }
 
-func (s *memoryTrackedPlayerStore) StoreIngest(context.Context, models.TrackedPlayerIngest) error {
-	return nil
+func (s *memoryTrackedPlayerStore) StoreBatch(context.Context, []models.TrackedPlayerIngest) (int, error) {
+	return 0, nil
 }
