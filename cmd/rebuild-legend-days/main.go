@@ -149,6 +149,7 @@ func run() error {
 	// battles and use transactional derived-data updates; interruption is retryable.
 	// Ranked subsets remain absent on days without historical rankings.
 	for _, day := range days {
+		dayStarted := time.Now()
 		dayCtx, dayCancel := context.WithTimeout(ctx, *timeout)
 		var writes int
 		if *observedOnly {
@@ -163,6 +164,7 @@ func run() error {
 			return fmt.Errorf("rebuild %s: %w", day.Format("2006-01-02"), err)
 		}
 		fmt.Printf("rebuilt day=%s derived_writes=%d\n", day.Format("2006-01-02"), writes)
+		fmt.Printf("rebuild_timing day=%s elapsed_ms=%d\n", day.Format("2006-01-02"), time.Since(dayStarted).Milliseconds())
 	}
 	return nil
 }

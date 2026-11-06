@@ -949,7 +949,7 @@ type armyCompositionRecord struct {
 	SiegeMachineID   *int32
 }
 
-func armyCompositionFromColumns(static *clashy.StaticData, shareCode string, columns map[string]uint16) armyCompositionRecord {
+func armyCompositionFromColumns(static armyMetadata, shareCode string, columns map[string]uint16) armyCompositionRecord {
 	record := armyCompositionRecord{
 		MainTroops: []armyQuantity{}, ClanCastleTroops: []armyQuantity{},
 		Spells: []armySpellQuantity{}, Heroes: []int32{},

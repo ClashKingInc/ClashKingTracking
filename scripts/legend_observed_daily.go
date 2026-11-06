@@ -53,7 +53,8 @@ func (s *timescaleScheduledStore) FinalizeObservedLegendDay(ctx context.Context,
 	return s.rebuildObservedLegendDay(ctx, dayStart(day), static)
 }
 
-func (s *timescaleScheduledStore) rebuildObservedLegendDay(ctx context.Context, day time.Time, static *clashy.StaticData) (int, error) {
+func (s *timescaleScheduledStore) rebuildObservedLegendDay(ctx context.Context, day time.Time, static armyMetadata) (int, error) {
+	static = cacheArmyMetadata(static)
 	start, end := legendDayWindow(day)
 	if end.After(time.Now().UTC()) {
 		return 0, fmt.Errorf("cannot finalize an incomplete Legend day")

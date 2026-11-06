@@ -226,7 +226,8 @@ func (s *timescaleScheduledStore) FinalizeLegendCloseout(ctx context.Context, da
 	return metadata + setups + performance, nil
 }
 
-func (s *timescaleScheduledStore) finalizeLegendCloseout(ctx context.Context, tx pgx.Tx, day time.Time, static *clashy.StaticData) (int, error) {
+func (s *timescaleScheduledStore) finalizeLegendCloseout(ctx context.Context, tx pgx.Tx, day time.Time, static armyMetadata) (int, error) {
+	static = cacheArmyMetadata(static)
 	start, end := legendDayWindow(day)
 	var err error
 	var snapshotExists bool
@@ -291,32 +292,64 @@ func upsertDecodedArmyCompositions(ctx context.Context, tx pgx.Tx, decoded map[s
 		codes = append(codes, code)
 	}
 	sort.Strings(codes)
-	for _, code := range codes {
-		record := decoded[code].record
-		mainTroops, err := json.Marshal(record.MainTroops)
+	// Replays usually reference already-persisted armies. Check bounded sets
+	// before encoding any JSON, instead of issuing one conflict-only INSERT per
+	// code. ON CONFLICT remains required for a concurrent live writer after the
+	// existence check; existing canonical compositions must never be replaced.
+	const batchSize = 512
+	type compositionRow struct {
+		Code      string              `json:"share_code"`
+		Main      []armyQuantity      `json:"main_troops"`
+		Castle    []armyQuantity      `json:"clan_castle_troops"`
+		Spells    []armySpellQuantity `json:"spells"`
+		Heroes    []int32             `json:"heroes"`
+		Equipment []armyHeroEquipment `json:"equipment"`
+		Pets      []armyPetAssignment `json:"pet_assignments"`
+		Siege     *int32              `json:"siege_machine_id"`
+	}
+	for start := 0; start < len(codes); start += batchSize {
+		end := min(start+batchSize, len(codes))
+		batch := codes[start:end]
+		rows, err := tx.Query(ctx, `SELECT share_code FROM army_compositions WHERE share_code = ANY($1::text[])`, batch)
 		if err != nil {
 			return err
 		}
-		clanCastleTroops, err := json.Marshal(record.ClanCastleTroops)
+		existing := make(map[string]bool, len(batch))
+		for rows.Next() {
+			var code string
+			if err = rows.Scan(&code); err != nil {
+				rows.Close()
+				return err
+			}
+			existing[code] = true
+		}
+		err = rows.Err()
+		rows.Close()
 		if err != nil {
 			return err
 		}
-		spells, err := json.Marshal(record.Spells)
+		missing := make([]compositionRow, 0, len(batch)-len(existing))
+		for _, code := range batch {
+			if existing[code] {
+				continue
+			}
+			r := decoded[code].record
+			missing = append(missing, compositionRow{code, r.MainTroops, r.ClanCastleTroops, r.Spells, r.Heroes, r.Equipment, r.PetAssignments, r.SiegeMachineID})
+		}
+		if len(missing) == 0 {
+			continue
+		}
+		payload, err := json.Marshal(missing)
 		if err != nil {
 			return err
 		}
-		equipment, err := json.Marshal(record.Equipment)
-		if err != nil {
-			return err
-		}
-		petAssignments, err := json.Marshal(record.PetAssignments)
-		if err != nil {
-			return err
-		}
-		if _, err = tx.Exec(ctx, `INSERT INTO army_compositions
+		_, err = tx.Exec(ctx, `INSERT INTO army_compositions
 			(share_code,main_troops,clan_castle_troops,spells,heroes,equipment,pet_assignments,siege_machine_id)
-			VALUES($1,$2::jsonb,$3::jsonb,$4::jsonb,$5,$6::jsonb,$7::jsonb,$8)
-			ON CONFLICT(share_code) DO NOTHING`, code, mainTroops, clanCastleTroops, spells, record.Heroes, equipment, petAssignments, record.SiegeMachineID); err != nil {
+			SELECT share_code,main_troops,clan_castle_troops,spells,heroes,equipment,pet_assignments,siege_machine_id
+			FROM jsonb_to_recordset($1::jsonb) AS army(share_code text,main_troops jsonb,clan_castle_troops jsonb,
+				spells jsonb,heroes integer[],equipment jsonb,pet_assignments jsonb,siege_machine_id integer)
+			ORDER BY share_code ON CONFLICT(share_code) DO NOTHING`, payload)
+		if err != nil {
 			return err
 		}
 	}
@@ -373,7 +406,7 @@ func readLegendAttacks(ctx context.Context, tx pgx.Tx, start, end time.Time, inc
 	}
 	return out, u, r.Err()
 }
-func decodeArmies(s *clashy.StaticData, u map[string]int64) (map[string]decodedArmy, error) {
+func decodeArmies(s armyMetadata, u map[string]int64) (map[string]decodedArmy, error) {
 	o := map[string]decodedArmy{}
 	for c, n := range u {
 		x, e := normalizeArmyShareCodeChecked(c)
@@ -420,7 +453,7 @@ func addUsage(m map[int]usageCount, id int, triple bool, seen map[int]bool) {
 	}
 	m[id] = v
 }
-func aggregateLegend(a []legendAttack, d map[string]decodedArmy, static *clashy.StaticData) (*dailyCounts, legendMetadata) {
+func aggregateLegend(a []legendAttack, d map[string]decodedArmy, static armyMetadata) (*dailyCounts, legendMetadata) {
 	g := newCounts()
 	metadata := legendMetadata{
 		heroes: map[int]usageCount{}, pets: map[int]usageCount{}, equipment: map[int]usageCount{},
@@ -504,7 +537,7 @@ func aggregateLegend(a []legendAttack, d map[string]decodedArmy, static *clashy.
 // Donated siege machines remain in ClanCastleTroops in the persisted army
 // composition. Prefer that selected machine over a main-army siege, matching
 // the normalized setup closeout's selection rule.
-func selectedLegendSiegeID(static *clashy.StaticData, record armyCompositionRecord) int {
+func selectedLegendSiegeID(static armyMetadata, record armyCompositionRecord) int {
 	if static != nil {
 		for _, troop := range record.ClanCastleTroops {
 			if data := static.LookupByID(troop.ID); data != nil && data["production_building"] == "Workshop" {

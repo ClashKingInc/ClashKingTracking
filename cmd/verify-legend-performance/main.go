@@ -139,6 +139,7 @@ func main() {
 		VALUES('#QYQ','#QQQ',$1,1,2,18,18,3,100,120,'{}','u10x8')`, missingDay.Add(5*time.Hour+time.Duration(i)*time.Minute))
 		must(err)
 	}
+	var persistedComposition string
 	for i := 0; i < 2; i++ {
 		_, err = scripts.RebuildLegendCloseouts(ctx, dsn, []time.Time{missingDay})
 		must(err)
@@ -148,6 +149,13 @@ func main() {
 		must(db.QueryRow(ctx, `SELECT count(*) FROM army_setup_daily_stats WHERE day=$1 AND rank_limit IS NULL`, missingDay).Scan(&setups))
 		must(db.QueryRow(ctx, `SELECT count(*) FROM legend_day_performance WHERE day=$1`, missingDay).Scan(&performance))
 		assert(attacks == 8 && ranked == 0 && setups > 0 && performance == 0, "Missing ranks must retain full-cohort totals/setups without fabricated ranked output")
+		var composition string
+		must(db.QueryRow(ctx, `SELECT to_jsonb(army)::text FROM army_compositions army WHERE share_code='u10x8'`).Scan(&composition))
+		if i == 0 {
+			persistedComposition = composition
+		} else {
+			assert(composition == persistedComposition, "Replay must preserve the existing canonical army and its creation time")
+		}
 	}
 	// Even with a rank snapshot, an observed Legend player missing from that
 	// snapshot belongs to All, never to either ranked subset.
