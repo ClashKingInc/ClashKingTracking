@@ -165,7 +165,7 @@ func main() {
 		default:
 		}
 		var n int
-		e = db.QueryRow(ctx, `SELECT count(*) FROM discord_cache.channels c JOIN discord_cache.guilds g ON g.id=c.guild_id WHERE g.id=$1 AND g.metadata_complete AND g.available AND ((c.id=$2 AND c.data->>'type'='20' AND c.data->>'name'='unknown-after' AND c.data->'future_field'->>'preserved'='true') OR (c.id=$3 AND c.data->>'type'='0' AND c.data->>'name'='burst-199'))`, guild, unknown, known).Scan(&n)
+		e = db.QueryRow(ctx, `SELECT count(*) FROM discord_cache.channels c JOIN discord_cache.guilds g ON g.id=c.guild_id WHERE g.id=$1 AND g.metadata_complete AND g.available AND ((c.id=$2 AND c.data->>'type'='20' AND c.data->>'name'='unknown-after' AND c.data->'future_field'->>'preserved'='true') OR (c.id=$3 AND c.data->>'type'='0' AND c.data->>'name' LIKE 'burst-%'))`, guild, unknown, known).Scan(&n)
 		must(e)
 		ready = n == 2
 		if !ready {
