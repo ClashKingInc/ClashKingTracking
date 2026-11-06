@@ -96,7 +96,7 @@ func (s *timescaleScheduledStore) rebuildObservedLegendDay(ctx context.Context, 
 			players[key] = player
 		}
 		player.attacks = append(player.attacks, attack)
-		player.trophies += observedAttackTrophies(attack)
+		player.trophies += legendAttackTrophies(attack.stars, attack.destruction)
 		population[attack.player] = true
 		if attack.code != "" {
 			usage[attack.code]++
@@ -174,15 +174,18 @@ func (s *timescaleScheduledStore) rebuildObservedLegendDay(ctx context.Context, 
 	return 2, nil
 }
 
-func observedAttackTrophies(a legendAttack) int {
-	switch a.stars {
+// Shared by observed daily analytics and raw Legend event presentation.
+// This is the existing API league-analytics.ts result formula.
+func legendAttackTrophies(stars, destruction int) int {
+	destruction = min(100, max(0, destruction))
+	switch stars {
 	case 3:
 		return 40
 	case 2:
-		return 16 + min(16, max(0, (a.destruction-50)/3))
+		return 16 + min(16, max(0, (destruction-50)/3))
 	case 1:
-		return 5 + min(10, max(0, (a.destruction-1)/9))
+		return 5 + min(10, max(0, (destruction-1)/9))
 	default:
-		return min(4, a.destruction/10)
+		return min(4, destruction/10)
 	}
 }

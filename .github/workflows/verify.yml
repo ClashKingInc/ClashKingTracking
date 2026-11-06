@@ -79,3 +79,6 @@ jobs:
 
       - name: Verify discovery throughput and scan ordering
         run: bash .ci-schema/scripts/with-test-integration.sh --profile retained-api -- go run -race ./cmd/verify-war-throughput
+
+      - name: Verify raw Legend Discord delivery without profile requests
+        run: bash .ci-schema/scripts/with-test-integration.sh --profile retained-api -- go run -race ./cmd/verify-legend-delivery

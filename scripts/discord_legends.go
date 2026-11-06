@@ -2,36 +2,34 @@ package scripts
 
 import (
 	"clashking_tracking/internal/platform"
+	"clashking_tracking/models"
 	"context"
 	"crypto/sha256"
-	"encoding/json"
 	"fmt"
-	clashy "github.com/clashkinginc/clashy.go"
 	"github.com/disgoorg/disgo/discord"
-	valkey "github.com/valkey-io/valkey-go"
-	"strconv"
 	"time"
 )
 
-type discordLegendSnapshot struct {
-	UpdatedAt time.Time `json:"updated_at"`
-	IDs       []string  `json:"ids"`
-}
-
 type discordLegendInterest struct {
-	clanTag string
-	types   map[string]struct{}
+	clanTag        string
+	clanName       string
+	clanBadgeToken string
+	playerName     string
+	playerTrophies int
+	types          map[string]struct{}
 }
 
 const discordLegendTargetsSQL = `
-	SELECT DISTINCT player.tag, player.clan_tag, log.type
-	FROM basic_player player
-	JOIN server_logs log ON log.clan_tag = player.clan_tag
-	JOIN servers server ON server.id = log.server_id
-	WHERE player.league_id = 105000036
-	  AND server.last_command_at >= now() - interval '90 days'
-	  AND log.disabled = false
-	  AND log.type IN ('legend_log_attacks', 'legend_log_defenses')
+ SELECT DISTINCT player.tag, player.clan_tag, player.name, coalesce(player.trophies,0),
+   coalesce(clan.name,player.clan_tag), coalesce(clan.badge_token,''), log.type
+ FROM basic_player player
+ JOIN server_logs log ON log.clan_tag=player.clan_tag
+ JOIN servers server ON server.id=log.server_id
+ LEFT JOIN basic_clan clan ON clan.tag=player.clan_tag
+ WHERE player.league_id=105000036
+ AND server.last_command_at >= now()-interval '90 days'
+ AND log.disabled=false
+ AND log.type IN ('legend_log_attacks','legend_log_defenses')
 `
 
 func (s *timescaleBattlelogStore) LoadDiscordLegendTargets(ctx context.Context) (map[string]discordLegendInterest, error) {
@@ -42,12 +40,12 @@ func (s *timescaleBattlelogStore) LoadDiscordLegendTargets(ctx context.Context) 
 	defer rows.Close()
 	targets := make(map[string]discordLegendInterest)
 	for rows.Next() {
-		var tag, clanTag, logType string
-		if err := rows.Scan(&tag, &clanTag, &logType); err != nil {
+		var tag, logType string
+		var interest discordLegendInterest
+		if err := rows.Scan(&tag, &interest.clanTag, &interest.playerName, &interest.playerTrophies, &interest.clanName, &interest.clanBadgeToken, &logType); err != nil {
 			return nil, err
 		}
-		interest := targets[tag]
-		interest.clanTag = clanTag
+		interest.types = targets[tag].types
 		if interest.types == nil {
 			interest.types = make(map[string]struct{})
 		}
@@ -57,89 +55,28 @@ func (s *timescaleBattlelogStore) LoadDiscordLegendTargets(ctx context.Context) 
 	return targets, rows.Err()
 }
 
-func discordLegendBattleID(tag, kind string, battle clashy.LeagueTierGroupBattleLogEntry) string {
-	return fmt.Sprintf("%x", sha256.Sum256([]byte(tag+"\x00"+kind+"\x00"+battle.CreationTime+"\x00"+battle.OpponentPlayerTag)))
+// The caller invokes this only after raw SQL commits. Legend I has no usable
+// league group: route and display context comes from existing player/clan data.
+func publishDiscordLegendEvent(ctx context.Context, app *platform.App, n models.DiscordLegendNotification) error {
+	row := n.Battle
+	kind := "legend_attack"
+	delta := legendAttackTrophies(int(row.Stars), int(row.DestructionPercentage))
+	if !row.Attack {
+		kind = "legend_defense"
+		delta = -delta
+	}
+	id := fmt.Sprintf("%x", sha256.Sum256([]byte(row.PlayerTag+"\x00"+kind+"\x00"+row.Timestamp.UTC().Format(time.RFC3339Nano))))
+	value := map[string]any{
+		"type": kind, "event_id": id, "player_tag": row.PlayerTag, "player_name": n.PlayerName,
+		"clan":     map[string]any{"tag": n.ClanTag, "name": n.ClanName, "badgeUrls": map[string]any{"large": notificationClanBadgeURL(n.ClanBadgeToken)}},
+		"trophies": n.PlayerTrophies, "trophy_change": delta, "battle_time": row.Timestamp.UTC().Format(time.RFC3339Nano),
+		"stars": row.Stars, "destruction_percentage": row.DestructionPercentage,
+	}
+	// Retain the existing Discord Legend stream dedupe namespace and TTL.
+	// Only the source changes from unavailable group logs to observed raw rows.
+	_, err := platform.AppendEventOnce(ctx, app.Valkey, app.Config, "discord-legend:"+id, 30*24*time.Hour, platform.Event{Topic: "discord_legend", ClanTag: n.ClanTag, Timestamp: row.Timestamp, Value: value})
+	return err
 }
-
-func discordLegendEventValue(player clashy.Player, kind, id string, battle clashy.LeagueTierGroupBattleLogEntry) map[string]any {
-	return map[string]any{
-		"type": kind, "event_id": id, "player_tag": player.Tag, "player_name": player.Name,
-		"clan": player.Clan, "trophies": player.Trophies,
-		"trophy_change": battle.Trophies, "battle_time": battle.CreationTime,
-		"stars": battle.Stars, "destruction_percentage": battle.DestructionPercentage,
-	}
-}
-
-// The group API gives individual battle trophy deltas. Comparing profile trophy
-// totals would merge simultaneous attacks and defenses and lose zero-trophy hits.
-func pollDiscordLegendLogs(ctx context.Context, app *platform.App, player clashy.Player, interests map[string]struct{}, limiter *clashy.Limiter, statsName string) error {
-	_, attacks := interests["legend_log_attacks"]
-	_, defenses := interests["legend_log_defenses"]
-	// The upstream #0 group is an unassigned sentinel, not a fetchable group.
-	if (!attacks && !defenses) || player.Clan == nil || (player.CurrentLeagueGroupTag == "" || player.CurrentLeagueGroupTag == "#0") || player.CurrentLeagueSeasonID == 0 || !discordLegendTier(player.LeagueTier.ID) || app.Valkey == nil {
-		return nil
-	}
-	key := app.Config.EventStreamName + ":discord-legend-snapshot:" + player.Tag + ":" + player.CurrentLeagueGroupTag + ":" + strconv.Itoa(player.CurrentLeagueSeasonID)
-	raw, err := app.Valkey.Do(ctx, app.Valkey.B().Get().Key(key).Build()).ToString()
-	if err != nil && !valkey.IsValkeyNil(err) {
-		return err
-	}
-	var previous discordLegendSnapshot
-	exists := err == nil
-	if exists {
-		if err := json.Unmarshal([]byte(raw), &previous); err != nil {
-			return err
-		}
-		if time.Since(previous.UpdatedAt) < 30*time.Second {
-			return nil
-		}
-	}
-	group, err := retryLimitedClashFetch(ctx, app, limiter, func(fetchCtx context.Context) (*clashy.LeagueTierGroup, error) {
-		start := time.Now()
-		group, err := app.Clash.GetPlayerLeagueGroup(fetchCtx, player.Tag, player.CurrentLeagueGroupTag, strconv.Itoa(player.CurrentLeagueSeasonID))
-		app.Stats.RecordRequest(statsName, time.Since(start), err)
-		return group, err
-	})
-	if err != nil {
-		return err
-	}
-	if group == nil {
-		return nil
-	}
-	known := map[string]bool{}
-	for _, id := range previous.IDs {
-		known[id] = true
-	}
-	current := discordLegendSnapshot{UpdatedAt: time.Now().UTC()}
-	for _, side := range []struct {
-		kind    string
-		enabled bool
-		items   []clashy.LeagueTierGroupBattleLogEntry
-	}{{"legend_attack", attacks, group.AttackLogs}, {"legend_defense", defenses, group.DefenseLogs}} {
-		for _, battle := range side.items {
-			if battle.CreationTime == "" {
-				continue
-			}
-			id := discordLegendBattleID(player.Tag, side.kind, battle)
-			current.IDs = append(current.IDs, id)
-			if !exists || known[id] || !side.enabled {
-				continue
-			}
-			// A separate topic avoids duplicating the mobile defense notification.
-			value := discordLegendEventValue(player, side.kind, id, battle)
-			if _, err := platform.AppendEventOnce(ctx, app.Valkey, app.Config, "discord-legend:"+id, 30*24*time.Hour, platform.Event{Topic: "discord_legend", ClanTag: player.Clan.Tag, Value: value}); err != nil {
-				return err
-			}
-		}
-	}
-	encoded, err := json.Marshal(current)
-	if err != nil {
-		return err
-	}
-	return app.Valkey.Do(ctx, app.Valkey.B().Set().Key(key).Value(string(encoded)).Ex(30*24*time.Hour).Build()).Error()
-}
-
-func discordLegendTier(id int) bool { return id == 105000036 }
 
 func discordLegendLogMessages(event mobileWarEvent, logType string, icons discordLogIcons) []discord.MessageCreate {
 	clan, _ := mapValue(event.Value["clan"])

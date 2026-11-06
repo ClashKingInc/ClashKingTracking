@@ -2,7 +2,7 @@
 
 ## What this process is for
 
-Battle-log tracking stores newly observed multiplayer battles for players whose history is worth polling. It also publishes a deduplicated mobile event for each newly observed Legend defense after the raw battle is durable, and produces subscribed Discord Legend attack and defense events from the league-group API.
+Battle-log tracking stores newly observed multiplayer battles for players whose history is worth polling. It also publishes a deduplicated mobile event for each newly observed Legend defense after the raw battle is durable, and produces subscribed Discord Legend attack and defense events from the same durable raw observations.
 
 ## When it runs
 
@@ -58,7 +58,7 @@ Checkpoint batches feed one long-lived pool rather than waiting for every retry 
 ## Clash API used
 
 - `GET /v1/players/{playerTag}/battlelog` for every target.
-- `GET /v1/players/{playerTag}` and its league group only for stored Legend players whose current clan has an active Discord Legend log subscription. Each request uses the battlelogs request limiter.
+- No separate profile or league-group requests. Legend I profiles expose an unassigned `#0` group; those endpoints are not a source for its raw events. Existing SQL player/clan data supplies Discord identity and routing context.
 
 ## Data read and written
 
@@ -70,7 +70,7 @@ Hero mode segments such as `h2m1p16e5_41` are accepted and preserved in canonica
 
 The battle identity is `(player_tag, battle_time)`. Deploy this writer only with the final DevKit migration 017 contract. Existing raw rows remain intact.
 
-The scheduled closeout rebuilds completed 05:00 UTC Legend-day and Ranked-season aggregates from raw attack perspectives. Current public statistics use the daily troop-group/setup classifier and item aggregates; historical family tables remain available to historical admin tooling and no longer receive current daily writes. Farming and Ranked/Legend raw rows retain one year.
+The scheduled closeout rebuilds completed 05:00 UTC Legend-day and Ranked-season aggregates from raw attack perspectives. Current public statistics use the daily troop-group/setup classifier and item aggregates; obsolete permanent family identities do not participate in the current daily classifier. Farming and Ranked/Legend raw rows retain one year.
 
 The active daily troop-group/setup classifier is specified in [its durable contract](../internal/armyfamily/DAILY_CLASSIFIER.md). It derives group keys and setup conditions from each completed day's observed attacks; it does not assign permanent numeric family IDs.
 
@@ -80,7 +80,7 @@ Every target is fetched on every pass whether it has a checkpoint or not, so an 
 
 ## Events and interaction
 
-After SQL succeeds, each newly observed Legend defense publishes a `legend` stream entry for mobile delivery. Its event ID is deterministic for the player and battle time, and the Valkey append is atomically deduplicated. First-seen checkpoint seeding publishes no historical mobile notifications. Subscribed Discord Legend attacks and defenses use a separate `discord_legend` topic with each league-group battle's own trophy delta; their snapshot and event IDs suppress replay and keep the mobile defense event separate. `trackedplayers` and standard battlelogs share target eligibility; wars do not write player rows to opt people in.
+After SQL succeeds, each newly observed Legend defense publishes a `legend` stream entry for mobile delivery. Its event ID is deterministic for the player and battle time, and the Valkey append is atomically deduplicated. First-seen checkpoint seeding publishes no historical mobile notifications. Subscribed Discord Legend attacks and defenses use a separate `discord_legend` topic after raw SQL commit. Trophy changes use the same result calculation as observed daily analytics; attack/defense direction comes from the raw flag, including zero-trophy results. First-seen checkpoint seeding is silent for Discord too. Existing deterministic stream-event identities suppress replay and keep mobile defense events separate. Player name, clan badge and displayed trophy total come from the stored player/clan snapshot loaded for the current poll pass, not an additional profile request. `trackedplayers` and standard battlelogs share target eligibility; wars do not write player rows to opt people in.
 
 ```mermaid
 flowchart LR
