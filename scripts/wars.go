@@ -114,18 +114,21 @@ const cwlRefreshTargetsSQL = `
 	    AND season < to_char(date_trunc('month', now() AT TIME ZONE 'UTC') + INTERVAL '1 month', 'YYYY-MM')
 	    AND state <> 'ended'
 	), representatives AS MATERIALIZED (
-	  SELECT current_group.cwl_id, min(group_clan.clan_tag) AS clan_tag
+	  SELECT current_group.cwl_id, representative.clan_tag
 	  FROM current_groups current_group
-	  JOIN cwl_group_clans group_clan ON group_clan.cwl_id = current_group.cwl_id
-	  JOIN basic_clan candidate_clan ON candidate_clan.tag = group_clan.clan_tag
-	  GROUP BY current_group.cwl_id
+	  CROSS JOIN LATERAL (
+	    SELECT group_clan.clan_tag
+	    FROM cwl_group_clans group_clan
+	    WHERE group_clan.cwl_id = current_group.cwl_id
+	      AND EXISTS (SELECT 1 FROM basic_clan c WHERE c.tag = group_clan.clan_tag)
+	    ORDER BY group_clan.clan_tag
+	    LIMIT 1
+	  ) representative
 	)
 	SELECT clan.tag, clan.name, COALESCE(clan.cwl_league_id, 0)
 	FROM representatives representative
 	JOIN basic_clan clan ON clan.tag = representative.clan_tag
-	WHERE representative.clan_tag > $1
 	ORDER BY representative.clan_tag
-	LIMIT $2
 `
 
 const activeWarTargetCountSQL = `SELECT count(*) FROM basic_clan WHERE ` + activeWarTargetPredicateSQL
@@ -366,7 +369,9 @@ type timescaleWarTargetSource struct {
 	cursor             string
 	dormantCursor      string
 	cwlDiscoveryCursor string
-	cwlRefreshCursor   string
+	cwlRefreshTargets  []models.BasicClanRow
+	cwlRefreshLoaded   bool
+	cwlRefreshOffset   int
 }
 
 func newTimescaleWarTargetSource(ctx context.Context, dsn string) (*timescaleWarTargetSource, error) {
@@ -411,9 +416,37 @@ func (s *timescaleWarTargetSource) NextCWLDiscoveryTargetBatch(ctx context.Conte
 func (s *timescaleWarTargetSource) NextCWLRefreshTargetBatch(ctx context.Context, limit int) ([]models.BasicClanRow, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	targets, cursor, err := s.nextCWLBatch(ctx, cwlRefreshTargetsSQL, limit, s.cwlRefreshCursor)
-	s.cwlRefreshCursor = cursor
-	return targets, err
+	// Resolve one stable representative per group once per sweep. Rebuilding
+	// all current groups for every page turns a 100k-group sweep into millions
+	// of repeated index probes. New membership is observed on the next sweep.
+	if !s.cwlRefreshLoaded {
+		rows, err := s.pool.Query(ctx, cwlRefreshTargetsSQL)
+		if err != nil {
+			return nil, err
+		}
+		var targets []models.BasicClanRow
+		for rows.Next() {
+			var row models.BasicClanRow
+			if err := rows.Scan(&row.Tag, &row.Name, &row.CWLLeagueID); err != nil {
+				rows.Close()
+				return nil, err
+			}
+			targets = append(targets, row)
+		}
+		rows.Close()
+		if err := rows.Err(); err != nil {
+			return nil, err
+		}
+		s.cwlRefreshTargets, s.cwlRefreshLoaded, s.cwlRefreshOffset = targets, true, 0
+	}
+	if s.cwlRefreshOffset == len(s.cwlRefreshTargets) {
+		s.cwlRefreshTargets, s.cwlRefreshLoaded, s.cwlRefreshOffset = nil, false, 0
+		return nil, nil
+	}
+	end := min(s.cwlRefreshOffset+max(1, limit), len(s.cwlRefreshTargets))
+	page := s.cwlRefreshTargets[s.cwlRefreshOffset:end]
+	s.cwlRefreshOffset = end
+	return page, nil
 }
 
 // CWL pages never wrap within a pass. An empty page marks completion and resets

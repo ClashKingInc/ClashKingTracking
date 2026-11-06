@@ -82,3 +82,6 @@ jobs:
 
       - name: Verify tracked-player batched throughput and commit ordering
         run: bash .ci-schema/scripts/with-test-integration.sh --profile retained-api -- go run -race ./cmd/verify-player-throughput
+
+      - name: Verify raw Legend Discord delivery without profile requests
+        run: bash .ci-schema/scripts/with-test-integration.sh --profile retained-api -- go run -race ./cmd/verify-legend-delivery

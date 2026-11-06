@@ -24,9 +24,21 @@ type BattlelogCheckpoint struct {
 }
 
 type BattlelogIngest struct {
-	Rows          []BattlelogRow
-	Notifications []BattlelogRow
-	Checkpoints   []BattlelogCheckpoint
+	Rows                 []BattlelogRow
+	Notifications        []BattlelogRow
+	Checkpoints          []BattlelogCheckpoint
+	DiscordNotifications []DiscordLegendNotification
+}
+
+// DiscordLegendNotification carries existing player/clan display metadata.
+// It is an in-memory event payload, not a persistence or delivery ledger.
+type DiscordLegendNotification struct {
+	Battle         BattlelogRow
+	PlayerName     string
+	PlayerTrophies int
+	ClanTag        string
+	ClanName       string
+	ClanBadgeToken string
 }
 
 type BattlelogRow struct {
