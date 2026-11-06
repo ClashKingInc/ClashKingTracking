@@ -6,7 +6,7 @@ Scheduled ranking jobs maintain official current/history tables. The adjacent le
 
 ## When it runs
 
-The live Legend I loop runs every `leaderboards.interval_seconds` with its own fixed 20-request-per-second limiter. A separate maintenance loop checks every minute and refreshes player Town Hall/league materialized views once six hours have elapsed since the last successful refresh. It populates uninitialized views on its first run. Ordinary official ranking fetches still share `scheduled.requests_per_second`.
+The live Legend I loop runs every `leaderboards.interval_seconds` with its own fixed 20-request-per-second limiter. A separate maintenance loop checks every minute and refreshes player Town Hall/league materialized views once 30 minutes have elapsed since the last successful refresh. It populates uninitialized views on its first run. Ordinary official ranking fetches still share `scheduled.requests_per_second`.
 
 ## Targets and endpoints
 
@@ -28,7 +28,7 @@ Load locations
   -> publish SQL-backed live Legend leaderboard
 
 basic_player
-  -> every six hours: refresh player_townhall_leaderboards / player_league_leaderboards
+  -> every 30 minutes: refresh player_townhall_leaderboards / player_league_leaderboards
   -> API reads up to 500 rows per board, without rebuilding ranks per request
 ```
 
@@ -80,3 +80,9 @@ Apply DevKit migration 020, deploy this Tracking change, verify both player view
 - It does not produce live events.
 - It does not calculate player activity.
 - It is not a separately selected script in `main.go`; `scheduled` starts it.
+
+## Snapshot maintenance budget
+
+A separate maintenance loop refreshes player Town Hall and league snapshots every 30 minutes. The same loop refreshes clan rankings and statistics every 30 minutes. One PostgreSQL advisory lock serializes these jobs across overlapping deployments, so heavy refreshes do not overlap and do not block the Legend collection loop. Only completed work advances the durable schedule; lock contention and failed refreshes retry.
+
+The maintenance connection uses one parallel worker, 64 MiB work memory, 128 MiB maintenance memory, a five-second lock timeout and a twenty-minute statement timeout. These settings apply only to that connection and are reset before returning it to the pool. Weekly trophy-reset time and closeout guards remain unchanged.

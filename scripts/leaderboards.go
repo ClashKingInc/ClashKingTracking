@@ -20,15 +20,13 @@ import (
 )
 
 const (
-	leaderboardsDomainName                    = "leaderboards"
-	unrankedPlayerLeagueID                    = 105000000
-	leaderboardIndexKey                       = "leaderboards:index"
-	leaderboardLeagueKeyPrefix                = "leaderboards:league:"
-	leaderboardTHKeyPrefix                    = "leaderboards:townhall:"
-	leaderboardUpdateRetries                  = 3
-	legendLeaderboardRequestsPerSecond        = 20
-	leaderboardMaterializedViewRefreshSeconds = 1800
-	leaderboardMaterializedViewCount          = 5
+	leaderboardsDomainName             = "leaderboards"
+	unrankedPlayerLeagueID             = 105000000
+	leaderboardIndexKey                = "leaderboards:index"
+	leaderboardLeagueKeyPrefix         = "leaderboards:league:"
+	leaderboardTHKeyPrefix             = "leaderboards:townhall:"
+	leaderboardUpdateRetries           = 3
+	legendLeaderboardRequestsPerSecond = 20
 )
 
 var leaderboardMaterializedViewRefreshQueries = [...]string{
@@ -110,15 +108,11 @@ const replaceLegendRankingsCurrentSQL = `
 `
 
 type leaderboardsDomain struct {
-	store                       *timescaleLeaderboardStore
-	limiter                     *clashy.Limiter
-	legendLimiter               *clashy.Limiter
-	limit                       int
-	nullAssetURL                string
-	materializedViewRefreshMu   sync.Mutex
-	materializedViewRefreshRun  bool
-	nextMaterializedViewRefresh time.Time
-	refreshMaterializedViews    func(context.Context) error
+	store         *timescaleLeaderboardStore
+	limiter       *clashy.Limiter
+	legendLimiter *clashy.Limiter
+	limit         int
+	nullAssetURL  string
 }
 
 type leaderboardCandidate struct {
@@ -196,13 +190,12 @@ func (d *leaderboardsDomain) Run(ctx context.Context, app *platform.App) error {
 		return err
 	}
 	d.store = store
-	d.refreshMaterializedViews = store.RefreshMaterializedViews
 	defer store.Close()
 	maintenanceCtx, stopMaintenance := context.WithCancel(ctx)
 	maintenanceDone := make(chan struct{})
 	go func() {
 		defer close(maintenanceDone)
-		store.runPlayerLeaderboardMaintenance(maintenanceCtx, app)
+		store.runLeaderboardMaintenance(maintenanceCtx, app)
 	}()
 	defer func() { stopMaintenance(); <-maintenanceDone }()
 
@@ -210,9 +203,6 @@ func (d *leaderboardsDomain) Run(ctx context.Context, app *platform.App) error {
 	for {
 		start := time.Now()
 		err := d.runCycle(ctx, app)
-		if refreshErr := d.refreshMaterializedViewsIfDue(ctx, app, time.Now().UTC()); refreshErr != nil {
-			err = errors.Join(err, refreshErr)
-		}
 		app.Stats.RecordProcess(leaderboardsDomainName, time.Since(start))
 		if err != nil {
 			app.Logger.Error("leaderboards cycle failed", "err", err)
@@ -296,41 +286,6 @@ func (d *leaderboardsDomain) refreshLegendRankings(ctx context.Context, app *pla
 
 func legendRefreshComplete(candidates, players, confirmedDeletions int) bool {
 	return players+confirmedDeletions == candidates
-}
-
-func (d *leaderboardsDomain) refreshMaterializedViewsIfDue(ctx context.Context, app *platform.App, now time.Time) error {
-	d.materializedViewRefreshMu.Lock()
-	if !d.nextMaterializedViewRefresh.IsZero() && now.Before(d.nextMaterializedViewRefresh) {
-		d.materializedViewRefreshMu.Unlock()
-		return nil
-	}
-	if d.materializedViewRefreshRun {
-		d.materializedViewRefreshMu.Unlock()
-		return nil
-	}
-	d.materializedViewRefreshRun = true
-	d.materializedViewRefreshMu.Unlock()
-	defer func() {
-		d.materializedViewRefreshMu.Lock()
-		d.materializedViewRefreshRun = false
-		d.materializedViewRefreshMu.Unlock()
-	}()
-	start := time.Now()
-	if err := d.refreshMaterializedViews(ctx); err != nil {
-		return fmt.Errorf("refresh leaderboard materialized views: %w", err)
-	}
-	duration := time.Since(start)
-	d.materializedViewRefreshMu.Lock()
-	d.nextMaterializedViewRefresh = now.Add(time.Duration(leaderboardMaterializedViewRefreshSeconds) * time.Second)
-	d.materializedViewRefreshMu.Unlock()
-	app.Logger.Info("leaderboards materialized views refreshed", "duration", duration)
-	app.Stats.RecordStore(
-		leaderboardsDomainName,
-		duration,
-		leaderboardMaterializedViewCount,
-		leaderboardMaterializedViewCount,
-	)
-	return nil
 }
 
 func (d *leaderboardsDomain) fetchLeagues(ctx context.Context, app *platform.App, limiter *clashy.Limiter) (map[int]leaderboardLeaguePayload, error) {
@@ -742,16 +697,16 @@ func (s *timescaleLeaderboardStore) LoadClanMetadata(ctx context.Context, clanTa
 	return out, rows.Err()
 }
 
-func (s *timescaleLeaderboardStore) RefreshMaterializedViews(ctx context.Context) error {
+func refreshMaterializedViews(ctx context.Context, conn *pgxpool.Conn) error {
 	for i, query := range leaderboardMaterializedViewRefreshQueries {
-		if _, err := s.pool.Exec(ctx, query); err != nil {
+		if _, err := conn.Exec(ctx, query); err != nil {
 			var pgErr *pgconn.PgError
 			if !errors.As(err, &pgErr) || !isUnpopulatedMaterializedViewError(pgErr) {
 				return err
 			}
 			// A new database starts these views WITH NO DATA. PostgreSQL rejects
 			// CONCURRENTLY until each view has completed one ordinary refresh.
-			if _, bootstrapErr := s.pool.Exec(ctx, leaderboardMaterializedViewBootstrapQueries[i]); bootstrapErr != nil {
+			if _, bootstrapErr := conn.Exec(ctx, leaderboardMaterializedViewBootstrapQueries[i]); bootstrapErr != nil {
 				return bootstrapErr
 			}
 		}
