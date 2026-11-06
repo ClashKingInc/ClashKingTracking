@@ -76,3 +76,6 @@ jobs:
 
       - name: Verify clan ingestion and CWL completion
         run: bash .ci-schema/scripts/with-test-integration.sh --profile retained-api -- bash -c 'bash .ci-schema/scripts/schema-smoke.sh && go run ./cmd/verify-clan-tracking'
+
+      - name: Verify discovery throughput and scan ordering
+        run: bash .ci-schema/scripts/with-test-integration.sh --profile retained-api -- go run -race ./cmd/verify-war-throughput

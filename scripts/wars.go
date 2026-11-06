@@ -601,20 +601,107 @@ func (d *warsDomain) runCycle(ctx context.Context, app *platform.App, limiter *c
 
 func (d *warsDomain) runDiscoveryLoop(ctx context.Context, app *platform.App, limiter *clashy.Limiter, dormant bool) error {
 	statsName := trackingProgressName(d.name, string(activeWarTargets))
+	rate := app.Config.WarDiscoveryActiveRequestsPerSecond
+	next := d.targets.NextTargetBatch
 	if dormant {
 		statsName = trackingProgressName(d.name, string(dormantWarTargets))
+		rate = app.Config.WarDiscoveryDormantRequestsPerSecond
+		next = d.targets.NextDormantTargetBatch
 	}
-	for {
-		start := time.Now()
-		if err := d.runDiscoveryCycle(ctx, app, limiter, dormant); err != nil {
-			return err
-		}
-		app.Stats.RecordProcess(statsName, time.Since(start))
-		app.Stats.SetReady(statsName, true, "")
-		if err := ctx.Err(); err != nil {
-			return err
+	workers := platform.RequestConcurrency(rate)
+	if app.Config.WarDiscoveryMaxInFlight > 0 {
+		workers = min(workers, app.Config.WarDiscoveryMaxInFlight)
+	}
+	workCtx, cancel := context.WithCancel(ctx)
+	jobs := make(chan warFetchRequest)
+	var wg sync.WaitGroup
+	var firstErr error
+	var errorOnce sync.Once
+	var pendingMu sync.Mutex
+	pending := make(map[string]chan struct{})
+	for range workers {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			for req := range jobs {
+				err := d.processWarRequest(workCtx, app, limiter, req)
+				pendingMu.Lock()
+				close(pending[req.ClanTag])
+				delete(pending, req.ClanTag)
+				pendingMu.Unlock()
+				if err != nil {
+					if workCtx.Err() == nil {
+						errorOnce.Do(func() {
+							app.Logger.Error("war processing failed", "err", err)
+							firstErr = err
+							cancel()
+						})
+					}
+					return
+				}
+				app.Stats.SetReady(statsName, true, "")
+			}
+		}()
+	}
+	defer cancel()
+	run := func() error {
+		for {
+			started := time.Now()
+			targets, err := next(workCtx, rate*app.Config.TargetPageMultiplier)
+			app.Stats.RecordProcess(statsName+".paging", time.Since(started))
+			if err != nil {
+				return err
+			}
+			if len(targets) == 0 {
+				if err := sleepOrDone(workCtx, time.Second); err != nil {
+					return err
+				}
+				continue
+			}
+			queue := &warQueue{}
+			for _, target := range targets {
+				if err := queue.Enqueue(warFetchRequest{ClanTag: target.Tag, StatsName: statsName}); err != nil {
+					return err
+				}
+			}
+			for _, req := range queue.items {
+				// Pages only bound SQL reads. A slow HTTP request or SQL write must not
+				// stall every other worker at a page boundary. Keep each clan serial when
+				// a small target set wraps, so an older observation cannot finish last.
+				for {
+					pendingMu.Lock()
+					previous := pending[req.ClanTag]
+					if previous == nil {
+						pending[req.ClanTag] = make(chan struct{})
+					}
+					pendingMu.Unlock()
+					if previous == nil {
+						break
+					}
+					select {
+					case <-previous:
+					case <-workCtx.Done():
+						return workCtx.Err()
+					}
+				}
+				select {
+				case jobs <- req:
+				case <-workCtx.Done():
+					return workCtx.Err()
+				}
+			}
 		}
 	}
+	err := run()
+	cancel()
+	close(jobs)
+	// Workers must finish before the caller closes SQL pools. Wait also makes
+	// the first fatal persistence error visible instead of reporting cancellation.
+	wg.Wait()
+	if firstErr != nil {
+		return firstErr
+	}
+	return err
 }
 
 func (d *warsDomain) runDiscoveryCycle(ctx context.Context, app *platform.App, limiter *clashy.Limiter, dormant bool) error {
@@ -663,33 +750,7 @@ func (d *warsDomain) processQueue(ctx context.Context, app *platform.App, limite
 		go func() {
 			defer wg.Done()
 			defer func() { <-slots }()
-			ingest, err := d.do(ctx, app, limiter, req)
-			var exhausted *platform.ClashFetchExhausted
-			if errors.As(err, &exhausted) && ctx.Err() == nil {
-				// Defer this clan to the next scan without storing an empty ingest
-				// or removing any pending finalization work. Other clans can proceed.
-				app.Logger.Error("war fetch deferred after retries", "clan", req.ClanTag,
-					"war_id", req.WarID, "attempts", exhausted.Attempts, "err", err)
-				app.Stats.RecordRequest(d.name+".fetch-failures", 0, err)
-				if app.Errors != nil {
-					app.Errors.Capture(err, map[string]string{"domain": d.name, "operation": "war-fetch"})
-				}
-				return
-			}
-			if err == nil {
-				err = d.storeIngest(ctx, app, ingest)
-			}
-			if err == nil && req.StoreOnly {
-				d.mu.Lock()
-				delete(d.scheduled, req.ScheduleKey)
-				d.mu.Unlock()
-			}
-			if err == nil && !req.StoreOnly && req.StatsName != "" {
-				// Progress means a fetched target whose resulting SQL work also
-				// succeeded. Deferred fetches and failed writes remain pending.
-				app.Stats.RecordTrackedTarget(req.StatsName)
-			}
-			if err != nil && ctx.Err() == nil {
+			if err := d.processWarRequest(ctx, app, limiter, req); err != nil && ctx.Err() == nil {
 				app.Logger.Error("war processing failed", "err", err)
 				errCh <- err
 			}
@@ -703,6 +764,36 @@ func (d *warsDomain) processQueue(ctx context.Context, app *platform.App, limite
 		}
 	}
 	return ctx.Err()
+}
+
+func (d *warsDomain) processWarRequest(ctx context.Context, app *platform.App, limiter *clashy.Limiter, req warFetchRequest) error {
+	ingest, err := d.do(ctx, app, limiter, req)
+	var exhausted *platform.ClashFetchExhausted
+	if errors.As(err, &exhausted) && ctx.Err() == nil {
+		// Defer this clan to the next scan without storing an empty ingest
+		// or removing any pending finalization work. Other clans can proceed.
+		app.Logger.Error("war fetch deferred after retries", "clan", req.ClanTag,
+			"war_id", req.WarID, "attempts", exhausted.Attempts, "err", err)
+		app.Stats.RecordRequest(d.name+".fetch-failures", 0, err)
+		if app.Errors != nil {
+			app.Errors.Capture(err, map[string]string{"domain": d.name, "operation": "war-fetch"})
+		}
+		return nil
+	}
+	if err == nil {
+		err = d.storeIngest(ctx, app, ingest)
+	}
+	if err == nil && req.StoreOnly {
+		d.mu.Lock()
+		delete(d.scheduled, req.ScheduleKey)
+		d.mu.Unlock()
+	}
+	if err == nil && !req.StoreOnly && req.StatsName != "" {
+		// Progress means a fetched target whose resulting SQL work also
+		// succeeded. Deferred fetches and failed writes remain pending.
+		app.Stats.RecordTrackedTarget(req.StatsName)
+	}
+	return err
 }
 
 func (d *warsDomain) do(ctx context.Context, app *platform.App, limiter *clashy.Limiter, req warFetchRequest) (models.WarIngest, error) {
