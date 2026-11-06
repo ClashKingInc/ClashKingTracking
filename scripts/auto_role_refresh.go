@@ -59,12 +59,30 @@ func (s *timescaleTrackedClanStore) QueueRoleRefresh(ctx context.Context, tag, c
 func (s *timescaleTrackedPlayerStore) QueueRoleRefresh(ctx context.Context, tag, clanTag string, triggers ...string) error {
 	return queueAutoRoleRefresh(ctx, s.pool, tag, clanTag, triggers...)
 }
+
+// Match every game input read by the Bot's refresh/plan.ts role predicates,
+// main-account selection and nickname vocabulary. Keep trophies and war stars:
+// they can change the selected account or rendered nickname even without a
+// league change. Unrelated observation/loot/upgrade changes still persist in
+// Tracking, but must not create Discord work. Nested objects are conservative
+// supersets so newly supplied clan/league metadata cannot silently be lost.
+func roleRefreshInputsChanged(previous, current map[string]any) bool {
+	for _, field := range []string{"tag", "name", "townHallLevel", "builderHallLevel",
+		"trophies", "bestTrophies", "bestBuilderBaseTrophies", "warStars", "role",
+		"clan", "league", "leagueTier", "builderBaseLeague"} {
+		if !equalJSON(previous[field], current[field]) {
+			return true
+		}
+	}
+	return false
+}
+
 func queuePlayerRoleRefreshes(ctx context.Context, store trackedPlayerStore, ingest models.TrackedPlayerIngest) error {
 	// Observation timestamps are written on every poll, even for identical
-	// profiles. Only a real comparison change may reopen automatic work;
+	// profiles. Only changed role/nickname inputs may reopen automatic work;
 	// otherwise unchanged polls reset retries and perpetually rebuild the queue.
 	// First-seen baselines are not changes and must not replay old account state.
-	if !ingest.AccountChanged {
+	if !ingest.RoleInputsChanged {
 		return nil
 	}
 	sink, ok := store.(roleRefreshSink)
