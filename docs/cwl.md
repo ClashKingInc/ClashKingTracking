@@ -52,3 +52,12 @@ The existing one-time league resolution is retained: reuse the group's saved lea
 DevKit migration 061 adds an online partial GIN index for completion lookups by war tag. Apply it before deploying the lookup deduplication; both nested tag arrays and `warTags` objects remain supported. Ingest checks each distinct war tag once, even when both clan perspectives reference it. Completion still uses the full official round list and the existing per-group lock.
 
 Discovery cursors are process-local; after restart, discovery begins again but excludes already-collected sibling clans. Newly signed-up clans missed earlier are revisited on later discovery sweeps. HTTP 404 for a clan without a CWL group remains an expected discovery outcome.
+
+### Refresh target snapshot
+
+Each known-group refresh sweep resolves one current clan representative per group
+once, ordered by clan tag. It pages that stable in-memory snapshot instead of
+rebuilding the entire season membership join for every page. The representative
+is the first clan in tag order that still exists in `basic_clan`; a missing first
+clan does not discard its group. New membership is observed on the next sweep.
+The snapshot is released when the sweep reaches its end.
