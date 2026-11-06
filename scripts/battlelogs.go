@@ -373,14 +373,19 @@ func (d *battlelogsDomain) do(
 	}
 	if job.Discord.clanTag != "" {
 		player, err := retryLimitedClashFetch(ctx, app, limiter, func(fetchCtx context.Context) (*clashy.Player, error) {
-			return app.Clash.GetPlayer(fetchCtx, job.Tag)
+			start := time.Now()
+			player, err := app.Clash.GetPlayer(fetchCtx, job.Tag)
+			// Enrichment spends this same request budget. Count it alongside
+			// raw pages so the configured rate and observed rate agree.
+			app.Stats.RecordRequest(statsName, time.Since(start), err)
+			return player, err
 		})
 		// Discord enrichment is best-effort and must never discard a successfully
 		// fetched raw battle page. Missing profiles/groups can be retried next poll.
 		if err != nil {
 			app.Logger.Warn("Discord Legend profile unavailable", "tag", job.Tag, "err", err)
 		} else if player != nil && player.Clan != nil && player.Clan.Tag == job.Discord.clanTag {
-			if err := pollDiscordLegendLogs(ctx, app, *player, job.Discord.types, limiter); err != nil {
+			if err := pollDiscordLegendLogs(ctx, app, *player, job.Discord.types, limiter, statsName); err != nil {
 				app.Logger.Warn("Discord Legend group unavailable", "tag", job.Tag, "err", err)
 			}
 		}
