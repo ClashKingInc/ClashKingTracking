@@ -329,6 +329,15 @@ func (w *discordDeliveryWorker) processEvent(ctx context.Context, event mobileWa
 }
 
 func (w *discordDeliveryWorker) deliverReminder(ctx context.Context, event mobileWarEvent) error {
+	if stringMapValue(event.Value, "type") == "raid" {
+		// A queued event can outlive its raid. Recheck at delivery, before any
+		// destination or mention lookup, so replay never pings a finished raid.
+		var raid clashy.RaidLogEntry
+		raw, err := json.Marshal(event.Value["raid"])
+		if err != nil || json.Unmarshal(raw, &raid) != nil || !activeReminderRaid(raid, time.Now()) {
+			return nil
+		}
+	}
 	tags := reminderMemberTags(event)
 	if len(tags) == 0 {
 		return nil

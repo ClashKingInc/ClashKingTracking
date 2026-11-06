@@ -792,6 +792,9 @@ func (d *remindersDomain) sendDiscordRaidReminders(ctx context.Context, app *pla
 			continue
 		}
 		for _, reminder := range reminders {
+			if !activeReminderRaid(raid, time.Now()) {
+				break
+			}
 			missing := raidMissingMembers(*clan, raid, reminder)
 			if len(missing) == 0 {
 				continue
@@ -817,7 +820,10 @@ func fetchReminderRaid(ctx context.Context, app *platform.App, limiter *clashy.L
 	if err != nil || len(entries) == 0 {
 		return clashy.RaidLogEntry{}, false, err
 	}
-	return entries[0], true, nil
+	raid := entries[0]
+	// At weekend rollover the API may still return the previous raid as its
+	// newest entry. A fresh HTTP response is not evidence of a current raid.
+	return raid, activeReminderRaid(raid, time.Now()) && raid.EndTime.Time.Equal(raidWeekendEnd(time.Now())), nil
 }
 
 func fetchReminderClan(ctx context.Context, app *platform.App, limiter *clashy.Limiter, clanTag string) (*clashy.Clan, error) {
@@ -844,10 +850,15 @@ func loadCachedRaid(ctx context.Context, app *platform.App, clanTag string) (cla
 	}
 	// The 96-hour cache can outlive a weekend. A prior-week snapshot must
 	// never supply early-weekend attack counts for the current reminder.
-	if raid.EndTime == nil || !raid.EndTime.Time.Equal(raidWeekendEnd(time.Now())) {
+	if !activeReminderRaid(raid, time.Now()) || !raid.EndTime.Time.Equal(raidWeekendEnd(time.Now())) {
 		return clashy.RaidLogEntry{}, false
 	}
 	return raid, true
+}
+
+func activeReminderRaid(raid clashy.RaidLogEntry, now time.Time) bool {
+	return raid.State == "ongoing" && raid.StartTime != nil && raid.EndTime != nil &&
+		!raid.StartTime.Time.After(now) && raid.EndTime.Time.After(now)
 }
 
 func raidWeekendEnd(now time.Time) time.Time {

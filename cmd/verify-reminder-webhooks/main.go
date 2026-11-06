@@ -49,12 +49,31 @@ func main() {
 	const thread = "999999999999992904"
 	const hook = "999999999999992905"
 	const badHook = "999999999999992906"
-	var sent, botMessages, badReads atomic.Int32
+	var sent, botMessages, badReads, raidReads atomic.Int32
+	var currentRaid atomic.Bool
 	var contents []string
 	globalAvatar := os.Getenv("CLASHKING_E2E_GLOBAL_AVATAR") == "1"
 	provider := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "application/json")
 		switch {
+		case strings.HasSuffix(r.URL.Path, "/capitalraidseasons"):
+			raidReads.Add(1)
+			now := time.Now().UTC()
+			days := (int(time.Monday) - int(now.Weekday()) + 7) % 7
+			end := time.Date(now.Year(), now.Month(), now.Day(), 7, 0, 0, 0, time.UTC).AddDate(0, 0, days)
+			if !end.After(now) {
+				end = end.AddDate(0, 0, 7)
+			}
+			start := now.Add(-time.Hour)
+			state := "ongoing"
+			if !currentRaid.Load() {
+				start = now.Add(-7 * 24 * time.Hour)
+				end = now.Add(-4 * 24 * time.Hour)
+				state = "ended"
+			}
+			json.NewEncoder(w).Encode(map[string]any{"items": []any{map[string]any{"state": state, "startTime": start.Format("20060102T150405.000Z"), "endTime": end.Format("20060102T150405.000Z"), "members": []any{}}}})
+		case strings.HasSuffix(r.URL.Path, "/clans/#PYLQ"):
+			json.NewEncoder(w).Encode(map[string]any{"tag": "#PYLQ", "name": "Fixture Clan", "memberList": []any{map[string]any{"tag": "#PYQ", "name": "Fresh Raid Player", "townHallLevel": 16, "role": "member"}}})
 		case strings.HasSuffix(r.URL.Path, "/guilds/"+guild+"/members/"+appID):
 			profile := map[string]any{"user": map[string]any{"id": appID, "username": "ClashKing", "avatar": "globalhash", "discriminator": "0"}}
 			if !globalAvatar {
@@ -113,7 +132,7 @@ func main() {
 		must(db.QueryRow(ctx, `INSERT INTO reminders(server_id,type,type_name,clan_tag,webhook_token,channel_id,thread_id,webhook_id,minutes_remaining) VALUES($1,1,'War','#PYLQ','',$2,$3,NULLIF($4,''),60) RETURNING id::text`, guild, channel, thread, h).Scan(&id))
 		ids = append(ids, id)
 	}
-	app := &platform.App{Config: platform.Config{TimescaleURL: dsn, ValkeyAddr: addr, DiscordBotToken: base64.RawStdEncoding.EncodeToString([]byte(appID)) + ".local.local", DiscordAPIURL: provider.URL, ClashKingAPIURL: provider.URL, ClashKingAPIToken: "fixture", DiscordDeliveryBatchSize: 20, EventStreamName: "reminder-webhook-fixture", EventStreamReclaimIdleSeconds: 1}, Clash: clash, Valkey: cache, Logger: slog.New(slog.NewTextHandler(os.Stderr, nil)), Stats: platform.NewTracker(), Availability: platform.NewAvailabilityGate(nil)}
+	app := &platform.App{Config: platform.Config{TimescaleURL: dsn, ReminderRequestsPerSecond: 10, ValkeyAddr: addr, DiscordBotToken: base64.RawStdEncoding.EncodeToString([]byte(appID)) + ".local.local", DiscordAPIURL: provider.URL, ClashKingAPIURL: provider.URL, ClashKingAPIToken: "fixture", DiscordDeliveryBatchSize: 20, EventStreamName: "reminder-webhook-fixture", EventStreamReclaimIdleSeconds: 1}, Clash: clash, Valkey: cache, Logger: slog.New(slog.NewTextHandler(os.Stderr, nil)), Stats: platform.NewTracker(), Availability: platform.NewAvailabilityGate(nil)}
 	runCtx, stop := context.WithCancel(ctx)
 	defer stop()
 	done := make(chan error, 1)
@@ -164,7 +183,7 @@ func main() {
 	time.Sleep(400 * time.Millisecond)
 	check(sent.Load() == 3, "completed CWL emitted reminder")
 	publishOther := func(kind string, data map[string]any) {
-		value := map[string]any{"type": kind, "clan": map[string]any{"name": "Fixture Clan"}, "members": []any{data}, "raid": map[string]any{"endTime": "20261108T070000.000Z"}, "reminder": map[string]any{"id": ids[0], "server_id": guild, "channel_id": channel, "thread_id": thread, "minutes_remaining": 60, "custom_text": "Follow the plan"}}
+		value := map[string]any{"type": kind, "clan": map[string]any{"name": "Fixture Clan"}, "members": []any{data}, "raid": map[string]any{"state": "ongoing", "startTime": time.Now().Add(-time.Hour).UTC().Format("20060102T150405.000Z"), "endTime": time.Now().Add(time.Hour).UTC().Format("20060102T150405.000Z")}, "reminder": map[string]any{"id": ids[0], "server_id": guild, "channel_id": channel, "thread_id": thread, "minutes_remaining": 60, "custom_text": "Follow the plan"}}
 		must(app.PublishEvent(ctx, platform.Event{Topic: "reminder", ClanTag: "#PYLQ", Value: value}))
 	}
 	publishOther("raid", map[string]any{"tag": "#PYQ", "name": "Raid Player", "townhall": 16, "attacks": 3, "total_attacks": 6})
@@ -174,11 +193,45 @@ func main() {
 	waitSent(5)
 	check(strings.HasPrefix(contents[4], "**Fixture Clan Clan Games**\n⏰ Ends <t:") && strings.Contains(contents[4], "(1500/4,000) TH16 Games Player | #PYQ") && strings.HasSuffix(contents[4], "Follow the plan"), "clan games command layout mismatch")
 
+	// Stale queued raids and future raids must be consumed without a webhook.
+	for _, window := range [][2]time.Time{{time.Now().Add(-7 * 24 * time.Hour), time.Now().Add(-4 * 24 * time.Hour)}, {time.Now().Add(time.Hour), time.Now().Add(2 * time.Hour)}} {
+		must(app.PublishEvent(ctx, platform.Event{Topic: "reminder", ClanTag: "#PYLQ", Value: map[string]any{"type": "raid", "raid": map[string]any{"state": "ongoing", "startTime": window[0].UTC().Format("20060102T150405.000Z"), "endTime": window[1].UTC().Format("20060102T150405.000Z")}, "members": []any{map[string]any{"tag": "#PYQ", "name": "Must not ping", "townhall": 16, "attacks": 0, "total_attacks": 5}}, "reminder": map[string]any{"id": ids[0], "server_id": guild, "channel_id": channel, "thread_id": thread}}}))
+	}
+	time.Sleep(500 * time.Millisecond)
+	check(sent.Load() == 5, "expired or not-yet-started raid emitted a reminder")
+	// Exercise the real producer's API fallback as well as queued delivery.
+	_, e = db.Exec(ctx, "UPDATE reminders SET type_name='Clan Capital',type=2 WHERE id=$1::uuid", ids[0])
+	must(e)
+	producerDone := make(chan error, 1)
+	go func() { producerDone <- scripts.NewRemindersDomain().Run(runCtx, app) }()
+	time.Sleep(300 * time.Millisecond)
+	wake := func() {
+		payload, _ := json.Marshal(map[string]any{"kind": "reminder_send", "serverId": guild, "reminderId": ids[0]})
+		_, err := db.Exec(ctx, "SELECT pg_notify('clashking_tracking_wake_v1',$1)", string(payload))
+		must(err)
+	}
+	wake()
+	until = time.Now().Add(5 * time.Second)
+	for raidReads.Load() == 0 && time.Now().Before(until) {
+		time.Sleep(25 * time.Millisecond)
+	}
+	check(raidReads.Load() > 0, "raid fallback not exercised")
+	time.Sleep(300 * time.Millisecond)
+	check(sent.Load() == 5, "last weekend from API fallback emitted reminder")
+	currentRaid.Store(true)
+	wake()
+	waitSent(6)
+	check(strings.Contains(contents[5], "Fresh Raid Player"), "current raid did not reach webhook")
 	stop()
+	select {
+	case <-producerDone:
+	case <-time.After(10 * time.Second):
+		panic("reminder producer did not stop")
+	}
 	select {
 	case <-done:
 	case <-time.After(15 * time.Second):
 		panic("delivery did not stop")
 	}
-	fmt.Println("PASS actual reminder delivery: CWL one hit, regular two hits, completed members excluded, command layouts for war/raid/games, bot avatar/name, owned webhook, thread, foreign/missing rejected, no bot fallback")
+	fmt.Println("PASS actual reminder delivery: CWL one hit, regular two hits, completed members excluded, stale API raids and queued raids suppressed, current raid delivered, command layouts for war/raid/games, bot avatar/name, owned webhook, thread, foreign/missing rejected, no bot fallback")
 }
