@@ -15,6 +15,7 @@ import (
 	"clashking_tracking/models"
 
 	clashy "github.com/clashkinginc/clashy.go"
+	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgconn"
 	"github.com/jackc/pgx/v5/pgxpool"
 )
@@ -28,22 +29,6 @@ const (
 	leaderboardUpdateRetries           = 3
 	legendLeaderboardRequestsPerSecond = 20
 )
-
-var leaderboardMaterializedViewRefreshQueries = [...]string{
-	`REFRESH MATERIALIZED VIEW CONCURRENTLY clan_leaderboards`,
-	`REFRESH MATERIALIZED VIEW war_league_counts`,
-	`REFRESH MATERIALIZED VIEW CONCURRENTLY townhall_counts`,
-	`REFRESH MATERIALIZED VIEW CONCURRENTLY api_global_counts`,
-	`REFRESH MATERIALIZED VIEW CONCURRENTLY api_league_tier_counts`,
-}
-
-var leaderboardMaterializedViewBootstrapQueries = [...]string{
-	`REFRESH MATERIALIZED VIEW clan_leaderboards`,
-	`REFRESH MATERIALIZED VIEW war_league_counts`,
-	`REFRESH MATERIALIZED VIEW townhall_counts`,
-	`REFRESH MATERIALIZED VIEW api_global_counts`,
-	`REFRESH MATERIALIZED VIEW api_league_tier_counts`,
-}
 
 const leaderboardCandidateSQL = `
 	WITH league_ids AS (
@@ -698,27 +683,48 @@ func (s *timescaleLeaderboardStore) LoadClanMetadata(ctx context.Context, clanTa
 }
 
 func refreshMaterializedViews(ctx context.Context, conn *pgxpool.Conn) error {
-	for i, query := range leaderboardMaterializedViewRefreshQueries {
-		if _, err := conn.Exec(ctx, query); err != nil {
-			var pgErr *pgconn.PgError
-			if !errors.As(err, &pgErr) || !isUnpopulatedMaterializedViewError(pgErr) {
-				return err
-			}
-			// A new database starts these views WITH NO DATA. PostgreSQL rejects
-			// CONCURRENTLY until each view has completed one ordinary refresh.
-			if _, bootstrapErr := conn.Exec(ctx, leaderboardMaterializedViewBootstrapQueries[i]); bootstrapErr != nil {
-				return bootstrapErr
-			}
+	// Revisit all invalidated historical buckets. A recent-only window would miss
+	// late imports, corrected dates and deletions. Unchanged materialized buckets
+	// do not need another raw scan; the real-time tail covers the current day.
+	for _, view := range []string{"stats_join_leave_daily_counts", "stats_war_daily_counts"} {
+		if _, err := conn.Exec(ctx, "CALL refresh_continuous_aggregate($1::regclass,NULL::timestamptz,date_trunc('day',now()))", view); err != nil {
+			return err
 		}
 	}
-	return nil
+	if err := refreshSnapshotView(ctx, conn, "clan_leaderboards"); err != nil {
+		return err
+	}
+	tx, err := conn.BeginTx(ctx, pgx.TxOptions{IsoLevel: pgx.RepeatableRead})
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback(ctx)
+	// Both population scans and every derived public count become visible at
+	// the same commit. A failed later refresh cannot expose mixed generations.
+	for _, view := range []string{"stats_player_count_snapshot", "stats_clan_count_snapshot", "war_league_counts", "townhall_counts", "api_global_counts", "api_league_tier_counts"} {
+		if err = refreshSnapshotView(ctx, tx, view); err != nil {
+			return err
+		}
+	}
+	return tx.Commit(ctx)
 }
 
-func isUnpopulatedMaterializedViewError(err *pgconn.PgError) bool {
-	if err == nil || (err.Code != "0A000" && err.Code != "55000") {
-		return false
+type snapshotExecutor interface {
+	Exec(context.Context, string, ...any) (pgconn.CommandTag, error)
+	QueryRow(context.Context, string, ...any) pgx.Row
+}
+
+func refreshSnapshotView(ctx context.Context, executor snapshotExecutor, view string) error {
+	var populated bool
+	if err := executor.QueryRow(ctx, "SELECT ispopulated FROM pg_matviews WHERE schemaname='public' AND matviewname=$1", view).Scan(&populated); err != nil {
+		return err
 	}
-	return err.Message == "CONCURRENTLY cannot be used when the materialized view is not populated"
+	query := "REFRESH MATERIALIZED VIEW "
+	if populated && view != "war_league_counts" {
+		query += "CONCURRENTLY "
+	}
+	_, err := executor.Exec(ctx, query+view)
+	return err
 }
 
 func leaderboardCacheKey(kind, key string) string {

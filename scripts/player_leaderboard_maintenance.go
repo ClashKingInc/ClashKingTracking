@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"log/slog"
 	"time"
 
 	"clashking_tracking/internal/platform"
@@ -64,9 +65,11 @@ func MaintainLeaderboardSnapshots(ctx context.Context, pool *pgxpool.Pool) error
 	if err = conn.QueryRow(ctx, `SELECT NOT EXISTS(SELECT 1 FROM tracking_scheduled_jobs WHERE job='statistics_refresh' AND completed_at>clock_timestamp()-interval '30 minutes')`).Scan(&due); err != nil || !due {
 		return err
 	}
+	started := time.Now()
 	if err = refreshMaterializedViews(ctx, conn); err != nil {
 		return err
 	}
+	slog.Info("statistics snapshots refreshed", "duration", time.Since(started))
 	_, err = conn.Exec(ctx, `INSERT INTO tracking_scheduled_jobs(job,period,completed_at) VALUES('statistics_refresh',(clock_timestamp() AT TIME ZONE 'UTC')::date,clock_timestamp()) ON CONFLICT(job,period) DO UPDATE SET completed_at=EXCLUDED.completed_at`)
 	return err
 }
@@ -97,6 +100,7 @@ func refreshPlayerLeaderboardSnapshots(ctx context.Context, conn *pgxpool.Conn) 
 	if err != nil || !due {
 		return err
 	}
+	started := time.Now()
 	for _, view := range []string{"player_townhall_leaderboards", "player_league_leaderboards"} {
 		var populated bool
 		if err = conn.QueryRow(ctx, "SELECT ispopulated FROM pg_matviews WHERE schemaname='public' AND matviewname=$1", view).Scan(&populated); err != nil {
@@ -110,6 +114,7 @@ func refreshPlayerLeaderboardSnapshots(ctx context.Context, conn *pgxpool.Conn) 
 			return err
 		}
 	}
+	slog.Info("player leaderboard snapshots refreshed", "duration", time.Since(started))
 	_, err = conn.Exec(ctx, `INSERT INTO tracking_scheduled_jobs(job,period,completed_at)
  VALUES('player_board_refresh',(clock_timestamp() AT TIME ZONE 'UTC')::date,clock_timestamp())
  ON CONFLICT(job,period) DO UPDATE SET completed_at=EXCLUDED.completed_at`)

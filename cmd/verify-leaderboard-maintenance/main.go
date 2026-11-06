@@ -77,5 +77,34 @@ func main() {
 	must(scripts.MaintainLeaderboardSnapshots(ctx, db))
 	must(db.QueryRow(ctx, "SELECT completed_at FROM tracking_scheduled_jobs WHERE job='player_board_refresh'").Scan(&afterFailure))
 	check(afterFailure.After(previous), "failed work did not retry")
+
+	// A blocked later output must roll back both shared source counts and every
+	// earlier public output. Then the same real service retries the whole set.
+	_, e = db.Exec(ctx, `INSERT INTO basic_player(tag,name,townhall_level,league_id,trophies) VALUES('#SECOND','Second',17,NULL,0);
+ INSERT INTO join_leave_history(time,type,clan_tag,player_tag,townhall_level) VALUES('2020-01-01 12:00Z','join','#CLAN','#SECOND',17);
+ INSERT INTO wars(war_id,clan_tag,opponent_tag,prep_time,start_time,end_time,size,war_type,state) VALUES(1,'#CLAN','#OTHER','2020-01-01 01:00Z','2020-01-02 01:00Z','2020-01-03 01:00Z',15,'random','warEnded');
+ UPDATE tracking_scheduled_jobs SET completed_at=clock_timestamp()-interval '31 minutes' WHERE job='statistics_refresh'`)
+	must(e)
+	tx, e = lock.Begin(ctx)
+	must(e)
+	_, e = tx.Exec(ctx, "REFRESH MATERIALIZED VIEW api_global_counts")
+	must(e)
+	e = scripts.MaintainLeaderboardSnapshots(ctx, db)
+	check(e != nil, "blocked count publication unexpectedly succeeded")
+	must(tx.Rollback(ctx))
+	var shared, publicCount int64
+	must(db.QueryRow(ctx, "SELECT row_count FROM stats_player_count_snapshot WHERE scope='total'").Scan(&shared))
+	must(db.QueryRow(ctx, "SELECT sum(total_count) FROM townhall_counts").Scan(&publicCount))
+	check(shared == 1 && publicCount == 1, "failed publication leaked part of the new count generation")
+	must(scripts.MaintainLeaderboardSnapshots(ctx, db))
+	var players, joins, wars int64
+	must(db.QueryRow(ctx, "SELECT player_count,total_join_leaves,wars_stored FROM api_global_counts").Scan(&players, &joins, &wars))
+	check(players == 2 && joins == 1 && wars == 1, "late history or shared population counts differ")
+	_, e = db.Exec(ctx, `DELETE FROM join_leave_history WHERE player_tag='#SECOND'; UPDATE wars SET end_time='2020-01-04 01:00Z' WHERE war_id=1; UPDATE tracking_scheduled_jobs SET completed_at=clock_timestamp()-interval '31 minutes' WHERE job='statistics_refresh'`)
+	must(e)
+	must(scripts.MaintainLeaderboardSnapshots(ctx, db))
+	must(db.QueryRow(ctx, "SELECT player_count,total_join_leaves,wars_stored FROM api_global_counts").Scan(&players, &joins, &wars))
+	check(players == 2 && joins == 0 && wars == 1, "historical deletion or date correction was missed")
+	fmt.Println("PASS shared count publication: atomic rollback/retry, late historical insertion, deletion and moved date")
 	fmt.Println("PASS real leaderboard maintenance: shared lock, both snapshot families, 30-minute due time, independent schedule, bounded lock failure and retry")
 }
