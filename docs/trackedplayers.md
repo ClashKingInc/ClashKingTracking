@@ -127,3 +127,11 @@ shared `basic_player` write, including unchanged snapshots. Older queued or
 concurrent observations cannot replace a newer row. Existing change-history and
 snapshot/event ordering is retained; the timestamp is not an upstream game
 revision and assumes synchronized writer clocks.
+
+## Bounded SQL batches
+
+Tracked-player fetches retain their configured request budget. The writer groups up to 250 prepared profiles into one SQL transaction, with a 100 ms flush timer and a bounded 1,000-item queue. It uses the existing retrying batch writer. Each fetch waits for its own batch to commit before publishing events, queueing role refreshes, or advancing the comparison snapshot. The complete scan waits for those acknowledgements, so a new scan cannot compare against unfinished writes. Shutdown joins the writer and uses its existing bounded flush.
+
+Counter advisory locks and basic-player row locks use sorted player tags. The existing observed-at guards and history conflict handling remain authoritative. A failed batch advances no comparison snapshots; retries preserve the original prepared event times. Store metrics report requested and actually affected basic-player rows; history/event counts remain in the existing write metrics.
+
+`cmd/verify-player-throughput` runs the actual domain against disposable SQL and Valkey with a loopback upstream. A SQL transaction-local 20 ms delay models storage latency; the check verifies the configured 250 requests/s, batched durable writes, and SQL-before-snapshot ordering. It never targets production.
