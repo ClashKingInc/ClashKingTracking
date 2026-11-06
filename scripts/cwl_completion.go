@@ -53,7 +53,11 @@ func completeCWLGroups(ctx context.Context, tx pgx.Tx, ids []string) error {
 	if err := rows.Err(); err != nil {
 		return err
 	}
-	_, err = tx.Exec(ctx, `UPDATE cwl_groups SET state='ended' WHERE cwl_id IN (`+CWLCompletionCandidatesSQL+`)`, ids)
+	// Bound the UPDATE itself as well as its completion subquery. PostgreSQL
+	// can otherwise choose an outer sequential scan of every historical group
+	// even when the caller locked only one group. This duplicate predicate is
+	// intentional: it preserves the same candidates and their row-lock scope.
+	_, err = tx.Exec(ctx, `UPDATE cwl_groups SET state='ended' WHERE cwl_id=ANY($1::text[]) AND cwl_id IN (`+CWLCompletionCandidatesSQL+`)`, ids)
 	return err
 }
 
