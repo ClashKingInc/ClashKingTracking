@@ -340,10 +340,17 @@ func (s *timescaleWarStore) Store(ctx context.Context, ingest models.WarIngest) 
 	for _, group := range ingest.CWLGroups {
 		groupIDs = append(groupIDs, group.CWLID)
 	}
+	// Both clan perspectives carry the same war tag. Check each tag once;
+	// completion still runs after every final-war commit with its fresh snapshot.
+	seenWarTags := make(map[string]struct{}, len(ingest.IndexRows))
 	for _, war := range ingest.IndexRows {
 		if war.WarTag == "" || war.WarTag == "#0" {
 			continue
 		}
+		if _, seen := seenWarTags[war.WarTag]; seen {
+			continue
+		}
+		seenWarTags[war.WarTag] = struct{}{}
 		rows, err := tx.Query(ctx, `SELECT cwl_id FROM cwl_groups WHERE state <> 'ended'
 			AND (rounds @> jsonb_build_array(jsonb_build_array($1::text))
 			OR rounds @> jsonb_build_array(jsonb_build_object('warTags', jsonb_build_array($1::text))))`, war.WarTag)

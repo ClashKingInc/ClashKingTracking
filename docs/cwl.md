@@ -49,4 +49,6 @@ The existing one-time league resolution is retained: reuse the group's saved lea
 - Existing `cwl.war_requests_per_second` remains accepted for scoped tooling; the running checker no longer fetches war payloads.
 - Both processes require the existing Timescale, Valkey and proxy configuration.
 
-No schema migration is required. Discovery cursors are process-local; after restart, discovery begins again but excludes already-collected sibling clans. Newly signed-up clans missed earlier are revisited on later discovery sweeps. HTTP 404 for a clan without a CWL group remains an expected discovery outcome.
+DevKit migration 061 adds an online partial GIN index for completion lookups by war tag. Apply it before deploying the lookup deduplication; both nested tag arrays and `warTags` objects remain supported. Ingest checks each distinct war tag once, even when both clan perspectives reference it. Completion still uses the full official round list and the existing per-group lock.
+
+Discovery cursors are process-local; after restart, discovery begins again but excludes already-collected sibling clans. Newly signed-up clans missed earlier are revisited on later discovery sweeps. HTTP 404 for a clan without a CWL group remains an expected discovery outcome.
