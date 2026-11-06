@@ -635,10 +635,19 @@ func upsertCWLGroups(ctx context.Context, tx pgx.Tx, rows []models.CWLGroupRow) 
 // CWL snapshots repeat unchanged clans and rosters throughout each sweep. Skip
 // identical rows to avoid WAL/dead-tuple churn; changed values and the separate
 // stale-member deletion must still commit together with the group snapshot.
+// The parent cwl_groups upsert locks this group before these statements. That
+// serialization lets the SELECT prefilter avoid even a conflict-row lock for
+// identical children without racing another snapshot of this group.
 const upsertCWLGroupClansSQL = `
 	INSERT INTO cwl_group_clans (cwl_id, clan_tag, name, clan_level, badge_token)
 	SELECT $1, snapshot.clan_tag, snapshot.name, snapshot.clan_level, snapshot.badge_token
 	FROM unnest($2::text[], $3::text[], $4::int[], $5::text[]) AS snapshot(clan_tag, name, clan_level, badge_token)
+	WHERE NOT EXISTS (
+		SELECT 1 FROM cwl_group_clans existing
+		WHERE existing.cwl_id = $1 AND existing.clan_tag = snapshot.clan_tag
+		AND (existing.name, existing.clan_level, existing.badge_token)
+			IS NOT DISTINCT FROM (snapshot.name, snapshot.clan_level, snapshot.badge_token)
+	)
 	ON CONFLICT (cwl_id, clan_tag) DO UPDATE SET
 		name = EXCLUDED.name,
 		clan_level = EXCLUDED.clan_level,
@@ -651,6 +660,12 @@ const upsertCWLGroupMembersSQL = `
 	INSERT INTO cwl_group_members (cwl_id, clan_tag, name, tag, town_hall)
 	SELECT $1, $2, source.name, source.tag, source.town_hall::smallint
 	FROM unnest($3::text[], $4::text[], $5::int[]) AS source(tag, name, town_hall)
+	WHERE NOT EXISTS (
+		SELECT 1 FROM cwl_group_members existing
+		WHERE existing.cwl_id = $1 AND existing.tag = source.tag
+		AND (existing.clan_tag, existing.name, existing.town_hall)
+			IS NOT DISTINCT FROM ($2::text, source.name, source.town_hall::smallint)
+	)
 	ON CONFLICT (cwl_id, tag) DO UPDATE SET
 		clan_tag = EXCLUDED.clan_tag,
 		name = EXCLUDED.name,

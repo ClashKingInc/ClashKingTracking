@@ -96,7 +96,7 @@ func main() {
 	}
 	rows := func(table, key string) map[string]string {
 		out := map[string]string{}
-		r, e := db.Query(ctx, "SELECT "+key+",xmin::text FROM "+table)
+		r, e := db.Query(ctx, "SELECT "+key+",xmin::text || ':' || xmax::text FROM "+table)
 		must(e)
 		defer r.Close()
 		for r.Next() {
@@ -111,7 +111,11 @@ func main() {
 	beforeClans := rows("cwl_group_clans", "clan_tag")
 	beforeMembers := rows("cwl_group_members", "tag")
 	check(len(beforeClans) == 8 && len(beforeMembers) == 120, "initial snapshot incomplete")
+	var walStart string
+	must(db.QueryRow(ctx, `SELECT pg_current_wal_insert_lsn()::text`).Scan(&walStart))
 	run()
+	var repeatedWALBytes int64
+	must(db.QueryRow(ctx, `SELECT pg_wal_lsn_diff(pg_current_wal_insert_lsn(), $1::pg_lsn)::bigint`, walStart).Scan(&repeatedWALBytes))
 	sameClans := rows("cwl_group_clans", "clan_tag")
 	sameMembers := rows("cwl_group_members", "tag")
 	var rewritten int
@@ -126,7 +130,7 @@ func main() {
 		}
 	}
 	if os.Getenv("CWL_SNAPSHOT_BASELINE") != "1" {
-		check(rewritten == 0, fmt.Sprintf("unchanged rows rewritten=%d", rewritten))
+		check(rewritten == 0, fmt.Sprintf("unchanged row metadata modified=%d", rewritten))
 	}
 	clans[0]["name"] = "Renamed clan"
 	members := clans[0]["members"].([]map[string]any)
@@ -141,5 +145,5 @@ func main() {
 	must(db.QueryRow(ctx, `SELECT name,town_hall FROM cwl_group_members WHERE tag='#M0000'`).Scan(&mn, &th))
 	must(db.QueryRow(ctx, `SELECT count(*) FROM cwl_group_members`).Scan(&count))
 	check(cn == "Renamed clan" && mn == "Renamed member" && th == 17 && count == 119, "changed values or stale-member removal lost")
-	fmt.Printf("CWL_SNAPSHOTS_PASS unchanged_rows=128 rewritten=%d changed_values=true stale_member_removed=true upstream_calls=%d actual_service=true\n", rewritten, requests.Load())
+	fmt.Printf("CWL_SNAPSHOTS_PASS unchanged_rows=128 tuple_metadata_changes=%d repeated_wal_bytes=%d changed_values=true stale_member_removed=true upstream_calls=%d actual_service=true\n", rewritten, repeatedWALBytes, requests.Load())
 }
