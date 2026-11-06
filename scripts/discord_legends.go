@@ -72,7 +72,7 @@ func discordLegendEventValue(player clashy.Player, kind, id string, battle clash
 
 // The group API gives individual battle trophy deltas. Comparing profile trophy
 // totals would merge simultaneous attacks and defenses and lose zero-trophy hits.
-func pollDiscordLegendLogs(ctx context.Context, app *platform.App, player clashy.Player, interests map[string]struct{}, limiter *clashy.Limiter) error {
+func pollDiscordLegendLogs(ctx context.Context, app *platform.App, player clashy.Player, interests map[string]struct{}, limiter *clashy.Limiter, statsName string) error {
 	_, attacks := interests["legend_log_attacks"]
 	_, defenses := interests["legend_log_defenses"]
 	// The upstream #0 group is an unassigned sentinel, not a fetchable group.
@@ -95,7 +95,10 @@ func pollDiscordLegendLogs(ctx context.Context, app *platform.App, player clashy
 		}
 	}
 	group, err := retryLimitedClashFetch(ctx, app, limiter, func(fetchCtx context.Context) (*clashy.LeagueTierGroup, error) {
-		return app.Clash.GetPlayerLeagueGroup(fetchCtx, player.Tag, player.CurrentLeagueGroupTag, strconv.Itoa(player.CurrentLeagueSeasonID))
+		start := time.Now()
+		group, err := app.Clash.GetPlayerLeagueGroup(fetchCtx, player.Tag, player.CurrentLeagueGroupTag, strconv.Itoa(player.CurrentLeagueSeasonID))
+		app.Stats.RecordRequest(statsName, time.Since(start), err)
+		return group, err
 	})
 	if err != nil {
 		return err
