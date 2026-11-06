@@ -105,13 +105,16 @@ func main() {
 	done := make(chan error, 1)
 	go func() { done <- scripts.NewWarDiscoveryDomain().Run(runCtx, app) }()
 	time.Sleep(14 * time.Second)
+	stopped := time.Now()
 	cancel()
 	<-done
 	mu.Lock()
 	for _, group := range []string{"A", "D"} {
 		times := starts[group]
 		check(len(times) > 0, "no actual discovery HTTP requests")
-		from, to := times[0].Add(2*time.Second), times[0].Add(12*time.Second)
+		// The limiter permits a whole initial burst. Measure the full observed
+		// run instead of cropping through a burst at both window boundaries.
+		from, to := times[0], stopped
 		n := 0
 		peak := 0
 		for i, t := range times {
@@ -124,7 +127,7 @@ func main() {
 			}
 			peak = max(peak, j-i)
 		}
-		rate := float64(n) / 10
+		rate := float64(n) / to.Sub(from).Seconds()
 		fmt.Printf("WAR_THROUGHPUT group=%s configured=40 observed=%.2f rolling_990ms_peak=%d requests=%d\n", group, rate, peak, len(times))
 		check(peak <= 44, "upstream request ceiling exceeded")
 		if os.Getenv("CLASHKING_THROUGHPUT_BASELINE") != "1" {
