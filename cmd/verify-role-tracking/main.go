@@ -198,10 +198,14 @@ func main() {
 		count, err := cache.Do(ctx, cache.B().Exists().Key("ps:#PYLQ").Build()).ToInt64()
 		return err == nil && count == 1
 	})
+	// Drain the initial unrestricted polls before measuring the disabled
+	// trigger. A poll already in SQL can legitimately use the old selection.
+	stop()
 	old = revision()
 	_, err = db.Exec(ctx, "UPDATE servers SET auto_role_triggers=ARRAY['league_change']::text[] WHERE id=$1", guild)
 	must(err)
 	hall.Store(15)
+	stop = run(scripts.NewTrackedPlayersDomain())
 	wait("filtered Town Hall snapshot", func() bool {
 		raw, err := cache.Do(ctx, cache.B().Get().Key("ps:#PYLQ").Build()).ToString()
 		decoded, e := utils.Decompress([]byte(raw))

@@ -319,21 +319,24 @@ func battlelogRequestConcurrency(requestsPerSecond int) int {
 }
 
 func mergeBattlelogIngests(values []models.BattlelogIngest) models.BattlelogIngest {
-	var totalRows, totalNotifications, totalCheckpoints int
+	var totalRows, totalNotifications, totalCheckpoints, totalDiscord int
 	for _, value := range values {
 		totalRows += len(value.Rows)
 		totalNotifications += len(value.Notifications)
 		totalCheckpoints += len(value.Checkpoints)
+		totalDiscord += len(value.DiscordNotifications)
 	}
 	out := models.BattlelogIngest{
-		Rows:          make([]models.BattlelogRow, 0, totalRows),
-		Notifications: make([]models.BattlelogRow, 0, totalNotifications),
-		Checkpoints:   make([]models.BattlelogCheckpoint, 0, totalCheckpoints),
+		Rows:                 make([]models.BattlelogRow, 0, totalRows),
+		Notifications:        make([]models.BattlelogRow, 0, totalNotifications),
+		Checkpoints:          make([]models.BattlelogCheckpoint, 0, totalCheckpoints),
+		DiscordNotifications: make([]models.DiscordLegendNotification, 0, totalDiscord),
 	}
 	checkpoints := make(map[string]models.BattlelogCheckpoint, totalCheckpoints)
 	for _, value := range values {
 		out.Rows = append(out.Rows, value.Rows...)
 		out.Notifications = append(out.Notifications, value.Notifications...)
+		out.DiscordNotifications = append(out.DiscordNotifications, value.DiscordNotifications...)
 		for _, checkpoint := range value.Checkpoints {
 			if checkpoint.Tag == "" || checkpoint.Timestamp.IsZero() {
 				continue
@@ -371,28 +374,29 @@ func (d *battlelogsDomain) do(
 	if err != nil {
 		return models.BattlelogIngest{}, err
 	}
-	if job.Discord.clanTag != "" {
-		player, err := retryLimitedClashFetch(ctx, app, limiter, func(fetchCtx context.Context) (*clashy.Player, error) {
-			start := time.Now()
-			player, err := app.Clash.GetPlayer(fetchCtx, job.Tag)
-			// Enrichment spends this same request budget. Count it alongside
-			// raw pages so the configured rate and observed rate agree.
-			app.Stats.RecordRequest(statsName, time.Since(start), err)
-			return player, err
-		})
-		// Discord enrichment is best-effort and must never discard a successfully
-		// fetched raw battle page. Missing profiles/groups can be retried next poll.
-		if err != nil {
-			app.Logger.Warn("Discord Legend profile unavailable", "tag", job.Tag, "err", err)
-		} else if player != nil && player.Clan != nil && player.Clan.Tag == job.Discord.clanTag {
-			if err := pollDiscordLegendLogs(ctx, app, *player, job.Discord.types, limiter, statsName); err != nil {
-				app.Logger.Warn("Discord Legend group unavailable", "tag", job.Tag, "err", err)
+	ingest, err := battlelogIngestFromEntries(entries, job.Tag, job.Checkpoint, time.Now().UTC(), app.Config.BattlelogFirstSeenLookbackDays)
+	if err != nil {
+		return ingest, err
+	}
+	// First-seen history never sends old Discord messages. Keep this aligned
+	// with mobile suppression; direction distinguishes zero-trophy defenses.
+	if !job.Checkpoint.Timestamp.IsZero() && job.Discord.clanTag != "" {
+		for _, row := range ingest.Rows {
+			if battlelogStorageMode(clashy.BattleType(row.BattleType)) != "legend" {
+				continue
 			}
+			logType := "legend_log_attacks"
+			if !row.Attack {
+				logType = "legend_log_defenses"
+			}
+			if _, enabled := job.Discord.types[logType]; !enabled {
+				continue
+			}
+			ingest.DiscordNotifications = append(ingest.DiscordNotifications, models.DiscordLegendNotification{Battle: row, PlayerName: job.Discord.playerName, PlayerTrophies: job.Discord.playerTrophies, ClanTag: job.Discord.clanTag, ClanName: job.Discord.clanName, ClanBadgeToken: job.Discord.clanBadgeToken})
 		}
 	}
-	ingest, err := battlelogIngestFromEntries(entries, job.Tag, job.Checkpoint, time.Now().UTC(), app.Config.BattlelogFirstSeenLookbackDays)
-	if err != nil || len(ingest.Notifications) == 0 {
-		return ingest, err
+	if len(ingest.Notifications) == 0 {
+		return ingest, nil
 	}
 	name, err := d.sink.PlayerName(ctx, job.Tag)
 	if err != nil {
@@ -509,6 +513,12 @@ func (d *battlelogsDomain) store(ctx context.Context, app *platform.App, ingest 
 			return err
 		}
 	}
+	for _, notification := range ingest.DiscordNotifications {
+		if err := publishDiscordLegendEvent(ctx, app, notification); err != nil {
+			return err
+		}
+	}
+
 	if !app.Config.DryRun {
 		// Checkpoints move only after durable rows write successfully.
 		update := d.updateCheckpoints
