@@ -93,3 +93,6 @@ jobs:
 
       - name: Verify serialized leaderboard snapshot maintenance
         run: bash .ci-schema/scripts/with-test-timescale.sh --profile retained-api -- go run ./cmd/verify-leaderboard-maintenance
+
+      - name: Verify late CWL discovery and delivery
+        run: bash .ci-schema/scripts/with-test-integration.sh --profile retained-api -- go run ./cmd/verify-cwl-discovery

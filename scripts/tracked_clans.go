@@ -911,20 +911,19 @@ func (d *trackedClansDomain) processCWLTarget(ctx context.Context, app *platform
 		state.Season = cwlSeasonMonth(state.Season)
 		d.setCWLActive(tag, state.Season == season && !state.Ended && !state.NoSpin && (state.BattleWarTag != "" || state.PreparationWarTag != "" || state.GroupState == "preparation" || state.GroupState == "inWar"))
 	}
-	if !ok && !cwlDiscoveryWindow(now) {
-		d.setCWLActive(tag, false)
-		return nil
-	}
 	if ok && !shouldPollCWL(now, *state) {
 		d.setCWLActive(tag, false)
 		return nil
 	}
 
+	// A cold start or new target must discover this month's CWL even after
+	// signup closes. Carrying last month's terminal state would suppress it.
+	currentSeason := ok && state.Season == season
 	current := botCWLState{Season: season}
-	if ok {
+	if currentSeason {
 		current = *state
 	}
-	refreshGroup := shouldRefreshCWLGroup(now, current, ok)
+	refreshGroup := shouldRefreshCWLGroup(now, current, currentSeason)
 
 	if current.BattleWarTag != "" {
 		war, raw, err := d.fetchCachedCWLWar(ctx, app, limiter, cache, current.BattleWarTag)
@@ -1006,14 +1005,16 @@ func (d *trackedClansDomain) processCWLTarget(ctx context.Context, app *platform
 	previousPreparationTag := current.PreparationWarTag
 	currentState.BattleWarTag = resolved.battleTag
 	currentState.PreparationWarTag = resolved.preparationTag
+	// Publish the newly discovered panel even on a cold start. Its snapshot
+	// seeds comparisons, so only attacks observed afterward enter the feed.
 	if resolved.battle != nil {
-		announce := ok && current.Season == season && previousBattleTag != resolved.battleTag
+		announce := previousBattleTag != resolved.battleTag
 		if err := d.handleCWLWarChange(ctx, app, tag, resolved.battleTag, *resolved.battle.war, resolved.battle.raw, currentState.GroupRaw, cwlWarBattle, announce, true); err != nil {
 			return err
 		}
 	}
 	if resolved.preparation != nil && resolved.preparationTag != resolved.battleTag {
-		announce := ok && current.Season == season && previousPreparationTag != resolved.preparationTag
+		announce := previousPreparationTag != resolved.preparationTag
 		if err := d.handleCWLWarChange(ctx, app, tag, resolved.preparationTag, *resolved.preparation.war, resolved.preparation.raw, currentState.GroupRaw, cwlWarPreparation, announce, resolved.battle == nil); err != nil {
 			return err
 		}
@@ -1291,7 +1292,10 @@ func shouldPollCWL(now time.Time, state botCWLState) bool {
 	if state.Season == season && (state.Ended || state.NoSpin) {
 		return false
 	}
-	if cwlDiscoveryWindow(now) {
+	// The signup window limits repeated negative lookups, not discovery after
+	// a restart, cache loss, newly configured clan, or month rollover. A miss
+	// after signup is stored as NoSpin and still stops subsequent polling.
+	if state.Season != season || cwlDiscoveryWindow(now) {
 		return true
 	}
 	return state.Season == season && state.GroupState != "" && state.GroupState != "ended"
