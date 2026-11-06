@@ -11,7 +11,6 @@ import (
 	"github.com/disgoorg/disgo/discord"
 	"github.com/disgoorg/snowflake/v2"
 	"github.com/google/uuid"
-	"github.com/jackc/pgx/v5/pgxpool"
 )
 
 type discordMemberRequestPriority uint8
@@ -302,7 +301,7 @@ func (s *discordMemberRequestScheduler) run(request discordMemberRequest) {
 }
 
 func (s *discordMemberRequestScheduler) enqueueMemberSyncCleanup(request discordMemberRequest) {
-	s.enqueue(discordCacheMutation{Meta: request.meta, Apply: func(ctx context.Context, pool *pgxpool.Pool) error {
+	s.enqueue(discordCacheMutation{Meta: request.meta, Apply: func(ctx context.Context, pool discordCacheStore) error {
 		_, clearErr := pool.Exec(ctx, `UPDATE discord_cache.guilds SET members_sync_token = NULL, members_complete = false, updated_at = now() WHERE id = $1 AND application_id = $2 AND shard_id = $3 AND generation = $4 AND members_sync_token = $5`, request.guildID, request.meta.ApplicationID, request.meta.ShardID, request.meta.Generation, request.token)
 		return clearErr
 	}})

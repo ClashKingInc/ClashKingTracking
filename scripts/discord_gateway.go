@@ -49,9 +49,20 @@ type discordMutationMeta struct {
 	Sequence      int64
 }
 
+// A mutation can run inside the writer's bounded transaction. Snapshot helpers
+// use nested transactions (savepoints), preserving their all-or-nothing behavior.
+type discordCacheStore interface {
+	Exec(context.Context, string, ...any) (pgconn.CommandTag, error)
+	Query(context.Context, string, ...any) (pgx.Rows, error)
+	QueryRow(context.Context, string, ...any) pgx.Row
+	Begin(context.Context) (pgx.Tx, error)
+	SendBatch(context.Context, *pgx.Batch) pgx.BatchResults
+}
+
 type discordCacheMutation struct {
-	Meta  discordMutationMeta
-	Apply func(context.Context, *pgxpool.Pool) error
+	Meta       discordMutationMeta
+	ObservedAt time.Time
+	Apply      func(context.Context, discordCacheStore) error
 }
 
 type discordMutationQueue struct {
@@ -76,6 +87,7 @@ func (q *discordMutationQueue) Enqueue(ctx context.Context, mutation discordCach
 		q.mu.Unlock()
 		return 0, false
 	}
+	mutation.ObservedAt = time.Now()
 	q.items = append(q.items, mutation)
 	depth := len(q.items)
 	q.mu.Unlock()
@@ -525,7 +537,7 @@ func markDiscordShardDisconnected(state *discordGatewayState, shardID int, enque
 	if !ok || !changed {
 		return
 	}
-	enqueue(discordCacheMutation{Meta: meta, Apply: func(ctx context.Context, pool *pgxpool.Pool) error {
+	enqueue(discordCacheMutation{Meta: meta, Apply: func(ctx context.Context, pool discordCacheStore) error {
 		return setDiscordShardHealthy(ctx, pool, meta, false)
 	}})
 }
@@ -850,7 +862,7 @@ func runDiscordGatewayHeartbeats(ctx context.Context, client *bot.Client, state 
 	}
 }
 
-func runDiscordGuildActivityReconciler(ctx context.Context, app *platform.App, pool *pgxpool.Pool, client *bot.Client, state *discordGatewayState, enqueue func(discordCacheMutation), scheduler *discordMemberRequestScheduler) error {
+func runDiscordGuildActivityReconciler(ctx context.Context, app *platform.App, pool discordCacheStore, client *bot.Client, state *discordGatewayState, enqueue func(discordCacheMutation), scheduler *discordMemberRequestScheduler) error {
 	ticker := time.NewTicker(discordGuildActivityReconcileInterval)
 	defer ticker.Stop()
 	for {
@@ -865,7 +877,7 @@ func runDiscordGuildActivityReconciler(ctx context.Context, app *platform.App, p
 	}
 }
 
-func runDiscordGuildActivitySignals(ctx context.Context, app *platform.App, pool *pgxpool.Pool, client *bot.Client, state *discordGatewayState, enqueue func(discordCacheMutation), scheduler *discordMemberRequestScheduler) error {
+func runDiscordGuildActivitySignals(ctx context.Context, app *platform.App, pool discordCacheStore, client *bot.Client, state *discordGatewayState, enqueue func(discordCacheMutation), scheduler *discordMemberRequestScheduler) error {
 	const group = "discord-gateway-activity"
 	err := app.Valkey.Do(ctx, app.Valkey.B().XgroupCreate().Key(app.Config.EventStreamName).Group(group).Id("0").Mkstream().Build()).Error()
 	if err != nil && !strings.Contains(err.Error(), "BUSYGROUP") {
@@ -898,33 +910,101 @@ func runDiscordGuildActivitySignals(ctx context.Context, app *platform.App, pool
 	}
 }
 
+// Apply at most 128 queued mutations or 250ms of work in one transaction, then
+// commit their checkpoints atomically. This avoids a WAL flush per event without
+// exposing a checkpoint ahead of its permission changes. Use receipt time, not
+// drain time: an old backlog must not look fresh. A slow individual snapshot may
+// exceed the time bound, but no further mutation is added after that deadline.
 func runDiscordCacheWriter(
 	ctx context.Context,
-	pool *pgxpool.Pool,
+	pool discordCacheStore,
 	mutations *discordMutationQueue,
 ) error {
+	type checkpoint struct {
+		ApplicationID string    `json:"application_id"`
+		ShardID       int       `json:"shard_id"`
+		ShardCount    int       `json:"shard_count"`
+		Generation    uuid.UUID `json:"generation"`
+		Sequence      int64     `json:"sequence"`
+		ObservedAt    time.Time `json:"observed_at"`
+	}
+	pending := make(map[int]checkpoint)
+	deadline := time.Now().Add(250 * time.Millisecond)
+	var tx pgx.Tx
+	batchSize := 0
+	defer func() {
+		if tx != nil {
+			_ = tx.Rollback(context.WithoutCancel(ctx))
+		}
+	}()
+	flush := func() error {
+		if tx == nil {
+			return nil
+		}
+		rows := make([]checkpoint, 0, len(pending))
+		for _, row := range pending {
+			rows = append(rows, row)
+		}
+		data, err := json.Marshal(rows)
+		if err != nil {
+			return err
+		}
+		_, err = tx.Exec(ctx, `
+   UPDATE discord_cache.gateway_shards shard
+   SET heartbeat_at = progress.observed_at,
+       last_applied_sequence = GREATEST(COALESCE(shard.last_applied_sequence, 0), progress.sequence)
+   FROM jsonb_to_recordset($1::jsonb) AS progress(
+    application_id text, shard_id integer, shard_count integer,
+    generation uuid, sequence bigint, observed_at timestamptz)
+   WHERE shard.application_id = progress.application_id
+     AND shard.shard_id = progress.shard_id AND shard.shard_count = progress.shard_count
+     AND shard.generation = progress.generation`, data)
+		if err != nil {
+			return err
+		}
+		if err = tx.Commit(ctx); err != nil {
+			return err
+		}
+		tx = nil
+		batchSize = 0
+		clear(pending)
+		return nil
+	}
 	for {
-		mutation, ok := mutations.Dequeue(ctx)
+		if batchSize >= 128 || !time.Now().Before(deadline) {
+			if err := flush(); err != nil {
+				return err
+			}
+			deadline = time.Now().Add(250 * time.Millisecond)
+		}
+		waitCtx, cancel := context.WithDeadline(ctx, deadline)
+		mutation, ok := mutations.Dequeue(waitCtx)
+		cancel()
 		if !ok {
-			return ctx.Err()
+			if ctx.Err() != nil {
+				return ctx.Err()
+			}
+			continue
 		}
 		if mutation.Apply == nil {
 			continue
 		}
-		if err := mutation.Apply(ctx, pool); err != nil {
+		if tx == nil {
+			var err error
+			tx, err = pool.Begin(ctx)
+			if err != nil {
+				return err
+			}
+		}
+		if err := mutation.Apply(ctx, tx); err != nil {
 			return err
 		}
+		batchSize++
 		if mutation.Meta.Generation == uuid.Nil {
 			continue
 		}
-		if _, err := pool.Exec(ctx, `
-				UPDATE discord_cache.gateway_shards
-				SET heartbeat_at = now(),
-					last_applied_sequence = GREATEST(COALESCE(last_applied_sequence, 0), $5)
-				WHERE application_id = $1 AND shard_id = $2 AND shard_count = $3 AND generation = $4
-		`, mutation.Meta.ApplicationID, mutation.Meta.ShardID, mutation.Meta.ShardCount, mutation.Meta.Generation, mutation.Meta.Sequence); err != nil {
-			return err
-		}
+		meta := mutation.Meta
+		pending[meta.ShardID] = checkpoint{meta.ApplicationID, meta.ShardID, meta.ShardCount, meta.Generation, meta.Sequence, mutation.ObservedAt}
 	}
 }
 
@@ -944,7 +1024,7 @@ func (s *discordGatewayState) rotateShard(event *events.GenericEvent, shardCount
 			delete(s.syncs, guildID)
 		}
 	}
-	enqueue(discordCacheMutation{Meta: meta, Apply: func(ctx context.Context, pool *pgxpool.Pool) error {
+	enqueue(discordCacheMutation{Meta: meta, Apply: func(ctx context.Context, pool discordCacheStore) error {
 		_, err := pool.Exec(ctx, `
 			INSERT INTO discord_cache.gateway_shards
 				(application_id, shard_id, shard_count, generation, healthy, heartbeat_at, last_applied_sequence)
@@ -962,13 +1042,13 @@ func (s *discordGatewayState) rotateShard(event *events.GenericEvent, shardCount
 	for _, guild := range readyGuilds {
 		guildIDs = append(guildIDs, guild.ID.String())
 	}
-	enqueue(discordCacheMutation{Meta: meta, Apply: func(ctx context.Context, pool *pgxpool.Pool) error {
+	enqueue(discordCacheMutation{Meta: meta, Apply: func(ctx context.Context, pool discordCacheStore) error {
 		return replaceDiscordReadyGuildInventory(ctx, pool, meta, guildIDs)
 	}})
 	return meta
 }
 
-func (s *discordGatewayState) enqueueEvent(event *events.GenericEvent, enqueue func(discordCacheMutation), apply func(discordMutationMeta, context.Context, *pgxpool.Pool) error) (discordMutationMeta, bool) {
+func (s *discordGatewayState) enqueueEvent(event *events.GenericEvent, enqueue func(discordCacheMutation), apply func(discordMutationMeta, context.Context, discordCacheStore) error) (discordMutationMeta, bool) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	shard, ok := s.shards[event.ShardID()]
@@ -979,7 +1059,7 @@ func (s *discordGatewayState) enqueueEvent(event *events.GenericEvent, enqueue f
 	shard.Sequence = max(shard.Sequence, sequence)
 	s.shards[event.ShardID()] = shard
 	meta := discordMutationMeta{ApplicationID: s.appID, ShardID: event.ShardID(), ShardCount: shard.ShardCount, Generation: shard.Generation, Sequence: sequence}
-	enqueue(discordCacheMutation{Meta: meta, Apply: func(ctx context.Context, pool *pgxpool.Pool) error { return apply(meta, ctx, pool) }})
+	enqueue(discordCacheMutation{Meta: meta, Apply: func(ctx context.Context, pool discordCacheStore) error { return apply(meta, ctx, pool) }})
 	return meta, true
 }
 
@@ -990,7 +1070,7 @@ func (s *discordGatewayState) enqueueHeartbeats(client *bot.Client, enqueue func
 		meta := discordMutationMeta{ApplicationID: s.appID, ShardID: shardID, ShardCount: shard.ShardCount, Generation: shard.Generation, Sequence: shard.Sequence}
 		gatewayShard := client.ShardManager.Shard(shardID)
 		connected := gatewayShard != nil && gatewayShard.Status() == gateway.StatusReady
-		enqueue(discordCacheMutation{Meta: meta, Apply: func(ctx context.Context, pool *pgxpool.Pool) error {
+		enqueue(discordCacheMutation{Meta: meta, Apply: func(ctx context.Context, pool discordCacheStore) error {
 			if connected {
 				return nil
 			}
@@ -999,7 +1079,7 @@ func (s *discordGatewayState) enqueueHeartbeats(client *bot.Client, enqueue func
 	}
 }
 
-func (s *discordGatewayState) enqueueMemberSnapshot(event *events.GenericEvent, guildID string, token uuid.UUID, initial bool, enqueue func(discordCacheMutation), apply func(discordMutationMeta, context.Context, *pgxpool.Pool) error) (discordMutationMeta, bool) {
+func (s *discordGatewayState) enqueueMemberSnapshot(event *events.GenericEvent, guildID string, token uuid.UUID, initial bool, enqueue func(discordCacheMutation), apply func(discordMutationMeta, context.Context, discordCacheStore) error) (discordMutationMeta, bool) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	shard, ok := s.shards[event.ShardID()]
@@ -1011,7 +1091,7 @@ func (s *discordGatewayState) enqueueMemberSnapshot(event *events.GenericEvent, 
 	s.shards[event.ShardID()] = shard
 	meta := discordMutationMeta{ApplicationID: s.appID, ShardID: event.ShardID(), ShardCount: shard.ShardCount, Generation: shard.Generation, Sequence: sequence}
 	s.syncs[guildID] = discordMemberSync{Meta: meta, Token: token}
-	enqueue(discordCacheMutation{Meta: meta, Apply: func(ctx context.Context, pool *pgxpool.Pool) error { return apply(meta, ctx, pool) }})
+	enqueue(discordCacheMutation{Meta: meta, Apply: func(ctx context.Context, pool discordCacheStore) error { return apply(meta, ctx, pool) }})
 	_ = initial
 	return meta, true
 }
@@ -1056,7 +1136,7 @@ func (s *discordGatewayState) memberSyncCurrent(guildID string, meta discordMuta
 	return ok && shard.Generation == meta.Generation && syncing && memberSync.Token == token && memberSync.Meta.Generation == meta.Generation
 }
 
-func (s *discordGatewayState) enqueueMemberDelta(event *events.GenericEvent, guildID string, delta discordMemberDelta, enqueue func(discordCacheMutation), apply func(discordMutationMeta, context.Context, *pgxpool.Pool) error) bool {
+func (s *discordGatewayState) enqueueMemberDelta(event *events.GenericEvent, guildID string, delta discordMemberDelta, enqueue func(discordCacheMutation), apply func(discordMutationMeta, context.Context, discordCacheStore) error) bool {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	shard, ok := s.shards[event.ShardID()]
@@ -1072,7 +1152,7 @@ func (s *discordGatewayState) enqueueMemberDelta(event *events.GenericEvent, gui
 		memberSync.Deltas = append(memberSync.Deltas, delta)
 		s.syncs[guildID] = memberSync
 	}
-	enqueue(discordCacheMutation{Meta: meta, Apply: func(ctx context.Context, pool *pgxpool.Pool) error { return apply(meta, ctx, pool) }})
+	enqueue(discordCacheMutation{Meta: meta, Apply: func(ctx context.Context, pool discordCacheStore) error { return apply(meta, ctx, pool) }})
 	return true
 }
 
@@ -1085,7 +1165,7 @@ func (s *discordGatewayState) completeMemberSync(guildID string, meta discordMut
 	}
 	delete(s.syncs, guildID)
 	deltas := append([]discordMemberDelta(nil), memberSync.Deltas...)
-	enqueue(discordCacheMutation{Meta: meta, Apply: func(ctx context.Context, pool *pgxpool.Pool) error {
+	enqueue(discordCacheMutation{Meta: meta, Apply: func(ctx context.Context, pool discordCacheStore) error {
 		return replaceDiscordGuildMembers(ctx, pool, guildID, meta, token, members, deltas)
 	}})
 	return true
@@ -1098,7 +1178,7 @@ type discordMemberRequester interface {
 func discordCacheListener(
 	ctx context.Context,
 	app *platform.App,
-	pool *pgxpool.Pool,
+	pool discordCacheStore,
 	state *discordGatewayState,
 	enqueue func(discordCacheMutation),
 	scheduleMembers func(discordMemberRequest),
@@ -1114,7 +1194,7 @@ func discordCacheListener(
 		guildID := guild.ID.String()
 		token := uuid.New()
 		applied := make(chan bool, 1)
-		meta, ok := state.enqueueMemberSnapshot(event, guildID, token, initial, enqueue, func(meta discordMutationMeta, ctx context.Context, pool *pgxpool.Pool) error {
+		meta, ok := state.enqueueMemberSnapshot(event, guildID, token, initial, enqueue, func(meta discordMutationMeta, ctx context.Context, pool discordCacheStore) error {
 			active, err := isActiveDiscordGuild(ctx, pool, guildID)
 			if err == nil {
 				err = replaceDiscordGuildSnapshot(ctx, pool, guild, meta, token, active)
@@ -1144,7 +1224,7 @@ func discordCacheListener(
 		},
 		OnResumed: func(event *events.Resumed) {
 			state.setShardReady(event.ShardID(), true)
-			state.enqueueEvent(event.GenericEvent, enqueue, func(meta discordMutationMeta, ctx context.Context, pool *pgxpool.Pool) error {
+			state.enqueueEvent(event.GenericEvent, enqueue, func(meta discordMutationMeta, ctx context.Context, pool discordCacheStore) error {
 				return setDiscordShardHealthy(ctx, pool, meta, true)
 			})
 		},
@@ -1164,7 +1244,7 @@ func discordCacheListener(
 			guildID := event.GuildID.String()
 			cancelMembers(guildID)
 			state.cancelMemberSync(guildID, uuid.Nil)
-			state.enqueueEvent(event.GenericEvent, enqueue, func(meta discordMutationMeta, ctx context.Context, pool *pgxpool.Pool) error {
+			state.enqueueEvent(event.GenericEvent, enqueue, func(meta discordMutationMeta, ctx context.Context, pool discordCacheStore) error {
 				return markDiscordGuildUnavailable(ctx, pool, guildID, meta)
 			})
 		},
@@ -1173,7 +1253,7 @@ func discordCacheListener(
 			if !allowedGuild(guild.ID) {
 				return
 			}
-			state.enqueueEvent(event.GenericEvent, enqueue, func(meta discordMutationMeta, ctx context.Context, pool *pgxpool.Pool) error {
+			state.enqueueEvent(event.GenericEvent, enqueue, func(meta discordMutationMeta, ctx context.Context, pool discordCacheStore) error {
 				return upsertDiscordGuildScoped(ctx, pool, guild, meta)
 			})
 		},
@@ -1184,7 +1264,7 @@ func discordCacheListener(
 			guildID := event.GuildID.String()
 			cancelMembers(guildID)
 			state.cancelMemberSync(guildID, uuid.Nil)
-			state.enqueueEvent(event.GenericEvent, enqueue, func(meta discordMutationMeta, ctx context.Context, pool *pgxpool.Pool) error {
+			state.enqueueEvent(event.GenericEvent, enqueue, func(meta discordMutationMeta, ctx context.Context, pool discordCacheStore) error {
 				return deleteDiscordGuild(ctx, pool, guildID, meta)
 			})
 		},
@@ -1193,7 +1273,7 @@ func discordCacheListener(
 			if !allowedGuild(channel.GuildID()) {
 				return
 			}
-			state.enqueueEvent(event.GenericEvent, enqueue, func(meta discordMutationMeta, ctx context.Context, pool *pgxpool.Pool) error {
+			state.enqueueEvent(event.GenericEvent, enqueue, func(meta discordMutationMeta, ctx context.Context, pool discordCacheStore) error {
 				return upsertDiscordChannelScoped(ctx, pool, channel, meta)
 			})
 		},
@@ -1202,7 +1282,7 @@ func discordCacheListener(
 			if !allowedGuild(channel.GuildID()) {
 				return
 			}
-			state.enqueueEvent(event.GenericEvent, enqueue, func(meta discordMutationMeta, ctx context.Context, pool *pgxpool.Pool) error {
+			state.enqueueEvent(event.GenericEvent, enqueue, func(meta discordMutationMeta, ctx context.Context, pool discordCacheStore) error {
 				return upsertDiscordChannelScoped(ctx, pool, channel, meta)
 			})
 		},
@@ -1212,7 +1292,7 @@ func discordCacheListener(
 			}
 			channelID := event.ChannelID.String()
 			guildID := event.GuildID.String()
-			state.enqueueEvent(event.GenericEvent, enqueue, func(meta discordMutationMeta, ctx context.Context, pool *pgxpool.Pool) error {
+			state.enqueueEvent(event.GenericEvent, enqueue, func(meta discordMutationMeta, ctx context.Context, pool discordCacheStore) error {
 				_, err := pool.Exec(ctx, `DELETE FROM discord_cache.channels channel USING discord_cache.guilds guild WHERE channel.id = $1 AND channel.guild_id = $2 AND guild.id = channel.guild_id AND guild.application_id = $3 AND guild.shard_id = $4 AND guild.generation = $5`, channelID, guildID, meta.ApplicationID, meta.ShardID, meta.Generation)
 				return err
 			})
@@ -1223,7 +1303,7 @@ func discordCacheListener(
 			}
 			guildID, member := event.GuildID.String(), event.Member
 			copy := member
-			accepted := state.enqueueMemberDelta(event.GenericEvent, guildID, discordMemberDelta{Member: &copy}, enqueue, func(meta discordMutationMeta, ctx context.Context, pool *pgxpool.Pool) error {
+			accepted := state.enqueueMemberDelta(event.GenericEvent, guildID, discordMemberDelta{Member: &copy}, enqueue, func(meta discordMutationMeta, ctx context.Context, pool discordCacheStore) error {
 				return upsertDiscordMemberScoped(ctx, pool, guildID, member, meta)
 			})
 			// Only genuine joins produce welcomes. Snapshot/chunk/update events also
@@ -1244,7 +1324,7 @@ func discordCacheListener(
 			}
 			guildID, member := event.GuildID.String(), event.Member
 			copy := member
-			state.enqueueMemberDelta(event.GenericEvent, guildID, discordMemberDelta{Member: &copy}, enqueue, func(meta discordMutationMeta, ctx context.Context, pool *pgxpool.Pool) error {
+			state.enqueueMemberDelta(event.GenericEvent, guildID, discordMemberDelta{Member: &copy}, enqueue, func(meta discordMutationMeta, ctx context.Context, pool discordCacheStore) error {
 				return upsertDiscordMemberScoped(ctx, pool, guildID, member, meta)
 			})
 		},
@@ -1253,7 +1333,7 @@ func discordCacheListener(
 				return
 			}
 			guildID, userID := event.GuildID.String(), event.User.ID.String()
-			state.enqueueMemberDelta(event.GenericEvent, guildID, discordMemberDelta{UserID: userID}, enqueue, func(meta discordMutationMeta, ctx context.Context, pool *pgxpool.Pool) error {
+			state.enqueueMemberDelta(event.GenericEvent, guildID, discordMemberDelta{UserID: userID}, enqueue, func(meta discordMutationMeta, ctx context.Context, pool discordCacheStore) error {
 				_, err := pool.Exec(ctx, `DELETE FROM discord_cache.members member USING discord_cache.guilds guild WHERE member.guild_id = $1 AND member.user_id = $2 AND guild.id = member.guild_id AND guild.application_id = $3 AND guild.shard_id = $4 AND guild.generation = $5`, guildID, userID, meta.ApplicationID, meta.ShardID, meta.Generation)
 				return err
 			})
@@ -1263,7 +1343,7 @@ func discordCacheListener(
 				return
 			}
 			guildID, role := event.GuildID.String(), event.Role
-			state.enqueueEvent(event.GenericEvent, enqueue, func(meta discordMutationMeta, ctx context.Context, pool *pgxpool.Pool) error {
+			state.enqueueEvent(event.GenericEvent, enqueue, func(meta discordMutationMeta, ctx context.Context, pool discordCacheStore) error {
 				return upsertDiscordRoleScoped(ctx, pool, guildID, role, meta)
 			})
 		},
@@ -1272,7 +1352,7 @@ func discordCacheListener(
 				return
 			}
 			guildID, role := event.GuildID.String(), event.Role
-			state.enqueueEvent(event.GenericEvent, enqueue, func(meta discordMutationMeta, ctx context.Context, pool *pgxpool.Pool) error {
+			state.enqueueEvent(event.GenericEvent, enqueue, func(meta discordMutationMeta, ctx context.Context, pool discordCacheStore) error {
 				return upsertDiscordRoleScoped(ctx, pool, guildID, role, meta)
 			})
 		},
@@ -1281,7 +1361,7 @@ func discordCacheListener(
 				return
 			}
 			guildID, roleID := event.GuildID.String(), event.RoleID.String()
-			state.enqueueEvent(event.GenericEvent, enqueue, func(meta discordMutationMeta, ctx context.Context, pool *pgxpool.Pool) error {
+			state.enqueueEvent(event.GenericEvent, enqueue, func(meta discordMutationMeta, ctx context.Context, pool discordCacheStore) error {
 				_, err := pool.Exec(ctx, `DELETE FROM discord_cache.roles role USING discord_cache.guilds guild WHERE role.guild_id = $1 AND role.id = $2 AND guild.id = role.guild_id AND guild.application_id = $3 AND guild.shard_id = $4 AND guild.generation = $5`, guildID, roleID, meta.ApplicationID, meta.ShardID, meta.Generation)
 				return err
 			})
@@ -1344,7 +1424,7 @@ func (s *discordGatewayState) shardReady(shardID int) bool {
 	return ok && shard.Ready
 }
 
-func isActiveDiscordGuild(ctx context.Context, pool *pgxpool.Pool, guildID string) (bool, error) {
+func isActiveDiscordGuild(ctx context.Context, pool discordCacheStore, guildID string) (bool, error) {
 	var active bool
 	err := pool.QueryRow(ctx, `SELECT EXISTS (SELECT 1 FROM servers WHERE id = $1 AND left_at IS NULL AND last_command_at >= now() - interval '90 days')`, guildID).Scan(&active)
 	return active, err
@@ -1358,7 +1438,7 @@ type discordGuildActivity struct {
 	active   bool
 }
 
-func reconcileDiscordGuildActivity(ctx context.Context, app *platform.App, pool *pgxpool.Pool, client *bot.Client, state *discordGatewayState, enqueue func(discordCacheMutation), scheduler *discordMemberRequestScheduler) error {
+func reconcileDiscordGuildActivity(ctx context.Context, app *platform.App, pool discordCacheStore, client *bot.Client, state *discordGatewayState, enqueue func(discordCacheMutation), scheduler *discordMemberRequestScheduler) error {
 	rows, err := pool.Query(ctx, `
 		SELECT guild.id, guild.shard_id, guild.members_complete,
 		       guild.members_sync_token IS NOT NULL,
@@ -1395,7 +1475,7 @@ func reconcileDiscordGuildActivity(ctx context.Context, app *platform.App, pool 
 	return nil
 }
 
-func reconcileOneDiscordGuildActivity(ctx context.Context, app *platform.App, pool *pgxpool.Pool, client *bot.Client, state *discordGatewayState, enqueue func(discordCacheMutation), scheduler *discordMemberRequestScheduler, guildID string) error {
+func reconcileOneDiscordGuildActivity(ctx context.Context, app *platform.App, pool discordCacheStore, client *bot.Client, state *discordGatewayState, enqueue func(discordCacheMutation), scheduler *discordMemberRequestScheduler, guildID string) error {
 	var item discordGuildActivity
 	err := pool.QueryRow(ctx, `
 		SELECT guild.id, guild.shard_id, guild.members_complete,
@@ -1420,7 +1500,7 @@ func reconcileOneDiscordGuildActivity(ctx context.Context, app *platform.App, po
 	return nil
 }
 
-func applyDiscordGuildActivity(ctx context.Context, app *platform.App, pool *pgxpool.Pool, client *bot.Client, state *discordGatewayState, enqueue func(discordCacheMutation), scheduler *discordMemberRequestScheduler, item discordGuildActivity, priority discordMemberRequestPriority) {
+func applyDiscordGuildActivity(ctx context.Context, app *platform.App, pool discordCacheStore, client *bot.Client, state *discordGatewayState, enqueue func(discordCacheMutation), scheduler *discordMemberRequestScheduler, item discordGuildActivity, priority discordMemberRequestPriority) {
 	if discordGuildActivityAction(item.active, item.complete, item.syncing) == "" {
 		return
 	}
@@ -1431,7 +1511,7 @@ func applyDiscordGuildActivity(ctx context.Context, app *platform.App, pool *pgx
 	if !item.active {
 		scheduler.CancelGuild(item.guildID)
 		state.cancelMemberSync(item.guildID, uuid.Nil)
-		enqueue(discordCacheMutation{Meta: meta, Apply: func(ctx context.Context, pool *pgxpool.Pool) error {
+		enqueue(discordCacheMutation{Meta: meta, Apply: func(ctx context.Context, pool discordCacheStore) error {
 			return deactivateDiscordGuildMembers(ctx, pool, item.guildID, meta)
 		}})
 		return
@@ -1444,7 +1524,7 @@ func applyDiscordGuildActivity(ctx context.Context, app *platform.App, pool *pgx
 	if !scheduler.Enqueue(discordMemberRequest{guildID: item.guildID, meta: meta, token: token, snapshotApplied: applied, priority: priority}) {
 		return
 	}
-	enqueue(discordCacheMutation{Meta: meta, Apply: func(ctx context.Context, pool *pgxpool.Pool) error {
+	enqueue(discordCacheMutation{Meta: meta, Apply: func(ctx context.Context, pool discordCacheStore) error {
 		result, err := pool.Exec(ctx, `
 			UPDATE discord_cache.guilds AS guild
 			SET members_complete = false, members_sync_token = $5, updated_at = now()
@@ -1470,7 +1550,7 @@ func discordGuildActivityAction(active, complete, syncing bool) string {
 	return ""
 }
 
-func deactivateDiscordGuildMembers(ctx context.Context, pool *pgxpool.Pool, guildID string, meta discordMutationMeta) error {
+func deactivateDiscordGuildMembers(ctx context.Context, pool discordCacheStore, guildID string, meta discordMutationMeta) error {
 	tx, err := pool.Begin(ctx)
 	if err != nil {
 		return err
@@ -1491,12 +1571,12 @@ func deactivateDiscordGuildMembers(ctx context.Context, pool *pgxpool.Pool, guil
 	return tx.Commit(ctx)
 }
 
-func setDiscordShardHealthy(ctx context.Context, pool *pgxpool.Pool, meta discordMutationMeta, healthy bool) error {
+func setDiscordShardHealthy(ctx context.Context, pool discordCacheStore, meta discordMutationMeta, healthy bool) error {
 	_, err := pool.Exec(ctx, `UPDATE discord_cache.gateway_shards SET healthy = $5, heartbeat_at = now() WHERE application_id = $1 AND shard_id = $2 AND shard_count = $3 AND generation = $4`, meta.ApplicationID, meta.ShardID, meta.ShardCount, meta.Generation, healthy)
 	return err
 }
 
-func replaceDiscordReadyGuildInventory(ctx context.Context, pool *pgxpool.Pool, meta discordMutationMeta, guildIDs []string) error {
+func replaceDiscordReadyGuildInventory(ctx context.Context, pool discordCacheStore, meta discordMutationMeta, guildIDs []string) error {
 	tx, err := pool.Begin(ctx)
 	if err != nil {
 		return err
@@ -1535,12 +1615,12 @@ func replaceDiscordReadyGuildInventory(ctx context.Context, pool *pgxpool.Pool, 
 	return tx.Commit(ctx)
 }
 
-func markDiscordGuildUnavailable(ctx context.Context, pool *pgxpool.Pool, guildID string, meta discordMutationMeta) error {
+func markDiscordGuildUnavailable(ctx context.Context, pool discordCacheStore, guildID string, meta discordMutationMeta) error {
 	_, err := pool.Exec(ctx, `UPDATE discord_cache.guilds SET available = false, metadata_complete = false, members_complete = false, members_sync_token = NULL, updated_at = now() WHERE id = $1 AND application_id = $2 AND shard_id = $3 AND generation = $4`, guildID, meta.ApplicationID, meta.ShardID, meta.Generation)
 	return err
 }
 
-func replaceDiscordGuildSnapshot(ctx context.Context, pool *pgxpool.Pool, guild discord.GatewayGuild, meta discordMutationMeta, token uuid.UUID, active bool) error {
+func replaceDiscordGuildSnapshot(ctx context.Context, pool discordCacheStore, guild discord.GatewayGuild, meta discordMutationMeta, token uuid.UUID, active bool) error {
 	tx, err := pool.Begin(ctx)
 	if err != nil {
 		return err
@@ -1610,7 +1690,7 @@ func replaceDiscordGuildSnapshot(ctx context.Context, pool *pgxpool.Pool, guild 
 
 func replaceDiscordGuildMembers(
 	ctx context.Context,
-	pool *pgxpool.Pool,
+	pool discordCacheStore,
 	guildID string,
 	meta discordMutationMeta,
 	token uuid.UUID,
@@ -1671,7 +1751,7 @@ func applyDiscordMemberDelta(ctx context.Context, db discordDB, guildID string, 
 	return nil
 }
 
-func upsertDiscordGuildScoped(ctx context.Context, pool *pgxpool.Pool, guild discord.Guild, meta discordMutationMeta) error {
+func upsertDiscordGuildScoped(ctx context.Context, pool discordCacheStore, guild discord.Guild, meta discordMutationMeta) error {
 	data, err := json.Marshal(guild)
 	if err != nil {
 		return err
@@ -1680,7 +1760,7 @@ func upsertDiscordGuildScoped(ctx context.Context, pool *pgxpool.Pool, guild dis
 	return err
 }
 
-func upsertDiscordChannelScoped(ctx context.Context, pool *pgxpool.Pool, channel discord.GuildChannel, meta discordMutationMeta) error {
+func upsertDiscordChannelScoped(ctx context.Context, pool discordCacheStore, channel discord.GuildChannel, meta discordMutationMeta) error {
 	var current bool
 	if err := pool.QueryRow(ctx, `SELECT EXISTS (SELECT 1 FROM discord_cache.guilds WHERE id = $1 AND application_id = $2 AND shard_id = $3 AND generation = $4)`, channel.GuildID().String(), meta.ApplicationID, meta.ShardID, meta.Generation).Scan(&current); err != nil || !current {
 		return err
@@ -1688,7 +1768,7 @@ func upsertDiscordChannelScoped(ctx context.Context, pool *pgxpool.Pool, channel
 	return upsertDiscordChannel(ctx, pool, channel)
 }
 
-func upsertDiscordMemberScoped(ctx context.Context, pool *pgxpool.Pool, guildID string, member discord.Member, meta discordMutationMeta) error {
+func upsertDiscordMemberScoped(ctx context.Context, pool discordCacheStore, guildID string, member discord.Member, meta discordMutationMeta) error {
 	var current bool
 	if err := pool.QueryRow(ctx, `SELECT EXISTS (
 		SELECT 1 FROM discord_cache.guilds guild
@@ -1702,7 +1782,7 @@ func upsertDiscordMemberScoped(ctx context.Context, pool *pgxpool.Pool, guildID 
 	return upsertDiscordMember(ctx, pool, guildID, member)
 }
 
-func upsertDiscordRoleScoped(ctx context.Context, pool *pgxpool.Pool, guildID string, role discord.Role, meta discordMutationMeta) error {
+func upsertDiscordRoleScoped(ctx context.Context, pool discordCacheStore, guildID string, role discord.Role, meta discordMutationMeta) error {
 	var current bool
 	if err := pool.QueryRow(ctx, `SELECT EXISTS (SELECT 1 FROM discord_cache.guilds WHERE id = $1 AND application_id = $2 AND shard_id = $3 AND generation = $4)`, guildID, meta.ApplicationID, meta.ShardID, meta.Generation).Scan(&current); err != nil || !current {
 		return err
@@ -1760,7 +1840,7 @@ func upsertDiscordRole(ctx context.Context, db discordDB, guildID string, role d
 	return err
 }
 
-func deleteDiscordGuild(ctx context.Context, pool *pgxpool.Pool, guildID string, meta discordMutationMeta) error {
+func deleteDiscordGuild(ctx context.Context, pool discordCacheStore, guildID string, meta discordMutationMeta) error {
 	tx, err := pool.Begin(ctx)
 	if err != nil {
 		return err
