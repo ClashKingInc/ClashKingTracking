@@ -31,6 +31,8 @@ func main() {
 	defer db.Close()
 	_, e = db.Exec(ctx, `INSERT INTO basic_player(tag,name,townhall_level,league_id,trophies) VALUES('#MAINT','Before',16,105000036,5000)`)
 	must(e)
+	_, e = db.Exec(ctx, "INSERT INTO tracking_scheduled_jobs(job,period,completed_at) VALUES('ranked_closeout',(clock_timestamp() AT TIME ZONE 'UTC')::date,clock_timestamp())")
+	must(e)
 	lock, e := db.Acquire(ctx)
 	must(e)
 	defer lock.Release()
