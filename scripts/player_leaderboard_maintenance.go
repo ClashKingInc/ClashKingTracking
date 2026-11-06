@@ -8,6 +8,7 @@ import (
 
 	"clashking_tracking/internal/platform"
 	"github.com/jackc/pgx/v5"
+	"github.com/jackc/pgx/v5/pgxpool"
 )
 
 // UTC, after the 05:12 closeout and before the 17:00 tournament opening.
@@ -18,10 +19,10 @@ func rankedResetWindow(now time.Time) (time.Time, bool) {
 	return day, now.Weekday() == time.Monday && !now.Before(day.Add(16*time.Hour+30*time.Minute)) && now.Before(day.Add(17*time.Hour))
 }
 
-func (s *timescaleLeaderboardStore) runPlayerLeaderboardMaintenance(ctx context.Context, app *platform.App) {
+func (s *timescaleLeaderboardStore) runLeaderboardMaintenance(ctx context.Context, app *platform.App) {
 	for {
-		if err := s.playerLeaderboardMaintenance(ctx); err != nil && ctx.Err() == nil {
-			app.Logger.Error("player leaderboard maintenance failed", "err", err)
+		if err := MaintainLeaderboardSnapshots(ctx, s.pool); err != nil && ctx.Err() == nil {
+			app.Logger.Error("leaderboard snapshot maintenance failed", "err", err)
 			app.Stats.SetReady("leaderboards.maintenance", false, err.Error())
 		} else if ctx.Err() == nil {
 			app.Stats.SetReady("leaderboards.maintenance", true, "")
@@ -32,24 +33,46 @@ func (s *timescaleLeaderboardStore) runPlayerLeaderboardMaintenance(ctx context.
 	}
 }
 
-func (s *timescaleLeaderboardStore) playerLeaderboardMaintenance(ctx context.Context) error {
-	conn, err := s.pool.Acquire(ctx)
+// MaintainLeaderboardSnapshots runs the actual SQL maintenance service once.
+// One shared session lock serializes both board families and statistics across
+// overlapping deployments. Collection uses its own loop and never waits here.
+func MaintainLeaderboardSnapshots(ctx context.Context, pool *pgxpool.Pool) error {
+	conn, err := pool.Acquire(ctx)
 	if err != nil {
 		return err
 	}
 	defer conn.Release()
-	// Session lock serializes maintenance across overlapping scheduled deployments.
 	var locked bool
 	if err = conn.QueryRow(ctx, "SELECT pg_try_advisory_lock(73194201)").Scan(&locked); err != nil || !locked {
 		return err
 	}
 	defer func() {
-		unlockCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		clean, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 		defer cancel()
-		if _, e := conn.Exec(unlockCtx, "SELECT pg_advisory_unlock(73194201)"); e != nil {
-			_ = conn.Conn().Close(unlockCtx)
+		// Do not leak a maintenance budget or a session lock into the shared pool.
+		if _, e := conn.Exec(clean, "RESET ALL; SELECT pg_advisory_unlock(73194201)"); e != nil {
+			_ = conn.Conn().Close(clean)
 		}
 	}()
+	if _, err = conn.Exec(ctx, "SET max_parallel_workers_per_gather=1; SET work_mem='64MB'; SET maintenance_work_mem='128MB'; SET lock_timeout='5s'; SET statement_timeout='20min'"); err != nil {
+		return err
+	}
+	if err = refreshPlayerLeaderboardSnapshots(ctx, conn); err != nil {
+		return err
+	}
+	var due bool
+	if err = conn.QueryRow(ctx, `SELECT NOT EXISTS(SELECT 1 FROM tracking_scheduled_jobs WHERE job='statistics_refresh' AND completed_at>clock_timestamp()-interval '30 minutes')`).Scan(&due); err != nil || !due {
+		return err
+	}
+	if err = refreshMaterializedViews(ctx, conn); err != nil {
+		return err
+	}
+	_, err = conn.Exec(ctx, `INSERT INTO tracking_scheduled_jobs(job,period,completed_at) VALUES('statistics_refresh',(clock_timestamp() AT TIME ZONE 'UTC')::date,clock_timestamp()) ON CONFLICT(job,period) DO UPDATE SET completed_at=EXCLUDED.completed_at`)
+	return err
+}
+
+func refreshPlayerLeaderboardSnapshots(ctx context.Context, conn *pgxpool.Conn) error {
+	var err error
 	var now time.Time
 	if err = conn.QueryRow(ctx, "SELECT clock_timestamp()").Scan(&now); err != nil {
 		return err
@@ -68,7 +91,7 @@ func (s *timescaleLeaderboardStore) playerLeaderboardMaintenance(ctx context.Con
 	var due bool
 	err = conn.QueryRow(ctx, `SELECT NOT EXISTS (
    SELECT 1 FROM tracking_scheduled_jobs refresh WHERE job='player_board_refresh'
-   AND completed_at > clock_timestamp()-interval '6 hours'
+   AND completed_at > clock_timestamp()-interval '30 minutes'
    AND completed_at >= COALESCE((SELECT max(completed_at) FROM tracking_scheduled_jobs WHERE job='ranked_trophy_reset'),'-infinity'::timestamptz)
  )`).Scan(&due)
 	if err != nil || !due {
