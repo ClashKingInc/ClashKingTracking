@@ -392,7 +392,7 @@ func (w *discordDeliveryWorker) executeGiveaway(ctx context.Context, id, effectI
 				return w.giveawayAPI(ctx, base+"/complete", complete, nil)
 			}
 		}
-		sent, err = w.client.Rest.CreateWebhookMessage(webhookID, target.Secret, discord.WebhookMessageCreate{
+		sent, err = w.createWebhookMessage(ctx, target.ServerID, webhookID, target.Secret, discord.WebhookMessageCreate{
 			Content: message.Content, Embeds: message.Embeds, Components: message.Components, AllowedMentions: message.AllowedMentions}, rest.CreateWebhookMessageParams{Wait: true, WithComponents: true}, rest.WithCtx(sendCtx))
 	}
 	if err != nil || sent == nil {

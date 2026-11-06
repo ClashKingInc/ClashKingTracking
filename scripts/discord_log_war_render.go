@@ -85,7 +85,7 @@ func discordWarType(event mobileWarEvent, war map[string]any) string {
 func discordWarAttacksPerMember(event mobileWarEvent, war map[string]any) int {
 	// CWL raw responses can omit attacksPerMember. The event still carries
 	// the war type, so never apply the regular-war fallback to a CWL round.
-	if strings.EqualFold(discordWarType(event, war), "cwl") || stringMapValue(event.Value, "war_tag") != "" {
+	if strings.EqualFold(discordWarType(event, war), "cwl") || stringMapValue(event.Value, "war_tag") != "" || stringMapValue(war, "tag") != "" {
 		return 1
 	}
 	if allowed := intValue(war["attacksPerMember"]); allowed > 0 {

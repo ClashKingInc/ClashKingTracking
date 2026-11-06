@@ -50,9 +50,18 @@ func main() {
 	const hook = "999999999999992905"
 	const badHook = "999999999999992906"
 	var sent, botMessages, badReads atomic.Int32
+	var contents []string
+	globalAvatar := os.Getenv("CLASHKING_E2E_GLOBAL_AVATAR") == "1"
 	provider := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "application/json")
 		switch {
+		case strings.HasSuffix(r.URL.Path, "/guilds/"+guild+"/members/"+appID):
+			profile := map[string]any{"user": map[string]any{"id": appID, "username": "ClashKing", "avatar": "globalhash", "discriminator": "0"}}
+			if !globalAvatar {
+				profile["nick"] = "Guild Bot"
+				profile["avatar"] = "guildhash"
+			}
+			json.NewEncoder(w).Encode(profile)
 		case strings.HasSuffix(r.URL.Path, "/emojis"):
 			fmt.Fprint(w, `{"items":[]}`)
 		case strings.HasSuffix(r.URL.Path, "/webhooks/"+hook) || strings.HasSuffix(r.URL.Path, "/webhooks/"+badHook):
@@ -66,6 +75,19 @@ func main() {
 			json.NewEncoder(w).Encode(map[string]any{"id": thread, "type": 11, "guild_id": guild, "parent_id": channel, "name": "fixture"})
 		case strings.Contains(r.URL.Path, "/webhooks/"+hook+"/fixture") && r.Method == "POST":
 			check(r.URL.Query().Get("thread_id") == thread, "thread not forwarded")
+			var payload struct {
+				Content  string `json:"content"`
+				Username string `json:"username"`
+				Avatar   string `json:"avatar_url"`
+			}
+			must(json.NewDecoder(r.Body).Decode(&payload))
+			if globalAvatar {
+				check(payload.Username == "ClashKing" && strings.Contains(payload.Avatar, "/avatars/"+appID+"/globalhash"), "global bot profile fallback missing")
+			} else {
+				check(payload.Username == "Guild Bot", "guild bot name missing")
+				check(strings.Contains(payload.Avatar, "/guilds/"+guild+"/users/"+appID+"/avatars/guildhash"), "guild bot avatar missing")
+			}
+			contents = append(contents, payload.Content)
 			sent.Add(1)
 			json.NewEncoder(w).Encode(map[string]any{"id": "999999999999992907", "channel_id": thread, "type": 0})
 		case strings.Contains(r.URL.Path, "/messages") && r.Method == "POST":
@@ -107,11 +129,56 @@ func main() {
 	check(sent.Load() == 1, "valid reminder did not use webhook")
 	check(badReads.Load() > 0, "foreign webhook case not exercised")
 	check(botMessages.Load() == 0, "reminder fell back to bot message")
+	// Feed the actual Valkey -> delivery -> webhook path with raw CWL data.
+	// A completed one-hit member must disappear even without event war_type.
+	publishWar := func(league bool, allDone bool) {
+		one := []any{map[string]any{"stars": 3}}
+		zero := []any{}
+		if allDone {
+			zero = one
+		}
+		war := map[string]any{"state": "inWar", "clan": map[string]any{"tag": "#PYLQ", "name": "Fixture Clan", "members": []any{
+			map[string]any{"tag": "#PYL", "name": "CompletedOne", "townhallLevel": 16, "attacks": one},
+			map[string]any{"tag": "#PYQ", "name": "MissingZero", "townhallLevel": 16, "attacks": zero},
+			map[string]any{"tag": "#PYY", "name": "CompletedTwo", "townhallLevel": 16, "attacks": []any{one[0], one[0]}},
+		}}, "opponent": map[string]any{"tag": "#QYL", "members": []any{}}}
+		if league {
+			war["tag"] = "#PYQL"
+		}
+		must(app.PublishEvent(ctx, platform.Event{Topic: "reminder", ClanTag: "#PYLQ", Value: map[string]any{"type": "war", "data": war, "reminder": map[string]any{"id": ids[0], "server_id": guild, "channel_id": channel, "thread_id": thread, "minutes_remaining": 60}}}))
+	}
+	waitSent := func(want int32) {
+		end := time.Now().Add(10 * time.Second)
+		for sent.Load() < want && time.Now().Before(end) {
+			time.Sleep(25 * time.Millisecond)
+		}
+		check(sent.Load() == want, "war reminder delivery count")
+	}
+	publishWar(true, false)
+	waitSent(2)
+	check(!strings.Contains(contents[1], "CompletedOne") && !strings.Contains(contents[1], "CompletedTwo") && strings.Contains(contents[1], "MissingZero") && strings.Contains(contents[1], "(1/1) TH16 MissingZero | #PYQ"), "CWL did not require exactly one hit")
+	publishWar(false, false)
+	waitSent(3)
+	check(strings.Contains(contents[2], "CompletedOne") && strings.Contains(contents[2], "MissingZero") && !strings.Contains(contents[2], "CompletedTwo") && strings.Contains(contents[2], "(2/2) TH16 MissingZero | #PYQ"), "regular war allowance changed")
+	publishWar(true, true)
+	time.Sleep(400 * time.Millisecond)
+	check(sent.Load() == 3, "completed CWL emitted reminder")
+	publishOther := func(kind string, data map[string]any) {
+		value := map[string]any{"type": kind, "clan": map[string]any{"name": "Fixture Clan"}, "members": []any{data}, "raid": map[string]any{"endTime": "20261108T070000.000Z"}, "reminder": map[string]any{"id": ids[0], "server_id": guild, "channel_id": channel, "thread_id": thread, "minutes_remaining": 60, "custom_text": "Follow the plan"}}
+		must(app.PublishEvent(ctx, platform.Event{Topic: "reminder", ClanTag: "#PYLQ", Value: value}))
+	}
+	publishOther("raid", map[string]any{"tag": "#PYQ", "name": "Raid Player", "townhall": 16, "attacks": 3, "total_attacks": 6})
+	waitSent(4)
+	check(strings.HasPrefix(contents[3], "**Fixture Clan Raid Weekend**\n⏰ Ends <t:") && strings.Contains(contents[3], "(3/6) TH16 Raid Player | #PYQ") && strings.HasSuffix(contents[3], "Follow the plan"), "raid command layout mismatch")
+	publishOther("clan_games", map[string]any{"tag": "#PYQ", "name": "Games Player", "townhall": 16, "points": 1500})
+	waitSent(5)
+	check(strings.HasPrefix(contents[4], "**Fixture Clan Clan Games**\n⏰ Ends <t:") && strings.Contains(contents[4], "(1500/4,000) TH16 Games Player | #PYQ") && strings.HasSuffix(contents[4], "Follow the plan"), "clan games command layout mismatch")
+
 	stop()
 	select {
 	case <-done:
 	case <-time.After(15 * time.Second):
 		panic("delivery did not stop")
 	}
-	fmt.Println("PASS actual reminder delivery: owned webhook, correct thread, foreign/missing webhook rejected, no bot-message fallback")
+	fmt.Println("PASS actual reminder delivery: CWL one hit, regular two hits, completed members excluded, command layouts for war/raid/games, bot avatar/name, owned webhook, thread, foreign/missing rejected, no bot fallback")
 }

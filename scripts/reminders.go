@@ -610,6 +610,7 @@ func finishDueWarJob(ctx context.Context, job dueWarJob, war *clashy.ClanWar, fe
 			clans[side.Tag] = true
 			if err := publish(ctx, platform.Event{Topic: "reminder", ClanTag: side.Tag, Value: map[string]any{
 				"type": "war", "schedule_key": job.key, "minutes_remaining": job.minutes,
+				"war_type": war.Type(), "war_tag": war.WarTag,
 				"data": json.RawMessage(raw),
 			}}); err != nil {
 				return err
