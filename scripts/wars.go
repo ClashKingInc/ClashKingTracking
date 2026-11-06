@@ -1032,7 +1032,10 @@ func (d *warsDomain) storeIngest(ctx context.Context, app *platform.App, ingest 
 	if len(ingest.IndexRows) == 0 && len(ingest.ArchivePayload) == 0 && len(ingest.Schedules) == 0 && len(ingest.PlayerTimers) == 0 && len(ingest.CWLGroups) == 0 {
 		return nil
 	}
-	if err := d.store.Store(ctx, ingest); err != nil {
+	started := time.Now()
+	err := d.store.Store(ctx, ingest)
+	app.Stats.RecordProcess(d.name+".store", time.Since(started))
+	if err != nil {
 		return err
 	}
 	// Only arm local timers after the schedule row is durable.
