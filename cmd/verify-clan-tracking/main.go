@@ -1,7 +1,7 @@
 // Command verify-clan-tracking exercises the real global-clan and war-archiver
 // domains against a loopback HTTP fault server and a disposable schema in the
 // canonical local development database. It never uses public as a SQL fallback.
-// Run with: go run ./cmd/verify-clan-tracking
+// Run through DevKit scripts/with-test-integration.sh --profile retained-api.
 package main
 
 import (
@@ -11,6 +11,7 @@ import (
 	"log/slog"
 	"net"
 	"net/http"
+	"net/url"
 	"os"
 	"strings"
 	"sync/atomic"
@@ -21,6 +22,7 @@ import (
 	"clashking_tracking/scripts"
 	clashy "github.com/clashkinginc/clashy.go"
 	"github.com/jackc/pgx/v5/pgxpool"
+	valkey "github.com/valkey-io/valkey-go"
 )
 
 func must(err error) {
@@ -36,10 +38,15 @@ func check(ok bool, message string) {
 
 func main() {
 	ctx := context.Background()
-	base := "postgres://clashking_local:clashking_local@127.0.0.1:54330/clashking_dev"
+	base := os.Getenv("TEST_DATABASE_URL")
+	check(os.Getenv("CLASHKING_DISPOSABLE_TIMESCALE") == "1" && strings.Contains(base, "@127.0.0.1:"), "canonical disposable Timescale required")
 	pool, err := pgxpool.New(ctx, base)
 	must(err)
 	defer pool.Close()
+	check(os.Getenv("CLASHKING_DISPOSABLE_VALKEY") == "1", "canonical disposable Valkey required")
+	cache, err := valkey.NewClient(valkey.ClientOption{InitAddress: []string{os.Getenv("TEST_VALKEY_ADDR")}})
+	must(err)
+	defer cache.Close()
 	schema := fmt.Sprintf("clan_refine_e2e_%d", time.Now().UnixNano())
 	_, err = pool.Exec(ctx, `CREATE SCHEMA `+schema)
 	must(err)
@@ -52,7 +59,12 @@ func main() {
 		_, err = pool.Exec(ctx, `CREATE TABLE `+schema+`.`+table+` (LIKE public.`+table+` INCLUDING ALL)`)
 		must(err)
 	}
-	dsn := base + "?search_path=" + schema // No public fallback: every runtime SQL write stays isolated.
+	target, err := url.Parse(base)
+	must(err)
+	query := target.Query()
+	query.Set("search_path", schema) // No public fallback: every runtime SQL write stays isolated.
+	target.RawQuery = query.Encode()
+	dsn := target.String()
 	db, err := pgxpool.New(ctx, dsn)
 	must(err)
 	defer db.Close()
@@ -109,7 +121,7 @@ func main() {
 	must(err)
 	defer client.Close()
 	newApp := func() *platform.App {
-		return &platform.App{Config: platform.Config{TimescaleURL: dsn, ValkeyAddr: "isolated-validation", GlobalClanPriorityRequestsPerSecond: 20, GlobalClanNonPriorityRequestsPerSecond: 20, GlobalClanWriteWorkers: 1, TargetPageMultiplier: 1, WarArchiveRequestsPerSecond: 20, WarArchiveScanSeconds: 1, WarArchivePackSize: 10000, WarArchiveEndpoint: "http://127.0.0.1:1", WarArchiveBucket: "disabled", WarArchiveAccessKeyID: "local", WarArchiveSecretAccessKey: "local", CWLRequestsPerSecond: 1, CWLWarRequestsPerSecond: 1, CWLSyncSeconds: 3600}, Logger: slog.New(slog.NewJSONHandler(os.Stdout, nil)), Clash: client, Stats: platform.NewTracker(), Availability: platform.NewAvailabilityGate(nil)}
+		return &platform.App{Config: platform.Config{TimescaleURL: dsn, ValkeyAddr: os.Getenv("TEST_VALKEY_ADDR"), GlobalClanPriorityRequestsPerSecond: 20, GlobalClanNonPriorityRequestsPerSecond: 20, GlobalClanWriteWorkers: 1, TargetPageMultiplier: 1, WarArchiveRequestsPerSecond: 20, WarArchiveScanSeconds: 1, WarArchivePackSize: 10000, WarArchiveEndpoint: "http://127.0.0.1:1", WarArchiveBucket: "disabled", WarArchiveAccessKeyID: "local", WarArchiveSecretAccessKey: "local", CWLRequestsPerSecond: 1, CWLWarRequestsPerSecond: 1, CWLSyncSeconds: 3600}, Logger: slog.New(slog.NewJSONHandler(os.Stdout, nil)), Clash: client, Valkey: cache, Stats: platform.NewTracker(), Availability: platform.NewAvailabilityGate(nil)}
 	}
 	app := newApp()
 	runCtx, cancel := context.WithCancel(ctx)
@@ -216,6 +228,15 @@ func main() {
 		_, err = db.Exec(ctx, `INSERT INTO war_schedule(schedule_key,war_id,source_clan_tag,opponent_tag,prep_time,end_time,next_run_at,war_type,war_tag) VALUES($1,$2,$3,$4,$5,$6,$6,$7,NULLIF($8,''))`, models.ComputeWarKey(pair[0], pair[1], prep), 200+i, pair[0], pair[1], prep, end, warType, warTag)
 		must(err)
 	}
+	// Both retained round representations must complete from the real archiver's
+	// final-war commit. An unresolved round must remain active even after that war.
+	_, err = db.Exec(ctx, `INSERT INTO cwl_groups(cwl_id,season,state,rounds) VALUES
+	 ('CWLArray0001','2026-11','inWar','[["#CCL"]]'),
+	 ('CWLObject001','2026-11','inWar','[{"warTags":["#CCL"]}]'),
+	 ('CWLPartial01','2026-11','inWar','[["#CCL"],["#0"]]');
+	 INSERT INTO cwl_group_clans(cwl_id,clan_tag)
+	 SELECT cwl_id,tag FROM cwl_groups CROSS JOIN (VALUES('#PYL'),('#PYC')) clans(tag)`)
+	must(err)
 	_, err = db.Exec(ctx, `UPDATE basic_clan SET last_active=$1 WHERE tag='#PYP'`, end.Add(time.Hour))
 	must(err)
 	mode.Store(3)
@@ -242,6 +263,12 @@ func main() {
 	must(db.QueryRow(ctx, `SELECT count(*) FROM war_schedule WHERE next_run_at>$1`, end).Scan(&remaining))
 	check(remaining == 1, "pending schedule not rescheduled")
 	fmt.Println("STORED_WARS_PASS regular_short_friendly_cwl=3 end_time_clans=5 newer_preserved=1 pending_clans_unchanged=2 concurrent_finalizers=2")
+	var completedGroups, incompleteGroups int
+	must(db.QueryRow(ctx, `SELECT count(*) FROM cwl_groups WHERE cwl_id IN ('CWLArray0001','CWLObject001') AND state='ended'`).Scan(&completedGroups))
+	must(db.QueryRow(ctx, `SELECT count(*) FROM cwl_groups WHERE cwl_id='CWLPartial01' AND state='inWar'`).Scan(&incompleteGroups))
+	check(completedGroups == 2 && incompleteGroups == 1, "CWL round-format completion or unresolved-round preservation failed")
+	fmt.Println("CWL_COMPLETION_PASS retained_formats=2 unresolved_group_preserved=1 concurrent_finalizers=2")
+
 	var streak, results int
 	must(db.QueryRow(ctx, `SELECT streak FROM war_triple_streaks WHERE player_tag='#LEFT0' AND townhall_level=18`).Scan(&streak))
 	check(streak == 2, "qualifying player did not receive exactly +2")
