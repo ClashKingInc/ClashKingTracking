@@ -198,6 +198,9 @@ func main() {
 		count, err := cache.Do(ctx, cache.B().Exists().Key("ps:#PYLQ").Build()).ToInt64()
 		return err == nil && count == 1
 	})
+	unchangedRevision := revision()
+	time.Sleep(1500 * time.Millisecond)
+	check(revision() == unchangedRevision, "Identical profile polls reopened automatic work")
 	// Drain the initial unrestricted polls before measuring the disabled
 	// trigger. A poll already in SQL can legitimately use the old selection.
 	stop()
