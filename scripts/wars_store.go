@@ -632,6 +632,9 @@ func upsertCWLGroups(ctx context.Context, tx pgx.Tx, rows []models.CWLGroupRow) 
 	return nil
 }
 
+// CWL snapshots repeat unchanged clans and rosters throughout each sweep. Skip
+// identical rows to avoid WAL/dead-tuple churn; changed values and the separate
+// stale-member deletion must still commit together with the group snapshot.
 const upsertCWLGroupClansSQL = `
 	INSERT INTO cwl_group_clans (cwl_id, clan_tag, name, clan_level, badge_token)
 	SELECT $1, snapshot.clan_tag, snapshot.name, snapshot.clan_level, snapshot.badge_token
@@ -640,6 +643,8 @@ const upsertCWLGroupClansSQL = `
 		name = EXCLUDED.name,
 		clan_level = EXCLUDED.clan_level,
 		badge_token = EXCLUDED.badge_token
+	WHERE (cwl_group_clans.name, cwl_group_clans.clan_level, cwl_group_clans.badge_token)
+		IS DISTINCT FROM (EXCLUDED.name, EXCLUDED.clan_level, EXCLUDED.badge_token)
 `
 
 const upsertCWLGroupMembersSQL = `
@@ -650,6 +655,8 @@ const upsertCWLGroupMembersSQL = `
 		clan_tag = EXCLUDED.clan_tag,
 		name = EXCLUDED.name,
 		town_hall = EXCLUDED.town_hall
+	WHERE (cwl_group_members.clan_tag, cwl_group_members.name, cwl_group_members.town_hall)
+		IS DISTINCT FROM (EXCLUDED.clan_tag, EXCLUDED.name, EXCLUDED.town_hall)
 `
 
 const deleteStaleCWLGroupMembersSQL = `
