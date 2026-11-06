@@ -50,8 +50,9 @@ type discordMutationMeta struct {
 }
 
 type discordCacheMutation struct {
-	Meta  discordMutationMeta
-	Apply func(context.Context, *pgxpool.Pool) error
+	Meta       discordMutationMeta
+	ObservedAt time.Time
+	Apply      func(context.Context, *pgxpool.Pool) error
 }
 
 type discordMutationQueue struct {
@@ -76,6 +77,7 @@ func (q *discordMutationQueue) Enqueue(ctx context.Context, mutation discordCach
 		q.mu.Unlock()
 		return 0, false
 	}
+	mutation.ObservedAt = time.Now()
 	q.items = append(q.items, mutation)
 	depth := len(q.items)
 	q.mu.Unlock()
@@ -898,15 +900,66 @@ func runDiscordGuildActivitySignals(ctx context.Context, app *platform.App, pool
 	}
 }
 
+// Checkpoints follow successful durable mutations. Combining these small writes
+// avoids a WAL flush per event without advancing past an unapplied permission
+// change. Use receipt time, not drain time: an old backlog must not look fresh.
 func runDiscordCacheWriter(
 	ctx context.Context,
 	pool *pgxpool.Pool,
 	mutations *discordMutationQueue,
 ) error {
+	type checkpoint struct {
+		ApplicationID string    `json:"application_id"`
+		ShardID       int       `json:"shard_id"`
+		ShardCount    int       `json:"shard_count"`
+		Generation    uuid.UUID `json:"generation"`
+		Sequence      int64     `json:"sequence"`
+		ObservedAt    time.Time `json:"observed_at"`
+	}
+	pending := make(map[int]checkpoint)
+	deadline := time.Now().Add(time.Second)
+	flush := func() error {
+		if len(pending) == 0 {
+			return nil
+		}
+		rows := make([]checkpoint, 0, len(pending))
+		for _, row := range pending {
+			rows = append(rows, row)
+		}
+		data, err := json.Marshal(rows)
+		if err != nil {
+			return err
+		}
+		_, err = pool.Exec(ctx, `
+   UPDATE discord_cache.gateway_shards shard
+   SET heartbeat_at = progress.observed_at,
+       last_applied_sequence = GREATEST(COALESCE(shard.last_applied_sequence, 0), progress.sequence)
+   FROM jsonb_to_recordset($1::jsonb) AS progress(
+    application_id text, shard_id integer, shard_count integer,
+    generation uuid, sequence bigint, observed_at timestamptz)
+   WHERE shard.application_id = progress.application_id
+     AND shard.shard_id = progress.shard_id AND shard.shard_count = progress.shard_count
+     AND shard.generation = progress.generation`, data)
+		if err == nil {
+			clear(pending)
+		}
+		return err
+	}
 	for {
-		mutation, ok := mutations.Dequeue(ctx)
+		if !time.Now().Before(deadline) {
+			if err := flush(); err != nil {
+				return err
+			}
+			deadline = time.Now().Add(time.Second)
+		}
+		waitCtx, cancel := context.WithDeadline(ctx, deadline)
+		mutation, ok := mutations.Dequeue(waitCtx)
+		cancel()
 		if !ok {
-			return ctx.Err()
+			if ctx.Err() != nil {
+				return ctx.Err()
+			}
+			continue
 		}
 		if mutation.Apply == nil {
 			continue
@@ -917,14 +970,8 @@ func runDiscordCacheWriter(
 		if mutation.Meta.Generation == uuid.Nil {
 			continue
 		}
-		if _, err := pool.Exec(ctx, `
-				UPDATE discord_cache.gateway_shards
-				SET heartbeat_at = now(),
-					last_applied_sequence = GREATEST(COALESCE(last_applied_sequence, 0), $5)
-				WHERE application_id = $1 AND shard_id = $2 AND shard_count = $3 AND generation = $4
-		`, mutation.Meta.ApplicationID, mutation.Meta.ShardID, mutation.Meta.ShardCount, mutation.Meta.Generation, mutation.Meta.Sequence); err != nil {
-			return err
-		}
+		meta := mutation.Meta
+		pending[meta.ShardID] = checkpoint{meta.ApplicationID, meta.ShardID, meta.ShardCount, meta.Generation, meta.Sequence, mutation.ObservedAt}
 	}
 }
 
