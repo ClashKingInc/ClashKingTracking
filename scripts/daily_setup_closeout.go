@@ -116,7 +116,8 @@ func (s *timescaleScheduledStore) rebuildDailyArmySetups(ctx context.Context, da
 
 // The normal closeout shares its transaction and lock with metadata writes, so
 // neither half becomes visible if setup classification or persistence fails.
-func rebuildDailyArmySetupsTx(ctx context.Context, tx pgx.Tx, day time.Time, static *clashy.StaticData) (int, error) {
+func rebuildDailyArmySetupsTx(ctx context.Context, tx pgx.Tx, day time.Time, static armyMetadata) (int, error) {
+	static = cacheArmyMetadata(static)
 	var snapshot bool
 	if err := tx.QueryRow(ctx, `SELECT EXISTS(SELECT 1 FROM legend_rankings_history WHERE day=$1)`, day).Scan(&snapshot); err != nil {
 		return 0, err
@@ -182,7 +183,7 @@ func rebuildDailyArmySetupsTx(ctx context.Context, tx pgx.Tx, day time.Time, sta
 	return writes, nil
 }
 
-func readSetupAttacks(ctx context.Context, tx pgx.Tx, day time.Time, static *clashy.StaticData) ([]setupAttack, error) {
+func readSetupAttacks(ctx context.Context, tx pgx.Tx, day time.Time, static armyMetadata) ([]setupAttack, error) {
 	start, end := legendDayWindow(day)
 	rows, err := tx.Query(ctx, `SELECT battle.player_tag,coalesce(battle.share_code,''),history.global_rank,
 		battle.stars,battle.destruction_percentage
@@ -210,7 +211,7 @@ func readSetupAttacks(ctx context.Context, tx pgx.Tx, day time.Time, static *cla
 // The share code has already been normalized to put the selected siege in the
 // Clan Castle section. This records the siege actually used by each attack,
 // including codes where it was originally exported in the main army section.
-func normalizedSetupSiegeID(static *clashy.StaticData, code string) int {
+func normalizedSetupSiegeID(static armyMetadata, code string) int {
 	for key := range parseArmyColumns(code) {
 		section, localID := splitArmyColumn(key)
 		if section != "i" {
@@ -224,7 +225,7 @@ func normalizedSetupSiegeID(static *clashy.StaticData, code string) int {
 	return 0
 }
 
-func normalizeSetupArmyCode(static *clashy.StaticData, source string) string {
+func normalizeSetupArmyCode(static armyMetadata, source string) string {
 	code, err := normalizeArmyShareCodeChecked(source)
 	if err != nil || code == "" {
 		return ""
@@ -271,7 +272,7 @@ func normalizeSetupArmyCode(static *clashy.StaticData, source string) string {
 	return strings.Join(parts, "")
 }
 
-func recipeForSetup(static *clashy.StaticData, code string, attacks int64) armyfamily.DailyRecipe {
+func recipeForSetup(static armyMetadata, code string, attacks int64) armyfamily.DailyRecipe {
 	recipe := armyfamily.DailyRecipe{Code: code, Attacks: attacks, TroopHousing: map[int]int{}, Spells: map[int]int{}}
 	if code == "" {
 		return recipe
@@ -289,7 +290,7 @@ func recipeForSetup(static *clashy.StaticData, code string, attacks int64) armyf
 	return recipe
 }
 
-func calculateDailySetups(attacks []setupAttack, static *clashy.StaticData) ([]*setupCohort, armyfamily.DailyResult, error) {
+func calculateDailySetups(attacks []setupAttack, static armyMetadata) ([]*setupCohort, armyfamily.DailyResult, error) {
 	usage := map[string]int64{}
 	for _, attack := range attacks {
 		usage[attack.code]++
