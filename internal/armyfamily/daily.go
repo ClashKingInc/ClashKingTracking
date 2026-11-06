@@ -133,25 +133,29 @@ func ClassifyDaily(input []DailyRecipe, options DailyOptions) DailyResult {
 		evidenceKeys[i] = recipeEvidenceKey(rows[i])
 	}
 	type prototype struct {
-		housing map[int]int
-		members []int
-		core    []int
+		housing      map[int]int
+		housingTotal int
+		members      []int
+		core         []int
 	}
 	prototypes := []prototype{}
 	for i, row := range rows {
+		// Recipes and prototypes do not change during matching. Cache their
+		// positive housing totals instead of rescanning both maps per comparison.
+		rowHousingTotal := housingTotal(row.TroopHousing)
 		best, overlap := -1, .8
 		for j, p := range prototypes {
 			if !sameIdentitySupport(row.TroopHousing, p.housing, options.IdentitySupportTroops) ||
-				!sameConditionalDominance(row.TroopHousing, p.housing, options.ConditionalCoreTroops) {
+				!sameConditionalDominance(row.TroopHousing, p.housing, rowHousingTotal, p.housingTotal, options.ConditionalCoreTroops) {
 				continue
 			}
-			s := troopOverlap(row.TroopHousing, p.housing, options.SupportTroops, options.ConditionalCoreTroops)
+			s := troopOverlap(row.TroopHousing, p.housing, rowHousingTotal, p.housingTotal, options.SupportTroops, options.ConditionalCoreTroops)
 			if s >= overlap {
 				best, overlap = j, s
 			}
 		}
 		if best < 0 {
-			prototypes = append(prototypes, prototype{housing: row.TroopHousing, members: []int{i}})
+			prototypes = append(prototypes, prototype{housing: row.TroopHousing, housingTotal: rowHousingTotal, members: []int{i}})
 		} else {
 			prototypes[best].members = append(prototypes[best].members, i)
 		}
@@ -299,8 +303,7 @@ func sameIdentitySupport(a, b map[int]int, identity map[int]bool) bool {
 	return true
 }
 
-func sameConditionalDominance(a, b map[int]int, conditional map[int]bool) bool {
-	at, bt := housingTotal(a), housingTotal(b)
+func sameConditionalDominance(a, b map[int]int, at, bt int, conditional map[int]bool) bool {
 	for id, enabled := range conditional {
 		if enabled && (at > 0 && 4*a[id] >= at) != (bt > 0 && 4*b[id] >= bt) {
 			return false
@@ -321,9 +324,8 @@ func housingTotal(m map[int]int) int {
 	return n
 }
 
-func troopOverlap(a, b map[int]int, support, conditional map[int]bool) float64 {
+func troopOverlap(a, b map[int]int, aTotal, bTotal int, support, conditional map[int]bool) float64 {
 	var at, bt, shared float64
-	aTotal, bTotal := housingTotal(a), housingTotal(b)
 	weightFor := func(id int) float64 {
 		if support[id] || conditional[id] && 4*a[id] < aTotal && 4*b[id] < bTotal {
 			return .15
