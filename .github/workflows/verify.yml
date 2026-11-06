@@ -85,3 +85,5 @@ jobs:
 
       - name: Verify raw Legend Discord delivery without profile requests
         run: bash .ci-schema/scripts/with-test-integration.sh --profile retained-api -- go run -race ./cmd/verify-legend-delivery
+      - name: Verify repeated CWL snapshots
+        run: bash .ci-schema/scripts/with-test-integration.sh --profile retained-api -- go run -race ./cmd/verify-cwl-snapshots
