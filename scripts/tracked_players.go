@@ -485,6 +485,7 @@ func (d *trackedPlayersDomain) doPlayer(
 		lastOnline = &now
 	}
 	ingest := models.TrackedPlayerIngest{
+		AccountChanged: true,
 		Players:        []models.BasicPlayerRow{trackedPlayerRow(player)},
 		ProfileChanges: changes,
 		StatChanges:    statChanges,

@@ -28,6 +28,7 @@ type PlayerStatChangeRow struct {
 }
 
 type TrackedPlayerIngest struct {
+	AccountChanged   bool
 	Players          []BasicPlayerRow
 	ProfileChanges   []PlayerProfileChangeRow
 	StatChanges      []PlayerStatChangeRow

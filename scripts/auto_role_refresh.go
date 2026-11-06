@@ -39,7 +39,8 @@ const queueAutoRoleRefreshSQL = `
    due_at=CASE WHEN role_refresh_jobs.completed_at IS NOT NULL THEN EXCLUDED.due_at
      WHEN $3::text[] @> ARRAY['member_join']::text[] THEN now()
      WHEN role_refresh_jobs.grace_until IS NOT NULL THEN role_refresh_jobs.grace_until
-     ELSE EXCLUDED.due_at END,
+     WHEN EXCLUDED.grace_until IS NOT NULL THEN EXCLUDED.grace_until
+     ELSE LEAST(role_refresh_jobs.due_at,EXCLUDED.due_at) END,
    grace_until=CASE WHEN role_refresh_jobs.completed_at IS NOT NULL THEN EXCLUDED.grace_until
      WHEN $3::text[] @> ARRAY['member_join']::text[] THEN NULL ELSE COALESCE(role_refresh_jobs.grace_until,EXCLUDED.grace_until) END,
    revision=role_refresh_jobs.revision+1,attempts=0,completed_at=NULL,result=NULL,updated_at=now()
@@ -59,6 +60,13 @@ func (s *timescaleTrackedPlayerStore) QueueRoleRefresh(ctx context.Context, tag,
 	return queueAutoRoleRefresh(ctx, s.pool, tag, clanTag, triggers...)
 }
 func queuePlayerRoleRefreshes(ctx context.Context, store trackedPlayerStore, ingest models.TrackedPlayerIngest) error {
+	// Observation timestamps are written on every poll, even for identical
+	// profiles. Only a real comparison change may reopen automatic work;
+	// otherwise unchanged polls reset retries and perpetually rebuild the queue.
+	// First-seen baselines are not changes and must not replay old account state.
+	if !ingest.AccountChanged {
+		return nil
+	}
 	sink, ok := store.(roleRefreshSink)
 	if !ok {
 		return nil
