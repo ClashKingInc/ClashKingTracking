@@ -57,6 +57,9 @@ jobs:
       - name: Verify retained reminder webhook delivery
         run: bash .ci-schema/scripts/with-test-integration.sh --profile retained-api -- go run ./cmd/verify-reminder-webhooks
 
+      - name: Verify reminder global avatar fallback
+        run: bash .ci-schema/scripts/with-test-integration.sh --profile retained-api -- env CLASHKING_E2E_GLOBAL_AVATAR=1 go run ./cmd/verify-reminder-webhooks
+
       - name: Verify giveaway migration cutover
         run: bash .ci-schema/scripts/with-test-integration.sh --profile retained-api -- go run ./cmd/verify-giveaway-cutover
 

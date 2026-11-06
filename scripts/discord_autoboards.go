@@ -211,7 +211,7 @@ func (w *discordDeliveryWorker) deliverDonationBoard(ctx context.Context, board 
 	}
 	if (board.Mode == "send" || messageID == "") && err == nil {
 		var message *discord.Message
-		message, err = w.client.Rest.CreateWebhookMessage(webhookID, target.Secret, discord.WebhookMessageCreate{Embeds: embeds, AllowedMentions: mentions}, rest.CreateWebhookMessageParams{Wait: true, ThreadID: threadID})
+		message, err = w.createWebhookMessage(ctx, target.ServerID, webhookID, target.Secret, discord.WebhookMessageCreate{Embeds: embeds, AllowedMentions: mentions}, rest.CreateWebhookMessageParams{Wait: true, ThreadID: threadID})
 		if err == nil && message != nil {
 			messageID = message.ID.String()
 		}

@@ -176,7 +176,7 @@ func (w *discordDeliveryWorker) deliverFarmingBoard(ctx context.Context, b farmi
 	}
 	if messageID == "" && err == nil {
 		var message *discord.Message
-		message, err = w.client.Rest.CreateWebhookMessage(webhookID, target.Secret, discord.WebhookMessageCreate{Embeds: embeds, AllowedMentions: mentions}, rest.CreateWebhookMessageParams{Wait: true, ThreadID: threadID})
+		message, err = w.createWebhookMessage(ctx, target.ServerID, webhookID, target.Secret, discord.WebhookMessageCreate{Embeds: embeds, AllowedMentions: mentions}, rest.CreateWebhookMessageParams{Wait: true, ThreadID: threadID})
 		if err == nil && message != nil {
 			messageID = message.ID.String()
 		}

@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"sort"
 	"strings"
+	"time"
 
 	"github.com/disgoorg/snowflake/v2"
 )
@@ -40,29 +41,65 @@ func discordReminderMessages(event mobileWarEvent, minutes int, custom string, l
 		return nil
 	}
 	sort.SliceStable(members, func(i, j int) bool {
-		return intValue(members[i]["townhall"]) > intValue(members[j]["townhall"])
+		a, b := intValue(members[i]["townhall"]), intValue(members[j]["townhall"])
+		if a != b {
+			return a > b
+		}
+		return strings.ToLower(stringMapValue(members[i], "name")) < strings.ToLower(stringMapValue(members[j], "name"))
 	})
-	title := map[string]string{"war": "War attacks", "raid": "Clan Capital", "clan_games": "Clan Games", "roster": "Roster"}[kind]
-	if preparing {
-		title = "War preparation"
-	}
-	// Ignore unsupported or retired reminder events still present in the stream.
-	if title == "" {
-		return nil
-	}
+	// Match the current Bot /reminders layout. Keep configured recipient
+	// selection upstream; presentation must not silently reset saved filters.
 	clan, _ := mapValue(event.Value["clan"])
-	if kind == "war" && stringMapValue(clan, "name") == "" {
-		clan, _ = discordWarSides(war, event.ClanTag)
+	own, opponent := discordWarSides(war, event.ClanTag)
+	if kind == "war" {
+		clan = own
 	}
 	name := firstDiscordString(stringMapValue(clan, "name"), event.ClanTag)
-	lines := []string{"⏰ **" + title + " reminder — " + discordLabel(name) + "**"}
-	if preparing && !discordWarTime(stringMapValue(war, "startTime")).IsZero() {
-		lines = append(lines, fmt.Sprintf("War starts <t:%d:R>", discordWarTime(stringMapValue(war, "startTime")).Unix()))
-	} else if minutes > 0 {
-		lines = append(lines, formatReminderTime(minutes)+" remaining")
+	var lines []string
+	stamp := func(label string, t time.Time) string {
+		if t.IsZero() {
+			return fmt.Sprintf("⏰ %s remaining", formatReminderTime(minutes))
+		}
+		return fmt.Sprintf("⏰ **%s <t:%d:R>**", label, t.Unix())
 	}
-	if custom != "" {
-		lines = append(lines, discordClip(custom, 1000))
+	switch kind {
+	case "war":
+		if preparing {
+			lines = append(lines, stamp("War starts", discordWarTime(stringMapValue(war, "startTime"))))
+		} else {
+			lines = append(lines, stamp("War ends", discordWarTime(stringMapValue(war, "endTime"))))
+		}
+		lines = append(lines, fmt.Sprintf("📌 **%s vs %s**", discordReminderLabel(name), discordReminderLabel(stringMapValue(opponent, "name"))))
+		if preparing {
+			lines = append(lines, "Prepare for battle day.")
+		} else {
+			count := func(side map[string]any) int {
+				n := 0
+				for _, raw := range anyList(side["members"]) {
+					m, _ := mapValue(raw)
+					n += len(anyList(m["attacks"]))
+				}
+				return n
+			}
+			lines = append(lines, fmt.Sprintf("⚔️ %d/%d  ⭐ %d/%d", count(own), count(opponent), intValue(own["stars"]), intValue(opponent["stars"])))
+		}
+	case "raid":
+		raid, _ := mapValue(event.Value["raid"])
+		lines = append(lines, "**"+discordReminderLabel(name)+" Raid Weekend**")
+		if end := discordWarTime(stringMapValue(raid, "endTime")); !end.IsZero() {
+			lines = append(lines, fmt.Sprintf("⏰ Ends <t:%d:R>", end.Unix()))
+		}
+	case "clan_games":
+		at := event.Timestamp.UTC()
+		if at.IsZero() {
+			at = time.Now().UTC()
+		}
+		end := time.Date(at.Year(), at.Month(), 28, 8, 0, 0, 0, time.UTC)
+		lines = append(lines, "**"+discordReminderLabel(name)+" Clan Games**", fmt.Sprintf("⏰ Ends <t:%d:R>", end.Unix()))
+	case "roster":
+		lines = append(lines, "⏰ **Roster reminder — "+discordReminderLabel(name)+"**")
+	default:
+		return nil
 	}
 	for _, member := range members {
 		tag := stringMapValue(member, "tag")
@@ -72,40 +109,62 @@ func discordReminderMessages(event mobileWarEvent, minutes int, custom string, l
 		if stringMapValue(member, "name") == "" {
 			member["name"] = tag
 		}
-		detail := ""
+		count := ""
 		switch kind {
 		case "war":
+			total := discordWarAttacksPerMember(event, war)
+			if value := intValue(member["total_attacks"]); value > 0 {
+				total = value
+			}
 			remaining := intValue(member["remaining"])
-			if total := intValue(member["total_attacks"]); total > 0 {
+			if _, provided := member["total_attacks"]; provided {
 				remaining = total - intValue(member["attacks"])
 			}
-			detail = fmt.Sprintf(" · %d attacks left", remaining)
 			if preparing {
-				detail = fmt.Sprintf(" · %d attacks available on battle day", remaining)
+				remaining = total
 			}
+			if remaining <= 0 {
+				continue
+			}
+			count = fmt.Sprintf("(%d/%d) ", remaining, total)
 		case "raid":
-			remaining := intValue(member["remaining_attacks"])
-			if total := intValue(member["total_attacks"]); total > 0 {
-				remaining = total - intValue(member["attacks"])
+			total := intValue(member["total_attacks"])
+			remaining := total - intValue(member["attacks"])
+			if total == 0 {
+				remaining = intValue(member["remaining_attacks"])
+				if remaining == 0 {
+					remaining = intValue(member["remaining"])
+				}
+				count = fmt.Sprintf("(%d left) ", remaining)
+			} else {
+				count = fmt.Sprintf("(%d/%d) ", remaining, total)
 			}
-			if remaining == 0 {
-				remaining = intValue(member["remaining"])
-			}
-			detail = fmt.Sprintf(" · %d attacks left", remaining)
 		case "clan_games":
-			detail = fmt.Sprintf(" · %s points", discordCompactNumber(intValue(member["points"])))
+			count = fmt.Sprintf("(%d/4,000) ", intValue(member["points"]))
 		}
 		mentions := make([]string, 0, len(linked[tag]))
 		for _, user := range linked[tag] {
 			mentions = append(mentions, "<@"+user.String()+">")
 		}
+		identity := tag
 		if len(mentions) > 0 {
-			detail += " · " + strings.Join(mentions, " ")
+			identity = strings.Join(mentions, " ")
 		}
-		lines = append(lines, icons.th(intValue(member["townhall"]))+discordPlayerLink(member)+detail)
+		hall := intValue(member["townhall"])
+		icon := icons.icon(fmt.Sprintf("th%d", hall), fmt.Sprintf("TH%d", hall))
+		lines = append(lines, count+icon+" "+discordReminderLabel(stringMapValue(member, "name"))+" | "+identity)
 	}
+	if custom != "" {
+		lines = append(lines, discordClip(custom, 1000))
+	}
+
 	if len(lines) == 0 {
 		return nil
 	}
 	return discordLineChunks(lines, 1900)
+}
+
+// Same escaping as the Bot command; names are plain text beside the identity.
+func discordReminderLabel(value string) string {
+	return strings.NewReplacer("\\", "\\\\", "`", "\\`", "*", "\\*", "_", "\\_", "~", "\\~", "|", "\\|", ">", "\\>", "[", "\\[", "]", "\\]", "\n", " ").Replace(value)
 }

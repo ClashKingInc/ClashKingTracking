@@ -88,7 +88,7 @@ func (w *discordDeliveryWorker) deliverWarPanel(ctx context.Context, event mobil
 		}
 	}
 	createParams := rest.CreateWebhookMessageParams{Wait: true, ThreadID: params.ThreadID, WithComponents: true}
-	created, err := w.client.Rest.CreateWebhookMessage(webhookID, resolved.Secret, discord.WebhookMessageCreate{
+	created, err := w.createWebhookMessage(ctx, resolved.ServerID, webhookID, resolved.Secret, discord.WebhookMessageCreate{
 		Embeds: message.Embeds, Components: message.Components, AllowedMentions: &discord.AllowedMentions{Parse: []discord.AllowedMentionType{}},
 	}, createParams)
 	if err != nil {

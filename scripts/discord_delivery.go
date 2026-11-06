@@ -152,6 +152,7 @@ func validateDiscordDeliveryConfig(cfg platform.Config, client valkey.Client) er
 }
 
 type discordDeliveryWorker struct {
+	profiles       map[string]discordWebhookProfile
 	emojis         map[string]string
 	nextEmojiLoad  time.Time
 	nextBoardCheck time.Time
@@ -756,7 +757,7 @@ func (w *discordDeliveryWorker) sendMessage(ctx context.Context, target discordD
 		if target.ThreadID != "" {
 			params.ThreadID = id
 		}
-		_, err = w.client.Rest.CreateWebhookMessage(webhookID, target.Secret, discord.WebhookMessageCreate{
+		_, err = w.createWebhookMessage(ctx, target.ServerID, webhookID, target.Secret, discord.WebhookMessageCreate{
 			Content: message.Content, Embeds: message.Embeds, Components: message.Components, Files: message.Files, AllowedMentions: message.AllowedMentions, Flags: message.Flags,
 		}, params)
 		return err
