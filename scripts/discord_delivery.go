@@ -34,20 +34,23 @@ const (
 type discordDeliveryDomain struct{}
 
 type discordDeliveryTarget struct {
-	ServerID     string
-	ChannelID    string
-	ThreadID     string
-	Custom       string
-	Config       string
-	ConfigID     string
-	WebhookID    string
-	LogType      string
-	ClanTag      string
-	ActiveWarID  string
-	MessageID    string
-	RedditRoleID string
-	Revision     time.Time
-	Secret       string
+	ServerID              string
+	ChannelID             string
+	ThreadID              string
+	Custom                string
+	Config                string
+	ConfigID              string
+	WebhookID             string
+	LogType               string
+	ClanTag               string
+	ActiveWarID           string
+	MessageID             string
+	RedditRoleID          string
+	RedditAccounts        []string
+	RedditMinTownhall     int
+	RedditIncludeComments bool
+	Revision              time.Time
+	Secret                string
 }
 
 func NewDiscordDeliveryDomain() platform.Domain { return &discordDeliveryDomain{} }
@@ -507,7 +510,7 @@ func (w *discordDeliveryWorker) deliverLogEvent(ctx context.Context, event mobil
 	}
 	query := `
 		SELECT server_id, COALESCE(clan_tag, ''), type, webhook_id, COALESCE(thread_id, ''), updated_at,
-		       COALESCE(active_war_id, ''), COALESCE(message_id, ''), COALESCE(reddit_role_id, '')
+		       COALESCE(active_war_id, ''), COALESCE(message_id, ''), COALESCE(reddit_role_id, ''), reddit_accounts, COALESCE(reddit_min_townhall,0), reddit_include_comments
 		FROM server_logs
 		WHERE disabled = false AND type = ANY($1)
 	`
@@ -520,8 +523,15 @@ func (w *discordDeliveryWorker) deliverLogEvent(ctx context.Context, event mobil
 		}
 		// Reddit usernames are case-insensitive. Keep stored spelling but match
 		// the original post author exactly; never send every comment to every feed.
-		query += ` AND EXISTS (SELECT 1 FROM unnest(reddit_accounts) account WHERE lower(account)=lower($2))`
+		query += ` AND type='reddit_user_feed' AND reddit_include_comments AND EXISTS (SELECT 1 FROM unnest(reddit_accounts) account WHERE lower(account)=lower($2))`
 		args = append(args, author)
+	}
+	if event.Topic == "reddit" && stringMapValue(event.Value, "type") != "redditcomment" {
+		data, _ := mapValue(event.Value["data"])
+		searching, _ := data["searching"].(bool)
+		// Discard unrelated authors before any player lookups or webhook reads.
+		query += ` AND ((type='reddit_feed' AND $2) OR (type='reddit_user_feed' AND EXISTS (SELECT 1 FROM unnest(reddit_accounts) account WHERE lower(account)=lower($3))))`
+		args = append(args, searching, stringMapValue(data, "author"))
 	}
 	if event.Topic != "reddit" && event.Topic != "maintenance" {
 		query += ` AND clan_tag = $2`
@@ -534,7 +544,7 @@ func (w *discordDeliveryWorker) deliverLogEvent(ctx context.Context, event mobil
 	var targets []discordDeliveryTarget
 	for rows.Next() {
 		var target discordDeliveryTarget
-		if err := rows.Scan(&target.ServerID, &target.ClanTag, &target.LogType, &target.WebhookID, &target.ThreadID, &target.Revision, &target.ActiveWarID, &target.MessageID, &target.RedditRoleID); err != nil {
+		if err := rows.Scan(&target.ServerID, &target.ClanTag, &target.LogType, &target.WebhookID, &target.ThreadID, &target.Revision, &target.ActiveWarID, &target.MessageID, &target.RedditRoleID, &target.RedditAccounts, &target.RedditMinTownhall, &target.RedditIncludeComments); err != nil {
 			rows.Close()
 			return err
 		}
@@ -556,7 +566,54 @@ func (w *discordDeliveryWorker) deliverLogEvent(ctx context.Context, event mobil
 		}
 	}
 	var deliveryErr error
+	var redditProfiles []map[string]any
+	if event.Topic == "reddit" && stringMapValue(event.Value, "type") != "redditcomment" && len(targets) > 0 {
+		data, _ := mapValue(event.Value["data"])
+		redditProfiles = w.redditPlayers(ctx, data)
+	}
 	for _, target := range targets {
+		if event.Topic == "reddit" {
+			data, _ := mapValue(event.Value["data"])
+			if stringMapValue(event.Value, "type") != "redditcomment" {
+				if target.LogType == "reddit_user_feed" {
+					author := stringMapValue(data, "author")
+					matched := false
+					for _, account := range target.RedditAccounts {
+						if strings.EqualFold(account, author) {
+							matched = true
+							break
+						}
+					}
+					if !matched {
+						continue
+					}
+				} else {
+					searching, _ := data["searching"].(bool)
+					if !searching {
+						continue
+					}
+				}
+				var chosen map[string]any
+				if len(redditProfiles) > 0 {
+					chosen = redditProfiles[0]
+				}
+				if target.LogType == "reddit_feed" && target.RedditMinTownhall > 0 {
+					profileMatch := false
+					for _, profile := range redditProfiles {
+						if intValue(profile["townHallLevel"]) >= target.RedditMinTownhall {
+							chosen = profile
+							profileMatch = true
+							break
+						}
+					}
+					if !profileMatch && redditTitleLevel(stringMapValue(data, "title")) < target.RedditMinTownhall {
+						continue
+					}
+				}
+				event.Value["reddit_player"] = chosen
+			}
+		}
+
 		if !w.app.Config.AllowsDiscordGuild(target.ServerID) {
 			continue
 		}
@@ -602,7 +659,7 @@ func (w *discordDeliveryWorker) deliverLogEvent(ctx context.Context, event mobil
 			continue
 		}
 		for _, message := range discordLogMessages(event, target.LogType, w.emojis) {
-			if target.LogType == "reddit_feed" && target.RedditRoleID != "" {
+			if (target.LogType == "reddit_feed" || target.LogType == "reddit_user_feed") && target.RedditRoleID != "" {
 				role, err := snowflake.Parse(target.RedditRoleID)
 				if err != nil {
 					deliveryErr = errors.Join(deliveryErr, fmt.Errorf("invalid Reddit role for server %s", target.ServerID))
@@ -943,7 +1000,7 @@ func discordEventLogTypes(event mobileWarEvent) []string {
 			return out
 		}
 	case "reddit":
-		return []string{"reddit_feed"}
+		return []string{"reddit_feed", "reddit_user_feed"}
 	}
 	return nil
 }

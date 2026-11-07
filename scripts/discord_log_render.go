@@ -65,7 +65,7 @@ func discordLogMessages(event mobileWarEvent, logType string, catalogs ...map[st
 			}
 		}
 		return discordFieldMessages(embed)
-	case "reddit_feed":
+	case "reddit_feed", "reddit_user_feed":
 		data, _ := mapValue(event.Value["data"])
 		if stringMapValue(event.Value, "type") == "redditcomment" {
 			permalink := stringMapValue(data, "url")
@@ -89,7 +89,11 @@ func discordLogMessages(event mobileWarEvent, logType string, catalogs ...map[st
 		embed.Description = discordClip(embed.Description, 4096)
 		message := discord.MessageCreate{Embeds: []discord.Embed{embed}}
 		if parsed, err := url.Parse(postURL); err == nil && parsed.Scheme == "https" && parsed.Host != "" && len(postURL) <= 512 {
-			message.Components = []discord.LayoutComponent{discord.NewActionRow(discord.NewLinkButton("Post Link", postURL))}
+			buttons := []discord.InteractiveComponent{discord.NewLinkButton("Post Link", postURL).WithEmoji(redditButtonEmoji(icons.icon("reddit_icon", "🔗")))}
+			if player, ok := mapValue(event.Value["reddit_player"]); ok && stringMapValue(player, "tag") != "" {
+				buttons = append(buttons, discord.NewSuccessButton("Player Profile", "redditplayer_"+stringMapValue(player, "tag")).WithEmoji(redditButtonEmoji(icons.icon("troop", "⚔️"))))
+			}
+			message.Components = []discord.LayoutComponent{discord.NewActionRow(buttons...)}
 		}
 		return []discord.MessageCreate{message}
 	case "war_log":
