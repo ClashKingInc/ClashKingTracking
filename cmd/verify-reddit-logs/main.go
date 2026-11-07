@@ -8,6 +8,7 @@ import (
 	"encoding/base64"
 	"encoding/json"
 	"fmt"
+	clashy "github.com/clashkinginc/clashy.go"
 	"github.com/jackc/pgx/v5/pgxpool"
 	"github.com/valkey-io/valkey-go"
 	"log/slog"
@@ -50,6 +51,8 @@ func main() {
 	provider := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "application/json")
 		switch {
+		case strings.HasPrefix(r.URL.Path, "/v1/players/"):
+			fmt.Fprint(w, `{"tag":"#PYPYVQ28","name":"Fixture player","townHallLevel":18}`)
 		case strings.HasSuffix(r.URL.Path, "/emojis"):
 			fmt.Fprint(w, `{"items":[]}`)
 		case strings.HasSuffix(r.URL.Path, "/webhooks/"+hook):
@@ -75,26 +78,54 @@ func main() {
 	defer provider.Close()
 	_, e = db.Exec(ctx, "INSERT INTO servers(id,name) VALUES($1,'Reddit fixture')", guild)
 	must(e)
-	_, e = db.Exec(ctx, "INSERT INTO server_logs(server_id,clan_tag,type,webhook_id,thread_id,reddit_role_id,reddit_accounts) VALUES($1,NULL,'reddit_feed',$2,$3,'999999999999992899',ARRAY['Recruiter'])", guild, hook, thread)
+	_, e = db.Exec(ctx, "INSERT INTO server_logs(server_id,clan_tag,type,webhook_id,thread_id,reddit_role_id,reddit_accounts) VALUES($1,NULL,'reddit_feed',$2,$3,'999999999999992899','{}')", guild, hook, thread)
 	must(e)
+	_, e = db.Exec(ctx, "UPDATE server_logs SET reddit_min_townhall=16 WHERE server_id=$1", guild)
+	must(e)
+	_, e = db.Exec(ctx, "INSERT INTO server_logs(server_id,type,webhook_id,thread_id,reddit_role_id,reddit_accounts,reddit_include_comments) VALUES($1,'reddit_user_feed',$2,$3,'999999999999992899',ARRAY['Recruiter','Second'],true)", guild, hook, thread)
+	must(e)
+	cfg := clashy.DefaultClientConfig()
+	cfg.BaseURL = provider.URL + "/v1"
+	cfg.LookupCache = false
+	cfg.UpdateCache = false
+	client, e := clashy.NewClient(cfg)
+	must(e)
+	defer client.Close()
 	stream := fmt.Sprintf("reddit-log-fixture:%d", os.Getpid())
-	app := &platform.App{Config: platform.Config{TimescaleURL: dsn, ValkeyAddr: addr, DiscordBotToken: base64.RawStdEncoding.EncodeToString([]byte(appID)) + ".local.local", DiscordAPIURL: provider.URL, ClashKingAPIURL: provider.URL, ClashKingAPIToken: "fixture", DiscordDeliveryBatchSize: 10, EventStreamName: stream, EventStreamReclaimIdleSeconds: 1}, Valkey: cache, Logger: slog.New(slog.NewTextHandler(os.Stderr, nil)), Stats: platform.NewTracker(), Availability: platform.NewAvailabilityGate(nil)}
+	app := &platform.App{Config: platform.Config{TimescaleURL: dsn, ValkeyAddr: addr, DiscordBotToken: base64.RawStdEncoding.EncodeToString([]byte(appID)) + ".local.local", DiscordAPIURL: provider.URL, ClashKingAPIURL: provider.URL, ClashKingAPIToken: "fixture", DiscordDeliveryBatchSize: 10, EventStreamName: stream, EventStreamReclaimIdleSeconds: 1}, Clash: client, Valkey: cache, Logger: slog.New(slog.NewTextHandler(os.Stderr, nil)), Stats: platform.NewTracker(), Availability: platform.NewAvailabilityGate(nil)}
 	runCtx, stop := context.WithCancel(ctx)
 	defer stop()
 	done := make(chan error, 1)
 	go func() { done <- scripts.NewDiscordDeliveryDomain().Run(runCtx, app) }()
 	for _, event := range []map[string]any{
 		{"type": "redditcomment", "data": map[string]any{"submission_author": "Other", "author": "Commenter", "body": "DO_NOT_DELIVER", "url": "/r/ClashOfClansRecruit/comments/abc/comment1"}},
-		{"type": "reddit", "data": map[string]any{"title": "Searching", "selftext": "Looking for a clan", "url": "https://www.reddit.com/r/ClashOfClansRecruit/comments/abc", "comments_link": "https://www.reddit.com/r/ClashOfClansRecruit/comments/abc", "score": 1}},
+		{"type": "reddit", "data": map[string]any{"title": "Searching Townhall16", "searching": true, "author": "Other", "selftext": "Looking for a clan", "url": "https://www.reddit.com/r/ClashOfClansRecruit/comments/abc", "comments_link": "https://www.reddit.com/r/ClashOfClansRecruit/comments/abc", "score": 1}},
 		{"type": "redditcomment", "data": map[string]any{"submission_author": "recruiter", "author": "Commenter", "body": "An actual reply", "url": "/r/ClashOfClansRecruit/comments/abc/comment2", "score": 2}},
+		{"type": "reddit", "data": map[string]any{"title": "Searching TH10+ DO_NOT_DELIVER", "searching": true, "author": "Other", "selftext": "TH18", "url": "https://www.reddit.com/r/ClashOfClansRecruit/comments/low"}},
+		{"type": "reddit", "data": map[string]any{"title": "Searching TH15 #PYPYVQ28", "searching": true, "author": "Other", "url": "https://www.reddit.com/r/ClashOfClansRecruit/comments/player"}},
+		{"type": "reddit", "data": map[string]any{"title": "Recruiting", "searching": false, "author": "RECRUITER", "url": "https://www.reddit.com/r/ClashOfClansRecruit/comments/recruit"}},
+		{"type": "reddit", "data": map[string]any{"title": "Second user", "searching": false, "author": "Second", "url": "https://www.reddit.com/r/ClashOfClansRecruit/comments/second"}},
+		{"type": "reddit", "data": map[string]any{"title": "Searching TH14/15/16", "searching": true, "author": "Recruiter", "url": "https://www.reddit.com/r/ClashOfClansRecruit/comments/both"}},
 	} {
 		must(app.PublishEvent(ctx, platform.Event{Topic: "reddit", Timestamp: time.Now(), Value: event}))
 	}
 	until := time.Now().Add(15 * time.Second)
-	for sent.Load() < 2 && time.Now().Before(until) {
+	for sent.Load() < 7 && time.Now().Before(until) {
 		time.Sleep(30 * time.Millisecond)
 	}
-	check(sent.Load() == 2, "post and subscribed comment did not reach the thread")
+	time.Sleep(300 * time.Millisecond)
+	check(sent.Load() == 7, fmt.Sprintf("expected 7 matching deliveries, got %d", sent.Load()))
+	// No minimum preserves all Searching posts; disabling comments affects only replies.
+	_, e = db.Exec(ctx, "UPDATE server_logs SET reddit_min_townhall=NULL,reddit_include_comments=false WHERE server_id=$1", guild)
+	must(e)
+	must(app.PublishEvent(ctx, platform.Event{Topic: "reddit", Timestamp: time.Now(), Value: map[string]any{"type": "reddit", "data": map[string]any{"title": "Searching without level", "searching": true, "author": "Other", "url": "https://www.reddit.com/r/ClashOfClansRecruit/comments/any"}}}))
+	until = time.Now().Add(5 * time.Second)
+	for sent.Load() < 8 && time.Now().Before(until) {
+		time.Sleep(30 * time.Millisecond)
+	}
+	must(app.PublishEvent(ctx, platform.Event{Topic: "reddit", Timestamp: time.Now(), Value: map[string]any{"type": "redditcomment", "data": map[string]any{"submission_author": "Recruiter", "author": "Commenter", "body": "DO_NOT_DELIVER", "url": "/r/ClashOfClansRecruit/comments/abc/off"}}}))
+	time.Sleep(300 * time.Millisecond)
+	check(sent.Load() == 8, "Any Town Hall or comments-off contract failed")
 	stop()
 	select {
 	case <-done:

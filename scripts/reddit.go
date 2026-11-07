@@ -211,7 +211,7 @@ type redditPostEvent struct {
 }
 
 func redditPostEventFromGRAWPost(post *grawreddit.Post) (redditPostEvent, bool) {
-	if post == nil || post.ID == "" || post.LinkFlairText != "Searching" {
+	if post == nil || post.ID == "" {
 		return redditPostEvent{}, false
 	}
 	text := strings.TrimSpace(post.SelfText + " " + post.Title)
@@ -219,6 +219,8 @@ func redditPostEventFromGRAWPost(post *grawreddit.Post) (redditPostEvent, bool) 
 	commentsURL := fmt.Sprintf("https://www.reddit.com/r/%s/comments/%s", redditSubreddit, post.ID)
 	data := map[string]any{
 		"title":         post.Title,
+		"author":        post.Author,
+		"searching":     post.LinkFlairText == "Searching",
 		"selftext":      post.SelfText,
 		"score":         int(post.Score),
 		"url":           post.URL,

@@ -1,11 +1,14 @@
-# Reddit feed automation
+# Reddit feeds
 
-The `bot-automations` process runs the Reddit domain. It reads new posts and comments from `r/ClashOfClansRecruit` through graw. The request interval is `reddit.poll_seconds`; startup requires the configured Reddit credentials, Valkey, and the event stream.
+`bot-automations` reads posts and comments from r/ClashOfClansRecruit. Post events include author and Searching-flair status. Valkey keeps post/comment IDs for 30 days; failed publication clears the ID for the next observation.
 
-Posts with the `Searching` flair become `reddit` events. Comments become `redditcomment` events inside the same `reddit` stream topic and include the original submission author. Valkey keeps post/comment seen IDs for 30 days, with separate namespaces. A failed event publish clears that seen ID so the next observation can retry.
+`discord-delivery` applies each enabled destination independently:
 
-`discord-delivery` reads enabled `server_logs` rows of type `reddit_feed`. All configured feeds receive Searching posts. A comment is sent only when its submission author matches a stored `reddit_accounts` value, case-insensitively. The commenter is not the subscription target. The optional `reddit_role_id` is the only role allowed to be mentioned; arbitrary Reddit text cannot enable automatic mentions.
+- `reddit_feed`: Searching posts only. `reddit_min_townhall` is optional. A resolved player at or above the minimum OR an explicit qualifying Town Hall in the title permits delivery. Body text can supply player tags but never a title-level match. TH10+ means 10. Lists/ranges and case/spacing variations are accepted.
+- `reddit_user_feed`: every post by one of `reddit_accounts` (one or two usernames, case-insensitive), regardless of flair. `reddit_include_comments` optionally forwards comments on those users' posts; the submission author is matched, not the commenter.
 
-Destinations use the same owned webhook and optional thread as other logs. The producer does not create destinations. The DevKit `reddit_feeds.go` repair preserves legacy top-level channel settings, role mentions, and watched accounts. Deleted or inaccessible destinations retain their records for review. Delivery remains best-effort; there is no occurrence ledger.
+Both use owned webhooks and optional threads, preserve explicit role-only mentions, and include a Post Link with the Reddit emoji. Valid player tags add a Player Profile button; the Bot opens it privately using the current viewer's context. Player lookups are bounded and shared across destinations. Missing profiles do not prevent title-based matches.
 
-Validation: `cmd/verify-reddit-logs` runs the actual SQL/Valkey/Discord delivery service against a loopback provider. It checks posts, subscribed and unrelated comments, role allowlists, and forum threads. Live Reddit polling and public Discord sends are not simulated by that check.
+Migration 069 copies existing watched users into the separate feed at the same destination with comments enabled. New feeds default to comments off and no minimum. Application rollback must preserve the new settings columns/rows; destructive schema downgrade is blocked.
+
+Delivery stays best effort. No occurrence ledger or retry table is introduced. `cmd/verify-reddit-logs` exercises the actual SQL/Valkey/delivery path with loopback providers; it does not send real Discord messages.
