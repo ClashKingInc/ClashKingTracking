@@ -526,6 +526,13 @@ func (w *discordDeliveryWorker) deliverLogEvent(ctx context.Context, event mobil
 		query += ` AND type='reddit_user_feed' AND reddit_include_comments AND EXISTS (SELECT 1 FROM unnest(reddit_accounts) account WHERE lower(account)=lower($2))`
 		args = append(args, author)
 	}
+	if event.Topic == "reddit" && stringMapValue(event.Value, "type") != "redditcomment" {
+		data, _ := mapValue(event.Value["data"])
+		searching, _ := data["searching"].(bool)
+		// Discard unrelated authors before any player lookups or webhook reads.
+		query += ` AND ((type='reddit_feed' AND $2) OR (type='reddit_user_feed' AND EXISTS (SELECT 1 FROM unnest(reddit_accounts) account WHERE lower(account)=lower($3))))`
+		args = append(args, searching, stringMapValue(data, "author"))
+	}
 	if event.Topic != "reddit" && event.Topic != "maintenance" {
 		query += ` AND clan_tag = $2`
 		args = append(args, event.ClanTag)
