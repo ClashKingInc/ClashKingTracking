@@ -6,7 +6,7 @@
 
 ## When it runs
 
-It runs continuously as `trackedclans`. A clan loop, a regular current-war loop, and a live CWL loop share the `trackedclans.requests_per_second` limiter. The target registry is reloaded every `trackedclans.target_refresh_seconds`; the CWL loop wakes every `cwl.sync_seconds` and only calls CWL endpoints for a current active season.
+It runs continuously as `trackedclans`. A clan loop, a regular current-war loop, and a live CWL loop share the `trackedclans.requests_per_second` limiter. The target registry is reloaded every `trackedclans.target_refresh_seconds`; the live CWL loop runs continuously under the same limiter and only calls CWL endpoints for a current active season. `cwl.sync_seconds` controls the separate bulk CWL worker, not live event polling. Known active CWL clans skip the regular current-war endpoint; a regular-war loop with no eligible targets sleeps instead of spinning.
 
 ## How a clan becomes a target
 
@@ -61,6 +61,8 @@ store current live snapshot
 For CWL, the live loop keeps explicit `battle` and `preparation` slots because a clan can have today's battle running while tomorrow's lineup is already in preparation. Each slot has its own war-tag snapshot, durable `war_schedule` row, participant timers, and reminders. A preparation war is never mislabeled as current just because it is round one. The entire 3rd remains a discovery day; a clan is marked as not participating only after that window closes.
 
 A clan with no current group is checked at most every 15 minutes during signup. Once a group exists but has not exposed its first war tags, it stays on the faster CWL loop so reminders are scheduled promptly. After tags are known, the tracker calls those tagged-war endpoints directly, refreshes the group only every 15 minutes or on a round transition, and shares each war-tag response across both participating tracked clans for the cycle.
+
+At a known preparation-to-battle transition, the tracker publishes both the battle announcement and any new attacks in that first battle response. These attacks are compared against the same war's preparation snapshot before the snapshot advances. First discovery without a prior same-war snapshot remains a baseline and does not replay historical attacks.
 
 Every CWL event includes `war_type: "cwl"`, `war_role`, `war_tag`, and `panel_target`. The one Discord panel follows events where `panel_target` is true: the ongoing battle wins, round-one preparation is eligible only while no battle exists, and preparation becomes the panel target when it enters `inWar`. The overlapping preparation war still emits `new_war` and `cwl_lineup_change` events with `panel_target: false`, allowing reminder and lineup consumers to act without replacing the battle panel. The separate `cwl` process remains responsible for the global durable group/member snapshot.
 
