@@ -147,6 +147,7 @@ func run() error {
 		if err := stage(ctx, conn, batch, outcomes, &stats); err != nil {
 			return err
 		}
+		fmt.Printf("staged physical=%d canonical=%d packs=%d\n", stats.PhysicalRows, stats.CanonicalWars, stats.Packs)
 		batch = nil
 		outcomes = nil
 		return nil
@@ -282,7 +283,8 @@ func run() error {
 			}
 			outcomes = append(outcomes, stagedOutcome{entry, o.Member, o.Clan, q, o.CreditedTriples})
 		}
-		if len(batch) >= 100 {
+		// Bound memory while amortizing SQL work across full archive pages.
+		if len(batch) >= 500 {
 			if err = flush(); err != nil {
 				return err
 			}
