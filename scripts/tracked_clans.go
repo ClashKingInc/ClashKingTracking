@@ -388,6 +388,17 @@ func runTrackedClanTracker[T any](
 	progressName := trackingProgressName(trackedClansDomainName, group)
 	for {
 		tags := domain.targetTags(group)
+		if group == "wars" {
+			eligible := make([]string, 0, len(tags))
+			for _, tag := range tags {
+				if !domain.isCWLActive(tag) {
+					eligible = append(eligible, tag)
+				}
+			}
+			// With every clan in CWL, an all-skipped regular loop would spin
+			// without ever acquiring the shared request limiter.
+			tags = eligible
+		}
 		if len(tags) == 0 {
 			if err := sleepOrDone(ctx, time.Second); err != nil {
 				return err
@@ -870,10 +881,6 @@ func (c *cwlCycleWarCache) fetch(ctx context.Context, warTag string, fetch func(
 }
 
 func (d *trackedClansDomain) runCWLLoop(ctx context.Context, app *platform.App, limiter *clashy.Limiter) error {
-	interval := time.Duration(app.Config.CWLSyncSeconds) * time.Second
-	if interval <= 0 {
-		interval = 3 * time.Minute
-	}
 	for {
 		start := time.Now()
 		err := d.runCWLCycle(ctx, app, limiter)
@@ -881,8 +888,16 @@ func (d *trackedClansDomain) runCWLLoop(ctx context.Context, app *platform.App, 
 		if err != nil {
 			return err
 		}
-		if err := sleepOrDone(ctx, interval); err != nil {
-			return err
+		// Live CWL shares the same limiter as regular-war and clan polling.
+		// CWLSyncSeconds belongs to the bulk history worker, not live feeds.
+		// Avoid a CPU spin when every target is a known nonparticipant.
+		d.activeCWLMu.RLock()
+		hasActive := len(d.activeCWL) > 0
+		d.activeCWLMu.RUnlock()
+		if !hasActive {
+			if err := sleepOrDone(ctx, time.Second); err != nil {
+				return err
+			}
 		}
 	}
 }
@@ -1226,7 +1241,8 @@ func (d *trackedClansDomain) handleCWLWarChange(
 			if err := app.PublishEvent(ctx, platform.Event{Topic: "war", ClanTag: clanTag, Value: base}); err != nil {
 				return err
 			}
-		} else if role == cwlWarPreparation && hasPrevious && previous != nil {
+		}
+		if role == cwlWarPreparation && !announce && hasPrevious && previous != nil {
 			if lineup := cwlLineupChanges(*previous, war); cwlLineupChanged(lineup) {
 				for key, value := range base {
 					lineup[key] = value
@@ -1235,7 +1251,10 @@ func (d *trackedClansDomain) handleCWLWarChange(
 					return err
 				}
 			}
-		} else if hasPrevious && previous != nil {
+		} else if role == cwlWarBattle && hasPrevious && previous != nil && sameWarIdentity(*previous, war) {
+			// A known preparation snapshot is a valid attack baseline even when
+			// this poll also announces battle start. Saving without this diff
+			// would permanently swallow every hit in the first battle response.
 			if attacks := newWarAttacks(*previous, war); len(attacks) > 0 {
 				attackEvent := cloneAnyMap(base)
 				attackEvent["type"] = "new_attacks"
@@ -1244,7 +1263,7 @@ func (d *trackedClansDomain) handleCWLWarChange(
 					return err
 				}
 			}
-			if previous.State != war.State {
+			if !announce && previous.State != war.State {
 				stateEvent := cloneAnyMap(base)
 				stateEvent["type"] = "war_state"
 				stateEvent["previous_war"] = json.RawMessage(jsonBytes(previous))
