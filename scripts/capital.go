@@ -73,7 +73,22 @@ func (d *capitalDomain) Run(ctx context.Context, app *platform.App) error {
 		}
 		targets := d.targetSnapshot()
 		if err := runBounded(ctx, platform.RequestConcurrency(app.Config.CapitalRequestsPerSecond), targets, func(workerCtx context.Context, target capitalTarget) error {
-			return d.pollTarget(workerCtx, app, limiter, target)
+			start := time.Now()
+			if err := d.pollTarget(workerCtx, app, limiter, target); err != nil {
+				if workerCtx.Err() != nil {
+					return workerCtx.Err()
+				}
+				// One clan's rejected or broken response must not stop raid
+				// collection for other clans. The next pass retries this target.
+				app.Logger.Error("capital target failed", "tag", target.Tag, "err", err)
+				app.Stats.SetReady(capitalDomainName, false, err.Error())
+				return nil
+			}
+			// Only a completed target proves recovery. Empty passes must not
+			// clear an upstream or storage failure without doing any work.
+			app.Stats.RecordProcess(capitalDomainName, time.Since(start))
+			app.Stats.SetReady(capitalDomainName, true, "")
+			return nil
 		}); err != nil {
 			return err
 		}

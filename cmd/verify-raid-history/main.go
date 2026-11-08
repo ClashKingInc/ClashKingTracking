@@ -51,9 +51,15 @@ func main() {
 	_, e = db.Exec(ctx, "INSERT INTO server_clans(server_id,tag) VALUES($1,$2)", guild, clan)
 	must(e)
 	var stage atomic.Int32
+	var deny atomic.Bool
 	var requests atomic.Int32
 	provider := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		requests.Add(1)
+		if deny.Load() {
+			w.WriteHeader(http.StatusForbidden)
+			fmt.Fprint(w, `{"reason":"accessDenied"}`)
+			return
+		}
 		check(r.URL.Query().Get("limit") == "10", "raid history not requested")
 		w.Header().Set("Content-Type", "application/json")
 		state, loot := "ended", 1000
@@ -78,10 +84,28 @@ func main() {
 	defer clash.Close()
 	app := &platform.App{Config: platform.Config{RunOnce: true, TimescaleURL: dsn, CapitalRequestsPerSecond: 10, CapitalTargetRefreshSeconds: 60, CapitalSnapshotPrefix: "raid-history-fixture:", EventStreamName: "raid-history-events"}, Clash: clash, Valkey: cache, Logger: slog.New(slog.NewTextHandler(os.Stderr, nil)), Stats: platform.NewTracker(), Availability: platform.NewAvailabilityGate(nil)}
 	run := func() { must(scripts.NewCapitalDomain().Run(ctx, app)) }
+	deny.Store(true)
+	run()
+	failed := false
+	for _, d := range app.Stats.Snapshot().Domains {
+		if d.Name == "capital" {
+			failed = !d.Healthy
+		}
+	}
+	check(failed, "failed target was reported healthy")
+	deny.Store(false)
+
 	run()
 	var count int
 	must(db.QueryRow(ctx, "SELECT count(*) FROM capital_raid_history WHERE clan_tag=$1", clan).Scan(&count))
 	check(count == 2, "available raid history not seeded")
+	recovered := false
+	for _, d := range app.Stats.Snapshot().Domains {
+		if d.Name == "capital" {
+			recovered = d.Healthy && d.LastError == "" && !d.LastSuccess.IsZero()
+		}
+	}
+	check(recovered, "successful raid target did not clear failed health")
 	stage.Store(1)
 	run()
 	var state string
@@ -100,6 +124,6 @@ func main() {
 	events, e := cache.Do(ctx, cache.B().Xlen().Key("raid-history-events").Build()).AsInt64()
 	must(e)
 	check(events == 0, "history-only clan emitted notifications")
-	check(requests.Load() == 4, "unexpected provider request count")
-	fmt.Println("PASS actual capital domain: linked clan history, available older weekends, terminal-state protection, cache-hit backfill, final correction, one-pass mode, no extra notifications")
+	check(requests.Load() == 5, "unexpected provider request count")
+	fmt.Println("PASS actual capital domain: linked clan history, available older weekends, terminal-state protection, cache-hit backfill, final correction, one-pass mode, target error isolated, health recovery, no extra notifications")
 }

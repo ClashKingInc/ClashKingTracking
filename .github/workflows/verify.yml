@@ -32,6 +32,8 @@ jobs:
         run: go run github.com/rhysd/actionlint/cmd/actionlint@v1.7.7 -shellcheck= .github/workflows/verify.yml
       - name: Build tracking and verification commands
         run: go build ./...
+      - name: Verify external GlobalClans incident observer
+        run: python3 ops/verify_globalclans_observer.py
       - name: Install schema migrator
         run: go install github.com/pressly/goose/v3/cmd/goose@v3.26.0
       - name: Verify autoboard delivery
