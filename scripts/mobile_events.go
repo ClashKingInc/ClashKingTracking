@@ -97,10 +97,8 @@ func (w *mobileEventsWorker) run(ctx context.Context, app *platform.App, statsNa
 			return err
 		}
 		app.Stats.SetQueueDepth(statsName, len(entries))
-		started := time.Now()
 		if err := w.processEntries(ctx, entries); err != nil {
 			readFreshNext = true
-			app.Stats.RecordRequest(statsName, time.Since(started), err)
 			app.Stats.SetReady(statsName, false, err.Error())
 			app.Logger.Error("mobile event delivery failed; leaving stream entry pending", "err", err)
 			if app.Errors != nil {
@@ -112,8 +110,6 @@ func (w *mobileEventsWorker) run(ctx context.Context, app *platform.App, statsNa
 			continue
 		}
 		app.Stats.SetQueueDepth(statsName, 0)
-		app.Stats.RecordProcess(statsName, time.Since(started))
-		app.Stats.SetReady(statsName, true, "")
 	}
 }
 
@@ -305,12 +301,30 @@ func (w *mobileEventsWorker) processEntries(ctx context.Context, entries []valke
 			}
 			continue
 		}
-		if err := process(ctx, entry.ID, event); err != nil {
+		started := time.Now()
+		err := process(ctx, entry.ID, event)
+		if w.app != nil && w.app.Stats != nil {
+			// Measure relevant event attempts. Ignored high-volume traffic must
+			// not clear a failed notification's health or inflate success counts.
+			w.app.Stats.RecordProcess(mobileEventsDomainName+".events", time.Since(started))
+			w.app.Stats.RecordRequest(mobileEventsDomainName+".events", time.Since(started), err)
+			if err == nil {
+				w.app.Stats.SetReady(mobileEventsDomainName+".events", true, "")
+			}
+		}
+		if err != nil {
 			if ctx.Err() != nil {
 				return ctx.Err()
 			}
-			entryErrors = append(entryErrors, fmt.Errorf("process mobile event %s: %w", entry.ID, err))
-			continue
+			status := permanentMobileSourceStatus(err)
+			w.logDeliveryError("mobile notification event failed", "stream_id", entry.ID, "topic", event.Topic,
+				"event_type", stringValue(event.Value["type"]), "clan_tag", event.ClanTag, "permanent_source_status", status, "dropped", status != 0, "err", err)
+			if status == 0 {
+				entryErrors = append(entryErrors, fmt.Errorf("process mobile event %s: %w", entry.ID, err))
+				continue
+			}
+			// A permanent source rejection cannot improve by replaying this old
+			// reminder. Best-effort delivery drops it and lets later events run.
 		}
 		if err := ack(ctx, entry.ID); err != nil {
 			if ctx.Err() != nil {
@@ -320,6 +334,25 @@ func (w *mobileEventsWorker) processEntries(ctx context.Context, entries []valke
 		}
 	}
 	return errors.Join(entryErrors...)
+}
+
+func permanentMobileSourceStatus(err error) int {
+	var invalid *clashy.InvalidArgument
+	var forbidden *clashy.Forbidden
+	var private *clashy.PrivateWarLog
+	var missing *clashy.NotFound
+	switch {
+	case errors.As(err, &invalid):
+		return 400
+	case errors.As(err, &forbidden), errors.As(err, &private):
+		return 403
+	case errors.As(err, &missing):
+		return 404
+	default:
+		// Authentication (401), throttling, transport errors and 5xx remain
+		// visible/retriable. FCM errors use their own provider policy.
+		return 0
+	}
 }
 
 func (w *mobileEventsWorker) ack(ctx context.Context, id string) error {

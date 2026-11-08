@@ -246,7 +246,7 @@ func missedAttacks(war War, used int) int {
 	}
 	attacksPerMember := war.AttacksPerMember
 	if attacksPerMember <= 0 {
-		attacksPerMember = 1
+		return 0
 	}
 	return max(0, size*attacksPerMember-used)
 }

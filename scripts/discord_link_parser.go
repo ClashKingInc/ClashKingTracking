@@ -10,6 +10,8 @@ import (
 	"net/url"
 	"strings"
 	"time"
+
+	"github.com/disgoorg/disgo/discord"
 )
 
 const clashLinkHost = "link.clashofclans.com"
@@ -20,6 +22,7 @@ type discordLinkParseSettings struct {
 		Base   bool `json:"base"`
 		Clan   bool `json:"clan"`
 		Player bool `json:"player"`
+		Show   bool `json:"show"`
 	} `json:"link_parse"`
 }
 
@@ -35,13 +38,20 @@ func (w *discordDeliveryWorker) deliverLinkParse(ctx context.Context, event mobi
 		return nil
 	}
 	link := firstClashLink(payload.Content)
-	if link == nil {
+	queries := showClanQueries(payload.Content)
+	if link == nil && len(queries) == 0 {
 		return nil
 	}
 
 	var settings discordLinkParseSettings
 	if err := w.clashKingAPIGet(ctx, "/v2/server/"+url.PathEscape(payload.GuildID)+"/settings", &settings); err != nil {
 		return fmt.Errorf("load link-parse settings: %w", err)
+	}
+	if link == nil {
+		if !settings.LinkParse.Show {
+			return nil
+		}
+		return w.deliverShowClans(ctx, payload, queries)
 	}
 
 	action := link.Query().Get("action")
@@ -78,6 +88,75 @@ func (w *discordDeliveryWorker) deliverLinkParse(ctx context.Context, event mobi
 		ServerID:  payload.GuildID,
 		ChannelID: payload.ChannelID,
 	}, content, nil)
+}
+
+// Legacy -show resolves up to five comma-separated clan names from this
+// server's configured family. It must never search arbitrary external clans.
+func showClanQueries(content string) []string {
+	if !strings.HasPrefix(content, "-show ") {
+		return nil
+	}
+	var queries []string
+	for _, value := range strings.Split(strings.TrimPrefix(content, "-show "), ",") {
+		if value = strings.TrimSpace(value); value != "" {
+			queries = append(queries, strings.ToLower(value))
+			if len(queries) == 5 {
+				break
+			}
+		}
+	}
+	return queries
+}
+
+func (w *discordDeliveryWorker) deliverShowClans(ctx context.Context, payload discordMessageCreatePayload, queries []string) error {
+	var family []struct {
+		Tag  string `json:"tag"`
+		Name string `json:"name"`
+	}
+	if err := w.clashKingAPIGet(ctx, "/v2/server/"+url.PathEscape(payload.GuildID)+"/clans-basic", &family); err != nil {
+		return fmt.Errorf("load -show family clans: %w", err)
+	}
+	inline := true
+	var embeds []discord.Embed
+	seen := map[string]bool{}
+	for _, query := range queries {
+		for _, reference := range family {
+			if !strings.Contains(strings.ToLower(reference.Name), query) {
+				continue
+			}
+			if seen[reference.Tag] {
+				break
+			}
+			seen[reference.Tag] = true
+			var clan map[string]any
+			if err := w.clashKingAPIGet(ctx, "/v2/clan/"+url.PathEscape(reference.Tag)+"/cached", &clan); err != nil {
+				return fmt.Errorf("load -show clan: %w", err)
+			}
+			embed := discord.Embed{
+				Title:       discordClip(reference.Name, 256),
+				URL:         "https://link.clashofclans.com/en?action=OpenClanProfile&tag=" + url.QueryEscape(reference.Tag),
+				Description: discordClip(stringMapValue(clan, "description"), 600),
+				Fields: []discord.EmbedField{
+					{Name: "Clan", Value: reference.Tag, Inline: &inline},
+					{Name: "Level", Value: fmt.Sprint(intValue(clan["clanLevel"])), Inline: &inline},
+					{Name: "Members", Value: fmt.Sprintf("%d/50", intValue(clan["members"])), Inline: &inline},
+					{Name: "Trophies", Value: fmt.Sprint(intValue(clan["clanPoints"])), Inline: &inline},
+					{Name: "War wins", Value: fmt.Sprint(intValue(clan["warWins"])), Inline: &inline},
+				},
+			}
+			if badge, ok := mapValue(clan["badgeUrls"]); ok {
+				if image := firstDiscordString(stringMapValue(badge, "large"), stringMapValue(badge, "medium")); image != "" {
+					embed.Thumbnail = &discord.EmbedResource{URL: image}
+				}
+			}
+			embeds = append(embeds, embed)
+			break
+		}
+	}
+	if len(embeds) == 0 {
+		return nil
+	}
+	return w.sendMessage(ctx, discordDeliveryTarget{ServerID: payload.GuildID, ChannelID: payload.ChannelID}, discord.MessageCreate{Embeds: embeds}, nil)
 }
 
 func (w *discordDeliveryWorker) playerLinkText(ctx context.Context, link *url.URL) (string, error) {

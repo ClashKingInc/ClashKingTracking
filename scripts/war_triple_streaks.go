@@ -8,6 +8,7 @@ import (
 	"time"
 
 	"clashking_tracking/internal/wararchive"
+	"github.com/clashkinginc/clashy.go"
 	"github.com/jackc/pgx/v5"
 )
 
@@ -24,7 +25,7 @@ func ScoreWarTripleStreaks(war wararchive.War, warType string) ([]WarTripleOutco
 	if warType != "random" || !strings.EqualFold(war.State, "warEnded") {
 		return nil, nil
 	}
-	if friendlyWarWindow(war.PreparationStartTime, war.StartTime, war.EndTime) {
+	if clashy.IsFriendlyWarWindow(war.PreparationStartTime, war.StartTime, war.EndTime) {
 		return nil, nil
 	}
 	if war.TeamSize <= 0 || len(war.Clan.Members) != war.TeamSize || len(war.Opponent.Members) != war.TeamSize {
@@ -66,6 +67,10 @@ func RecordWarTripleStreaks(ctx context.Context, tx pgx.Tx, warID int32, end tim
 	// Lock keys in a stable order across both rosters. The transaction lock
 	// serializes concurrent wars/backfills for a player without locking others.
 	sort.Slice(outcomes, func(i, j int) bool { return outcomes[i].Member.Tag < outcomes[j].Member.Tag })
+	clanTag, opponentTag := war.Clan.Tag, war.Opponent.Tag
+	if clanTag > opponentTag {
+		clanTag, opponentTag = opponentTag, clanTag
+	}
 	for _, item := range outcomes {
 		member := item.Member
 		if _, err := tx.Exec(ctx, `SELECT pg_advisory_xact_lock(hashtextextended($1, 731))`, fmt.Sprintf("%s:%d", member.Tag, member.TownhallLevel)); err != nil {
@@ -73,21 +78,34 @@ func RecordWarTripleStreaks(ctx context.Context, tx pgx.Tx, warID int32, end tim
 		}
 		if _, err := tx.Exec(ctx, `INSERT INTO war_triple_streak_results
             (player_tag,townhall_level,war_id,war_end_time,qualified,player_name,clan_tag)
-            VALUES ($1,$2,$3,$4,$5,$6,$7) ON CONFLICT DO NOTHING`, member.Tag, member.TownhallLevel, warID, end, item.Qualified, member.Name, item.Clan); err != nil {
+            SELECT $1,$2,$3,$4,$5,$6,$7 WHERE NOT EXISTS (
+                SELECT 1 FROM war_triple_streak_results result
+                JOIN wars prior ON prior.war_id=result.war_id AND prior.end_time=result.war_end_time
+                WHERE result.player_tag=$1 AND result.townhall_level=$2 AND result.war_end_time=$4
+                  AND prior.clan_tag=$8 AND prior.opponent_tag=$9 AND prior.prep_time=$10
+            ) ON CONFLICT DO NOTHING`, member.Tag, member.TownhallLevel, warID, end, item.Qualified, member.Name, item.Clan,
+			clanTag, opponentTag, war.PreparationStartTime); err != nil {
 			return err
 		}
-		// Recompute the successful suffix, not an increment. Replayed or older
-		// wars are therefore safe and a failed/missed-hit war cuts the suffix.
-		if _, err := tx.Exec(ctx, `WITH latest AS (
-            SELECT * FROM war_triple_streak_results WHERE player_tag=$1 AND townhall_level=$2
-            ORDER BY war_end_time DESC,war_id DESC LIMIT 1
+		// Recompute by game-war identity, not allocated SQL IDs. Older data can
+		// contain duplicate IDs for one war; a later real war must not restore
+		// their inflated score after the derived leaderboard is repaired.
+		if _, err := tx.Exec(ctx, `WITH canonical AS MATERIALIZED (
+            SELECT min(result.war_id) AS war_id,result.war_end_time,bool_and(result.qualified) AS qualified
+            FROM war_triple_streak_results result
+            JOIN wars war ON war.war_id=result.war_id AND war.end_time=result.war_end_time
+            WHERE result.player_tag=$1 AND result.townhall_level=$2
+            GROUP BY war.clan_tag,war.opponent_tag,war.prep_time,result.war_end_time
+        ), latest AS (
+            SELECT result.player_tag,result.townhall_level,result.player_name,result.clan_tag,canonical.war_end_time
+            FROM canonical JOIN war_triple_streak_results result
+              ON result.player_tag=$1 AND result.townhall_level=$2 AND result.war_id=canonical.war_id
+            ORDER BY canonical.war_end_time DESC,canonical.war_id DESC LIMIT 1
         ), reset AS (
-            SELECT war_end_time,war_id FROM war_triple_streak_results
-            WHERE player_tag=$1 AND townhall_level=$2 AND NOT qualified
+            SELECT war_end_time,war_id FROM canonical WHERE NOT qualified
             ORDER BY war_end_time DESC,war_id DESC LIMIT 1
         ), total AS (
-            SELECT (count(*)*2)::integer AS streak FROM war_triple_streak_results r
-            WHERE player_tag=$1 AND townhall_level=$2 AND qualified
+            SELECT (count(*)*2)::integer AS streak FROM canonical r WHERE qualified
             AND (NOT EXISTS(SELECT 1 FROM reset) OR (r.war_end_time,r.war_id) > (SELECT war_end_time,war_id FROM reset))
         ) INSERT INTO war_triple_streaks (player_tag,townhall_level,streak,last_attack_time,player_name,clan_tag)
         SELECT player_tag,townhall_level,total.streak,war_end_time,player_name,clan_tag FROM latest CROSS JOIN total
@@ -97,21 +115,4 @@ func RecordWarTripleStreaks(ctx context.Context, tx pgx.Tx, warID int32, end tim
 		}
 	}
 	return nil
-}
-
-// The current Go Clash client labels every untagged war "random". Recognize
-// friendly preparation windows as cocpy does, plus shortened battle windows.
-// This check also protects replay of archives indexed before that correction.
-func friendlyWarWindow(prep, start, end time.Time) bool {
-	if start.IsZero() || end.IsZero() {
-		return false
-	}
-	if end.After(start) && end.Sub(start) < 24*time.Hour {
-		return true
-	}
-	switch start.Sub(prep) {
-	case 5 * time.Minute, 15 * time.Minute, 30 * time.Minute, time.Hour, 2 * time.Hour, 4 * time.Hour, 6 * time.Hour, 8 * time.Hour, 12 * time.Hour, 16 * time.Hour, 20 * time.Hour, 24 * time.Hour:
-		return true
-	}
-	return false
 }

@@ -1073,8 +1073,6 @@ func buildWarIngest(war clashy.ClanWar, sourceClanTag string, finished bool, war
 	warType := war.Type()
 	if warTag != "" {
 		warType = "cwl"
-	} else if war.StartTime != nil && friendlyWarWindow(prepAt, war.StartTime.Time.UTC(), endAt) {
-		warType = "friendly"
 	}
 	if !finished {
 		// Discovery creates an end-time schedule, including an immediately due
@@ -1130,13 +1128,9 @@ func warScheduleNextRunAt(endAt time.Time, warTag string, now time.Time) time.Ti
 }
 
 func canonicalArchiveWar(war clashy.ClanWar, clan, opponent *clashy.WarClan, warType, warTag string, prepAt, startAt, endAt time.Time) wararchive.War {
-	attacksPerMember := 1
-	if warType == "random" {
-		attacksPerMember = 2
-	}
 	return wararchive.War{
 		WarTag: warTag, State: strings.ToLower(string(war.State)),
-		TeamSize: war.TeamSize, AttacksPerMember: attacksPerMember,
+		TeamSize: war.TeamSize, AttacksPerMember: clashy.ResolveWarAttackLimit(warType, war.AttacksPerMember),
 		PreparationStartTime: prepAt, StartTime: startAt, EndTime: endAt,
 		BattleModifier: wararchive.NormalizeBattleModifier(string(war.BattleModifier)),
 		Clan:           canonicalArchiveClan(clan), Opponent: canonicalArchiveClan(opponent),
@@ -1217,10 +1211,6 @@ func canonicalWarSides(clan, opponent *clashy.WarClan) (*clashy.WarClan, *clashy
 }
 
 func warIndexRow(warID int32, clan, opponent *clashy.WarClan, prepAt, startAt, endAt time.Time, war clashy.ClanWar, warType, warTag string) models.WarLogIndexRow {
-	attacksPerMember := 1
-	if warType == "random" {
-		attacksPerMember = 2
-	}
 	return models.WarLogIndexRow{
 		WarID:                         warID,
 		ClanTag:                       clan.Tag,
@@ -1229,7 +1219,7 @@ func warIndexRow(warID int32, clan, opponent *clashy.WarClan, prepAt, startAt, e
 		StartTime:                     startAt,
 		EndTime:                       endAt,
 		Size:                          war.TeamSize,
-		AttacksPerMember:              attacksPerMember,
+		AttacksPerMember:              clashy.ResolveWarAttackLimit(warType, war.AttacksPerMember),
 		WarType:                       warType,
 		State:                         string(war.State),
 		BattleModifier:                wararchive.NormalizeBattleModifier(string(war.BattleModifier)),

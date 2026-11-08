@@ -51,5 +51,9 @@ func (w *discordDeliveryWorker) createWebhookMessage(ctx context.Context, guild 
 	if profile.avatar != "" {
 		message.AvatarURL = profile.avatar
 	}
-	return w.client.Rest.CreateWebhookMessage(id, token, message, params, opts...)
+	created, err := w.client.Rest.CreateWebhookMessage(id, token, message, params, opts...)
+	if err == nil && w.app.Stats != nil {
+		w.app.Stats.RecordWrite(discordDeliveryDomainName, 1)
+	}
+	return created, err
 }

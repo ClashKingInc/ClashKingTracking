@@ -120,9 +120,9 @@ func discordLogMessages(event mobileWarEvent, logType string, catalogs ...map[st
 					player, other = defender, attacker
 				}
 				stars := min(3, max(0, intValue(attack["stars"])))
-				lines = append(lines, fmt.Sprintf("%s %s**%s%s** %s%s **%d%%** %s%s", icon,
+				lines = append(lines, fmt.Sprintf("%s %s**%s%s** %s **%d%%** %s%s", icon,
 					icons.th(intValue(player["townhallLevel"])), discordLabel(stringMapValue(player, "name")), discordSuperscript(intValue(player["mapPosition"])),
-					strings.Repeat(icons.icon("war_star", "★"), stars), strings.Repeat(icons.icon("no_star", "☆"), 3-stars), intValue(attack["destructionPercentage"]),
+					icons.stars(stars), intValue(attack["destructionPercentage"]),
 					icons.th(intValue(other["townhallLevel"])), discordSuperscript(intValue(other["mapPosition"]))))
 			}
 			var messages []discord.MessageCreate

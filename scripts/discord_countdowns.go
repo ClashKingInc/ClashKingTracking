@@ -13,14 +13,14 @@ import (
 	"github.com/disgoorg/snowflake/v2"
 )
 
-type countdownChannel struct{ Server, Clan, Kind, Channel string }
+type countdownChannel struct{ Server, Clan, Kind, Channel, Revision string }
 type countdownWar struct {
 	War *clashy.ClanWar
 	Err error
 }
 
 func (w *discordDeliveryWorker) refreshCountdownChannels(ctx context.Context, now time.Time, wars map[string]countdownWar) error {
-	rows, err := w.pool.Query(ctx, `SELECT c.server_id,COALESCE(c.clan_tag,''),c.type,c.channel_id
+	rows, err := w.pool.Query(ctx, `SELECT c.server_id,COALESCE(c.clan_tag,''),c.type,c.channel_id,c.updated_at::text
  FROM server_countdowns c JOIN servers s ON s.id=c.server_id
  WHERE s.left_at IS NULL AND (c.clan_tag IS NULL OR EXISTS(SELECT 1 FROM server_clans sc WHERE sc.server_id=c.server_id AND sc.tag=c.clan_tag))
  ORDER BY c.server_id,c.channel_id`)
@@ -30,7 +30,7 @@ func (w *discordDeliveryWorker) refreshCountdownChannels(ctx context.Context, no
 	var channels []countdownChannel
 	for rows.Next() {
 		var c countdownChannel
-		if err = rows.Scan(&c.Server, &c.Clan, &c.Kind, &c.Channel); err != nil {
+		if err = rows.Scan(&c.Server, &c.Clan, &c.Kind, &c.Channel, &c.Revision); err != nil {
 			rows.Close()
 			return err
 		}
@@ -41,18 +41,45 @@ func (w *discordDeliveryWorker) refreshCountdownChannels(ctx context.Context, no
 	if err != nil {
 		return err
 	}
+	if w.countdownUnavailable == nil {
+		w.countdownUnavailable = map[string]time.Time{}
+	}
+	configured := make(map[string]bool, len(channels))
 	for _, c := range channels {
+		key := c.Server + ":" + c.Channel + ":" + c.Kind + ":" + c.Clan + ":" + c.Revision
+		configured[key] = true
 		if !w.app.Config.AllowsDiscordGuild(c.Server) {
 			continue
 		}
+		if until := w.countdownUnavailable[key]; now.Before(until) {
+			continue
+		}
+		delete(w.countdownUnavailable, key)
 		channelCtx, cancel := context.WithTimeout(ctx, 15*time.Second)
+		started := time.Now()
 		target, err := w.countdownText(channelCtx, c, now, wars)
 		if err == nil && target != "" {
 			err = w.renameCountdown(channelCtx, c, target)
 		}
 		cancel()
+		if w.app.Stats != nil {
+			w.app.Stats.RecordProcess(discordDeliveryDomainName+".countdowns", time.Since(started))
+			w.app.Stats.RecordRequest(discordDeliveryDomainName+".countdowns", time.Since(started), err)
+		}
 		if err != nil {
+			var response *rest.Error
+			if errors.As(err, &response) && response.Code == rest.JSONErrorCodeUnknownChannel {
+				// The existing GET proved this destination unavailable. Retain the
+				// user's configuration, but stop re-reading it on every scan. Any
+				// configuration edit changes the key and retries immediately.
+				w.countdownUnavailable[key] = now.Add(24 * time.Hour)
+			}
 			w.app.Logger.Warn("countdown update failed", "server_id", c.Server, "channel_id", c.Channel, "err", err)
+		}
+	}
+	for key := range w.countdownUnavailable {
+		if !configured[key] {
+			delete(w.countdownUnavailable, key)
 		}
 	}
 	return nil

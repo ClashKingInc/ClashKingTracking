@@ -1371,7 +1371,7 @@ func discordCacheListener(
 				return
 			}
 			message := event.Message
-			if firstClashLink(message.Content) == nil {
+			if firstClashLink(message.Content) == nil && len(showClanQueries(message.Content)) == 0 {
 				return
 			}
 			go func() {

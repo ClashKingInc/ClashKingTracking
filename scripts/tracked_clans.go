@@ -451,6 +451,10 @@ func processTrackedClanTarget[T any](
 	}); err != nil {
 		return err
 	}
+	// Unchanged snapshots are successful polls too. Clear a prior upstream
+	// error only after snapshot/storage/event work succeeds, not on HTTP alone.
+	app.Stats.SetReady(progressName, true, "")
+	app.Stats.SetReady(trackedClansDomainName, true, "")
 	app.Stats.RecordTrackedTarget(progressName)
 	return nil
 }
