@@ -33,6 +33,10 @@ type BasicClanMember struct {
 	Tag      string `json:"tag"`
 	Name     string `json:"name"`
 	TownHall int    `json:"town_hall"`
+	// Nil distinguishes legacy snapshots from a known zero value. The first
+	// refresh hydrates these fields before unchanged members can be skipped.
+	LeagueID *int `json:"league_id,omitempty"`
+	Trophies *int `json:"trophies,omitempty"`
 }
 
 type ClanChangeRow struct {
