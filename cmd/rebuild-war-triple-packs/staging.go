@@ -96,8 +96,8 @@ func stage(ctx context.Context, _ *pgx.Conn, wars []stagedWar, outcomes []staged
 		item := event{o.war.end.Unix(), o.war.identity, o.war.id, o.member.Name, o.clan, o.credits}
 		state := replay.players[key]
 		if state == nil {
-			if len(replay.players) >= 12000000 {
-				return fmt.Errorf("replay exceeds reviewed 12-million-key memory bound")
+			if len(replay.players) >= 20000000 {
+				return fmt.Errorf("replay exceeds reviewed 20-million-key memory bound")
 			}
 			state = &playerState{latest: item}
 			replay.players[key] = state
