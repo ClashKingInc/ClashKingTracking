@@ -73,8 +73,11 @@ func main() {
 			own["stars"] = 3
 			own["destructionPercentage"] = 50
 		}
-		state := "inWar"
+		state, warTag := "inWar", "#CWLP"
+		prepTime, startTime, endTime := now.Add(-25*time.Hour), now.Add(-time.Hour), now.Add(23*time.Hour)
 		if transitionScenario.Load() {
+			warTag = "#CWLQ"
+			prepTime, startTime, endTime = now.Add(-24*time.Hour), now, now.Add(24*time.Hour)
 			old["name"] = "Early Hit"
 			if preparation.Load() {
 				state = "preparation"
@@ -82,7 +85,7 @@ func main() {
 				own["attacks"] = 0
 			}
 		}
-		return map[string]any{"tag": "#CWLP", "state": state, "teamSize": 2, "attacksPerMember": 1, "preparationStartTime": stamp(now.Add(-25 * time.Hour)), "startTime": stamp(now.Add(-time.Hour)), "endTime": stamp(now.Add(23 * time.Hour)), "clan": own, "opponent": map[string]any{"tag": "#PYQ", "name": "Opponent", "clanLevel": 10, "badgeUrls": map[string]string{}, "attacks": 0, "stars": 0, "destructionPercentage": 0, "members": []any{map[string]any{"tag": "#PYG", "name": "Defender", "townhallLevel": 16, "mapPosition": 1}}}}
+		return map[string]any{"tag": warTag, "state": state, "teamSize": 2, "attacksPerMember": 1, "preparationStartTime": stamp(prepTime), "startTime": stamp(startTime), "endTime": stamp(endTime), "clan": own, "opponent": map[string]any{"tag": "#PYQ", "name": "Opponent", "clanLevel": 10, "badgeUrls": map[string]string{}, "attacks": 0, "stars": 0, "destructionPercentage": 0, "members": []any{map[string]any{"tag": "#PYG", "name": "Defender", "townhallLevel": 16, "mapPosition": 1}}}}
 	}
 	provider := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "application/json")
@@ -106,7 +109,11 @@ func main() {
 			json.NewEncoder(w).Encode(map[string]any{"id": "999999999999992905", "channel_id": channel, "type": 0})
 		case strings.HasSuffix(r.URL.Path, "/currentwar/leaguegroup"):
 			groups.Add(1)
-			json.NewEncoder(w).Encode(map[string]any{"season": now.Format("2006-01"), "state": "inWar", "clans": []any{}, "rounds": []any{map[string]any{"warTags": []string{"#CWLP"}}}})
+			tag := "#CWLP"
+			if transitionScenario.Load() {
+				tag = "#CWLQ"
+			}
+			json.NewEncoder(w).Encode(map[string]any{"season": now.Format("2006-01"), "state": "inWar", "clans": []any{}, "rounds": []any{map[string]any{"warTags": []string{tag}}}})
 		case strings.Contains(r.URL.Path, "/clanwarleagues/wars/"):
 			json.NewEncoder(w).Encode(war())
 		case strings.HasSuffix(r.URL.Path, "/currentwar"):
@@ -200,9 +207,23 @@ func main() {
 	preparation.Store(true)
 	attack.Store(false)
 	must(cache.Do(ctx, cache.B().Del().Key("cwl-discovery:cwlstate:#PYL", "cwl-discovery:cwlwar:CWLP:#PYL").Build()).Error())
-	beforePanels := panels.Load()
+	// This is a new war, not a rewind of the previous battle. Wait for the
+	// persisted preparation baseline rather than an unrelated queued panel.
 	stop = run()
-	wait(ctx, "preparation panel", func() bool { return panels.Load() > beforePanels })
+	wait(ctx, "persisted preparation snapshot", func() bool {
+		raw, err := cache.Do(ctx, cache.B().Get().Key("cwl-discovery:cwlwar:CWLQ:#PYL").Build()).AsBytes()
+		if err != nil {
+			return false
+		}
+		decoded, err := utils.Decompress(raw)
+		if err != nil {
+			return false
+		}
+		var snapshot struct {
+			State string `json:"state"`
+		}
+		return json.Unmarshal(decoded, &snapshot) == nil && snapshot.State == "preparation"
+	})
 	preparation.Store(false)
 	wait(ctx, "first battle attack delivered", func() bool { return earlyFeeds.Load() > 0 })
 	time.Sleep(150 * time.Millisecond)
