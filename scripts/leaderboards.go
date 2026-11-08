@@ -32,6 +32,7 @@ const (
 var leaderboardMaterializedViewRefreshQueries = [...]string{
 	`REFRESH MATERIALIZED VIEW CONCURRENTLY clan_leaderboards`,
 	`REFRESH MATERIALIZED VIEW war_league_counts`,
+	`REFRESH MATERIALIZED VIEW CONCURRENTLY api_clan_distribution_counts`,
 	`REFRESH MATERIALIZED VIEW CONCURRENTLY townhall_counts`,
 	`REFRESH MATERIALIZED VIEW CONCURRENTLY api_global_counts`,
 	`REFRESH MATERIALIZED VIEW CONCURRENTLY api_league_tier_counts`,
@@ -40,6 +41,7 @@ var leaderboardMaterializedViewRefreshQueries = [...]string{
 var leaderboardMaterializedViewBootstrapQueries = [...]string{
 	`REFRESH MATERIALIZED VIEW clan_leaderboards`,
 	`REFRESH MATERIALIZED VIEW war_league_counts`,
+	`REFRESH MATERIALIZED VIEW api_clan_distribution_counts`,
 	`REFRESH MATERIALIZED VIEW townhall_counts`,
 	`REFRESH MATERIALIZED VIEW api_global_counts`,
 	`REFRESH MATERIALIZED VIEW api_league_tier_counts`,
