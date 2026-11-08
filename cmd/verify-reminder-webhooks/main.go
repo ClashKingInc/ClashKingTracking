@@ -163,6 +163,10 @@ func main() {
 		}}, "opponent": map[string]any{"tag": "#QYL", "members": []any{}}}
 		if league {
 			war["tag"] = "#PYQL"
+		} else {
+			// Regular/friendly payloads report their allowance. Only CWL omits
+			// it; a fixture must not rely on the removed two-hit guess.
+			war["attacksPerMember"] = 2
 		}
 		must(app.PublishEvent(ctx, platform.Event{Topic: "reminder", ClanTag: "#PYLQ", Value: map[string]any{"type": "war", "data": war, "reminder": map[string]any{"id": ids[0], "server_id": guild, "channel_id": channel, "thread_id": thread, "minutes_remaining": 60}}}))
 	}
