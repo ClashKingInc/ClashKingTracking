@@ -156,6 +156,17 @@ func main() {
 	mu.Lock()
 	check(len(sent) == 0, "first-seen history sent Discord messages")
 	entries = append(entries, battle(3, 3, 100, true), battle(4, 2, 80, false), battle(5, 0, 0, true))
+	entries[2].Timestamp = "not-a-timestamp"
+	failedAt := rawCalls.Load()
+	mu.Unlock()
+	wait(func() bool { return rawCalls.Load() >= failedAt+3 })
+	check(checkpoint() == origin.Add(2*time.Second).Format(time.RFC3339Nano), "malformed response advanced the checkpoint")
+	var malformedRows int
+	must(db.QueryRow(ctx, `SELECT count(*) FROM battles_ranked WHERE player_tag='#PYLQ'`).Scan(&malformedRows))
+	check(malformedRows == 2, "malformed response partially persisted newer observations")
+	mu.Lock()
+	check(len(sent) == 0, "malformed response emitted a Discord event")
+	entries[2].Timestamp = origin.Add(3 * time.Second).Format("20060102T150405.000Z")
 	mu.Unlock()
 	total := func() int {
 		mu.Lock()
@@ -202,5 +213,5 @@ func main() {
 			panic("service shutdown timed out")
 		}
 	}
-	fmt.Printf("PASS raw Legend delivery: profiles/groups=0 raw_polls=%d Discord=3 mobile=1 SQL-before-send=true first-seen-silent=true replay-suppressed=true thread-routing=true trophies=+40,-26,+0\n", rawCalls.Load())
+	fmt.Printf("PASS raw Legend delivery: profiles/groups=0 raw_polls=%d malformed-page-checkpoint-preserved=true repaired-row-retained=true Discord=3 mobile=1 SQL-before-send=true first-seen-silent=true replay-suppressed=true thread-routing=true trophies=+40,-26,+0\n", rawCalls.Load())
 }
