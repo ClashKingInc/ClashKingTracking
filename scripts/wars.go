@@ -1286,8 +1286,19 @@ func (d *warsDomain) runCWLSweeps(ctx context.Context, app *platform.App, groupL
 			}
 			startup = false
 		}
-		app.Stats.RecordProcess(statsName, time.Since(start))
-		app.Stats.SetReady(statsName, true, "")
+		// Finishing a best-effort sweep is not proof that a failed fetch
+		// recovered. Only a completed target may clear that failure below.
+		healthy := true
+		for _, observed := range app.Stats.Snapshot().Domains {
+			if observed.Name == statsName {
+				healthy = observed.Healthy
+				break
+			}
+		}
+		if healthy {
+			app.Stats.RecordProcess(statsName, time.Since(start))
+			app.Stats.SetReady(statsName, true, "")
+		}
 		delay := time.Duration(app.Config.CWLSyncSeconds) * time.Second
 		if !refresh && cwlGlobalDiscoveryWindow(d.currentTime()) {
 			// Immediately begin another full pass, with a small idle floor for
@@ -1357,6 +1368,11 @@ func (d *warsDomain) syncCWLTargets(ctx context.Context, app *platform.App, grou
 	season := utils.CurrentSeason(d.currentTime())
 	deduper := newCWLSyncDeduper()
 	return runBounded(ctx, platform.RequestConcurrency(app.Config.CWLRequestsPerSecond), targets, func(workerCtx context.Context, target models.BasicClanRow) error {
+		started := time.Now()
+		completed := func() {
+			app.Stats.RecordProcess(statsName, time.Since(started))
+			app.Stats.SetReady(statsName, true, "")
+		}
 		defer app.Stats.RecordTrackedTarget(statsName)
 		if deduper.covered(target.Tag) {
 			return nil
@@ -1364,7 +1380,14 @@ func (d *warsDomain) syncCWLTargets(ctx context.Context, app *platform.App, grou
 		group, err := retryLimitedClashFetch(workerCtx, app, groupLimiter, func(fetchCtx context.Context) (*clashy.ClanWarLeagueGroup, error) {
 			start := time.Now()
 			group, err := app.Clash.GetLeagueGroup(fetchCtx, target.Tag)
-			app.Stats.RecordRequest(statsName, time.Since(start), err)
+			// A clan without a current CWL group is a valid discovery result.
+			// Keep counting the request, but do not report that 404 as an outage.
+			reported := err
+			var absent *clashy.NotFound
+			if errors.As(err, &absent) {
+				reported = nil
+			}
+			app.Stats.RecordRequest(statsName, time.Since(start), reported)
 			return group, err
 		})
 		var notFound *clashy.NotFound
@@ -1372,10 +1395,18 @@ func (d *warsDomain) syncCWLTargets(ctx context.Context, app *platform.App, grou
 			if store, ok := d.store.(interface {
 				CompleteCWLGroupsForClan(context.Context, string, string) error
 			}); ok {
-				return store.CompleteCWLGroupsForClan(workerCtx, target.Tag, season)
+				if err := store.CompleteCWLGroupsForClan(workerCtx, target.Tag, season); err != nil {
+					return err
+				}
 			}
+			completed()
+			return nil
 		}
-		if err != nil || group == nil || cwlSeasonMonth(group.Season) != season {
+		if err != nil || group == nil {
+			return nil
+		}
+		if cwlSeasonMonth(group.Season) != season {
+			completed()
 			return nil
 		}
 		cwlID, clanTags := cwlGroupID(group)
@@ -1407,6 +1438,9 @@ func (d *warsDomain) syncCWLTargets(ctx context.Context, app *platform.App, grou
 		if err := d.storeIngest(workerCtx, app, models.WarIngest{CWLGroups: []models.CWLGroupRow{groupRow}}); err != nil {
 			return err
 		}
+		// An unchanged snapshot is still a completed target. Waiting for a
+		// multi-hour global sweep to finish would leave old failures sticky.
+		completed()
 		return nil
 	})
 }
