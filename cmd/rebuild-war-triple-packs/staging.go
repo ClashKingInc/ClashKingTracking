@@ -2,211 +2,285 @@ package main
 
 import (
 	"context"
+	"encoding/csv"
 	"fmt"
+	"github.com/jackc/pgx/v5"
+	"io"
 	"os"
 	"path/filepath"
+	"sort"
+	"strconv"
 	"time"
-
-	"github.com/jackc/pgx/v5"
 )
 
-// Temporary SQL state bounds Go memory regardless of archive size. It retains
-// unique game identities and only each key's latest reset/qualified suffix.
-const stagingSchema = `
-CREATE TEMP TABLE replay_wars (
- identity text PRIMARY KEY,
- fingerprint text NOT NULL,
- war_id integer NOT NULL,
- war_end_time timestamptz NOT NULL
-);
-CREATE TEMP TABLE replay_state (
- player_tag text NOT NULL,
- townhall_level smallint NOT NULL,
- reset_end timestamptz,
- reset_identity text,
- reset_war_id integer,
- reset_player_name text,
- reset_clan_tag text,
- unknown_end timestamptz,
- unknown_identity text,
- latest_end timestamptz NOT NULL,
- latest_identity text NOT NULL,
- war_id integer NOT NULL,
- player_name text NOT NULL,
- clan_tag text NOT NULL,
- PRIMARY KEY(player_tag,townhall_level)
-);
-CREATE TEMP TABLE replay_wins (
- credited_triples smallint NOT NULL,
- player_tag text NOT NULL,
- townhall_level smallint NOT NULL,
- identity text NOT NULL,
- war_id integer NOT NULL,
- war_end_time timestamptz NOT NULL,
- player_name text NOT NULL,
- clan_tag text NOT NULL,
- PRIMARY KEY(player_tag,townhall_level,identity)
-);
-CREATE TEMP TABLE incoming_wars (LIKE replay_wars INCLUDING DEFAULTS);
-CREATE TEMP TABLE new_wars (identity text PRIMARY KEY);
-CREATE TEMP TABLE incoming_outcomes (
- player_tag text,
- townhall_level smallint,
- identity text,
- war_id integer,
- war_end_time timestamptz,
- qualified boolean,
- credited_triples smallint,
- player_name text,
- clan_tag text
-);
-`
+// This one-month operational replay keeps only each player's boundaries in
+// memory. Qualified events spill to disk and are streamed once after all reset
+// boundaries are known; source pack order must never determine the result.
+const stagingSchema = `SELECT 1`
 
-func stage(ctx context.Context, conn *pgx.Conn, wars []stagedWar, outcomes []stagedOutcome, stats *replayStats) error {
-	tx, err := conn.Begin(ctx)
-	if err != nil {
-		return err
-	}
-	defer tx.Rollback(ctx)
-	if _, err = tx.Exec(ctx, `TRUNCATE incoming_wars,incoming_outcomes,new_wars`); err != nil {
-		return err
-	}
-	rows := make([][]any, 0, len(wars))
-	for _, war := range wars {
-		rows = append(rows, []any{war.identity, war.fingerprint, war.id, war.end})
-	}
-	if _, err = tx.CopyFrom(ctx, pgx.Identifier{"incoming_wars"}, []string{"identity", "fingerprint", "war_id", "war_end_time"}, pgx.CopyFromRows(rows)); err != nil {
-		return err
-	}
-	var conflict bool
-	if err = tx.QueryRow(ctx, `SELECT EXISTS(
- SELECT 1 FROM incoming_wars GROUP BY identity HAVING count(DISTINCT fingerprint)>1
- UNION ALL
- SELECT 1 FROM incoming_wars incoming JOIN replay_wars stored USING(identity)
- WHERE incoming.fingerprint<>stored.fingerprint
- )`).Scan(&conflict); err != nil {
-		return err
-	}
-	if conflict {
-		return fmt.Errorf("canonical source versions disagree on roster or scoring; preview withheld")
-	}
-	tag, err := tx.Exec(ctx, `WITH inserted AS (
- INSERT INTO replay_wars SELECT DISTINCT ON(identity) identity,fingerprint,war_id,war_end_time
- FROM incoming_wars ORDER BY identity,war_id ON CONFLICT DO NOTHING RETURNING identity
- ) INSERT INTO new_wars SELECT identity FROM inserted`)
-	if err != nil {
-		return err
-	}
-	stats.CanonicalWars += tag.RowsAffected()
-	stats.DuplicateRows += int64(len(wars)) - tag.RowsAffected()
-	rows = rows[:0]
-	for _, o := range outcomes {
-		rows = append(rows, []any{o.member.Tag, o.member.TownhallLevel, o.war.identity, o.war.id, o.war.end, o.qualified, o.credits, o.member.Name, o.clan})
-	}
-	if _, err = tx.CopyFrom(ctx, pgx.Identifier{"incoming_outcomes"}, []string{"player_tag", "townhall_level", "identity", "war_id", "war_end_time", "qualified", "credited_triples", "player_name", "clan_tag"}, pgx.CopyFromRows(rows)); err != nil {
-		return err
-	}
-	_, err = tx.Exec(ctx, `
- DELETE FROM incoming_outcomes WHERE identity NOT IN(SELECT identity FROM new_wars);
- INSERT INTO replay_state(player_tag,townhall_level,latest_end,latest_identity,war_id,player_name,clan_tag)
- SELECT DISTINCT ON(player_tag,townhall_level) player_tag,townhall_level,war_end_time,identity,war_id,player_name,clan_tag
- FROM incoming_outcomes ORDER BY player_tag,townhall_level,war_end_time DESC,identity DESC
- ON CONFLICT(player_tag,townhall_level) DO UPDATE SET
- latest_end=EXCLUDED.latest_end,latest_identity=EXCLUDED.latest_identity,war_id=EXCLUDED.war_id,
- player_name=EXCLUDED.player_name,clan_tag=EXCLUDED.clan_tag
- WHERE (EXCLUDED.latest_end,EXCLUDED.latest_identity)>(replay_state.latest_end,replay_state.latest_identity);
- UPDATE replay_state state SET reset_end=source.war_end_time,reset_identity=source.identity,
- reset_war_id=source.war_id,reset_player_name=source.player_name,reset_clan_tag=source.clan_tag
- FROM(SELECT DISTINCT ON(player_tag,townhall_level) player_tag,townhall_level,war_end_time,identity,war_id,player_name,clan_tag
- FROM incoming_outcomes WHERE qualified=false ORDER BY player_tag,townhall_level,war_end_time DESC,identity DESC)source
- WHERE state.player_tag=source.player_tag AND state.townhall_level=source.townhall_level
- AND(state.reset_end IS NULL OR(source.war_end_time,source.identity)>(state.reset_end,state.reset_identity));
- UPDATE replay_state state SET unknown_end=source.war_end_time,unknown_identity=source.identity
- FROM(SELECT DISTINCT ON(player_tag,townhall_level) player_tag,townhall_level,war_end_time,identity
- FROM incoming_outcomes WHERE qualified IS NULL ORDER BY player_tag,townhall_level,war_end_time DESC,identity DESC)source
- WHERE state.player_tag=source.player_tag AND state.townhall_level=source.townhall_level
- AND(state.unknown_end IS NULL OR(source.war_end_time,source.identity)>(state.unknown_end,state.unknown_identity));
- DELETE FROM replay_wins win USING replay_state state,(SELECT DISTINCT player_tag,townhall_level FROM incoming_outcomes)changed
- WHERE state.player_tag=changed.player_tag AND state.townhall_level=changed.townhall_level
- AND win.player_tag=state.player_tag AND win.townhall_level=state.townhall_level
- AND(win.war_end_time,win.identity)<=(state.reset_end,state.reset_identity);
- INSERT INTO replay_wins
- SELECT DISTINCT ON(source.player_tag,source.townhall_level,source.identity)
- source.credited_triples,source.player_tag,source.townhall_level,source.identity,source.war_id,source.war_end_time,source.player_name,source.clan_tag
- FROM incoming_outcomes source JOIN replay_state state USING(player_tag,townhall_level)
- WHERE source.qualified=true AND(state.reset_end IS NULL OR(source.war_end_time,source.identity)>(state.reset_end,state.reset_identity))
- ON CONFLICT DO NOTHING;
- `)
-	if err != nil {
-		return err
-	}
-	return tx.Commit(ctx)
+type playerKey struct {
+	tag string
+	th  int
+}
+type event struct {
+	end        int64
+	identity   string
+	warID      int32
+	name, clan string
+	credits    int
+}
+type playerState struct {
+	latest         event
+	reset, unknown *event
+	score          int
+}
+type acceptedWar struct {
+	fingerprint string
+	id          int32
 }
 
-func finish(ctx context.Context, conn *pgx.Conn, output string, stats *replayStats) error {
-	var barrier any
-	if stats.GlobalBarrier != nil {
-		barrier = *stats.GlobalBarrier
+var replay = struct {
+	wars    map[string]acceptedWar
+	players map[playerKey]*playerState
+	spool   *os.File
+	writer  *csv.Writer
+}{wars: map[string]acceptedWar{}, players: map[playerKey]*playerState{}}
+
+func newer(a, b event) bool { return a.end > b.end || a.end == b.end && a.identity > b.identity }
+func eventRow(key playerKey, e event) []string {
+	return []string{key.tag, strconv.Itoa(key.th), strconv.FormatInt(int64(e.warID), 10), time.Unix(e.end, 0).UTC().Format(time.RFC3339), e.identity, e.name, e.clan, strconv.Itoa(e.credits)}
+}
+func stage(ctx context.Context, _ *pgx.Conn, wars []stagedWar, outcomes []stagedOutcome, stats *replayStats) error {
+	if e := ctx.Err(); e != nil {
+		return e
 	}
-	// An unknown source is a barrier, not a made-up reset. A later actual reset
-	// restores an exact suffix; a newer success alone cannot prove continuity.
-	_, err := conn.Exec(ctx, `CREATE TEMP TABLE replay_preview AS
- SELECT state.*,
- (unknown_end IS NULL OR(reset_end,reset_identity)>(unknown_end,unknown_identity))
- AND($1::timestamptz IS NULL OR reset_end>$1) AS available,
- (SELECT COALESCE(sum(credited_triples),0) FROM replay_wins win WHERE win.player_tag=state.player_tag AND win.townhall_level=state.townhall_level)::integer AS streak
- FROM replay_state state`, barrier)
-	if err != nil {
-		return err
+	if replay.spool == nil {
+		f, e := os.CreateTemp("", "ck-war-qualified-*.csv")
+		if e != nil {
+			return e
+		}
+		replay.spool = f
+		replay.writer = csv.NewWriter(f)
 	}
-	if err = conn.QueryRow(ctx, `SELECT count(*),count(*) FILTER(WHERE available),count(*) FILTER(WHERE available IS NOT TRUE),(SELECT count(*) FROM replay_wins) FROM replay_preview`).Scan(&stats.PlayerKeys, &stats.ExactKeys, &stats.UnavailableKeys, &stats.QualifiedSuffixRows); err != nil {
-		return err
+	accepted := map[string]int32{}
+	for _, w := range wars {
+		if prior, ok := replay.wars[w.identity]; ok {
+			if prior.fingerprint != w.fingerprint {
+				return fmt.Errorf("canonical source versions disagree on roster or scoring; preview withheld")
+			}
+			stats.DuplicateRows++
+			continue
+		}
+		replay.wars[w.identity] = acceptedWar{w.fingerprint, w.id}
+		accepted[w.identity] = w.id
+		stats.CanonicalWars++
+	}
+	seen := map[struct {
+		key      playerKey
+		identity string
+	}]bool{}
+	for _, o := range outcomes {
+		id, ok := accepted[o.war.identity]
+		if !ok || id != o.war.id {
+			continue
+		}
+		key := playerKey{o.member.Tag, o.member.TownhallLevel}
+		unique := struct {
+			key      playerKey
+			identity string
+		}{key, o.war.identity}
+		if seen[unique] {
+			continue
+		}
+		seen[unique] = true
+		item := event{o.war.end.Unix(), o.war.identity, o.war.id, o.member.Name, o.clan, o.credits}
+		state := replay.players[key]
+		if state == nil {
+			if len(replay.players) >= 20000000 {
+				return fmt.Errorf("replay exceeds reviewed 20-million-key memory bound")
+			}
+			state = &playerState{latest: item}
+			replay.players[key] = state
+		} else if newer(item, state.latest) {
+			state.latest = item
+		}
+		if o.qualified == nil {
+			if state.unknown == nil || newer(item, *state.unknown) {
+				copy := item
+				state.unknown = &copy
+			}
+			continue
+		}
+		if !*o.qualified {
+			if state.reset == nil || newer(item, *state.reset) {
+				copy := item
+				state.reset = &copy
+			}
+			continue
+		}
+		if e := replay.writer.Write(eventRow(key, item)); e != nil {
+			return e
+		}
+	}
+	replay.writer.Flush()
+	return replay.writer.Error()
+}
+func csvFile(output, name string, header []string) (*os.File, *csv.Writer, error) {
+	f, e := os.OpenFile(filepath.Join(output, name), os.O_CREATE|os.O_EXCL|os.O_WRONLY, 0600)
+	if e != nil {
+		return nil, nil, e
+	}
+	w := csv.NewWriter(f)
+	e = w.Write(header)
+	if e != nil {
+		f.Close()
+		return nil, nil, e
+	}
+	return f, w, nil
+}
+func closeCSV(f *os.File, w *csv.Writer) error {
+	w.Flush()
+	if e := w.Error(); e != nil {
+		f.Close()
+		return e
+	}
+	if e := f.Sync(); e != nil {
+		f.Close()
+		return e
+	}
+	return f.Close()
+}
+func available(s *playerState, stats *replayStats) bool {
+	if s.unknown != nil && (s.reset == nil || !newer(*s.reset, *s.unknown)) {
+		return false
+	}
+	if stats.GlobalBarrier != nil && (s.reset == nil || s.reset.end <= stats.GlobalBarrier.Unix()) {
+		return false
+	}
+	return true
+}
+func finish(ctx context.Context, _ *pgx.Conn, output string, stats *replayStats) error {
+	header := []string{"player_tag", "townhall_level", "war_id", "war_end_time", "identity", "player_name", "clan_tag", "credited_triples"}
+	f, w, e := csvFile(output, "qualified-suffix.csv", header)
+	if e != nil {
+		return e
+	}
+	if replay.spool != nil {
+		defer os.Remove(replay.spool.Name())
+		defer replay.spool.Close()
+		if e = replay.spool.Sync(); e != nil {
+			return e
+		}
+		if _, e = replay.spool.Seek(0, 0); e != nil {
+			return e
+		}
+		r := csv.NewReader(replay.spool)
+		for {
+			if e = ctx.Err(); e != nil {
+				return e
+			}
+			row, e := r.Read()
+			if e == io.EOF {
+				break
+			}
+			if e != nil {
+				return e
+			}
+			th, e := strconv.Atoi(row[1])
+			if e != nil {
+				return e
+			}
+			end, e := time.Parse(time.RFC3339, row[3])
+			if e != nil {
+				return e
+			}
+			key := playerKey{row[0], th}
+			state := replay.players[key]
+			if state == nil {
+				return fmt.Errorf("qualified event has no player state")
+			}
+			item := event{end: end.Unix(), identity: row[4]}
+			if state.reset != nil && !newer(item, *state.reset) {
+				continue
+			}
+			credits, e := strconv.Atoi(row[7])
+			if e != nil {
+				return e
+			}
+			state.score += credits
+			stats.QualifiedSuffixRows++
+			if e = w.Write(row); e != nil {
+				return e
+			}
+		}
+	}
+	if e = closeCSV(f, w); e != nil {
+		return e
+	}
+	keys := make([]playerKey, 0, len(replay.players))
+	for k := range replay.players {
+		keys = append(keys, k)
+	}
+	sort.Slice(keys, func(i, j int) bool {
+		if keys[i].tag == keys[j].tag {
+			return keys[i].th < keys[j].th
+		}
+		return keys[i].tag < keys[j].tag
+	})
+	preview, pw, e := csvFile(output, "preview.csv", []string{"player_tag", "townhall_level", "streak", "available", "latest_end", "player_name", "clan_tag", "reset_end", "unknown_end"})
+	if e != nil {
+		return e
+	}
+	resets, rw, e := csvFile(output, "latest-resets.csv", header[:7])
+	if e != nil {
+		return e
+	}
+	barriers, bw, e := csvFile(output, "coverage-barriers.csv", []string{"player_tag", "townhall_level", "unknown_end", "unknown_identity"})
+	if e != nil {
+		return e
+	}
+	for _, key := range keys {
+		s := replay.players[key]
+		ok := available(s, stats)
+		score, resetEnd, unknownEnd := "", "", ""
+		stats.PlayerKeys++
+		if ok {
+			stats.ExactKeys++
+			score = strconv.Itoa(s.score)
+		} else {
+			stats.UnavailableKeys++
+		}
+		if s.reset != nil {
+			resetEnd = time.Unix(s.reset.end, 0).UTC().Format(time.RFC3339)
+			if e = rw.Write(eventRow(key, *s.reset)[:7]); e != nil {
+				return e
+			}
+		}
+		if s.unknown != nil {
+			unknownEnd = time.Unix(s.unknown.end, 0).UTC().Format(time.RFC3339)
+			if e = bw.Write([]string{key.tag, strconv.Itoa(key.th), unknownEnd, s.unknown.identity}); e != nil {
+				return e
+			}
+		}
+		boolText := "f"
+		if ok {
+			boolText = "t"
+		}
+		if e = pw.Write([]string{key.tag, strconv.Itoa(key.th), score, boolText, time.Unix(s.latest.end, 0).UTC().Format(time.RFC3339), s.latest.name, s.latest.clan, resetEnd, unknownEnd}); e != nil {
+			return e
+		}
+	}
+	for _, x := range []struct {
+		f *os.File
+		w *csv.Writer
+	}{{preview, pw}, {resets, rw}, {barriers, bw}} {
+		if e = closeCSV(x.f, x.w); e != nil {
+			return e
+		}
 	}
 	if stats.UnavailableKeys > 0 || stats.GlobalBarrier != nil {
 		stats.ManifestScorable = false
 	}
-	f, err := os.OpenFile(filepath.Join(output, "preview.csv"), os.O_CREATE|os.O_EXCL|os.O_WRONLY, 0600)
-	if err != nil {
-		return err
-	}
-	defer f.Close()
-	_, err = conn.PgConn().CopyTo(ctx, f, `COPY(SELECT player_tag,townhall_level,CASE WHEN available THEN streak END AS streak,
- available IS TRUE AS available,latest_end,player_name,clan_tag,reset_end,unknown_end
- FROM replay_preview ORDER BY player_tag,townhall_level)TO STDOUT WITH CSV HEADER`)
-	if err != nil {
-		return err
-	}
-	if err = f.Sync(); err != nil {
-		return err
-	}
-	// Preserve actual event times and identities for reviewed application and
-	// future finalization; a derived score alone cannot preserve reset boundaries.
-	artifacts := []struct{ name, query string }{
-		{"qualified-suffix.csv", `COPY(SELECT player_tag,townhall_level,war_id,war_end_time,identity,player_name,clan_tag,credited_triples
-         FROM replay_wins ORDER BY player_tag,townhall_level,war_end_time,identity)TO STDOUT WITH CSV HEADER`},
-		{"latest-resets.csv", `COPY(SELECT player_tag,townhall_level,reset_war_id AS war_id,reset_end AS war_end_time,
-         reset_identity AS identity,reset_player_name AS player_name,reset_clan_tag AS clan_tag
-         FROM replay_state WHERE reset_end IS NOT NULL ORDER BY player_tag,townhall_level)TO STDOUT WITH CSV HEADER`},
-		{"coverage-barriers.csv", `COPY(SELECT player_tag,townhall_level,unknown_end,unknown_identity
-         FROM replay_state WHERE unknown_end IS NOT NULL ORDER BY player_tag,townhall_level)TO STDOUT WITH CSV HEADER`},
-	}
-	for _, artifact := range artifacts {
-		file, e := os.OpenFile(filepath.Join(output, artifact.name), os.O_CREATE|os.O_EXCL|os.O_WRONLY, 0600)
-		if e != nil {
-			return e
-		}
-		_, e = conn.PgConn().CopyTo(ctx, file, artifact.query)
-		if e == nil {
-			e = file.Sync()
-		}
-		closeErr := file.Close()
-		if e != nil {
-			return e
-		}
-		if closeErr != nil {
-			return closeErr
-		}
-	}
-	fmt.Printf("preview physical=%d canonical=%d duplicates=%d keys=%d exact=%d unavailable=%d packs=%d bytes=%d at=%s\n", stats.PhysicalRows, stats.CanonicalWars, stats.DuplicateRows, stats.PlayerKeys, stats.ExactKeys, stats.UnavailableKeys, stats.Packs, stats.DownloadBytes, time.Now().UTC().Format(time.RFC3339))
+	fmt.Printf("preview physical=%d canonical=%d keys=%d exact=%d unavailable=%d\n", stats.PhysicalRows, stats.CanonicalWars, stats.PlayerKeys, stats.ExactKeys, stats.UnavailableKeys)
 	return nil
 }
