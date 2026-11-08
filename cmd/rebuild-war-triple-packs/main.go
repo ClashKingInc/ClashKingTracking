@@ -1,26 +1,30 @@
-// Manual full-source replay. The source SQL transaction is read-only; all
-// scoring writes are restricted to the canonical loopback development DB.
+// Read-only archive replay into disposable, bounded SQL staging. The command
+// never opens a production SQL session or changes a leaderboard table.
 package main
 
 import (
 	"context"
+	"crypto/sha256"
 	"encoding/base64"
 	"encoding/csv"
+	"encoding/hex"
+	"encoding/json"
 	"flag"
 	"fmt"
 	"io"
 	"net/http"
+	"net/url"
 	"os"
-	"os/exec"
-	"regexp"
+	"path/filepath"
+	"sort"
 	"strconv"
 	"strings"
 	"time"
 
 	"clashking_tracking/internal/wararchive"
 	"clashking_tracking/scripts"
+	"github.com/clashkinginc/clashy.go"
 	"github.com/jackc/pgx/v5"
-	"github.com/jackc/pgx/v5/pgxpool"
 	"github.com/klauspost/compress/zstd"
 )
 
@@ -30,63 +34,121 @@ func main() {
 		os.Exit(1)
 	}
 }
+
+type replayStats struct {
+	AsOf                    time.Time  `json:"as_of"`
+	Cutoff                  time.Time  `json:"cutoff"`
+	PhysicalRows            int64      `json:"physical_rows"`
+	CanonicalWars           int64      `json:"canonical_wars"`
+	DuplicateRows           int64      `json:"duplicate_rows"`
+	Excluded                int64      `json:"excluded"`
+	Unscorable              int64      `json:"unscorable"`
+	Packs                   int64      `json:"packs"`
+	DownloadBytes           int64      `json:"download_bytes"`
+	PlayerKeys              int64      `json:"player_keys"`
+	QualifiedSuffixRows     int64      `json:"qualified_suffix_rows"`
+	ExactKeys               int64      `json:"exact_keys"`
+	UnavailableKeys         int64      `json:"unavailable_keys"`
+	GlobalBarrier           *time.Time `json:"global_barrier"`
+	ManifestScorable        bool       `json:"manifest_scorable"`
+	SourceCoverageValidated bool       `json:"source_coverage_validated"`
+	Complete                bool       `json:"complete"`
+}
+
+type stagedWar struct {
+	id                    int32
+	end                   time.Time
+	identity, fingerprint string
+	known                 bool
+	reason                string
+}
+type stagedOutcome struct {
+	war       stagedWar
+	member    wararchive.Member
+	clan      string
+	qualified *bool
+	credits   int
+}
+
 func run() error {
-	days := flag.Int("days", 30, "completed-war lookback")
-	apply := flag.Bool("apply", false, "write only to loopback development DB")
-	limit := flag.Int("pack-limit", 0, "optional bounded verification; zero scans all packs")
-	container := flag.String("source-container", "", "explicit source Timescale container")
+	index := flag.String("index-file", "", "reviewed seven-column CSV manifest, ordered by pack ID; no automatic production export")
+	output := flag.String("output-dir", "", "new directory for coverage.json and preview.csv")
+	asOfText := flag.String("as-of", "", "required frozen UTC RFC3339 window end")
+	dsn := flag.String("staging-dsn", "postgres://clashking_local:clashking_local@127.0.0.1:54330/clashking_dev", "disposable loopback staging database only")
+	archiveBase := flag.String("archive-base", "https://wars.clashk.ing/", "archive origin (loopback permitted for actual service E2E)")
+	packLimit := flag.Int("pack-limit", 0, "bounded diagnostic limit; always marks coverage incomplete")
+	apply := flag.Bool("apply", false, "unsupported: production application requires a separately reviewed artifact")
 	flag.Parse()
-	if *days < 1 || *days > 365 || !regexp.MustCompile(`^timescale-[a-z0-9-]+$`).MatchString(*container) {
-		return fmt.Errorf("invalid days or source container")
+	if *apply {
+		return fmt.Errorf("score application is disabled; review the coverage preview before preparing an apply artifact")
+	}
+	asOf, err := time.Parse(time.RFC3339Nano, *asOfText)
+	if err != nil {
+		return fmt.Errorf("explicit RFC3339 as-of is required")
+	}
+	asOf = asOf.UTC()
+	var cutoff time.Time
+	if *index == "" || *output == "" || *packLimit < 0 {
+		return fmt.Errorf("index-file and new output-dir are required")
+	}
+	u, err := url.Parse(*dsn)
+	canonical := err == nil && u.Hostname() == "127.0.0.1" && u.Port() == "54330" && u.Path == "/clashking_dev"
+	disposable := err == nil && os.Getenv("CLASHKING_DISPOSABLE_TIMESCALE") == "1" && *dsn == os.Getenv("TEST_DATABASE_URL") && u.Hostname() == "127.0.0.1" && u.Path == "/clashking_test"
+	if !canonical && !disposable {
+		return fmt.Errorf("staging is restricted to the canonical loopback development database")
+	}
+	base, err := url.Parse(*archiveBase)
+	if err != nil || base.User != nil || base.RawQuery != "" || base.Fragment != "" {
+		return fmt.Errorf("invalid archive origin")
+	}
+	if !(base.Scheme == "https" && base.Host == "wars.clashk.ing") && !(base.Scheme == "http" && (base.Hostname() == "127.0.0.1" || base.Hostname() == "localhost")) {
+		return fmt.Errorf("archive origin must be the canonical public archive or loopback")
+	}
+	if err = os.Mkdir(*output, 0700); err != nil {
+		return err
 	}
 	ctx := context.Background()
-	until := time.Now().UTC()
-	from := until.AddDate(0, 0, -*days)
-	// Use source-assigned IDs and locators. Pack frames deliberately omit IDs;
-	// guessing them from offsets would collide and corrupt repeatable scoring.
-	sql := fmt.Sprintf(`BEGIN READ ONLY;
- SET LOCAL statement_timeout='180s';
- COPY (SELECT COALESCE(w.archive_pack_id,0),w.war_id,COALESCE(w.archive_offset,0),COALESCE(w.archive_compressed_bytes,0),floor(extract(epoch FROM w.end_time))::bigint,COALESCE(encode(convert_to(p.payload::text,'UTF8'),'base64'),'')
- FROM wars w LEFT JOIN war_archive_pending p USING(war_id,end_time)
- WHERE w.war_type='random' AND w.state='warEnded' AND w.end_time>='%s' AND w.end_time<='%s'
- ORDER BY COALESCE(w.archive_pack_id,0),w.archive_offset,w.war_id) TO STDOUT WITH CSV;
- ROLLBACK;`, from.Format(time.RFC3339Nano), until.Format(time.RFC3339Nano))
-	source, err := os.CreateTemp("", "ck-war-index-*.csv")
+	conn, err := pgx.Connect(ctx, *dsn)
 	if err != nil {
 		return err
 	}
-	defer os.Remove(source.Name())
-	defer source.Close()
-	command := exec.CommandContext(ctx, "ssh", "-o", "BatchMode=yes", "-o", "ConnectTimeout=10", "root@152.53.82.182", fmt.Sprintf(`docker exec -i %s sh -c 'exec psql -X -q -A -t -v ON_ERROR_STOP=1 -U "$POSTGRES_USER" -d clashking'`, *container))
-	command.Stdin = strings.NewReader(sql)
-	command.Stdout = source
-	command.Stderr = os.Stderr
-	if err = command.Run(); err != nil {
-		return fmt.Errorf("read-only source export: %w", err)
-	}
-	if _, err = source.Seek(0, 0); err != nil {
+	defer conn.Close(ctx)
+	// PostgreSQL defines the production calendar month, including month-end
+	// clamping. Go AddDate normalizes Feb29 differently and must not set it.
+	if err = conn.QueryRow(ctx, `SELECT (($1::timestamptz AT TIME ZONE 'UTC') - interval '1 month') AT TIME ZONE 'UTC'`, asOf).Scan(&cutoff); err != nil {
 		return err
 	}
-	fmt.Printf("source window=%s..%s apply=%t\n", from.Format(time.RFC3339), until.Format(time.RFC3339), *apply)
-	pool, err := pgxpool.New(ctx, "postgres://clashking_local:clashking_local@127.0.0.1:54330/clashking_dev")
+	cutoff = cutoff.UTC()
+	if _, err = conn.Exec(ctx, stagingSchema); err != nil {
+		return err
+	}
+	f, err := os.Open(*index)
 	if err != nil {
 		return err
 	}
-	defer pool.Close()
+	defer f.Close()
 	decoder, err := zstd.NewReader(nil, zstd.WithDecoderDicts(wararchive.Dictionary), zstd.WithDecoderMaxMemory(32<<20))
 	if err != nil {
 		return err
 	}
 	defer decoder.Close()
+	stats := replayStats{AsOf: asOf, Cutoff: cutoff, ManifestScorable: *packLimit == 0}
+	reader := csv.NewReader(f)
+	reader.FieldsPerRecord = 7
 	client := &http.Client{Timeout: 90 * time.Second}
-	reader := csv.NewReader(source)
-	var pack int64 = -1
+	var currentPack int64 = -1
 	var data []byte
-	var batch [][]any
-	states := make(map[streakKey]*streakSuffix)
-	packs, wars, skipped, qualified, resets := 0, 0, 0, 0, 0
+	var batch []stagedWar
+	var outcomes []stagedOutcome
 	flush := func() error {
-		fmt.Printf("packs=%d wars=%d excluded=%d qualified=%d resets=%d\n", packs, wars, skipped, qualified, resets)
+		if len(batch) == 0 {
+			return nil
+		}
+		if err := stage(ctx, conn, batch, outcomes, &stats); err != nil {
+			return err
+		}
+		batch = nil
+		outcomes = nil
 		return nil
 	}
 	for {
@@ -97,28 +159,33 @@ func run() error {
 		if e != nil {
 			return e
 		}
-		if len(row) != 6 {
-			return fmt.Errorf("unexpected source index columns")
-		}
 		nums := make([]int64, 5)
 		for i := range nums {
 			nums[i], e = strconv.ParseInt(row[i], 10, 64)
 			if e != nil {
-				return e
+				return fmt.Errorf("invalid manifest integer column %d", i+1)
 			}
 		}
-		if nums[0] != pack {
-			if e = flush(); e != nil {
-				return e
+		if nums[0] < 0 || nums[1] <= 0 || nums[1] > 2147483647 {
+			return fmt.Errorf("invalid source-assigned IDs")
+		}
+		if nums[0] != currentPack {
+			if err = flush(); err != nil {
+				return err
 			}
-			if *limit > 0 && packs >= *limit {
+			if nums[0] < currentPack {
+				return fmt.Errorf("manifest must be ordered by pack ID, then frame offset")
+			}
+			if *packLimit > 0 && stats.Packs >= int64(*packLimit) {
+				stats.ManifestScorable = false
 				break
 			}
-			pack = nums[0]
+			currentPack = nums[0]
 			data = nil
-			if pack > 0 {
-				url := "https://wars.clashk.ing/" + wararchive.ObjectKey(pack)
-				req, _ := http.NewRequestWithContext(ctx, "GET", url, nil)
+			if currentPack > 0 {
+				archiveURL := *base
+				archiveURL.Path = strings.TrimRight(base.Path, "/") + "/" + wararchive.ObjectKey(currentPack)
+				req, _ := http.NewRequestWithContext(ctx, "GET", archiveURL.String(), nil)
 				resp, e := client.Do(req)
 				if e != nil {
 					return e
@@ -129,18 +196,20 @@ func run() error {
 					return e
 				}
 				if resp.StatusCode != 200 || len(data) == 0 || len(data) >= 128<<20 {
-					return fmt.Errorf("pack %d download invalid: status=%d bytes=%d", pack, resp.StatusCode, len(data))
+					return fmt.Errorf("pack %d invalid response: status=%d bytes=%d", currentPack, resp.StatusCode, len(data))
 				}
-				packs++
+				stats.Packs++
+				stats.DownloadBytes += int64(len(data))
 			}
 		}
+		stats.PhysicalRows++
 		var raw []byte
-		if pack == 0 {
+		if currentPack == 0 {
 			raw, e = base64.StdEncoding.DecodeString(strings.ReplaceAll(row[5], "\n", ""))
 		} else {
 			offset, size := nums[2], nums[3]
-			if offset < 0 || size <= 0 || offset+size > int64(len(data)) {
-				return fmt.Errorf("war %d pack %d invalid locator", nums[1], pack)
+			if offset < 0 || size <= 0 || size > 2<<20 || offset > int64(len(data))-size {
+				return fmt.Errorf("war %d invalid pack locator", nums[1])
 			}
 			raw, e = decoder.DecodeAll(data[offset:offset+size], nil)
 		}
@@ -148,148 +217,119 @@ func run() error {
 			return e
 		}
 		if len(raw) == 0 {
-			return fmt.Errorf("war %d has neither pack nor pending payload", nums[1])
+			return fmt.Errorf("war %d missing source payload; coverage cannot be published", nums[1])
 		}
 		war, e := wararchive.Unmarshal(raw)
 		if e != nil {
 			return e
 		}
 		end := time.Unix(nums[4], 0).UTC()
-		if war.EndTime.Unix() != end.Unix() {
+		if !war.EndTime.Equal(end) {
 			return fmt.Errorf("war %d frame end does not match index", nums[1])
 		}
-		outcomes, e := scripts.ScoreWarTripleStreaks(war, "random")
+		if end.Before(cutoff) || end.After(asOf) {
+			stats.Excluded++
+			continue
+		}
+		warType := row[6]
+		if warType != "random" || !strings.EqualFold(war.State, "warEnded") || clashy.IsFriendlyWarWindow(war.PreparationStartTime, war.StartTime, war.EndTime) {
+			stats.Excluded++
+			continue
+		}
+		if war.Clan.Tag == "" || war.Opponent.Tag == "" || war.Clan.Tag == war.Opponent.Tag || war.PreparationStartTime.IsZero() {
+			return fmt.Errorf("war %d lacks canonical identity", nums[1])
+		}
+		normalized := war
+		if normalized.Clan.Tag > normalized.Opponent.Tag {
+			normalized.Clan, normalized.Opponent = normalized.Opponent, normalized.Clan
+		}
+		identity := fmt.Sprintf("%s|%s|%d|%d", normalized.Clan.Tag, normalized.Opponent.Tag, normalized.PreparationStartTime.Unix(), end.Unix())
+		fingerprint, e := scoringFingerprint(normalized)
 		if e != nil {
 			return e
 		}
-		wars++
-		if len(outcomes) == 0 {
-			skipped++
+		entry := stagedWar{id: int32(nums[1]), end: end, identity: identity, fingerprint: fingerprint, known: true}
+		// A complete roster still identifies affected keys when the archive
+		// omits its allowance. Validate its members separately, but never
+		// award credits or manufacture resets from that unknown source.
+		rosterWar := war
+		if rosterWar.AttacksPerMember != 2 {
+			rosterWar.AttacksPerMember = 2
 		}
-		for _, o := range outcomes {
-			if o.Qualified {
-				qualified++
-			} else {
-				resets++
+		scored, e := scripts.ScoreWarTripleStreaks(rosterWar, "random")
+		if e != nil || len(scored) == 0 || war.AttacksPerMember != 2 {
+			entry.known = false
+			entry.reason = "incomplete_or_invalid_roster"
+			if war.AttacksPerMember != 2 {
+				entry.reason = "unknown_attack_allowance"
 			}
-			key := streakKey{o.Member.Tag, o.Member.TownhallLevel}
-			state := states[key]
-			if state == nil {
-				state = &streakSuffix{}
-				states[key] = state
+			stats.Unscorable++
+			// A complete roster identifies affected keys even when attack rules are unknown.
+			// A missing/invalid roster cannot identify everyone; retain a global barrier.
+			if len(scored) == 0 || e != nil {
+				if stats.GlobalBarrier == nil || end.After(*stats.GlobalBarrier) {
+					v := end
+					stats.GlobalBarrier = &v
+				}
 			}
-			state.add(scoredWar{int32(nums[1]), end, o.Qualified, o.Member.Name, o.Clan})
+		}
+		batch = append(batch, entry)
+		for _, o := range scored {
+			var q *bool
+			if entry.known {
+				v := o.Qualified
+				q = &v
+			}
+			outcomes = append(outcomes, stagedOutcome{entry, o.Member, o.Clan, q, o.CreditedTriples})
+		}
+		if len(batch) >= 100 {
+			if err = flush(); err != nil {
+				return err
+			}
 		}
 	}
 	if err = flush(); err != nil {
 		return err
 	}
-	// Only the latest reset and successful suffix affect the current streak.
-	// Retain those exact source events, not millions of redundant earlier fails.
-	// Existing local events remain untouched; SQL still merges newer live data.
-	stored := 0
-	for key, state := range states {
-		appendRow := func(row scoredWar) {
-			batch = append(batch, []any{key.tag, key.th, row.id, row.end, row.qualified, row.name, row.clan})
-		}
-		if state.reset != nil {
-			appendRow(*state.reset)
-		}
-		for _, row := range state.wins {
-			appendRow(row)
-		}
-		if len(batch) >= 50000 {
-			if *apply {
-				if err = store(ctx, pool, batch); err != nil {
-					return err
-				}
-			}
-			stored += len(batch)
-			batch = nil
-			fmt.Printf("materialized=%d player_keys=%d\n", stored, len(states))
-		}
+	if err = finish(ctx, conn, *output, &stats); err != nil {
+		return err
 	}
-	if len(batch) > 0 {
-		if *apply {
-			if err = store(ctx, pool, batch); err != nil {
-				return err
-			}
-		}
-		stored += len(batch)
+	encoded, _ := json.MarshalIndent(stats, "", "  ")
+	if err = os.WriteFile(filepath.Join(*output, "coverage.json"), append(encoded, '\n'), 0600); err != nil {
+		return err
 	}
-	fmt.Printf("DONE packs=%d wars=%d excluded=%d qualified=%d resets=%d apply=%t\n", packs, wars, skipped, qualified, resets, *apply)
+	fmt.Println(string(encoded))
 	return nil
 }
 
-type streakKey struct {
-	tag string
-	th  int
-}
-type scoredWar struct {
-	id         int32
-	end        time.Time
-	qualified  bool
-	name, clan string
-}
-type streakSuffix struct {
-	reset *scoredWar
-	wins  map[int32]scoredWar
-}
-
-func later(a, b scoredWar) bool { return a.end.After(b.end) || (a.end.Equal(b.end) && a.id > b.id) }
-func (s *streakSuffix) add(row scoredWar) {
-	if row.qualified {
-		if s.reset != nil && !later(row, *s.reset) {
-			return
-		}
-		if s.wins == nil {
-			s.wins = make(map[int32]scoredWar)
-		}
-		s.wins[row.id] = row
-		return
-	}
-	if s.reset != nil && !later(row, *s.reset) {
-		return
-	}
-	s.reset = &row
-	for id, win := range s.wins {
-		if !later(win, row) {
-			delete(s.wins, id)
+// Hash only scoring semantics. Clan/player names and other mutable display
+// fields cannot turn repeated observations of the same game war into conflicts.
+func scoringFingerprint(war wararchive.War) (string, error) {
+	for _, side := range []*wararchive.Clan{&war.Clan, &war.Opponent} {
+		side.Members = append([]wararchive.Member(nil), side.Members...)
+		side.Name = ""
+		side.BadgeToken = ""
+		side.ClanLevel = 0
+		side.Attacks = 0
+		side.Stars = 0
+		side.DestructionPercentage = 0
+		sort.Slice(side.Members, func(i, j int) bool { return side.Members[i].Tag < side.Members[j].Tag })
+		for i := range side.Members {
+			m := &side.Members[i]
+			m.Attacks = append([]wararchive.Attack(nil), m.Attacks...)
+			m.Name = ""
+			m.MapPosition = 0
+			sort.Slice(m.Attacks, func(i, j int) bool { return m.Attacks[i].Order < m.Attacks[j].Order })
+			for j := range m.Attacks {
+				m.Attacks[j].DestructionPercentage = 0
+				m.Attacks[j].Duration = 0
+			}
 		}
 	}
-}
-
-func store(ctx context.Context, pool *pgxpool.Pool, rows [][]any) error {
-	tx, err := pool.BeginTx(ctx, pgx.TxOptions{IsoLevel: pgx.Serializable})
+	raw, err := json.Marshal(war)
 	if err != nil {
-		return err
+		return "", err
 	}
-	defer tx.Rollback(ctx)
-	// A bounded temporary batch commits atomically. Replay
-	// never clears existing history, so a failure or rerun cannot erase progress.
-	_, err = tx.Exec(ctx, `CREATE TEMP TABLE triple_replay (LIKE war_triple_streak_results INCLUDING DEFAULTS) ON COMMIT DROP`)
-	if err != nil {
-		return err
-	}
-	_, err = tx.CopyFrom(ctx, pgx.Identifier{"triple_replay"}, []string{"player_tag", "townhall_level", "war_id", "war_end_time", "qualified", "player_name", "clan_tag"}, pgx.CopyFromRows(rows))
-	if err != nil {
-		return err
-	}
-	_, err = tx.Exec(ctx, `INSERT INTO war_triple_streak_results SELECT * FROM triple_replay ON CONFLICT DO NOTHING;
- CREATE TEMP TABLE triple_keys ON COMMIT DROP AS SELECT DISTINCT player_tag,townhall_level FROM triple_replay;
- CREATE UNIQUE INDEX ON triple_keys(player_tag,townhall_level);
- ANALYZE triple_keys;
- WITH ranked AS (
- SELECT r.*,row_number() OVER(PARTITION BY r.player_tag,r.townhall_level ORDER BY r.war_end_time DESC,r.war_id DESC) AS position,
- count(*) FILTER(WHERE NOT r.qualified) OVER(PARTITION BY r.player_tag,r.townhall_level ORDER BY r.war_end_time DESC,r.war_id DESC ROWS UNBOUNDED PRECEDING) AS resets
- FROM war_triple_streak_results r JOIN triple_keys k USING(player_tag,townhall_level)
- ), totals AS (
- SELECT player_tag,townhall_level,(count(*) FILTER(WHERE qualified AND resets=0)*2)::integer AS streak FROM ranked GROUP BY player_tag,townhall_level
- ) INSERT INTO war_triple_streaks(player_tag,townhall_level,streak,last_attack_time,player_name,clan_tag)
- SELECT r.player_tag,r.townhall_level,t.streak,r.war_end_time,r.player_name,r.clan_tag FROM ranked r JOIN totals t USING(player_tag,townhall_level) WHERE r.position=1
- ON CONFLICT(player_tag,townhall_level) DO UPDATE SET streak=EXCLUDED.streak,last_attack_time=EXCLUDED.last_attack_time,player_name=EXCLUDED.player_name,clan_tag=EXCLUDED.clan_tag`)
-	if err != nil {
-		return err
-	}
-	return tx.Commit(ctx)
+	sum := sha256.Sum256(raw)
+	return hex.EncodeToString(sum[:]), nil
 }

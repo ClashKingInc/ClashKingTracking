@@ -14,13 +14,15 @@ import (
 
 // WarTripleOutcome includes non-attackers so missed hits remain reset events.
 type WarTripleOutcome struct {
-	Member    wararchive.Member
-	Clan      string
-	Qualified bool
+	Member          wararchive.Member
+	Clan            string
+	Qualified       bool
+	CreditedTriples int
 }
 
 // ScoreWarTripleStreaks is shared by live finalization and full-pack replay.
-// Walk the roster, never just attackers: zero or one attack must reset a streak.
+// Walk the roster, never just attackers: a missed attack resets a streak.
+// Different-TH hits are neutral, including failures; only same-TH triples add.
 func ScoreWarTripleStreaks(war wararchive.War, warType string) ([]WarTripleOutcome, error) {
 	if warType != "random" || !strings.EqualFold(war.State, "warEnded") {
 		return nil, nil
@@ -29,6 +31,9 @@ func ScoreWarTripleStreaks(war wararchive.War, warType string) ([]WarTripleOutco
 		return nil, nil
 	}
 	if war.TeamSize <= 0 || len(war.Clan.Members) != war.TeamSize || len(war.Opponent.Members) != war.TeamSize {
+		return nil, nil
+	}
+	if war.AttacksPerMember != 2 {
 		return nil, nil
 	}
 	var outcomes []WarTripleOutcome
@@ -43,15 +48,31 @@ func ScoreWarTripleStreaks(war wararchive.War, warType string) ([]WarTripleOutco
 				return nil, fmt.Errorf("invalid regular-war roster for streak scoring")
 			}
 			seen[member.Tag] = true
-			qualifies := war.AttacksPerMember == 2 && len(member.Attacks) == 2
+			if len(member.Attacks) > 2 {
+				return nil, fmt.Errorf("too many regular-war attacks for streak scoring")
+			}
+			qualifies := len(member.Attacks) == 2
+			credits := 0
 			orders := map[int]bool{}
 			for _, attack := range member.Attacks {
-				if attack.Stars != 3 || opponents[attack.DefenderTag] != member.TownhallLevel || (attack.Order > 0 && orders[attack.Order]) {
-					qualifies = false
+				defenderTH, found := opponents[attack.DefenderTag]
+				if !found || attack.Stars < 0 || attack.Stars > 3 || (attack.Order > 0 && orders[attack.Order]) {
+					return nil, fmt.Errorf("invalid regular-war attack for streak scoring")
 				}
 				orders[attack.Order] = true
+				if defenderTH != member.TownhallLevel {
+					continue
+				}
+				if attack.Stars != 3 {
+					qualifies = false
+				} else {
+					credits++
+				}
 			}
-			outcomes = append(outcomes, WarTripleOutcome{member, side.own.Tag, qualifies})
+			if !qualifies {
+				credits = 0
+			}
+			outcomes = append(outcomes, WarTripleOutcome{Member: member, Clan: side.own.Tag, Qualified: qualifies, CreditedTriples: credits})
 		}
 	}
 	return outcomes, nil
@@ -77,21 +98,21 @@ func RecordWarTripleStreaks(ctx context.Context, tx pgx.Tx, warID int32, end tim
 			return err
 		}
 		if _, err := tx.Exec(ctx, `INSERT INTO war_triple_streak_results
-            (player_tag,townhall_level,war_id,war_end_time,qualified,player_name,clan_tag)
-            SELECT $1,$2,$3,$4,$5,$6,$7 WHERE NOT EXISTS (
+            (player_tag,townhall_level,war_id,war_end_time,qualified,player_name,clan_tag,credited_triples)
+            SELECT $1,$2,$3,$4,$5,$6,$7,$11 WHERE NOT EXISTS (
                 SELECT 1 FROM war_triple_streak_results result
                 JOIN wars prior ON prior.war_id=result.war_id AND prior.end_time=result.war_end_time
                 WHERE result.player_tag=$1 AND result.townhall_level=$2 AND result.war_end_time=$4
                   AND prior.clan_tag=$8 AND prior.opponent_tag=$9 AND prior.prep_time=$10
             ) ON CONFLICT DO NOTHING`, member.Tag, member.TownhallLevel, warID, end, item.Qualified, member.Name, item.Clan,
-			clanTag, opponentTag, war.PreparationStartTime); err != nil {
+			clanTag, opponentTag, war.PreparationStartTime, item.CreditedTriples); err != nil {
 			return err
 		}
 		// Recompute by game-war identity, not allocated SQL IDs. Older data can
 		// contain duplicate IDs for one war; a later real war must not restore
 		// their inflated score after the derived leaderboard is repaired.
 		if _, err := tx.Exec(ctx, `WITH canonical AS MATERIALIZED (
-            SELECT min(result.war_id) AS war_id,result.war_end_time,bool_and(result.qualified) AS qualified
+            SELECT min(result.war_id) AS war_id,result.war_end_time,bool_and(result.qualified) AS qualified,min(result.credited_triples) AS credited_triples
             FROM war_triple_streak_results result
             JOIN wars war ON war.war_id=result.war_id AND war.end_time=result.war_end_time
             WHERE result.player_tag=$1 AND result.townhall_level=$2
@@ -105,7 +126,7 @@ func RecordWarTripleStreaks(ctx context.Context, tx pgx.Tx, warID int32, end tim
             SELECT war_end_time,war_id FROM canonical WHERE NOT qualified
             ORDER BY war_end_time DESC,war_id DESC LIMIT 1
         ), total AS (
-            SELECT (count(*)*2)::integer AS streak FROM canonical r WHERE qualified
+            SELECT COALESCE(sum(credited_triples),0)::integer AS streak FROM canonical r WHERE qualified
             AND (NOT EXISTS(SELECT 1 FROM reset) OR (r.war_end_time,r.war_id) > (SELECT war_end_time,war_id FROM reset))
         ) INSERT INTO war_triple_streaks (player_tag,townhall_level,streak,last_attack_time,player_name,clan_tag)
         SELECT player_tag,townhall_level,total.streak,war_end_time,player_name,clan_tag FROM latest CROSS JOIN total
