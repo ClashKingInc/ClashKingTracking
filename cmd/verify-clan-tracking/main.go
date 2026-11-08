@@ -73,6 +73,7 @@ func main() {
 		must(err)
 	}
 	var mode atomic.Int32
+	var memberVersion atomic.Int32
 	var calls atomic.Int64
 	warResponses := map[string]any{}
 	listener, err := net.Listen("tcp", "127.0.0.1:0")
@@ -109,7 +110,25 @@ func main() {
 			return
 		}
 		tag := r.URL.Path[strings.LastIndex(r.URL.Path, "/")+1:]
-		_ = json.NewEncoder(w).Encode(map[string]any{"tag": tag, "name": "refreshed", "members": 10, "isWarLogPublic": true, "clanLevel": 10, "warWins": 5, "warWinStreak": 0, "clanPoints": 1000, "clanBuilderBasePoints": 100, "badgeUrls": map[string]string{"large": "https://example.invalid/badge.png"}, "warLeague": map[string]any{"id": 48000001, "name": "Bronze"}, "memberList": []any{}})
+		members := []any{}
+		if tag == "#PYQ" {
+			version := memberVersion.Load()
+			name, townHall, trophies, league := "Member", 15, 5000, 105000036
+			if version >= 1 {
+				trophies = 5010
+			}
+			if version >= 2 {
+				league = 105000035
+			}
+			if version >= 3 {
+				name = "Renamed"
+			}
+			if version >= 4 {
+				townHall = 16
+			}
+			members = []any{map[string]any{"tag": "#LQPY", "name": name, "townHallLevel": townHall, "trophies": trophies, "leagueTier": map[string]any{"id": league}}}
+		}
+		_ = json.NewEncoder(w).Encode(map[string]any{"tag": tag, "name": "refreshed", "members": 10, "isWarLogPublic": true, "clanLevel": 10, "warWins": 5, "warWinStreak": 0, "clanPoints": 1000, "clanBuilderBasePoints": 100, "badgeUrls": map[string]string{"large": "https://example.invalid/badge.png"}, "warLeague": map[string]any{"id": 48000001, "name": "Bronze"}, "memberList": members})
 	})}
 	go server.Serve(listener)
 	defer server.Close()
@@ -124,6 +143,10 @@ func main() {
 		return &platform.App{Config: platform.Config{TimescaleURL: dsn, ValkeyAddr: os.Getenv("TEST_VALKEY_ADDR"), GlobalClanPriorityRequestsPerSecond: 20, GlobalClanNonPriorityRequestsPerSecond: 20, GlobalClanWriteWorkers: 1, TargetPageMultiplier: 1, WarArchiveRequestsPerSecond: 20, WarArchiveScanSeconds: 1, WarArchivePackSize: 10000, WarArchiveEndpoint: "http://127.0.0.1:1", WarArchiveBucket: "disabled", WarArchiveAccessKeyID: "local", WarArchiveSecretAccessKey: "local", CWLRequestsPerSecond: 1, CWLWarRequestsPerSecond: 1, CWLSyncSeconds: 3600}, Logger: slog.New(slog.NewJSONHandler(os.Stdout, nil)), Clash: client, Valkey: cache, Stats: platform.NewTracker(), Availability: platform.NewAvailabilityGate(nil)}
 	}
 	app := newApp()
+	// Legacy snapshots lack the two diff fields. The actual domain must hydrate
+	// them once, then avoid player writes across repeated unchanged fetches.
+	_, err = db.Exec(ctx, `UPDATE basic_clan SET members='[{"tag":"#LQPY","name":"Member","town_hall":15}]'::jsonb WHERE tag='#PYQ'`)
+	must(err)
 	runCtx, cancel := context.WithCancel(ctx)
 	done := make(chan error, 1)
 	go func() { done <- scripts.NewGlobalClansDomain().Run(runCtx, app) }()
@@ -148,6 +171,31 @@ func main() {
 	var stored int
 	must(db.QueryRow(ctx, `SELECT count(*) FROM basic_clan WHERE name='refreshed'`).Scan(&stored))
 	check(stored > 0, "no actual SQL refresh")
+	var firstObserved time.Time
+	var firstVersion string
+	must(db.QueryRow(ctx, `SELECT observed_at,xmin::text FROM basic_player WHERE tag='#LQPY'`).Scan(&firstObserved, &firstVersion))
+	time.Sleep(time.Second)
+	var unchangedObserved time.Time
+	var unchangedVersion string
+	must(db.QueryRow(ctx, `SELECT observed_at,xmin::text FROM basic_player WHERE tag='#LQPY'`).Scan(&unchangedObserved, &unchangedVersion))
+	check(firstObserved.Equal(unchangedObserved) && firstVersion == unchangedVersion, "unchanged player was rewritten")
+	var hydrated bool
+	must(db.QueryRow(ctx, `SELECT members->0 ? 'league_id' AND members->0 ? 'trophies' FROM basic_clan WHERE tag='#PYQ'`).Scan(&hydrated))
+	check(hydrated, "legacy member snapshot did not hydrate")
+	for phase := int32(1); phase <= 4; phase++ {
+		memberVersion.Store(phase)
+		deadline := time.Now().Add(10 * time.Second)
+		for {
+			var changed bool
+			must(db.QueryRow(ctx, `SELECT trophies=5010 AND ($1<2 OR league_id=105000035) AND ($1<3 OR name='Renamed') AND ($1<4 OR townhall_level=16) AND observed_at>$2 FROM basic_player WHERE tag='#LQPY'`, phase, firstObserved).Scan(&changed))
+			if changed {
+				break
+			}
+			check(time.Now().Before(deadline), "member field change did not reach SQL")
+			time.Sleep(100 * time.Millisecond)
+		}
+	}
+	fmt.Println("PLAYER_DIFF_PASS legacy_hydrated=true unchanged_row_and_timestamp_preserved=true trophies_league_name_townhall_updated=true")
 	mode.Store(1)
 	time.Sleep(2 * time.Second)
 	countBefore := calls.Load()

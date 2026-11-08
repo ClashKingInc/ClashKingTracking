@@ -62,7 +62,11 @@ Writes:
 
 - `basic_clan`: current profile, public-war-log flag, members, known Clash IDs, and the clan's cumulative Capital Gold deposits. This process preserves `last_active`; the war pipeline advances it.
 - `clan_records`: best clan points and war streak records.
-- `basic_player`: inexpensive member facts learned from the clan response.
+- `basic_player`: new or changed member facts learned from the clan response. The comparison happens in code against the persisted clan member snapshot, keyed by player tag; reordering the response does not count as a change. Unchanged members do not enter the player upsert or advance `observed_at`.
+
+Member snapshots retain name, town hall, league ID and trophies. Older JSON lacks the last two fields, so the next successful observation hydrates that clan's players once before skipping unchanged members. This uses the existing JSON column and needs no SQL migration. Unknown incoming league IDs and zero trophies retain the existing player-upsert fallback behavior.
+
+This comparison intentionally does not reconcile independent changes made by another player writer. `observed_at` is stamped on submitted changes, not refreshed as a GlobalClans last-seen heartbeat. The existing SQL ordering guard remains for those submitted changes. Slow-store logs include `members_observed` and `player_rows_submitted` to distinguish fetched membership from attempted player writes; these logs are thresholded samples, not fleet-wide totals.
 - `join_leave_history`: durable join and leave rows.
 - `clan_change_history`: durable description, level, league, and other supported profile changes.
 

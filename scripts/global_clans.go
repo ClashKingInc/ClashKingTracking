@@ -668,7 +668,7 @@ func buildGlobalClanIngest(current globalClanSnapshot, previous *globalClanSnaps
 	}
 	ingest := models.GlobalClanIngest{
 		Clans:       []models.BasicClanRow{current.Row},
-		Players:     basicPlayerRows(current.Clan.Tag, current.Clan.Members, current.FetchedAt),
+		Players:     changedBasicPlayerRows(current.Clan.Tag, current.Clan.Members, previousRow.Members, current.FetchedAt),
 		ClanRecords: clanRecordRows(current.Clan, previousRow, current.FetchedAt),
 	}
 	if previous != nil && !isGlobalClanFirstHydration(previous.Row, current.Clan) {
@@ -706,6 +706,7 @@ func (w *globalClanAsyncWriter) writeBatch(ctx context.Context, jobs []globalCla
 	group := jobs[0].Group
 	snapshotsByTag := make(map[string]globalClanSnapshot)
 	var ingest models.GlobalClanIngest
+	membersObserved := 0
 	for _, job := range jobs {
 		if job.Group != group {
 			group = "mixed"
@@ -731,6 +732,7 @@ func (w *globalClanAsyncWriter) writeBatch(ctx context.Context, jobs []globalCla
 	}
 	for _, tag := range tags {
 		snapshot := snapshotsByTag[tag]
+		membersObserved += len(snapshot.Clan.Members)
 		var previous *globalClanSnapshot
 		if row, ok := previousRows[tag]; ok {
 			previous = &globalClanSnapshot{Row: row}
@@ -751,6 +753,8 @@ func (w *globalClanAsyncWriter) writeBatch(ctx context.Context, jobs []globalCla
 				"group", group,
 				"jobs", len(jobs),
 				"requested_writes", requestedWrites,
+				"members_observed", membersObserved,
+				"player_rows_submitted", len(ingest.Players),
 				"duration_ms", durationMillis(storeDuration),
 				"err", err,
 			)
@@ -763,6 +767,8 @@ func (w *globalClanAsyncWriter) writeBatch(ctx context.Context, jobs []globalCla
 			"group", group,
 			"jobs", len(jobs),
 			"requested_writes", requestedWrites,
+			"members_observed", membersObserved,
+			"player_rows_submitted", len(ingest.Players),
 			"affected_writes", result.WriteCount,
 			"duration_ms", durationMillis(storeDuration),
 			"players_ms", durationMillis(result.PlayerStoreDuration),
@@ -932,9 +938,10 @@ func clanRecordRows(clan clashy.Clan, previous models.BasicClanRow, now time.Tim
 	return []models.ClanRecordRow{row}
 }
 
-func basicPlayerRows(clanTag string, members []clashy.ClanMember, observedAt time.Time) []models.BasicPlayerRow {
+func changedBasicPlayerRows(clanTag string, members []clashy.ClanMember, previous []models.BasicClanMember, observedAt time.Time) []models.BasicPlayerRow {
 	out := make([]models.BasicPlayerRow, 0, len(members))
 	seen := make(map[string]struct{}, len(members))
+	prior := snapshotMembersByTag(previous)
 	for _, member := range members {
 		if member.Tag == "" || member.Name == "" || member.TownHall <= 0 {
 			continue
@@ -943,6 +950,16 @@ func basicPlayerRows(clanTag string, members []clashy.ClanMember, observedAt tim
 			continue
 		}
 		seen[member.Tag] = struct{}{}
+		// Compare the persisted clan snapshot in code, not basic_player: other
+		// ingesters may change that row independently. Unchanged members do not
+		// refresh observed_at; it is not a last-seen heartbeat from GlobalClans.
+		// Preserve the upsert's unknown-league/zero-trophy fallback semantics.
+		if old, ok := prior[member.Tag]; ok && old.LeagueID != nil && old.Trophies != nil &&
+			old.Name == member.Name && old.TownHall == member.TownHall &&
+			(member.LeagueTier.ID == 0 || *old.LeagueID == member.LeagueTier.ID) &&
+			(member.Trophies <= 0 || *old.Trophies == member.Trophies) {
+			continue
+		}
 		out = append(out, models.BasicPlayerRow{
 			ObservedAt:   observedAt,
 			Tag:          member.Tag,
@@ -969,7 +986,8 @@ func memberSnapshot(members []clashy.ClanMember) []models.BasicClanMember {
 			continue
 		}
 		seen[member.Tag] = struct{}{}
-		out = append(out, models.BasicClanMember{Tag: member.Tag, Name: member.Name, TownHall: member.TownHall})
+		leagueID, trophies := member.LeagueTier.ID, member.Trophies
+		out = append(out, models.BasicClanMember{Tag: member.Tag, Name: member.Name, TownHall: member.TownHall, LeagueID: &leagueID, Trophies: &trophies})
 	}
 	sort.Slice(out, func(i, j int) bool { return out[i].Tag < out[j].Tag })
 	return out
@@ -1693,7 +1711,8 @@ func memberSlicesEqual(left, right []models.BasicClanMember) bool {
 		return false
 	}
 	for i := range left {
-		if left[i] != right[i] {
+		if left[i].Tag != right[i].Tag || left[i].Name != right[i].Name || left[i].TownHall != right[i].TownHall ||
+			!optionalIntEqual(left[i].LeagueID, right[i].LeagueID) || !optionalIntEqual(left[i].Trophies, right[i].Trophies) {
 			return false
 		}
 	}
