@@ -155,17 +155,18 @@ func validateDiscordDeliveryConfig(cfg platform.Config, client valkey.Client) er
 }
 
 type discordDeliveryWorker struct {
-	profiles       map[string]discordWebhookProfile
-	emojis         map[string]string
-	nextEmojiLoad  time.Time
-	nextBoardCheck time.Time
-	loadEmojisFn   func() (map[string]string, error)
-	app            *platform.App
-	client         *bot.Client
-	pool           *pgxpool.Pool
-	processEventFn func(context.Context, mobileWarEvent) (bool, error)
-	ackFn          func(context.Context, string) error
-	disableFn      func(context.Context, discordDeliveryTarget, string) (int64, error)
+	profiles             map[string]discordWebhookProfile
+	emojis               map[string]string
+	nextEmojiLoad        time.Time
+	nextBoardCheck       time.Time
+	countdownUnavailable map[string]time.Time
+	loadEmojisFn         func() (map[string]string, error)
+	app                  *platform.App
+	client               *bot.Client
+	pool                 *pgxpool.Pool
+	processEventFn       func(context.Context, mobileWarEvent) (bool, error)
+	ackFn                func(context.Context, string) error
+	disableFn            func(context.Context, discordDeliveryTarget, string) (int64, error)
 }
 
 func (w *discordDeliveryWorker) group() string { return "discord-delivery" }
@@ -241,7 +242,16 @@ func (w *discordDeliveryWorker) processEntries(ctx context.Context, entries []va
 			}
 			continue
 		}
+		started := time.Now()
 		handled, err := w.process(ctx, event)
+		if handled && w.app.Stats != nil {
+			// Ignored stream traffic is not evidence of a successful delivery.
+			w.app.Stats.RecordProcess(discordDeliveryDomainName, time.Since(started))
+			w.app.Stats.RecordRequest(discordDeliveryDomainName, time.Since(started), err)
+			if err == nil {
+				w.app.Stats.SetReady(discordDeliveryDomainName, true, "")
+			}
+		}
 		if err != nil {
 			// Discord delivery is intentionally best effort. A failed provider or
 			// destination attempt is recorded and dropped instead of leaving the
@@ -829,6 +839,9 @@ func (w *discordDeliveryWorker) sendMessage(ctx context.Context, target discordD
 		return err
 	}
 	_, err = w.client.Rest.CreateMessage(id, message)
+	if err == nil && w.app.Stats != nil {
+		w.app.Stats.RecordWrite(discordDeliveryDomainName, 1)
+	}
 	return err
 }
 

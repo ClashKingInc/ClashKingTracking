@@ -300,7 +300,7 @@ func (s *timescaleWarStore) Store(ctx context.Context, ingest models.WarIngest) 
 			return err
 		}
 		if ingest.FinishedWarID == 0 {
-			return nil
+			return tx.Commit(ctx)
 		}
 	}
 	if err := insertWarIndexRows(ctx, tx, ingest.IndexRows); err != nil {
@@ -403,6 +403,28 @@ func (s *timescaleWarStore) prepareFinishedWar(ctx context.Context, tx pgx.Tx, i
 	}
 	if err != nil {
 		return err
+	}
+	// A completed schedule is deleted. Rediscovering that same game war must
+	// not allocate a new archive/streak identity after the schedule has gone.
+	if len(ingest.IndexRows) > 0 {
+		war := ingest.IndexRows[0]
+		var retainedID int32
+		err := tx.QueryRow(ctx, `SELECT war_id FROM wars
+			WHERE clan_tag=$1 AND opponent_tag=$2 AND prep_time=$3 AND end_time=$4
+			ORDER BY war_id LIMIT 1`, war.ClanTag, war.OpponentTag, war.PrepTime, war.EndTime).Scan(&retainedID)
+		if err == nil {
+			if err := deleteWarSchedule(ctx, tx, ingest.FinishedScheduleKey); err != nil {
+				return err
+			}
+			ingest.FinishedWarID = 0
+			ingest.IndexRows = nil
+			ingest.ArchivePayload = nil
+			ingest.ArchiveParticipants = nil
+			return nil
+		}
+		if !errors.Is(err, pgx.ErrNoRows) {
+			return err
+		}
 	}
 	rewriteWarIngestID(ingest, canonicalWarID)
 	return nil
@@ -538,7 +560,12 @@ func upsertWarSchedules(ctx context.Context, tx pgx.Tx, rows []models.WarSchedul
 				schedule_key, source_clan_tag, opponent_tag, prep_time,
 				end_time, next_run_at, war_type, war_tag
 			)
-			VALUES ($1, $2, $3, $4, $5, $6, $7, NULLIF($8, ''))
+			SELECT $1, $2, $3, $4, $5, $6, $7, NULLIF($8, '')
+			WHERE NOT EXISTS (
+				SELECT 1 FROM wars
+				WHERE clan_tag=LEAST($2::text,$3::text) AND opponent_tag=GREATEST($2::text,$3::text)
+				  AND prep_time=$4 AND end_time=$5
+			)
 			ON CONFLICT (schedule_key) DO UPDATE SET
 				source_clan_tag = EXCLUDED.source_clan_tag,
 				opponent_tag = EXCLUDED.opponent_tag,

@@ -68,7 +68,7 @@ func main() {
 	db, err := pgxpool.New(ctx, dsn)
 	must(err)
 	defer db.Close()
-	for _, tag := range []string{"#PYY", "#PYP", "#PYQ", "#PYG", "#PYL", "#PYC", "#PYJ", "#PYR"} {
+	for _, tag := range []string{"#PYY", "#PYP", "#PYQ", "#PYG", "#PYL", "#PYC", "#PYJ", "#PYR", "#PUP", "#PUQ"} {
 		_, err = db.Exec(ctx, `INSERT INTO basic_clan(tag,name,public_war_log,war_wins,member_count,badge_token,troops_donated,troops_received,last_active) VALUES($1,'seed',true,0,10,'',0,0,CASE WHEN $1 IN ('#PYY','#PYP') THEN now() ELSE NULL END)`, tag)
 		must(err)
 	}
@@ -190,13 +190,14 @@ func main() {
 	fmt.Println("TERMINAL_PASS both_sides_prep=2 both_sides_clock=2 schedules_deleted=2")
 	_, err = db.Exec(ctx, `UPDATE basic_clan SET last_active=NULL`)
 	must(err)
-	for i, pair := range [][2]string{{"#PYY", "#PYP"}, {"#PYQ", "#PYG"}, {"#PYL", "#PYC"}, {"#PYJ", "#PYR"}} {
+	for i, pair := range [][2]string{{"#PYY", "#PYP"}, {"#PYQ", "#PYG"}, {"#PYL", "#PYC"}, {"#PYJ", "#PYR"}, {"#PUP", "#PUQ"}} {
 		warTag := ""
 		warType := "random"
 		state := "warEnded"
 		start := end.Add(-24 * time.Hour)
-		if i == 1 {
+		if i == 1 || i == 4 {
 			start = end.Add(-15 * time.Minute)
+			warType = "friendly"
 		}
 		if i == 2 {
 			warTag = "#CCL"
@@ -207,6 +208,12 @@ func main() {
 		}
 		stamp := func(t time.Time) string { return t.Format("20060102T150405.000Z") }
 		war := map[string]any{"state": state, "teamSize": 5, "attacksPerMember": 2, "preparationStartTime": stamp(prep), "startTime": stamp(start), "endTime": stamp(end), "clan": map[string]any{"tag": pair[0], "name": "A", "clanLevel": 10, "attacks": 0, "stars": 0, "destructionPercentage": 0, "members": []any{}}, "opponent": map[string]any{"tag": pair[1], "name": "B", "clanLevel": 10, "attacks": 0, "stars": 0, "destructionPercentage": 0, "members": []any{}}}
+		if i == 2 {
+			delete(war, "attacksPerMember") // Official CWL responses omit it.
+		}
+		if i == 4 {
+			war["attacksPerMember"] = 1
+		}
 		warResponses[pair[0]] = war
 		// Feed complete real endpoint-shaped rosters through the archiver, not
 		// a helper-only test. One player qualifies; every other member misses.
@@ -215,6 +222,9 @@ func main() {
 			member := map[string]any{"tag": fmt.Sprintf("#LEFT%d", j), "name": "Left", "townhallLevel": 18, "mapPosition": j + 1}
 			if j == 0 {
 				member["attacks"] = []any{map[string]any{"defenderTag": "#RIGHT0", "stars": 3, "order": 1}, map[string]any{"defenderTag": "#RIGHT1", "stars": 3, "order": 2}}
+				if i == 2 || i == 4 {
+					member["attacks"] = member["attacks"].([]any)[:1]
+				}
 			}
 			left = append(left, member)
 			right = append(right, map[string]any{"tag": fmt.Sprintf("#RIGHT%d", j), "name": "Right", "townhallLevel": 18, "mapPosition": j + 1})
@@ -252,7 +262,13 @@ func main() {
 	<-done
 	var finished, correct, pending int
 	must(db.QueryRow(ctx, `SELECT count(*) FROM wars`).Scan(&finished))
-	check(finished == 3, "not all completed wars stored")
+	check(finished == 4, "not all completed wars stored")
+	var limits int
+	must(db.QueryRow(ctx, `SELECT count(*) FROM wars w JOIN war_archive_pending p USING(war_id,end_time)
+		WHERE w.attacks_per_member=(p.payload->>'attacksPerMember')::integer
+		AND (w.war_type,w.attacks_per_member,w.clan_tag) IN (('random',2,'#PYP'),('friendly',2,'#PYG'),('cwl',1,'#PYC'),('friendly',1,'#PUP'))`).Scan(&limits))
+	check(limits == 4, "source war allowances did not survive HTTP decoding and SQL/archive ingestion")
+	fmt.Println("WAR_ALLOWANCE_PASS regular=2 friendly=1 friendly=2 cwl_missing_field=1 SQL_archive_agree=4")
 	must(db.QueryRow(ctx, `SELECT count(*) FROM basic_clan WHERE tag IN ('#PYY','#PYQ','#PYG','#PYL','#PYC') AND last_active=$1`, end).Scan(&correct))
 	check(correct == 5, "stored war end times wrong")
 	var newer bool
@@ -262,7 +278,7 @@ func main() {
 	check(pending == 2, "pending retry advanced activity")
 	must(db.QueryRow(ctx, `SELECT count(*) FROM war_schedule WHERE next_run_at>$1`, end).Scan(&remaining))
 	check(remaining == 1, "pending schedule not rescheduled")
-	fmt.Println("STORED_WARS_PASS regular_short_friendly_cwl=3 end_time_clans=5 newer_preserved=1 pending_clans_unchanged=2 concurrent_finalizers=2")
+	fmt.Println("STORED_WARS_PASS regular_short_friendly_cwl=4 end_time_clans=5 newer_preserved=1 pending_clans_unchanged=2 concurrent_finalizers=2")
 	var completedGroups, incompleteGroups int
 	must(db.QueryRow(ctx, `SELECT count(*) FROM cwl_groups WHERE cwl_id IN ('CWLArray0001','CWLObject001') AND state='ended'`).Scan(&completedGroups))
 	must(db.QueryRow(ctx, `SELECT count(*) FROM cwl_groups WHERE cwl_id='CWLPartial01' AND state='inWar'`).Scan(&incompleteGroups))
@@ -277,6 +293,27 @@ func main() {
 	must(db.QueryRow(ctx, `SELECT count(*) FROM war_triple_streaks WHERE streak=0`).Scan(&results))
 	check(results == 9, "missed attacks did not reset every other roster member")
 	fmt.Println("WAR_TRIPLE_STREAK_PASS complete_rosters=2 qualified=1 resets=9 excluded_cwl_friendly=2 concurrent_finalizers=2")
+	// Recreated schedules used to allocate fresh SQL IDs for one completed game
+	// war. Drive those duplicates through the real concurrent finalizers.
+	for i := 0; i < 6; i++ {
+		_, err = db.Exec(ctx, `INSERT INTO war_schedule(schedule_key,war_id,source_clan_tag,opponent_tag,prep_time,end_time,next_run_at,war_type)
+			VALUES($1,$2,'#PYY','#PYP',$3,$4,now(),'random')`, models.ComputeWarKey("#PYY", "#PYP", prep), 300+i, prep, end)
+		must(err)
+		app = newApp()
+		runCtx, cancel = context.WithCancel(ctx)
+		done = make(chan error, 1)
+		go func() { done <- scripts.NewWarArchiverDomain().Run(runCtx, app) }()
+		time.Sleep(250 * time.Millisecond)
+		cancel()
+		<-done
+		must(db.QueryRow(ctx, `SELECT count(*) FROM war_schedule WHERE schedule_key=$1`, models.ComputeWarKey("#PYY", "#PYP", prep)).Scan(&remaining))
+		check(remaining == 0, "completed duplicate schedule was not durably removed")
+	}
+	must(db.QueryRow(ctx, `SELECT count(*) FROM wars`).Scan(&finished))
+	check(finished == 4, "one game war produced multiple retained SQL identities")
+	must(db.QueryRow(ctx, `SELECT streak FROM war_triple_streaks WHERE player_tag='#LEFT0' AND townhall_level=18`).Scan(&streak))
+	check(streak == 2, "recreated completed schedules inflated the streak")
+	fmt.Println("WAR_IDENTITY_PASS repeated_ended_rediscoveries=6 retained_war_ids=4 streak_unchanged=2")
 	replay := func(id int, offset time.Duration, qualify, upgrade bool) {
 		raw, _ := json.Marshal(warResponses["#PYY"])
 		var war map[string]any
@@ -309,9 +346,22 @@ func main() {
 		cancel()
 		<-done
 	}
+	// Reproduce existing production corruption in disposable SQL. The next
+	// actual finalized war must deduplicate old results during recomputation.
+	for duplicateID := 410; duplicateID < 413; duplicateID++ {
+		_, err = db.Exec(ctx, `INSERT INTO wars
+			SELECT (jsonb_populate_record(NULL::wars,to_jsonb(war) || jsonb_build_object('war_id',$1::integer))).*
+			FROM wars war WHERE war_id=200`, duplicateID)
+		must(err)
+		_, err = db.Exec(ctx, `INSERT INTO war_triple_streak_results
+			SELECT player_tag,townhall_level,$1,war_end_time,qualified,player_name,clan_tag
+			FROM war_triple_streak_results WHERE war_id=200`, duplicateID)
+		must(err)
+	}
 	replay(301, 4*time.Hour, true, false)
 	must(db.QueryRow(ctx, `SELECT streak FROM war_triple_streaks WHERE player_tag='#LEFT0' AND townhall_level=18`).Scan(&streak))
 	check(streak == 4, "second qualifying war did not add 2")
+	fmt.Println("WAR_IDENTITY_LEGACY_PASS old_duplicate_results=30 next_real_war_does_not_reinflate=1")
 	replay(302, 2*time.Hour, false, false)
 	must(db.QueryRow(ctx, `SELECT streak FROM war_triple_streaks WHERE player_tag='#LEFT0' AND townhall_level=18`).Scan(&streak))
 	check(streak == 2, "out-of-order older reset did not preserve the later suffix")
@@ -327,4 +377,24 @@ func main() {
 	must(db.QueryRow(ctx, `SELECT last_attack_time FROM war_triple_streaks WHERE player_tag='#LEFT0' AND townhall_level=19`).Scan(&last))
 	check(last.Equal(end.Add(8*time.Hour)), "last attack time is not war end time")
 	fmt.Println("WAR_TRIPLE_REPLAY_PASS increments=2 out_of_order_reset=1 latest_reset=1 townhall_keys=2 last_time=war_end")
+	// Equal end timestamps alone are not game-war identities. A distinct
+	// opponent must survive the duplicate defense and count as another war.
+	latest := warResponses["#PYY"].(map[string]any)
+	latest["opponent"].(map[string]any)["tag"] = "#PYV"
+	warResponses["#PYV"] = latest
+	latestEnd := end.Add(8 * time.Hour)
+	latestPrep := latestEnd.Add(-47 * time.Hour)
+	_, err = db.Exec(ctx, `INSERT INTO war_schedule(schedule_key,war_id,source_clan_tag,opponent_tag,prep_time,end_time,next_run_at,war_type)
+		VALUES($1,399,'#PYY','#PYV',$2,$3,now(),'random')`, models.ComputeWarKey("#PYY", "#PYV", latestPrep), latestPrep, latestEnd)
+	must(err)
+	app = newApp()
+	runCtx, cancel = context.WithCancel(ctx)
+	done = make(chan error, 1)
+	go func() { done <- scripts.NewWarArchiverDomain().Run(runCtx, app) }()
+	time.Sleep(2 * time.Second)
+	cancel()
+	<-done
+	must(db.QueryRow(ctx, `SELECT streak FROM war_triple_streaks WHERE player_tag='#LEFT0' AND townhall_level=19`).Scan(&streak))
+	check(streak == 4, "distinct opponent sharing an end timestamp was discarded")
+	fmt.Println("WAR_IDENTITY_DISTINCT_PASS same_end_time_distinct_opponent_retained=1 streak=4")
 }

@@ -8,7 +8,7 @@ require (
 	github.com/aws/aws-sdk-go-v2 v1.41.3
 	github.com/aws/aws-sdk-go-v2/credentials v1.19.11
 	github.com/aws/aws-sdk-go-v2/service/s3 v1.96.4
-	github.com/clashkinginc/clashy.go v0.1.15-0.20260901045716-ed49cb54e8ea
+	github.com/clashkinginc/clashy.go v0.1.18-0.20261108053152-86c7b1d28d5b
 	github.com/disgoorg/disgo v0.19.6
 	github.com/disgoorg/snowflake/v2 v2.0.3
 	github.com/getsentry/sentry-go v0.36.0

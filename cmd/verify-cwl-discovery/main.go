@@ -58,6 +58,7 @@ func main() {
 	const hook = "999999999999992903"
 	const channel = "999999999999992904"
 	var attack atomic.Bool
+	var failClan atomic.Bool
 	var panels, feeds, groups atomic.Int32
 	now := time.Now().UTC()
 	stamp := func(t time.Time) string { return t.Format("20060102T150405.000Z") }
@@ -99,6 +100,11 @@ func main() {
 		case strings.HasSuffix(r.URL.Path, "/currentwar"):
 			fmt.Fprint(w, `{"state":"notInWar"}`)
 		case strings.Contains(r.URL.Path, "/clans/"):
+			if failClan.Load() {
+				w.WriteHeader(http.StatusGatewayTimeout)
+				fmt.Fprint(w, `{"reason":"gatewayTimeout"}`)
+				return
+			}
 			json.NewEncoder(w).Encode(map[string]any{"tag": "#PYL", "name": "Active CWL", "clanLevel": 10, "members": 1, "memberList": []any{}, "badgeUrls": map[string]string{}})
 		default:
 			http.Error(w, "unexpected route "+r.URL.Path, 404)
@@ -154,6 +160,20 @@ func main() {
 	stop := run()
 	wait(ctx, "cold-start CWL panel", func() bool { return panels.Load() > 0 })
 	check(feeds.Load() == 0, "cold start replayed old attacks")
+	clanHealth := func() (bool, int64) {
+		for _, domain := range app.Stats.Snapshot().Domains {
+			if domain.Name == "trackedclans.clans" {
+				return domain.Healthy, domain.Requests
+			}
+		}
+		return true, 0
+	}
+	failClan.Store(true)
+	wait(ctx, "tracked clan upstream error", func() bool { healthy, _ := clanHealth(); return !healthy })
+	_, failedRequests := clanHealth()
+	failClan.Store(false)
+	wait(ctx, "unchanged tracked clan recovers health", func() bool { healthy, requests := clanHealth(); return healthy && requests > failedRequests })
+	fmt.Println("PASS tracked-clan health recovers after upstream 504 and unchanged successful snapshot")
 	attack.Store(true)
 	wait(ctx, "new CWL attack delivered", func() bool { return feeds.Load() > 0 })
 	stop()

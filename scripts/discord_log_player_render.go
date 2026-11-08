@@ -19,10 +19,26 @@ func discordEmojiKey(value string) string {
 	}, value)
 }
 func (i discordLogIcons) icon(name, fallback string) string {
+	if name == "war_star" {
+		if v := i[discordEmojiKey("war_star_filled")]; v != "" {
+			return v
+		}
+	}
+	if name == "no_star" {
+		for _, candidate := range []string{"war_star_empty", "full_no_star"} {
+			if v := i[discordEmojiKey(candidate)]; v != "" {
+				return v
+			}
+		}
+	}
 	if v := i[discordEmojiKey(name)]; v != "" {
 		return v
 	}
 	return fallback
+}
+func (i discordLogIcons) stars(count int) string {
+	count = max(0, min(3, count))
+	return strings.Repeat(i.icon("war_star", "★"), count) + strings.Repeat(i.icon("no_star", "☆"), 3-count)
 }
 func (i discordLogIcons) th(level int) string {
 	return i.icon(fmt.Sprintf("th%d", level), fmt.Sprintf("TH%d ", level))

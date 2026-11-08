@@ -9,6 +9,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/clashkinginc/clashy.go"
 	"github.com/disgoorg/disgo/discord"
 )
 
@@ -83,15 +84,11 @@ func discordWarType(event mobileWarEvent, war map[string]any) string {
 }
 
 func discordWarAttacksPerMember(event mobileWarEvent, war map[string]any) int {
-	// CWL raw responses can omit attacksPerMember. The event still carries
-	// the war type, so never apply the regular-war fallback to a CWL round.
+	warType := strings.ToLower(discordWarType(event, war))
 	if strings.EqualFold(discordWarType(event, war), "cwl") || stringMapValue(event.Value, "war_tag") != "" || stringMapValue(war, "tag") != "" {
-		return 1
+		warType = "cwl"
 	}
-	if allowed := intValue(war["attacksPerMember"]); allowed > 0 {
-		return allowed
-	}
-	return 2
+	return clashy.ResolveWarAttackLimit(warType, intValue(war["attacksPerMember"]))
 }
 
 // discordWarPanelMessage reproduces the legacy main war page and gives every
@@ -129,8 +126,14 @@ func discordWarPanelMessage(event mobileWarEvent, icons discordLogIcons) (discor
 	}
 	maxHits := intValue(war["teamSize"]) * discordWarAttacksPerMember(event, war)
 	clanHits, opponentHits := discordWarAttackCounts(clan), discordWarAttackCounts(opponent)
+	formatHits := func(used int) string {
+		if maxHits == 0 {
+			return strconv.Itoa(used)
+		}
+		return fmt.Sprintf("%d/%d", used, maxHits)
+	}
 	stats := fmt.Sprintf("`%-7s`%s`%7s`\n`%-7d`%s`%7d`\n`%-7s`%s`%7s`",
-		fmt.Sprintf("%d/%d", clanHits, maxHits), icons.icon("animated_clash_swords", "⚔️"), fmt.Sprintf("%d/%d", opponentHits, maxHits),
+		formatHits(clanHits), icons.icon("animated_clash_swords", "⚔️"), formatHits(opponentHits),
 		intValue(clan["stars"]), icons.icon("war_star", "★"), intValue(opponent["stars"]),
 		fmt.Sprintf("%.2f%%", floatValue(clan["destructionPercentage"])), icons.icon("broken_sword", "🗡️"), fmt.Sprintf("%.2f%%", floatValue(opponent["destructionPercentage"])))
 	embed := discord.Embed{Description: discordWarLink(clan), Color: color, Thumbnail: discordWarBadge(clan), Footer: &discord.EmbedFooter{Text: warKind + " War"},
@@ -200,7 +203,7 @@ func discordWarRecentAttacks(clan, opponent, war map[string]any, icons discordLo
 					icon = icons.icon("shield", "🛡️")
 				}
 				stars := min(3, max(0, intValue(attack["stars"])))
-				entries = append(entries, entry{order: intValue(attack["order"]), line: fmt.Sprintf("%s`%3d%%`%s%s`%s`", icon, intValue(attack["destructionPercentage"]), strings.Repeat(icons.icon("war_star", "★"), stars), strings.Repeat(icons.icon("no_star", "☆"), 3-stars), discordLabel(stringMapValue(member, "name")))})
+				entries = append(entries, entry{order: intValue(attack["order"]), line: fmt.Sprintf("%s`%3d%%`%s`%s`", icon, intValue(attack["destructionPercentage"]), icons.stars(stars), discordLabel(stringMapValue(member, "name")))})
 			}
 		}
 	}
