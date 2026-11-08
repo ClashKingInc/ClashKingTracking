@@ -1,0 +1,22 @@
+[Unit]
+Description=ClashKing GlobalClans lifecycle diagnostics
+After=docker.service
+Requires=docker.service
+StartLimitIntervalSec=0
+
+[Service]
+Type=simple
+Environment=DOCKER_HOST=unix:///var/run/docker.sock
+Environment=DOCKER_CONFIG=/var/log/clashking-globalclans/docker
+ExecStart=/usr/bin/python3 /usr/local/lib/clashking/globalclans_observer.py --uuid hk4ykclekid9tkax4j7kf6fj --output /var/log/clashking-globalclans --interval 60
+Restart=always
+RestartSec=10
+UMask=0077
+NoNewPrivileges=true
+ProtectSystem=strict
+ProtectHome=true
+PrivateTmp=true
+ReadWritePaths=/var/log/clashking-globalclans
+
+[Install]
+WantedBy=multi-user.target
