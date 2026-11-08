@@ -59,6 +59,8 @@ func main() {
 	names := map[string]string{}
 	types := map[string]int{}
 	owners := map[string]string{}
+	failures := map[string]int{}
+	channelReads := map[string]int{}
 	writes := 0
 	duplicateWrites := 0
 	writesByChannel := map[string]int{}
@@ -103,6 +105,11 @@ func main() {
 		defer mu.Unlock()
 		if strings.HasPrefix(r.URL.Path, "/v1/") {
 			warReads++
+			if state == "forbidden" {
+				w.WriteHeader(403)
+				fmt.Fprint(w, `{"reason":"accessDenied"}`)
+				return
+			}
 			if state == "notInWar" {
 				json.NewEncoder(w).Encode(map[string]any{"state": "notInWar"})
 				return
@@ -112,6 +119,12 @@ func main() {
 		}
 		parts := strings.Split(r.URL.Path, "/")
 		id := parts[len(parts)-1]
+		channelReads[id]++
+		if code := failures[id]; code != 0 {
+			w.WriteHeader(403)
+			fmt.Fprintf(w, `{"code":%d}`, code)
+			return
+		}
 		name, ok := names[id]
 		if !ok {
 			w.WriteHeader(404)
@@ -141,7 +154,7 @@ func main() {
 	clash, e := clashy.NewClient(cfg)
 	must(e)
 	defer clash.Close()
-	for phase := 0; phase < 4; phase++ {
+	for phase := 0; phase < 6; phase++ {
 		mu.Lock()
 		before := writes
 		beforeScore, beforeTimer := writesByChannel["999999999999998605"], writesByChannel["999999999999998606"]
@@ -152,6 +165,13 @@ func main() {
 		if phase == 3 {
 			state = "notInWar"
 		}
+		if phase == 4 {
+			failures["999999999999998600"] = 50001
+			failures["999999999999998601"] = 50013
+			failures["999999999999998602"] = 10003
+			state = "forbidden"
+		}
+		beforeFailures := channelReads["999999999999998600"] + channelReads["999999999999998601"] + channelReads["999999999999998602"]
 		mu.Unlock()
 		stream := fmt.Sprintf("countdown-e2e:%d:%d", os.Getpid(), phase)
 		app := &platform.App{Config: platform.Config{TimescaleURL: dsn, DiscordBotToken: base64.RawStdEncoding.EncodeToString([]byte(appID)) + ".local.local", DiscordAPIURL: provider.URL, ClashKingAPIURL: provider.URL, ClashKingAPIToken: "local-only", DiscordGuildAllowlist: map[string]struct{}{guild: {}, "999999999999998800": {}, "999999999999998801": {}}, DiscordDeliveryBatchSize: 10, EventStreamName: stream, EventStreamReclaimIdleSeconds: 1}, Clash: clash, Valkey: cache, Logger: slog.New(slog.NewTextHandler(os.Stderr, nil)), Stats: platform.NewTracker(), Availability: platform.NewAvailabilityGate(nil)}
@@ -186,6 +206,20 @@ func main() {
 		stop()
 		<-done
 		must(cache.Do(ctx, cache.B().Del().Key(stream).Build()).Error())
+		if phase >= 4 {
+			var disabled int
+			must(db.QueryRow(ctx, "SELECT count(*) FROM server_countdowns WHERE server_id=$1 AND disabled", guild).Scan(&disabled))
+			check(disabled == 3, fmt.Sprintf("expected exactly three disabled Discord destinations, got %d", disabled))
+			var warDisabled bool
+			must(db.QueryRow(ctx, "SELECT bool_or(disabled) FROM server_countdowns WHERE server_id=$1 AND clan_tag=$2", guild, clan).Scan(&warDisabled))
+			check(!warDisabled, "Clash API failure disabled a countdown")
+			mu.Lock()
+			if phase == 5 {
+				check(beforeFailures == channelReads["999999999999998600"]+channelReads["999999999999998601"]+channelReads["999999999999998602"], "disabled destinations retried after restart")
+			}
+			mu.Unlock()
+			continue
+		}
 		mu.Lock()
 		delta := writes - before
 		reads := warReads

@@ -155,18 +155,17 @@ func validateDiscordDeliveryConfig(cfg platform.Config, client valkey.Client) er
 }
 
 type discordDeliveryWorker struct {
-	profiles             map[string]discordWebhookProfile
-	emojis               map[string]string
-	nextEmojiLoad        time.Time
-	nextBoardCheck       time.Time
-	countdownUnavailable map[string]time.Time
-	loadEmojisFn         func() (map[string]string, error)
-	app                  *platform.App
-	client               *bot.Client
-	pool                 *pgxpool.Pool
-	processEventFn       func(context.Context, mobileWarEvent) (bool, error)
-	ackFn                func(context.Context, string) error
-	disableFn            func(context.Context, discordDeliveryTarget, string) (int64, error)
+	profiles       map[string]discordWebhookProfile
+	emojis         map[string]string
+	nextEmojiLoad  time.Time
+	nextBoardCheck time.Time
+	loadEmojisFn   func() (map[string]string, error)
+	app            *platform.App
+	client         *bot.Client
+	pool           *pgxpool.Pool
+	processEventFn func(context.Context, mobileWarEvent) (bool, error)
+	ackFn          func(context.Context, string) error
+	disableFn      func(context.Context, discordDeliveryTarget, string) (int64, error)
 }
 
 func (w *discordDeliveryWorker) group() string { return "discord-delivery" }

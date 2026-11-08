@@ -22,7 +22,7 @@ type countdownWar struct {
 func (w *discordDeliveryWorker) refreshCountdownChannels(ctx context.Context, now time.Time, wars map[string]countdownWar) error {
 	rows, err := w.pool.Query(ctx, `SELECT c.server_id,COALESCE(c.clan_tag,''),c.type,c.channel_id,c.updated_at::text
  FROM server_countdowns c JOIN servers s ON s.id=c.server_id
- WHERE s.left_at IS NULL AND (c.clan_tag IS NULL OR EXISTS(SELECT 1 FROM server_clans sc WHERE sc.server_id=c.server_id AND sc.tag=c.clan_tag))
+ WHERE NOT c.disabled AND s.left_at IS NULL AND (c.clan_tag IS NULL OR EXISTS(SELECT 1 FROM server_clans sc WHERE sc.server_id=c.server_id AND sc.tag=c.clan_tag))
  ORDER BY c.server_id,c.channel_id`)
 	if err != nil {
 		return err
@@ -41,25 +41,17 @@ func (w *discordDeliveryWorker) refreshCountdownChannels(ctx context.Context, no
 	if err != nil {
 		return err
 	}
-	if w.countdownUnavailable == nil {
-		w.countdownUnavailable = map[string]time.Time{}
-	}
-	configured := make(map[string]bool, len(channels))
 	for _, c := range channels {
-		key := c.Server + ":" + c.Channel + ":" + c.Kind + ":" + c.Clan + ":" + c.Revision
-		configured[key] = true
 		if !w.app.Config.AllowsDiscordGuild(c.Server) {
 			continue
 		}
-		if until := w.countdownUnavailable[key]; now.Before(until) {
-			continue
-		}
-		delete(w.countdownUnavailable, key)
 		channelCtx, cancel := context.WithTimeout(ctx, 15*time.Second)
 		started := time.Now()
 		target, err := w.countdownText(channelCtx, c, now, wars)
+		destinationFailure := false
 		if err == nil && target != "" {
 			err = w.renameCountdown(channelCtx, c, target)
+			destinationFailure = err != nil
 		}
 		cancel()
 		if w.app.Stats != nil {
@@ -68,18 +60,20 @@ func (w *discordDeliveryWorker) refreshCountdownChannels(ctx context.Context, no
 		}
 		if err != nil {
 			var response *rest.Error
-			if errors.As(err, &response) && response.Code == rest.JSONErrorCodeUnknownChannel {
-				// The existing GET proved this destination unavailable. Retain the
-				// user's configuration, but stop re-reading it on every scan. Any
-				// configuration edit changes the key and retries immediately.
-				w.countdownUnavailable[key] = now.Add(24 * time.Hour)
+			// Only Discord destination errors disable a countdown. A Clash API
+			// 403 while reading the war says nothing about channel permissions.
+			if destinationFailure && errors.As(err, &response) &&
+				(response.Code == rest.JSONErrorCodeUnknownChannel || response.Code == rest.JSONErrorCodeMissingAccess || response.Code == rest.JSONErrorCodeLackPermissionsToPerformAction) {
+				// Match the revision so an in-flight failure cannot disable a
+				// channel the manager has just replaced or explicitly re-enabled.
+				_, disableErr := w.pool.Exec(ctx, `UPDATE server_countdowns SET disabled=true, updated_at=clock_timestamp()
+ WHERE server_id=$1 AND COALESCE(clan_tag,'')=$2 AND type=$3 AND channel_id=$4 AND updated_at::text=$5 AND NOT disabled`,
+					c.Server, c.Clan, c.Kind, c.Channel, c.Revision)
+				if disableErr != nil {
+					return fmt.Errorf("disable inaccessible countdown: %w", disableErr)
+				}
 			}
 			w.app.Logger.Warn("countdown update failed", "server_id", c.Server, "channel_id", c.Channel, "err", err)
-		}
-	}
-	for key := range w.countdownUnavailable {
-		if !configured[key] {
-			delete(w.countdownUnavailable, key)
 		}
 	}
 	return nil
