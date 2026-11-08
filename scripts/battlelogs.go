@@ -428,7 +428,10 @@ func battlelogIngestFromEntries(entries []clashy.BattleLogEntry, playerTag strin
 		// into unbounded historical ingestion on their first poll.
 		after = now.Add(-time.Duration(firstSeenLookbackDays) * 24 * time.Hour)
 	}
-	newEntries := entriesAfterTimestamp(entries, after)
+	newEntries, err := entriesAfterTimestamp(entries, after)
+	if err != nil {
+		return models.BattlelogIngest{}, err
+	}
 	if len(newEntries) == 0 {
 		return models.BattlelogIngest{}, nil
 	}
@@ -445,11 +448,6 @@ func battlelogIngestFromEntries(entries []clashy.BattleLogEntry, playerTag strin
 	var checkpointTime time.Time
 	for _, entry := range newEntries {
 		timestamp := battlelogEntryTimestamp(entry)
-		if timestamp.IsZero() {
-			// Do not checkpoint past incomplete rows; later polls can retry after
-			// the API returns the required battle timestamp.
-			break
-		}
 		include := false
 		switch battlelogStorageMode(entry.BattleType) {
 		case "farming":
@@ -1136,15 +1134,21 @@ func battlelogCheckpointKey(tag string) string {
 	return "bl:" + tag
 }
 
-func entriesAfterTimestamp(entries []clashy.BattleLogEntry, after time.Time) []clashy.BattleLogEntry {
+func entriesAfterTimestamp(entries []clashy.BattleLogEntry, after time.Time) ([]clashy.BattleLogEntry, error) {
 	out := make([]clashy.BattleLogEntry, 0, len(entries))
 	for _, entry := range entries {
 		timestamp := battlelogEntryTimestamp(entry)
-		if !timestamp.IsZero() && timestamp.After(after) {
+		// Missing time also means unknown age. Validate the whole bounded page
+		// before filtering, so newer valid rows cannot checkpoint past a later
+		// repaired observation. No rows or notifications leave a rejected page.
+		if timestamp.IsZero() {
+			return nil, errors.New("battlelog source observation has no valid timestamp")
+		}
+		if timestamp.After(after) {
 			out = append(out, entry)
 		}
 	}
-	return out
+	return out, nil
 }
 
 func battlelogEntryTimestamp(entry clashy.BattleLogEntry) time.Time {
