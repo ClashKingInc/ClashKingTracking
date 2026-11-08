@@ -354,7 +354,7 @@ func main() {
 			FROM wars war WHERE war_id=200`, duplicateID)
 		must(err)
 		_, err = db.Exec(ctx, `INSERT INTO war_triple_streak_results
-			SELECT player_tag,townhall_level,$1,war_end_time,qualified,player_name,clan_tag
+			SELECT player_tag,townhall_level,$1,war_end_time,qualified,player_name,clan_tag,credited_triples
 			FROM war_triple_streak_results WHERE war_id=200`, duplicateID)
 		must(err)
 	}
@@ -397,4 +397,37 @@ func main() {
 	must(db.QueryRow(ctx, `SELECT streak FROM war_triple_streaks WHERE player_tag='#LEFT0' AND townhall_level=19`).Scan(&streak))
 	check(streak == 4, "distinct opponent sharing an end timestamp was discarded")
 	fmt.Println("WAR_IDENTITY_DISTINCT_PASS same_end_time_distinct_opponent_retained=1 streak=4")
+	// Exercise the product rules through HTTP -> archiver -> actual SQL.
+	latest["opponent"].(map[string]any)["tag"] = "#PYP"
+	leftMember := latest["clan"].(map[string]any)["members"].([]any)[0].(map[string]any)
+	defenders := latest["opponent"].(map[string]any)["members"].([]any)
+	hits := leftMember["attacks"].([]any)
+	defenders[0].(map[string]any)["townhallLevel"] = 19
+	defenders[1].(map[string]any)["townhallLevel"] = 18
+	hits[1].(map[string]any)["stars"] = 0
+	replayMixed := func(id int, offset time.Duration) {
+		warResponses["#PYY"] = latest
+		replay(id, offset, true, false)
+	}
+	assertStreak := func(want int, message string) {
+		must(db.QueryRow(ctx, `SELECT streak FROM war_triple_streaks WHERE player_tag='#LEFT0' AND townhall_level=19`).Scan(&streak))
+		check(streak == want, message)
+	}
+	replayMixed(400, 10*time.Hour)
+	assertStreak(5, "one same-TH triple plus different-TH failure must add one")
+	defenders[0].(map[string]any)["townhallLevel"] = 18
+	replayMixed(401, 12*time.Hour)
+	assertStreak(5, "two different-TH attacks must preserve streak")
+	defenders[0].(map[string]any)["townhallLevel"] = 19
+	hits[0].(map[string]any)["stars"] = 2
+	replayMixed(402, 14*time.Hour)
+	assertStreak(0, "same-TH failure must reset streak")
+	hits[0].(map[string]any)["stars"] = 3
+	replayMixed(403, 16*time.Hour)
+	assertStreak(1, "one qualifying triple must support odd streak")
+	leftMember["attacks"] = hits[:1]
+	replayMixed(404, 18*time.Hour)
+	assertStreak(0, "missed second attack must reset even with one qualifying triple")
+	fmt.Println("WAR_TRIPLE_CREDITS_PASS mixed=+1 two_different_TH=neutral same_TH_failure=reset missed=reset odd_streak=1")
+
 }

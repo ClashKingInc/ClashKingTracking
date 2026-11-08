@@ -101,7 +101,10 @@ func main() {
 			fmt.Fprint(w, `{"state":"notInWar"}`)
 		case strings.Contains(r.URL.Path, "/clans/"):
 			if failClan.Load() {
-				w.WriteHeader(http.StatusGatewayTimeout)
+				// A 5xx closes the shared maintenance gate; this fixture has no
+				// maintenance controller. Use a real non-outage error to isolate
+				// clan health recovery without blocking later CWL discovery.
+				w.WriteHeader(http.StatusForbidden)
 				fmt.Fprint(w, `{"reason":"gatewayTimeout"}`)
 				return
 			}
@@ -173,7 +176,7 @@ func main() {
 	_, failedRequests := clanHealth()
 	failClan.Store(false)
 	wait(ctx, "unchanged tracked clan recovers health", func() bool { healthy, requests := clanHealth(); return healthy && requests > failedRequests })
-	fmt.Println("PASS tracked-clan health recovers after upstream 504 and unchanged successful snapshot")
+	fmt.Println("PASS tracked-clan health recovers after upstream 403 and unchanged successful snapshot")
 	attack.Store(true)
 	wait(ctx, "new CWL attack delivered", func() bool { return feeds.Load() > 0 })
 	stop()

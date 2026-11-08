@@ -21,7 +21,7 @@ jobs:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
         with:
           repository: ClashKingInc/DevKit
-          ref: c92aa56b4dee63f4e5320f35af85a8d0f65072b4
+          ref: ac9f1365a5a478286b31f5d2f63816a967b29356
           path: .ci-schema
           persist-credentials: false
       - uses: actions/setup-go@40f1582b2485089dde7abd97c1529aa768e1baff
@@ -98,3 +98,6 @@ jobs:
 
       - name: Verify late CWL discovery and delivery
         run: bash .ci-schema/scripts/with-test-integration.sh --profile retained-api -- go run ./cmd/verify-cwl-discovery
+
+      - name: Verify one-month regular-war archive replay
+        run: bash .ci-schema/scripts/with-test-timescale.sh --profile retained-api -- go run ./cmd/verify-war-triple-rebuild
