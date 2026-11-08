@@ -50,9 +50,20 @@ func main() {
 	setPayload := func() { b, e := json.Marshal(snapshot); must(e); payload.Store(b) }
 	setPayload()
 	var requests atomic.Int64
+	var responseStatus atomic.Int64
 	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		check(strings.HasSuffix(r.URL.Path, "/currentwar/leaguegroup"), "unexpected auxiliary HTTP request")
 		requests.Add(1)
+		if status := int(responseStatus.Load()); status > 0 && status != 200 {
+			w.Header().Set("Content-Type", "application/json")
+			w.WriteHeader(status)
+			reason := "accessDenied"
+			if status == 404 {
+				reason = "notFound"
+			}
+			_ = json.NewEncoder(w).Encode(map[string]string{"reason": reason})
+			return
+		}
 		w.Header().Set("Content-Type", "application/json")
 		_, _ = w.Write(payload.Load().([]byte))
 	}))
@@ -145,5 +156,49 @@ func main() {
 	must(db.QueryRow(ctx, `SELECT name,town_hall FROM cwl_group_members WHERE tag='#M0000'`).Scan(&mn, &th))
 	must(db.QueryRow(ctx, `SELECT count(*) FROM cwl_group_members`).Scan(&count))
 	check(cn == "Renamed clan" && mn == "Renamed member" && th == 17 && count == 119, "changed values or stale-member removal lost")
+
+	// Run the actual refresh service through an upstream outage, an unchanged
+	// successful snapshot, and expected no-group responses. No fixture calls
+	// the health helper directly: HTTP, SQL and normal polling drive recovery.
+	app := &platform.App{Config: platform.Config{TimescaleURL: dsn, CWLRequestsPerSecond: 10, CWLWarRequestsPerSecond: 10, CWLSyncSeconds: 1, TargetPageMultiplier: 1}, Clash: client, Logger: slog.New(slog.NewTextHandler(io.Discard, nil)), Stats: platform.NewTracker(), Availability: platform.NewAvailabilityGate(nil)}
+	healthCtx, stopHealth := context.WithTimeout(ctx, 25*time.Second)
+	defer stopHealth()
+	responseStatus.Store(403)
+	healthDone := make(chan error, 1)
+	go func() { healthDone <- scripts.NewCWLDomain().Run(healthCtx, app) }()
+	state := func() platform.DomainStats {
+		for _, row := range app.Stats.Snapshot().Domains {
+			if row.Name == "cwl.groups" {
+				return row
+			}
+		}
+		return platform.DomainStats{}
+	}
+	await := func(test func() bool, message string) {
+		for healthCtx.Err() == nil {
+			if test() {
+				return
+			}
+			time.Sleep(5 * time.Millisecond)
+		}
+		panic(message)
+	}
+	await(func() bool { v := state(); return v.Errors > 0 && !v.Healthy }, "upstream failure did not remain visible")
+	responseStatus.Store(200)
+	await(func() bool { v := state(); return v.Healthy && v.LastError == "" && !v.LastSuccess.IsZero() }, "unchanged successful snapshot left failed health sticky")
+	beforeNegative := requests.Load()
+	responseStatus.Store(404)
+	await(func() bool { return requests.Load() >= beforeNegative+3 && state().Healthy }, "expected no-group discovery did not stay healthy")
+	errorCount := state().Errors
+	beforeMoreNegative := requests.Load()
+	await(func() bool { return requests.Load() >= beforeMoreNegative+3 && state().Healthy }, "no-group discovery stopped making progress")
+	check(state().Errors == errorCount, "expected no-group responses counted as errors")
+	stopHealth()
+	select {
+	case <-healthDone:
+	case <-time.After(5 * time.Second):
+		panic("health probe service did not stop")
+	}
+	fmt.Println("CWL_HEALTH_PASS upstream_failure_visible=true unchanged_snapshot_recovers=true no_group_is_not_outage=true actual_http_sql_service=true")
 	fmt.Printf("CWL_SNAPSHOTS_PASS unchanged_rows=128 tuple_metadata_changes=%d repeated_wal_bytes=%d changed_values=true stale_member_removed=true upstream_calls=%d actual_service=true\n", rewritten, repeatedWALBytes, requests.Load())
 }
