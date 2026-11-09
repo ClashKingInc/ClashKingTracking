@@ -154,15 +154,16 @@ func RebuildCWLParticipation(ctx context.Context, pool *pgxpool.Pool, season str
 		 WHERE season >= $1 AND season < $2 AND cwl_league_id > 48000000 AND war_size BETWEEN 1 AND 50
 		), clans AS (
 		 SELECT e.cwl_league_id,e.war_size,count(*) AS n FROM eligible e JOIN cwl_group_clans c USING(cwl_id) GROUP BY 1,2
-		), members AS (
-		 SELECT e.cwl_league_id,e.war_size,m.cwl_id,m.tag,m.town_hall
-		 FROM eligible e CROSS JOIN LATERAL (SELECT cwl_id,tag,town_hall FROM cwl_group_members WHERE cwl_id=e.cwl_id OFFSET 0) m
-		), member_totals AS (
-		 SELECT cwl_league_id,war_size,count(*) AS n FROM members GROUP BY 1,2
-		), townhall_totals AS (
-		 SELECT cwl_league_id,war_size,jsonb_agg(jsonb_build_object('level',town_hall,'count',n) ORDER BY town_hall DESC) AS counts
-		 FROM (SELECT cwl_league_id,war_size,town_hall,count(*) AS n FROM members WHERE town_hall > 0 GROUP BY 1,2,3) t GROUP BY 1,2
-		)
+		), member_counts AS (
+         SELECT e.cwl_league_id,e.war_size,m.town_hall,count(*) AS n
+         FROM eligible e CROSS JOIN LATERAL (SELECT town_hall FROM cwl_group_members WHERE cwl_id=e.cwl_id OFFSET 0) m
+         GROUP BY 1,2,3
+        ), member_totals AS (
+         SELECT cwl_league_id,war_size,sum(n) AS n FROM member_counts GROUP BY 1,2
+        ), townhall_totals AS (
+         SELECT cwl_league_id,war_size,jsonb_agg(jsonb_build_object('level',town_hall,'count',n) ORDER BY town_hall DESC) AS counts
+         FROM member_counts WHERE town_hall > 0 GROUP BY 1,2
+        )
 		SELECT e.cwl_league_id,e.war_size,count(*)::bigint,coalesce(c.n,0)::bigint,coalesce(m.n,0)::bigint,coalesce(t.counts,'[]'::jsonb)
 		FROM eligible e LEFT JOIN clans c USING(cwl_league_id,war_size) LEFT JOIN member_totals m USING(cwl_league_id,war_size) LEFT JOIN townhall_totals t USING(cwl_league_id,war_size)
 		GROUP BY e.cwl_league_id,e.war_size,c.n,m.n,t.counts ORDER BY e.cwl_league_id,e.war_size`, label, nextCWLSeason(label))
