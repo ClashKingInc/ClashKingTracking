@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"sort"
 	"strings"
+	"sync"
 
 	"clashking_tracking/internal/wararchive"
 	"github.com/jackc/pgx/v5"
@@ -62,6 +63,9 @@ const cwlFinalizedWarsSQL = `
     WHERE g.season >= $1 AND g.season < $2 AND g.cwl_league_id > 48000000 AND g.war_size BETWEEN 1 AND 50
     AND w.end_time >= ($1::text || '-01')::date - interval '7 days' AND w.end_time < ($2::text || '-01')::date + interval '7 days'`
 
+// OFFSET 0 retains the parameterized cwl_id index scan. Flattening this join
+// made the planner scan the billion-row history table for a single season.
+// The (tag,cwl_id) primary key makes count(*) equivalent to distinct group count.
 const cwlDuplicateCountsSQL = `
     WITH eligible AS (
       SELECT cwl_id FROM cwl_groups
@@ -70,8 +74,9 @@ const cwlDuplicateCountsSQL = `
       SELECT clan_tag FROM eligible JOIN cwl_group_clans USING (cwl_id)
       GROUP BY clan_tag HAVING count(DISTINCT cwl_id) > 1
     ), duplicate_members AS (
-      SELECT tag FROM eligible JOIN cwl_group_members USING (cwl_id)
-      GROUP BY tag HAVING count(DISTINCT cwl_id) > 1
+      SELECT member.tag FROM eligible e
+      CROSS JOIN LATERAL (SELECT tag FROM cwl_group_members WHERE cwl_id=e.cwl_id OFFSET 0) member
+      GROUP BY member.tag HAVING count(*) > 1
     )
     SELECT (SELECT count(*) FROM duplicate_clans), (SELECT count(*) FROM duplicate_members)`
 
@@ -92,7 +97,18 @@ func CWLSeasonLabel(value string) (string, error) {
 }
 
 func RebuildCWLParticipation(ctx context.Context, pool *pgxpool.Pool, season string, readArchive CWLArchiveReader) (CWLParticipationReport, error) {
-	tx, err := pool.BeginTx(ctx, pgx.TxOptions{IsoLevel: pgx.RepeatableRead})
+	conn, err := pool.Acquire(ctx)
+	if err != nil {
+		return CWLParticipationReport{}, err
+	}
+	defer conn.Release()
+	// One manual publication at a time, without retaining a transaction during
+	// archive downloads. The lock is released even when a download fails.
+	if _, err = conn.Exec(ctx, "SELECT pg_advisory_lock(hashtext('cwl_participation_rebuild'))"); err != nil {
+		return CWLParticipationReport{}, err
+	}
+	defer conn.Exec(context.Background(), "SELECT pg_advisory_unlock(hashtext('cwl_participation_rebuild'))")
+	tx, err := conn.BeginTx(ctx, pgx.TxOptions{IsoLevel: pgx.RepeatableRead})
 	if err != nil {
 		return CWLParticipationReport{}, err
 	}
@@ -116,6 +132,12 @@ func RebuildCWLParticipation(ctx context.Context, pool *pgxpool.Pool, season str
 	if err := tx.QueryRow(ctx, `SELECT count(*) FILTER (WHERE cwl_league_id IS NULL OR cwl_league_id <= 48000000), count(*) FILTER (WHERE cwl_league_id > 48000000 AND (war_size IS NULL OR war_size NOT BETWEEN 1 AND 50)) FROM cwl_groups WHERE season >= $1 AND season < $2`, label, nextCWLSeason(label)).Scan(&report.SkippedUnknownLeague, &report.SkippedUnknownSize); err != nil {
 		return report, err
 	}
+	// The distinct-account guard can cover tens of millions of rows. Its
+	// cardinality is badly underestimated, so prefer an external sort over a
+	// hash aggregate that repeatedly spills underestimated partitions.
+	if _, err = tx.Exec(ctx, "SET LOCAL work_mem='128MB'; SET LOCAL enable_hashagg=off"); err != nil {
+		return report, err
+	}
 	var duplicatedClans, duplicatedMembers int64
 	if err := tx.QueryRow(ctx, cwlDuplicateCountsSQL, label, nextCWLSeason(label)).Scan(&duplicatedClans, &duplicatedMembers); err != nil {
 		return report, err
@@ -123,21 +145,25 @@ func RebuildCWLParticipation(ctx context.Context, pool *pgxpool.Pool, season str
 	if duplicatedClans > 0 || duplicatedMembers > 0 {
 		return report, fmt.Errorf("CWL %s has %d clans and %d players in multiple eligible groups; participation was not replaced", label, duplicatedClans, duplicatedMembers)
 	}
+	if _, err = tx.Exec(ctx, "SET LOCAL enable_hashagg=on"); err != nil {
+		return report, err
+	}
 	rows, err := tx.Query(ctx, `
 		WITH eligible AS (
 		 SELECT cwl_id,cwl_league_id,war_size FROM cwl_groups
 		 WHERE season >= $1 AND season < $2 AND cwl_league_id > 48000000 AND war_size BETWEEN 1 AND 50
 		), clans AS (
 		 SELECT e.cwl_league_id,e.war_size,count(*) AS n FROM eligible e JOIN cwl_group_clans c USING(cwl_id) GROUP BY 1,2
-		), members AS (
-		 SELECT e.cwl_league_id,e.war_size,m.cwl_id,m.tag,max(m.town_hall) AS town_hall
-		 FROM eligible e JOIN cwl_group_members m USING(cwl_id) GROUP BY 1,2,3,4
-		), member_totals AS (
-		 SELECT cwl_league_id,war_size,count(*) AS n FROM members GROUP BY 1,2
-		), townhall_totals AS (
-		 SELECT cwl_league_id,war_size,jsonb_agg(jsonb_build_object('level',town_hall,'count',n) ORDER BY town_hall DESC) AS counts
-		 FROM (SELECT cwl_league_id,war_size,town_hall,count(*) AS n FROM members WHERE town_hall > 0 GROUP BY 1,2,3) t GROUP BY 1,2
-		)
+		), member_counts AS (
+         SELECT e.cwl_league_id,e.war_size,m.town_hall,count(*) AS n
+         FROM eligible e CROSS JOIN LATERAL (SELECT town_hall FROM cwl_group_members WHERE cwl_id=e.cwl_id OFFSET 0) m
+         GROUP BY 1,2,3
+        ), member_totals AS (
+         SELECT cwl_league_id,war_size,sum(n) AS n FROM member_counts GROUP BY 1,2
+        ), townhall_totals AS (
+         SELECT cwl_league_id,war_size,jsonb_agg(jsonb_build_object('level',town_hall,'count',n) ORDER BY town_hall DESC) AS counts
+         FROM member_counts WHERE town_hall > 0 GROUP BY 1,2
+        )
 		SELECT e.cwl_league_id,e.war_size,count(*)::bigint,coalesce(c.n,0)::bigint,coalesce(m.n,0)::bigint,coalesce(t.counts,'[]'::jsonb)
 		FROM eligible e LEFT JOIN clans c USING(cwl_league_id,war_size) LEFT JOIN member_totals m USING(cwl_league_id,war_size) LEFT JOIN townhall_totals t USING(cwl_league_id,war_size)
 		GROUP BY e.cwl_league_id,e.war_size,c.n,m.n,t.counts ORDER BY e.cwl_league_id,e.war_size`, label, nextCWLSeason(label))
@@ -164,10 +190,37 @@ func RebuildCWLParticipation(ctx context.Context, pool *pgxpool.Pool, season str
 		return report, err
 	}
 	rows.Close()
-	warRows, err := tx.Query(ctx, cwlFinalizedWarsSQL, label, nextCWLSeason(label))
+	// Count all eligible completed wars in SQL. Only supported hit-rate leagues
+	// need archive frames, avoiding millions of rows crossing the connection.
+	countRows, err := tx.Query(ctx, `SELECT cwl_league_id,war_size,count(*) FROM (`+cwlFinalizedWarsSQL+`) wars GROUP BY 1,2`, label, nextCWLSeason(label))
 	if err != nil {
 		return report, err
 	}
+	for countRows.Next() {
+		var league, size int
+		var count int64
+		if err = countRows.Scan(&league, &size, &count); err != nil {
+			countRows.Close()
+			return report, err
+		}
+		if b := byBucket[[2]int{league, size}]; b != nil {
+			b.FinalizedWars = count
+		}
+	}
+	if err = countRows.Err(); err != nil {
+		countRows.Close()
+		return report, err
+	}
+	countRows.Close()
+	warRows, err := tx.Query(ctx, `SELECT * FROM (`+cwlFinalizedWarsSQL+`) wars WHERE cwl_league_id BETWEEN 48000019 AND 48000022 AND archive_pack_id IS NOT NULL`, label, nextCWLSeason(label))
+	if err != nil {
+		return report, err
+	}
+	type frame struct {
+		bucket  *CWLParticipationBucket
+		locator CWLArchiveLocator
+	}
+	var frames []frame
 	seenWars := map[[3]int64]bool{}
 	for warRows.Next() {
 		var league, size int
@@ -183,25 +236,63 @@ func RebuildCWLParticipation(ctx context.Context, pool *pgxpool.Pool, season str
 			continue
 		}
 		seenWars[[3]int64{int64(league), int64(size), id}] = true
-		b.FinalizedWars++
 		if league < 48000019 || league > 48000022 || packID == nil || offset == nil || compressed == nil || readArchive == nil {
 			continue
 		}
-		war, err := readArchive(ctx, CWLArchiveLocator{*packID, *offset, *compressed})
-		if err != nil {
-			report.ArchiveReadFailures++
-			continue
-		}
-		b.ArchivedWars++
-		if league >= 48000019 && league <= 48000022 {
-			addCWLSameTHHits(b, war)
-		}
+		frames = append(frames, frame{b, CWLArchiveLocator{*packID, *offset, *compressed}})
 	}
 	if err := warRows.Err(); err != nil {
 		warRows.Close()
 		return report, err
 	}
 	warRows.Close()
+	// End the source snapshot before any remote archive I/O. This manual
+	// rebuild has no scheduled caller; publication takes a separate short lock.
+	if err = tx.Commit(ctx); err != nil {
+		return report, err
+	}
+	fmt.Printf("cwl %s source_loaded buckets=%d archive_frames=%d\n", label, len(byBucket), len(frames))
+	// Bound archive I/O. Results are folded by this goroutine only, keeping
+	// bucket counters race-free and memory proportional to worker count.
+	type frameResult struct {
+		bucket *CWLParticipationBucket
+		war    wararchive.War
+		err    error
+	}
+	jobs := make(chan frame)
+	results := make(chan frameResult, 8)
+	var readers sync.WaitGroup
+	for worker := 0; worker < 8; worker++ {
+		readers.Add(1)
+		go func() {
+			defer readers.Done()
+			for f := range jobs {
+				w, e := readArchive(ctx, f.locator)
+				results <- frameResult{f.bucket, w, e}
+			}
+		}()
+	}
+	go func() {
+		for _, f := range frames {
+			jobs <- f
+		}
+		close(jobs)
+		readers.Wait()
+		close(results)
+	}()
+	completed := 0
+	for r := range results {
+		completed++
+		if r.err != nil {
+			report.ArchiveReadFailures++
+		} else {
+			r.bucket.ArchivedWars++
+			addCWLSameTHHits(r.bucket, r.war)
+		}
+		if completed%500 == 0 {
+			fmt.Printf("cwl %s archives_read=%d/%d failures=%d\n", label, completed, len(frames), report.ArchiveReadFailures)
+		}
+	}
 	for _, b := range byBucket {
 		if b.ArchivedWars == 0 || b.CWLLeagueID < 48000019 || b.CWLLeagueID > 48000022 {
 			b.SameTHHitRates = nil
@@ -217,6 +308,14 @@ func RebuildCWLParticipation(ctx context.Context, pool *pgxpool.Pool, season str
 		}
 		return report.Buckets[i].WarSize < report.Buckets[j].WarSize
 	})
+	tx, err = conn.Begin(ctx)
+	if err != nil {
+		return report, err
+	}
+	defer tx.Rollback(ctx)
+	if _, err = tx.Exec(ctx, `SELECT pg_advisory_xact_lock(hashtext('cwl_participation'),hashtext($1))`, label); err != nil {
+		return report, err
+	}
 	if _, err = tx.Exec(ctx, `DELETE FROM cwl_participation WHERE season=$1`, label); err != nil {
 		return report, err
 	}

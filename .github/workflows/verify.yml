@@ -107,5 +107,8 @@ jobs:
       - name: Verify late CWL discovery and delivery
         run: bash .ci-schema/scripts/with-test-integration.sh --profile retained-api -- go run ./cmd/verify-cwl-discovery
 
+      - name: Verify manual CWL participation publication
+        run: bash .ci-schema/scripts/with-test-timescale.sh --profile retained-api -- go run ./cmd/verify-cwl-participation
+
       - name: Verify one-month regular-war archive replay
         run: bash .ci-schema/scripts/with-test-timescale.sh --profile retained-api -- go run ./cmd/verify-war-triple-rebuild
