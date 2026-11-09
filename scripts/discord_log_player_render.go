@@ -31,8 +31,19 @@ func (i discordLogIcons) icon(name, fallback string) string {
 			}
 		}
 	}
-	if v := i[discordEmojiKey(name)]; v != "" {
+	key := discordEmojiKey(name)
+	if v := i[key]; v != "" {
 		return v
+	}
+	// The current API says "Legend III" while the artwork inventory can use
+	// "Legend League III". Resolve the same badge before using a generic icon.
+	for _, suffix := range []string{"iii", "ii", "i"} {
+		if strings.HasSuffix(key, suffix) {
+			if v := i[strings.TrimSuffix(key, suffix)+"league"+suffix]; v != "" {
+				return v
+			}
+			break
+		}
 	}
 	return fallback
 }
