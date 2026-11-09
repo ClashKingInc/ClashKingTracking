@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"sort"
 	"strings"
+	"sync"
 
 	"clashking_tracking/internal/wararchive"
 	"github.com/jackc/pgx/v5"
@@ -92,7 +93,18 @@ func CWLSeasonLabel(value string) (string, error) {
 }
 
 func RebuildCWLParticipation(ctx context.Context, pool *pgxpool.Pool, season string, readArchive CWLArchiveReader) (CWLParticipationReport, error) {
-	tx, err := pool.BeginTx(ctx, pgx.TxOptions{IsoLevel: pgx.RepeatableRead})
+	conn, err := pool.Acquire(ctx)
+	if err != nil {
+		return CWLParticipationReport{}, err
+	}
+	defer conn.Release()
+	// One manual publication at a time, without retaining a transaction during
+	// archive downloads. The lock is released even when a download fails.
+	if _, err = conn.Exec(ctx, "SELECT pg_advisory_lock(hashtext('cwl_participation_rebuild'))"); err != nil {
+		return CWLParticipationReport{}, err
+	}
+	defer conn.Exec(context.Background(), "SELECT pg_advisory_unlock(hashtext('cwl_participation_rebuild'))")
+	tx, err := conn.BeginTx(ctx, pgx.TxOptions{IsoLevel: pgx.RepeatableRead})
 	if err != nil {
 		return CWLParticipationReport{}, err
 	}
@@ -164,10 +176,37 @@ func RebuildCWLParticipation(ctx context.Context, pool *pgxpool.Pool, season str
 		return report, err
 	}
 	rows.Close()
-	warRows, err := tx.Query(ctx, cwlFinalizedWarsSQL, label, nextCWLSeason(label))
+	// Count all eligible completed wars in SQL. Only supported hit-rate leagues
+	// need archive frames, avoiding millions of rows crossing the connection.
+	countRows, err := tx.Query(ctx, `SELECT cwl_league_id,war_size,count(*) FROM (`+cwlFinalizedWarsSQL+`) wars GROUP BY 1,2`, label, nextCWLSeason(label))
 	if err != nil {
 		return report, err
 	}
+	for countRows.Next() {
+		var league, size int
+		var count int64
+		if err = countRows.Scan(&league, &size, &count); err != nil {
+			countRows.Close()
+			return report, err
+		}
+		if b := byBucket[[2]int{league, size}]; b != nil {
+			b.FinalizedWars = count
+		}
+	}
+	if err = countRows.Err(); err != nil {
+		countRows.Close()
+		return report, err
+	}
+	countRows.Close()
+	warRows, err := tx.Query(ctx, `SELECT * FROM (`+cwlFinalizedWarsSQL+`) wars WHERE cwl_league_id BETWEEN 48000019 AND 48000022 AND archive_pack_id IS NOT NULL`, label, nextCWLSeason(label))
+	if err != nil {
+		return report, err
+	}
+	type frame struct {
+		bucket  *CWLParticipationBucket
+		locator CWLArchiveLocator
+	}
+	var frames []frame
 	seenWars := map[[3]int64]bool{}
 	for warRows.Next() {
 		var league, size int
@@ -183,25 +222,63 @@ func RebuildCWLParticipation(ctx context.Context, pool *pgxpool.Pool, season str
 			continue
 		}
 		seenWars[[3]int64{int64(league), int64(size), id}] = true
-		b.FinalizedWars++
 		if league < 48000019 || league > 48000022 || packID == nil || offset == nil || compressed == nil || readArchive == nil {
 			continue
 		}
-		war, err := readArchive(ctx, CWLArchiveLocator{*packID, *offset, *compressed})
-		if err != nil {
-			report.ArchiveReadFailures++
-			continue
-		}
-		b.ArchivedWars++
-		if league >= 48000019 && league <= 48000022 {
-			addCWLSameTHHits(b, war)
-		}
+		frames = append(frames, frame{b, CWLArchiveLocator{*packID, *offset, *compressed}})
 	}
 	if err := warRows.Err(); err != nil {
 		warRows.Close()
 		return report, err
 	}
 	warRows.Close()
+	// End the source snapshot before any remote archive I/O. This manual
+	// rebuild has no scheduled caller; publication takes a separate short lock.
+	if err = tx.Commit(ctx); err != nil {
+		return report, err
+	}
+	fmt.Printf("cwl %s source_loaded buckets=%d archive_frames=%d\n", label, len(byBucket), len(frames))
+	// Bound archive I/O. Results are folded by this goroutine only, keeping
+	// bucket counters race-free and memory proportional to worker count.
+	type frameResult struct {
+		bucket *CWLParticipationBucket
+		war    wararchive.War
+		err    error
+	}
+	jobs := make(chan frame)
+	results := make(chan frameResult, 8)
+	var readers sync.WaitGroup
+	for worker := 0; worker < 8; worker++ {
+		readers.Add(1)
+		go func() {
+			defer readers.Done()
+			for f := range jobs {
+				w, e := readArchive(ctx, f.locator)
+				results <- frameResult{f.bucket, w, e}
+			}
+		}()
+	}
+	go func() {
+		for _, f := range frames {
+			jobs <- f
+		}
+		close(jobs)
+		readers.Wait()
+		close(results)
+	}()
+	completed := 0
+	for r := range results {
+		completed++
+		if r.err != nil {
+			report.ArchiveReadFailures++
+		} else {
+			r.bucket.ArchivedWars++
+			addCWLSameTHHits(r.bucket, r.war)
+		}
+		if completed%500 == 0 {
+			fmt.Printf("cwl %s archives_read=%d/%d failures=%d\n", label, completed, len(frames), report.ArchiveReadFailures)
+		}
+	}
 	for _, b := range byBucket {
 		if b.ArchivedWars == 0 || b.CWLLeagueID < 48000019 || b.CWLLeagueID > 48000022 {
 			b.SameTHHitRates = nil
@@ -217,6 +294,14 @@ func RebuildCWLParticipation(ctx context.Context, pool *pgxpool.Pool, season str
 		}
 		return report.Buckets[i].WarSize < report.Buckets[j].WarSize
 	})
+	tx, err = conn.Begin(ctx)
+	if err != nil {
+		return report, err
+	}
+	defer tx.Rollback(ctx)
+	if _, err = tx.Exec(ctx, `SELECT pg_advisory_xact_lock(hashtext('cwl_participation'),hashtext($1))`, label); err != nil {
+		return report, err
+	}
 	if _, err = tx.Exec(ctx, `DELETE FROM cwl_participation WHERE season=$1`, label); err != nil {
 		return report, err
 	}
