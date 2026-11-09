@@ -1374,15 +1374,20 @@ func discordCacheListener(
 			if firstClashLink(message.Content) == nil && len(showClanQueries(message.Content)) == 0 {
 				return
 			}
+			attachments := make([]map[string]any, 0, len(message.Attachments))
+			for _, attachment := range message.Attachments {
+				attachments = append(attachments, map[string]any{"url": attachment.URL, "content_type": attachment.ContentType})
+			}
 			go func() {
 				err := app.PublishEvent(ctx, platform.Event{
 					Topic: "discord_message_create",
 					Value: map[string]any{
-						"id":         message.ID.String(),
-						"guild_id":   event.GuildID.String(),
-						"channel_id": message.ChannelID.String(),
-						"author_id":  message.Author.ID.String(),
-						"content":    message.Content,
+						"id":          message.ID.String(),
+						"guild_id":    event.GuildID.String(),
+						"channel_id":  message.ChannelID.String(),
+						"author_id":   message.Author.ID.String(),
+						"content":     message.Content,
+						"attachments": attachments,
 					},
 				})
 				if err != nil && !errors.Is(err, context.Canceled) {

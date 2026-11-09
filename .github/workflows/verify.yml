@@ -69,6 +69,9 @@ jobs:
 
       - name: Verify all war types reach configured log threads
         run: bash .ci-schema/scripts/with-test-integration.sh --profile retained-api -- go run ./cmd/verify-war-logs
+      - name: Verify automatic link parser previews
+        run: bash .ci-schema/scripts/with-test-integration.sh --profile retained-api -- go run ./cmd/verify-link-parsers
+
       - name: Verify Reddit post and subscribed comment delivery
         run: bash .ci-schema/scripts/with-test-integration.sh --profile retained-api -- go run ./cmd/verify-reddit-logs
 
