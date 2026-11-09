@@ -19,7 +19,12 @@ func discordClanLogMessages(event mobileWarEvent, logType string, icons discordL
 			player = member
 		}
 		level := intValue(player["townHallLevel"])
-		league, _ := mapValue(player["league"])
+		// Current home-village leagues use leagueTier; league is retained only
+		// for older snapshots. Falling straight to league loses modern badges.
+		league, _ := mapValue(player["leagueTier"])
+		if stringMapValue(league, "name") == "" {
+			league, _ = mapValue(player["league"])
+		}
 		embed.Description = fmt.Sprintf("[**%s** (%s)](https://link.clashofclans.com/en?action=OpenPlayerProfile&tag=%%23%s)\n", discordLabel(stringMapValue(player, "name")), stringMapValue(player, "tag"), strings.TrimPrefix(stringMapValue(player, "tag"), "#"))
 		stats := fmt.Sprintf("%s%d%s%d", icons.th(level), level, icons.icon(stringMapValue(league, "name"), icons.icon("trophy", "🏆")), intValue(player["trophies"]))
 		if logType == "join_log" {
