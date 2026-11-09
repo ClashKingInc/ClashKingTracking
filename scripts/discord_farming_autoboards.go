@@ -109,7 +109,7 @@ func (w *discordDeliveryWorker) deliverFarmingBoard(ctx context.Context, b farmi
 			return err
 		}
 		value := fmt.Sprintf("**%s** total loot · **%d** attacks\n%s **%s** · %s **%s** · %s **%s**", farmingCompact(total), attacks,
-			icons.icon("full_gold", icons.icon("gold", "🟡")), farmingCompact(gold), icons.icon("full_elixir", icons.icon("elixir", "🟣")), farmingCompact(elixir), icons.icon("full_dark_elixir", icons.icon("dark_elixir", "⚫")), farmingCompact(dark))
+			icons.icon("gold", "🟡"), farmingCompact(gold), icons.icon("elixir", "🟣"), farmingCompact(elixir), icons.icon("dark_elixir", "⚫"), farmingCompact(dark))
 		totalNumber, _ := new(big.Rat).SetString(total)
 		if totalNumber != nil && attacks > 0 {
 			perAttack := new(big.Rat).Quo(totalNumber, new(big.Rat).SetInt64(attacks))
