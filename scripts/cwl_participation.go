@@ -63,6 +63,9 @@ const cwlFinalizedWarsSQL = `
     WHERE g.season >= $1 AND g.season < $2 AND g.cwl_league_id > 48000000 AND g.war_size BETWEEN 1 AND 50
     AND w.end_time >= ($1::text || '-01')::date - interval '7 days' AND w.end_time < ($2::text || '-01')::date + interval '7 days'`
 
+// OFFSET 0 retains the parameterized cwl_id index scan. Flattening this join
+// made the planner scan the billion-row history table for a single season.
+// The (tag,cwl_id) primary key makes count(*) equivalent to distinct group count.
 const cwlDuplicateCountsSQL = `
     WITH eligible AS (
       SELECT cwl_id FROM cwl_groups
@@ -71,8 +74,9 @@ const cwlDuplicateCountsSQL = `
       SELECT clan_tag FROM eligible JOIN cwl_group_clans USING (cwl_id)
       GROUP BY clan_tag HAVING count(DISTINCT cwl_id) > 1
     ), duplicate_members AS (
-      SELECT tag FROM eligible JOIN cwl_group_members USING (cwl_id)
-      GROUP BY tag HAVING count(DISTINCT cwl_id) > 1
+      SELECT member.tag FROM eligible e
+      CROSS JOIN LATERAL (SELECT tag FROM cwl_group_members WHERE cwl_id=e.cwl_id OFFSET 0) member
+      GROUP BY member.tag HAVING count(*) > 1
     )
     SELECT (SELECT count(*) FROM duplicate_clans), (SELECT count(*) FROM duplicate_members)`
 
@@ -143,7 +147,8 @@ func RebuildCWLParticipation(ctx context.Context, pool *pgxpool.Pool, season str
 		 SELECT e.cwl_league_id,e.war_size,count(*) AS n FROM eligible e JOIN cwl_group_clans c USING(cwl_id) GROUP BY 1,2
 		), members AS (
 		 SELECT e.cwl_league_id,e.war_size,m.cwl_id,m.tag,max(m.town_hall) AS town_hall
-		 FROM eligible e JOIN cwl_group_members m USING(cwl_id) GROUP BY 1,2,3,4
+		 FROM eligible e CROSS JOIN LATERAL (SELECT cwl_id,tag,town_hall FROM cwl_group_members WHERE cwl_id=e.cwl_id OFFSET 0) m
+         GROUP BY 1,2,3,4
 		), member_totals AS (
 		 SELECT cwl_league_id,war_size,count(*) AS n FROM members GROUP BY 1,2
 		), townhall_totals AS (
