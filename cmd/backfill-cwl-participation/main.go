@@ -57,7 +57,7 @@ func run() error {
 	pc.MaxConns = 1
 	// Backfills are bounded operator jobs, not interactive requests. Avoid the
 	// interactive 15s timeout while retaining a finite per-statement ceiling.
-	pc.ConnConfig.RuntimeParams["statement_timeout"] = "300000"
+	pc.ConnConfig.RuntimeParams["statement_timeout"] = "900000"
 	pc.ConnConfig.RuntimeParams["application_name"] = "cwl-participation-backfill"
 	pool, err := pgxpool.NewWithConfig(ctx, pc)
 	if err != nil {

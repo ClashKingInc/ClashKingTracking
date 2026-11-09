@@ -132,12 +132,21 @@ func RebuildCWLParticipation(ctx context.Context, pool *pgxpool.Pool, season str
 	if err := tx.QueryRow(ctx, `SELECT count(*) FILTER (WHERE cwl_league_id IS NULL OR cwl_league_id <= 48000000), count(*) FILTER (WHERE cwl_league_id > 48000000 AND (war_size IS NULL OR war_size NOT BETWEEN 1 AND 50)) FROM cwl_groups WHERE season >= $1 AND season < $2`, label, nextCWLSeason(label)).Scan(&report.SkippedUnknownLeague, &report.SkippedUnknownSize); err != nil {
 		return report, err
 	}
+	// The distinct-account guard can cover tens of millions of rows. Its
+	// cardinality is badly underestimated, so prefer an external sort over a
+	// hash aggregate that repeatedly spills underestimated partitions.
+	if _, err = tx.Exec(ctx, "SET LOCAL work_mem='128MB'; SET LOCAL enable_hashagg=off"); err != nil {
+		return report, err
+	}
 	var duplicatedClans, duplicatedMembers int64
 	if err := tx.QueryRow(ctx, cwlDuplicateCountsSQL, label, nextCWLSeason(label)).Scan(&duplicatedClans, &duplicatedMembers); err != nil {
 		return report, err
 	}
 	if duplicatedClans > 0 || duplicatedMembers > 0 {
 		return report, fmt.Errorf("CWL %s has %d clans and %d players in multiple eligible groups; participation was not replaced", label, duplicatedClans, duplicatedMembers)
+	}
+	if _, err = tx.Exec(ctx, "SET LOCAL enable_hashagg=on"); err != nil {
+		return report, err
 	}
 	rows, err := tx.Query(ctx, `
 		WITH eligible AS (
@@ -146,9 +155,8 @@ func RebuildCWLParticipation(ctx context.Context, pool *pgxpool.Pool, season str
 		), clans AS (
 		 SELECT e.cwl_league_id,e.war_size,count(*) AS n FROM eligible e JOIN cwl_group_clans c USING(cwl_id) GROUP BY 1,2
 		), members AS (
-		 SELECT e.cwl_league_id,e.war_size,m.cwl_id,m.tag,max(m.town_hall) AS town_hall
+		 SELECT e.cwl_league_id,e.war_size,m.cwl_id,m.tag,m.town_hall
 		 FROM eligible e CROSS JOIN LATERAL (SELECT cwl_id,tag,town_hall FROM cwl_group_members WHERE cwl_id=e.cwl_id OFFSET 0) m
-         GROUP BY 1,2,3,4
 		), member_totals AS (
 		 SELECT cwl_league_id,war_size,count(*) AS n FROM members GROUP BY 1,2
 		), townhall_totals AS (
