@@ -33,6 +33,13 @@ Mobile accounts are verified accounts only. Legend defenses require an enabled a
 
 War reminder events use a single v2 representation: `data` must be a nested war object and `minutes_remaining` must be a positive integer. Stringified JSON and formatted-hour compatibility fields are deliberately rejected so producers and consumers cannot silently disagree about the contract.
 
+Saved Discord reminders sent through the dashboard's Send now action also use
+`reminder/war`, but carry `manual: true` and Discord-specific configuration.
+The mobile consumer acknowledges and ignores those events, including entries
+already pending from an older consumer. It must not copy their nested timing
+into the mobile contract or notify app users for a server-only action. Scheduled
+war events remain eligible and keep the strict top-level timing validation.
+
 ## Sender flow
 
 ```text
