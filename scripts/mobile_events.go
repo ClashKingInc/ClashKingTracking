@@ -866,7 +866,12 @@ func mobilePushEventType(event mobileWarEvent) bool {
 	// mobile pushes, even for accounts with the legacy preference enabled.
 	case "new_war", "war_state":
 		return event.Topic == "war"
-	case "war", "raid_mobile":
+	case "war":
+		// A saved Discord reminder's Send now action shares this stream but is
+		// not a mobile request. Ignore it before decoding or recipient lookup:
+		// copying its nested timing would fan a server action out to app users.
+		return event.Topic == "reminder" && event.Value["manual"] != true
+	case "raid_mobile":
 		return event.Topic == "reminder"
 	case "legend_defense":
 		return event.Topic == "legend"
