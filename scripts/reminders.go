@@ -278,6 +278,9 @@ func (d *remindersDomain) reconcileWar(ctx context.Context, scheduleKey string) 
 		return err
 	}
 	defer tx.Rollback(ctx)
+	// Dashboard labels retain display casing (for example "CWL"). Both clock
+	// creation and cleanup must compare those labels case-insensitively, or a
+	// valid saved filter can suppress its clock or delete an existing one.
 	_, err = tx.Exec(ctx, `
 		WITH schedule AS (
 			SELECT schedule_key, source_clan_tag, opponent_tag, end_time, war_type
@@ -290,7 +293,10 @@ func (d *remindersDomain) reconcileWar(ctx context.Context, scheduleKey string) 
 			 AND reminder.type_name = 'War'
 			 AND reminder.clan_tag IN (schedule.source_clan_tag, schedule.opponent_tag)
 			WHERE reminder.minutes_remaining > 0
-			  AND (cardinality(reminder.war_type_names) = 0 OR schedule.war_type = ANY(reminder.war_type_names))
+			  AND (cardinality(reminder.war_type_names) = 0 OR EXISTS (
+			      SELECT 1 FROM unnest(reminder.war_type_names) AS configured(war_type)
+			      WHERE lower(configured.war_type) = lower(schedule.war_type)
+			  ))
 			UNION
 			SELECT DISTINCT timing
 			FROM schedule
@@ -323,7 +329,10 @@ func (d *remindersDomain) reconcileWar(ctx context.Context, scheduleKey string) 
 			  AND reminder.type_name = 'War'
 			  AND reminder.clan_tag IN (schedule.source_clan_tag, schedule.opponent_tag)
 			  AND reminder.minutes_remaining = job.minutes_remaining
-			  AND (cardinality(reminder.war_type_names) = 0 OR schedule.war_type = ANY(reminder.war_type_names))
+			  AND (cardinality(reminder.war_type_names) = 0 OR EXISTS (
+			      SELECT 1 FROM unnest(reminder.war_type_names) AS configured(war_type)
+			      WHERE lower(configured.war_type) = lower(schedule.war_type)
+			  ))
 		  )
 		  AND NOT EXISTS (
 			SELECT 1
