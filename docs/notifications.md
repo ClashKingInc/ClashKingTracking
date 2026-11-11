@@ -12,7 +12,7 @@
 - storing posts or campaigns that need delivery;
 - loading due attempts;
 - recording success/failure;
-- updating retry state and disabling invalid tokens;
+- recording delivery results and disabling confirmed invalid tokens;
 - preventing the same logical reminder from being delivered repeatedly.
 
 This keeps SQL mechanics out of event decoding and FCM transport code.
@@ -47,7 +47,8 @@ Load due delivery attempts
   -> decrypt/load device token
   -> send through FCM
   -> success: record delivered
-  -> retryable error: move next attempt forward
+  -> failed recipient after provider delivery starts: record and consume the event; never replay the full audience
+  -> source/provider failure: log the error and finish the attempt; no automatic replay
   -> invalid token/disabled device: stop future delivery to that device
 ```
 
@@ -77,7 +78,7 @@ For Raid Weekend, the reminder producer has already grouped the user's verified 
 
 ## Data and services used
 
-Consumes the configured Valkey event stream. Reads mobile account, preference, device, and war participation data as required. Administrative sends use posts, campaigns, and their delivery-attempt tables; live events are retried through unacknowledged stream entries. Calls Firebase Cloud Messaging; it never sends a Discord webhook.
+Consumes the configured Valkey event stream. Reads mobile account, preference, device, and war participation data as required. Administrative sends use posts, campaigns, and their delivery-attempt tables; live events read only new consumer-group entries. Previously attempted entries are never automatically reclaimed. New mobile events use consumer-group NOACK and are attempted once. No new pending record or recovery pass is created. A crash after consuming can miss an alert, rather than duplicate it. Campaign claims likewise are never reclaimed automatically. Calls Firebase Cloud Messaging; it never sends a Discord webhook.
 
 The event consumer reports `mobilepush.events` active-batch depth, processing duration, and readiness. The scheduled delivery worker reports its existing `mobilepush` run and write metrics; neither uses target progress because both consume ongoing work.
 

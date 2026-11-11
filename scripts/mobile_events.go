@@ -2,7 +2,6 @@ package scripts
 
 import (
 	"context"
-	"crypto/sha256"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -71,25 +70,13 @@ func (w *mobileEventsWorker) run(ctx context.Context, app *platform.App, statsNa
 	if err := w.ensureGroup(ctx); err != nil {
 		return err
 	}
-	readFreshNext := false
 	for {
 		if err := ctx.Err(); err != nil {
 			return err
 		}
-		var err error
-		var entries []valkey.XRangeEntry
-		if readFreshNext {
-			entries, err = w.read(ctx)
-			readFreshNext = false
-		} else {
-			entries, err = w.claimPending(ctx)
-			if err == nil && len(entries) == 0 {
-				entries, err = w.readPending(ctx)
-			}
-		}
-		if err == nil && len(entries) == 0 {
-			entries, err = w.read(ctx)
-		}
+		// NOACK consumes each event for this group when read. There is no
+		// pending/recovery pass: try delivery once, then move to the next event.
+		entries, err := w.read(ctx)
 		if err != nil {
 			if valkey.IsValkeyNil(err) {
 				continue
@@ -98,14 +85,11 @@ func (w *mobileEventsWorker) run(ctx context.Context, app *platform.App, statsNa
 		}
 		app.Stats.SetQueueDepth(statsName, len(entries))
 		if err := w.processEntries(ctx, entries); err != nil {
-			readFreshNext = true
+			app.Stats.SetQueueDepth(statsName, 0)
 			app.Stats.SetReady(statsName, false, err.Error())
-			app.Logger.Error("mobile event delivery failed; leaving stream entry pending", "err", err)
+			app.Logger.Error("mobile event processing failed; automatic replay disabled", "err", err)
 			if app.Errors != nil {
 				app.Errors.Capture(err, map[string]string{"domain": mobileEventsDomainName, "operation": "stream-delivery"})
-			}
-			if err := sleepOrDone(ctx, time.Second); err != nil {
-				return err
 			}
 			continue
 		}
@@ -120,9 +104,6 @@ func validateMobileEventsConfig(cfg platform.Config, client valkey.Client) error
 	if cfg.EventStreamName == "" {
 		return errors.New("events.stream is required for mobilepush")
 	}
-	if cfg.EventStreamReclaimIdleSeconds <= 0 {
-		return errors.New("events.reclaim_idle_seconds must be greater than zero for mobilepush")
-	}
 	if cfg.TimescaleURL == "" {
 		return errors.New("TIMESCALE_* connection variables are required for mobilepush")
 	}
@@ -136,69 +117,12 @@ func validateMobileEventsConfig(cfg platform.Config, client valkey.Client) error
 }
 
 type mobileEventsWorker struct {
-	client        valkey.Client
-	cfg           platform.Config
-	pool          *pgxpool.Pool
-	app           *platform.App
-	logger        *slog.Logger
-	legendMarkers legendDeliveryMarkerStore
-	processEntry  func(context.Context, string, mobileWarEvent) error
-	ackEntry      func(context.Context, string) error
-}
-
-type legendDeliveryMarkerStore interface {
-	Delivered(context.Context, string, string) (bool, error)
-	MarkDelivered(context.Context, string, string) error
-}
-
-type valkeyLegendDeliveryMarkers struct {
-	client valkey.Client
-	stream string
-	ttl    time.Duration
-}
-
-var markLegendDeliveryScript = valkey.NewLuaScript(`
-	redis.call('SADD', KEYS[1], ARGV[1])
-	redis.call('EXPIRE', KEYS[1], ARGV[2])
-	return 1
-`)
-
-func legendDeliveryMarkerTTL(cfg platform.Config) time.Duration {
-	// Keep per-device retry state slightly longer than the shared stream entry
-	// without extending retention for every high-volume domain event.
-	ttl := 2 * time.Duration(cfg.EventStreamRetentionSeconds) * time.Second
-	if ttl < 10*time.Minute {
-		ttl = 10 * time.Minute
-	}
-	if ttl > time.Hour {
-		ttl = time.Hour
-	}
-	return ttl
-}
-
-func legendDeliveryMarkerIdentity(value string) string {
-	return fmt.Sprintf("%x", sha256.Sum256([]byte(value)))
-}
-
-func (m *valkeyLegendDeliveryMarkers) key(eventID string) string {
-	return m.stream + ":mobilepush:legend-delivered:" + legendDeliveryMarkerIdentity(eventID)
-}
-
-func (m *valkeyLegendDeliveryMarkers) Delivered(ctx context.Context, eventID, deviceID string) (bool, error) {
-	if m == nil || m.client == nil {
-		return false, errors.New("Valkey is required for Legend delivery retry markers")
-	}
-	return m.client.Do(ctx, m.client.B().Sismember().Key(m.key(eventID)).Member(legendDeliveryMarkerIdentity(deviceID)).Build()).AsBool()
-}
-
-func (m *valkeyLegendDeliveryMarkers) MarkDelivered(ctx context.Context, eventID, deviceID string) error {
-	if m == nil || m.client == nil {
-		return errors.New("Valkey is required for Legend delivery retry markers")
-	}
-	seconds := int64(m.ttl / time.Second)
-	return markLegendDeliveryScript.Exec(ctx, m.client, []string{m.key(eventID)}, []string{
-		legendDeliveryMarkerIdentity(deviceID), fmt.Sprintf("%d", seconds),
-	}).Error()
+	client       valkey.Client
+	cfg          platform.Config
+	pool         *pgxpool.Pool
+	app          *platform.App
+	logger       *slog.Logger
+	processEntry func(context.Context, string, mobileWarEvent) error
 }
 
 func (w *mobileEventsWorker) group() string {
@@ -229,8 +153,9 @@ func (w *mobileEventsWorker) ensureGroup(ctx context.Context) error {
 func (w *mobileEventsWorker) read(ctx context.Context) ([]valkey.XRangeEntry, error) {
 	result, err := w.client.Do(ctx, w.client.B().Xreadgroup().
 		Group(w.group(), w.consumer()).
-		Count(50).
+		Count(1).
 		Block(5000).
+		Noack().
 		Streams().
 		Key(w.cfg.EventStreamName).
 		Id(">").
@@ -242,63 +167,15 @@ func (w *mobileEventsWorker) read(ctx context.Context) ([]valkey.XRangeEntry, er
 	return result[w.cfg.EventStreamName], nil
 }
 
-func (w *mobileEventsWorker) readPending(ctx context.Context) ([]valkey.XRangeEntry, error) {
-	result, err := w.client.Do(ctx, w.client.B().Xreadgroup().
-		Group(w.group(), w.consumer()).
-		Count(50).
-		Streams().
-		Key(w.cfg.EventStreamName).
-		Id("0").
-		Build(),
-	).AsXRead()
-	if err != nil {
-		return nil, err
-	}
-	return result[w.cfg.EventStreamName], nil
-}
-
-func (w *mobileEventsWorker) claimPending(ctx context.Context) ([]valkey.XRangeEntry, error) {
-	minIdle := fmt.Sprintf("%d", w.cfg.EventStreamReclaimIdleSeconds*1000)
-	values, err := w.client.Do(ctx, w.client.B().Xautoclaim().
-		Key(w.cfg.EventStreamName).
-		Group(w.group()).
-		Consumer(w.consumer()).
-		MinIdleTime(minIdle).
-		Start("0-0").
-		Count(50).
-		Build(),
-	).ToArray()
-	if err != nil {
-		if valkey.IsValkeyNil(err) {
-			return nil, nil
-		}
-		return nil, err
-	}
-	if len(values) < 2 {
-		return nil, nil
-	}
-	return values[1].AsXRange()
-}
-
 func (w *mobileEventsWorker) processEntries(ctx context.Context, entries []valkey.XRangeEntry) error {
 	process := w.processEvent
 	if w.processEntry != nil {
 		process = w.processEntry
 	}
-	ack := w.ack
-	if w.ackEntry != nil {
-		ack = w.ackEntry
-	}
 	var entryErrors []error
 	for _, entry := range entries {
 		event, ok := mobileEventFromEntry(entry)
 		if !ok || !mobilePushEventType(event) {
-			if err := ack(ctx, entry.ID); err != nil {
-				if ctx.Err() != nil {
-					return ctx.Err()
-				}
-				entryErrors = append(entryErrors, fmt.Errorf("acknowledge ignored mobile event %s: %w", entry.ID, err))
-			}
 			continue
 		}
 		started := time.Now()
@@ -318,20 +195,12 @@ func (w *mobileEventsWorker) processEntries(ctx context.Context, entries []valke
 			}
 			status := permanentMobileSourceStatus(err)
 			w.logDeliveryError("mobile notification event failed", "stream_id", entry.ID, "topic", event.Topic,
-				"event_type", stringValue(event.Value["type"]), "clan_tag", event.ClanTag, "permanent_source_status", status, "dropped", status != 0, "err", err)
-			if status == 0 {
-				entryErrors = append(entryErrors, fmt.Errorf("process mobile event %s: %w", entry.ID, err))
-				continue
-			}
-			// A permanent source rejection cannot improve by replaying this old
-			// reminder. Best-effort delivery drops it and lets later events run.
+				"event_type", stringValue(event.Value["type"]), "clan_tag", event.ClanTag, "permanent_source_status", status, "dropped", true, "err", err)
+			// The event was already consumed by NOACK. Log the failure
+			// without replaying this fanout to successful recipients.
+			entryErrors = append(entryErrors, fmt.Errorf("process mobile event %s: %w", entry.ID, err))
 		}
-		if err := ack(ctx, entry.ID); err != nil {
-			if ctx.Err() != nil {
-				return ctx.Err()
-			}
-			entryErrors = append(entryErrors, fmt.Errorf("acknowledge mobile event %s: %w", entry.ID, err))
-		}
+
 	}
 	return errors.Join(entryErrors...)
 }
@@ -349,19 +218,9 @@ func permanentMobileSourceStatus(err error) int {
 	case errors.As(err, &missing):
 		return 404
 	default:
-		// Authentication (401), throttling, transport errors and 5xx remain
-		// visible/retriable. FCM errors use their own provider policy.
+		// Classification is diagnostic only; mobile sends are one-shot.
 		return 0
 	}
-}
-
-func (w *mobileEventsWorker) ack(ctx context.Context, id string) error {
-	return w.client.Do(ctx, w.client.B().Xack().
-		Key(w.cfg.EventStreamName).
-		Group(w.group()).
-		Id(id).
-		Build(),
-	).Error()
 }
 
 func (w *mobileEventsWorker) processEvent(ctx context.Context, entryID string, event mobileWarEvent) error {
@@ -450,11 +309,7 @@ func (w *mobileEventsWorker) processLegendDefense(ctx context.Context, entryID s
 		Body:  body,
 		Data:  data,
 	}
-	deliveryID := stringValue(event.Value["event_id"])
-	if deliveryID == "" {
-		deliveryID = entryID
-	}
-	return w.deliverLegendDefenseDevices(ctx, deliveryID, playerTag, devices, message)
+	return w.deliverLegendDefenseDevices(ctx, playerTag, devices, message)
 }
 
 func legendDefenseNotificationText(value map[string]any) (string, string, error) {
@@ -484,25 +339,9 @@ func legendDefenseNotificationText(value map[string]any) (string, string, error)
 	return player + " was attacked", fmt.Sprintf("%s %s (%d%%)", opponent, starDisplay, destruction), nil
 }
 
-func (w *mobileEventsWorker) deliverLegendDefenseDevices(ctx context.Context, deliveryID, playerTag string, devices []models.PushDevice, message pushMessage) error {
-	markers := w.legendMarkers
-	if markers == nil {
-		markers = &valkeyLegendDeliveryMarkers{
-			client: w.client,
-			stream: w.cfg.EventStreamName,
-			ttl:    legendDeliveryMarkerTTL(w.cfg),
-		}
-	}
+func (w *mobileEventsWorker) deliverLegendDefenseDevices(ctx context.Context, playerTag string, devices []models.PushDevice, message pushMessage) error {
 	var deliveryErrors []error
 	for _, device := range devices {
-		deviceIdentity := strings.Join([]string{device.UserID, device.DeviceID, device.Provider, device.Environment}, "\x00")
-		delivered, err := markers.Delivered(ctx, deliveryID, deviceIdentity)
-		if err != nil {
-			return fmt.Errorf("read Legend delivery marker for device %s: %w", device.DeviceID, err)
-		}
-		if delivered {
-			continue
-		}
 		token, err := utils.DecryptSecret(device.TokenCiphertext, w.cfg.MobilePushTokenKey)
 		if err != nil || token == "" {
 			if err == nil {
@@ -518,12 +357,7 @@ func (w *mobileEventsWorker) deliverLegendDefenseDevices(ctx context.Context, de
 			}
 			continue
 		}
-		// The provider send deliberately precedes the marker so delivery remains
-		// at-least-once. A process crash between these calls can duplicate this
-		// device on retry; marking first would instead lose the notification.
-		if err := markers.MarkDelivered(ctx, deliveryID, deviceIdentity); err != nil {
-			deliveryErrors = append(deliveryErrors, fmt.Errorf("record Legend delivery for device %s: %w", device.DeviceID, err))
-		}
+
 	}
 	return errors.Join(deliveryErrors...)
 }

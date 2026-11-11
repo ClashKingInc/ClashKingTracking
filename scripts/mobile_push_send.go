@@ -57,6 +57,8 @@ func (e *pushProviderHTTPError) Error() string {
 	}
 }
 
+// Classify temporary delivery failures for reporting; callers do not enqueue
+// automatic retries. A failed fanout must never resend successful recipients.
 func isRetryablePushError(err error) bool {
 	if err == nil || errors.Is(err, context.Canceled) {
 		return false

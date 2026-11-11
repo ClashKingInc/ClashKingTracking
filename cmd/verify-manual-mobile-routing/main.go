@@ -203,10 +203,12 @@ func main() {
 	must(err)
 	check(len(pending) == 1, "manual pending fixture absent")
 	go func() { done <- scripts.NewMobileEventsDomain().Run(runCtx, app) }()
-	until(ctx, "old pending manual event acknowledged", func() bool {
-		p, e := cache.Do(ctx, cache.B().Arbitrary("XPENDING", stream, "mobilepush", manualID, manualID, "1").Build()).ToArray()
-		return e == nil && len(p) == 0
-	})
+	// A legacy pending entry must not be replayed by the NOACK consumer.
+	time.Sleep(1200 * time.Millisecond)
+	pending, err = cache.Do(ctx, cache.B().Arbitrary("XPENDING", stream, "mobilepush", manualID, manualID, "1").Build()).ToArray()
+	must(err)
+	check(len(pending) == 1, "legacy pending event was unexpectedly processed")
+
 	check(fcmSends.Load() == 0, "manual Discord event sent an unexpected mobile push")
 	b, _ := os.ReadFile(logPath)
 	check(!strings.Contains(string(b), "war reminder minutes_remaining must be a positive integer"), "manual event reached strict mobile decoder")
@@ -215,7 +217,7 @@ func main() {
 	must(err)
 	_, err = db.Exec(ctx, `INSERT INTO war_reminder_jobs(schedule_key,minutes_remaining,run_at) VALUES($1,15,now()-interval '1 second')`, schedule)
 	must(err)
-	until(ctx, "scheduled delivery after discarding old manual event", func() bool { return fcmSends.Load() == 2 && discordSends.Load() == 2 })
+	until(ctx, "scheduled delivery without replaying old manual event", func() bool { return fcmSends.Load() == 2 && discordSends.Load() == 2 })
 	var jobs int
 	must(db.QueryRow(ctx, `SELECT count(*) FROM war_reminder_jobs WHERE schedule_key=$1`, schedule).Scan(&jobs))
 	check(jobs == 0, "due clock not consumed")
@@ -256,7 +258,7 @@ func main() {
 			panic("domain did not stop")
 		}
 	}
-	result := map[string]any{"environment": "disposable local Timescale + Valkey + real tracking domains; Clash/Discord/FCM are loopback providers", "manual": map[string]any{"produced_by": "PostgreSQL NOTIFY -> real reminders.processManualReminder", "nested_minutes": 15, "top_level_minutes_present": false, "discord_webhooks_delivered": 1, "mobile_pushes": 0, "old_pending_acknowledged": true, "mobile_decoder_errors": 0}, "scheduled": map[string]any{"produced_by": "real due war job -> real reminders.finishDueWarJob", "side_events": scheduledCount, "top_level_minutes": 15, "discord_webhooks_delivered": 1, "mobile_pushes_delivered": fcmSends.Load(), "remaining_mobile_pending": scheduledPending, "due_job_removed": true}, "malformed_scheduled_event_rejected": true, "war_provider_reads": warReads.Load(), "production_writes": 0}
+	result := map[string]any{"environment": "disposable local Timescale + Valkey + real tracking domains; Clash/Discord/FCM are loopback providers", "manual": map[string]any{"produced_by": "PostgreSQL NOTIFY -> real reminders.processManualReminder", "nested_minutes": 15, "top_level_minutes_present": false, "discord_webhooks_delivered": 1, "mobile_pushes": 0, "old_pending_not_replayed": true, "mobile_decoder_errors": 0}, "scheduled": map[string]any{"produced_by": "real due war job -> real reminders.finishDueWarJob", "side_events": scheduledCount, "top_level_minutes": 15, "discord_webhooks_delivered": 1, "mobile_pushes_delivered": fcmSends.Load(), "remaining_mobile_pending": scheduledPending, "due_job_removed": true}, "malformed_scheduled_event_rejected": true, "war_provider_reads": warReads.Load(), "production_writes": 0}
 	output, err := json.MarshalIndent(result, "", "  ")
 	must(err)
 	fmt.Println(string(output))

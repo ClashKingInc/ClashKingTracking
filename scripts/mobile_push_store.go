@@ -941,14 +941,13 @@ func (s *timescaleMobilePushStore) ClaimDueCampaigns(ctx context.Context, now ti
 	}
 	rows.Close()
 
+	// Retain an existing claim for inspection; never replay a partially sent campaign.
 	claimed := make([]models.NotificationCampaign, 0, len(due))
 	for _, campaign := range due {
 		tag, err := tx.Exec(ctx, `INSERT INTO admin_campaign_delivery_attempts
 			(campaign_id, scheduled_for, eligible_count, sent_count, skipped_count, status, attempted_at)
 			VALUES ($1, $2::date, 0, 0, 0, 'processing', $3)
-			ON CONFLICT (campaign_id, scheduled_for) DO UPDATE SET status='processing', attempted_at=$3
-			WHERE admin_campaign_delivery_attempts.status = 'processing'
-			  AND admin_campaign_delivery_attempts.attempted_at <= $3::timestamptz - interval '5 minutes'`,
+			ON CONFLICT (campaign_id, scheduled_for) DO NOTHING`,
 			campaign.ID, campaignScheduledFor(campaign, now), now)
 		if err != nil {
 			return nil, err
@@ -1425,9 +1424,8 @@ func (s *memoryMobilePushStore) ClaimDueCampaigns(_ context.Context, now time.Ti
 		due = due || monthlyCampaignDue(campaign, now)
 		claimKey := campaign.ID + ":" + campaignScheduledFor(campaign, now).Format("2006-01-02")
 		if due {
-			lastClaim, claimed := s.campaignClaims[claimKey]
-			lastStatus := s.campaignStatuses[claimKey]
-			if !claimed || (lastStatus == "processing" && !lastClaim.After(now.Add(-5*time.Minute))) {
+			_, claimed := s.campaignClaims[claimKey]
+			if !claimed {
 				s.campaignClaims[claimKey] = now
 				s.campaignStatuses[claimKey] = "processing"
 				out = append(out, campaign)
