@@ -41,13 +41,3 @@ func DecryptSecret(value, key string) (string, error) {
 	}
 	return string(plain), nil
 }
-
-// Read with the API's current key first. Retain the previous worker key during
-// migration so an old row remains deliverable until its ciphertext is replaced.
-func DecryptPushToken(value, currentKey, legacyKey string) (string, error) {
-	token, err := DecryptSecret(value, currentKey)
-	if err != nil && legacyKey != "" && legacyKey != currentKey {
-		return DecryptSecret(value, legacyKey)
-	}
-	return token, err
-}

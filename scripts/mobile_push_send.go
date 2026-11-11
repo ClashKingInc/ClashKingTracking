@@ -85,7 +85,7 @@ func sendPushToDevices(ctx context.Context, app *platform.App, devices []models.
 		go func() {
 			defer wg.Done()
 			for device := range jobs {
-				token, err := utils.DecryptPushToken(device.TokenCiphertext, app.Config.MobilePushTokenKey, app.Config.MobilePushLegacyTokenKey)
+				token, err := utils.DecryptSecret(device.TokenCiphertext, app.Config.MobilePushTokenKey)
 				if err != nil {
 					app.Logger.Warn("mobile_push: failed to decrypt device token", "device_id", device.DeviceID, "err", err)
 					mu.Lock()

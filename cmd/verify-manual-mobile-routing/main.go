@@ -81,7 +81,6 @@ func main() {
 	const clan = "#PYLQRRJC"
 	const enemy = "#PYLQRRJY"
 	const player = "#PYLQRRJP"
-	const key = "disposable-fixture-key"
 	const currentKey = "disposable-current-push-key"
 	const stream = "investigate:mobile:reminders"
 	now := time.Now().UTC().Truncate(time.Second)
@@ -143,7 +142,7 @@ func main() {
 			panic(problem)
 		}
 	}()
-	app := &platform.App{Config: platform.Config{TimescaleURL: dsn, ValkeyAddr: addr, EventStreamName: stream, EventStreamConsumer: "fixture", EventStreamRetentionSeconds: 300, EventStreamReclaimIdleSeconds: 1, ReminderRequestsPerSecond: 10, DiscordBotToken: base64.RawStdEncoding.EncodeToString([]byte(appID)) + ".local.fixture", DiscordAPIURL: provider.URL, DiscordDeliveryBatchSize: 20, ClashKingAPIURL: provider.URL, ClashKingAPIToken: "fixture", MobilePushTokenKey: currentKey, MobilePushLegacyTokenKey: key, MobilePushFCMProjectID: "fixture", MobilePushFCMServiceAccountJSON: string(sa), MobilePushFCMAPIOrigin: provider.URL}, Clash: client, Valkey: cache, Logger: slog.New(slog.NewTextHandler(logFile, nil)), Stats: platform.NewTracker(), Availability: platform.NewAvailabilityGate(nil)}
+	app := &platform.App{Config: platform.Config{TimescaleURL: dsn, ValkeyAddr: addr, EventStreamName: stream, EventStreamConsumer: "fixture", EventStreamRetentionSeconds: 300, EventStreamReclaimIdleSeconds: 1, ReminderRequestsPerSecond: 10, DiscordBotToken: base64.RawStdEncoding.EncodeToString([]byte(appID)) + ".local.fixture", DiscordAPIURL: provider.URL, DiscordDeliveryBatchSize: 20, ClashKingAPIURL: provider.URL, ClashKingAPIToken: "fixture", MobilePushTokenKey: currentKey, MobilePushFCMProjectID: "fixture", MobilePushFCMServiceAccountJSON: string(sa), MobilePushFCMAPIOrigin: provider.URL}, Clash: client, Valkey: cache, Logger: slog.New(slog.NewTextHandler(logFile, nil)), Stats: platform.NewTracker(), Availability: platform.NewAvailabilityGate(nil)}
 	_, err = db.Exec(ctx, `INSERT INTO auth_users(user_id,provider) VALUES($1,'discord');`, user)
 	must(err)
 	_, err = db.Exec(ctx, `INSERT INTO servers(id,name,last_command_at) VALUES($1,'Fixture',now())`, guild)
@@ -154,9 +153,9 @@ func main() {
 	must(err)
 	_, err = db.Exec(ctx, `INSERT INTO mobile_notification_preferences(user_id,war_reminders_enabled,reminder_timings) VALUES($1,true,ARRAY[15])`, user)
 	must(err)
-	_, err = db.Exec(ctx, `INSERT INTO mobile_push_devices(user_id,device_id,platform,provider,environment,token_ciphertext,token_hash,authorization_status) VALUES($1,'fixture-device','ios','fcm','sandbox',$2,'fixture','authorized')`, user, encrypt("fixture-device-token", key))
+	_, err = db.Exec(ctx, `INSERT INTO mobile_push_devices(user_id,device_id,platform,provider,environment,token_ciphertext,token_hash,authorization_status) VALUES($1,'fixture-device','ios','fcm','sandbox',$2,'fixture','authorized')`, user, encrypt("fixture-device-token", currentKey))
 	must(err)
-	// Exercise both previous-key devices and current-API-key devices through
+	// Exercise multiple devices encrypted with the API key through
 	// the actual notification stream consumer and local FCM HTTP provider.
 	_, err = db.Exec(ctx, `INSERT INTO mobile_push_devices(user_id,device_id,platform,provider,environment,token_ciphertext,token_hash,authorization_status) VALUES($1,'rotated-device','ios','fcm','sandbox',$2,'fixture-v2','authorized')`, user, encrypt("rotated-device-token", currentKey))
 	must(err)
