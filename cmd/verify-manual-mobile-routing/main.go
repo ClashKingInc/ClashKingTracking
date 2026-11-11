@@ -82,6 +82,7 @@ func main() {
 	const enemy = "#PYLQRRJY"
 	const player = "#PYLQRRJP"
 	const key = "disposable-fixture-key"
+	const currentKey = "disposable-current-push-key"
 	const stream = "investigate:mobile:reminders"
 	now := time.Now().UTC().Truncate(time.Second)
 	prep := now.Add(-25 * time.Hour)
@@ -142,7 +143,7 @@ func main() {
 			panic(problem)
 		}
 	}()
-	app := &platform.App{Config: platform.Config{TimescaleURL: dsn, ValkeyAddr: addr, EventStreamName: stream, EventStreamConsumer: "fixture", EventStreamRetentionSeconds: 300, EventStreamReclaimIdleSeconds: 1, ReminderRequestsPerSecond: 10, DiscordBotToken: base64.RawStdEncoding.EncodeToString([]byte(appID)) + ".local.fixture", DiscordAPIURL: provider.URL, DiscordDeliveryBatchSize: 20, ClashKingAPIURL: provider.URL, ClashKingAPIToken: "fixture", MobilePushTokenKey: key, MobilePushFCMProjectID: "fixture", MobilePushFCMServiceAccountJSON: string(sa), MobilePushFCMAPIOrigin: provider.URL}, Clash: client, Valkey: cache, Logger: slog.New(slog.NewTextHandler(logFile, nil)), Stats: platform.NewTracker(), Availability: platform.NewAvailabilityGate(nil)}
+	app := &platform.App{Config: platform.Config{TimescaleURL: dsn, ValkeyAddr: addr, EventStreamName: stream, EventStreamConsumer: "fixture", EventStreamRetentionSeconds: 300, EventStreamReclaimIdleSeconds: 1, ReminderRequestsPerSecond: 10, DiscordBotToken: base64.RawStdEncoding.EncodeToString([]byte(appID)) + ".local.fixture", DiscordAPIURL: provider.URL, DiscordDeliveryBatchSize: 20, ClashKingAPIURL: provider.URL, ClashKingAPIToken: "fixture", MobilePushTokenKey: currentKey, MobilePushLegacyTokenKey: key, MobilePushFCMProjectID: "fixture", MobilePushFCMServiceAccountJSON: string(sa), MobilePushFCMAPIOrigin: provider.URL}, Clash: client, Valkey: cache, Logger: slog.New(slog.NewTextHandler(logFile, nil)), Stats: platform.NewTracker(), Availability: platform.NewAvailabilityGate(nil)}
 	_, err = db.Exec(ctx, `INSERT INTO auth_users(user_id,provider) VALUES($1,'discord');`, user)
 	must(err)
 	_, err = db.Exec(ctx, `INSERT INTO servers(id,name,last_command_at) VALUES($1,'Fixture',now())`, guild)
@@ -154,6 +155,10 @@ func main() {
 	_, err = db.Exec(ctx, `INSERT INTO mobile_notification_preferences(user_id,war_reminders_enabled,reminder_timings) VALUES($1,true,ARRAY[15])`, user)
 	must(err)
 	_, err = db.Exec(ctx, `INSERT INTO mobile_push_devices(user_id,device_id,platform,provider,environment,token_ciphertext,token_hash,authorization_status) VALUES($1,'fixture-device','ios','fcm','sandbox',$2,'fixture','authorized')`, user, encrypt("fixture-device-token", key))
+	must(err)
+	// Exercise both retained v1 devices and freshly rotated v2 devices through
+	// the actual notification stream consumer and local FCM HTTP provider.
+	_, err = db.Exec(ctx, `INSERT INTO mobile_push_devices(user_id,device_id,platform,provider,environment,token_ciphertext,token_hash,authorization_status) VALUES($1,'rotated-device','ios','fcm','sandbox',$2,'fixture-v2','authorized')`, user, strings.Replace(encrypt("rotated-device-token", currentKey), "v1.", "v2.", 1))
 	must(err)
 	var reminder string
 	must(db.QueryRow(ctx, `INSERT INTO reminders(server_id,type,type_name,clan_tag,webhook_token,channel_id,webhook_id,minutes_remaining,roles,townhalls) VALUES($1,1,'War',$2,'',$3,$4,15,ARRAY['member'],ARRAY[16]) RETURNING id::text`, guild, clan, channel, hook).Scan(&reminder))
@@ -211,12 +216,12 @@ func main() {
 	must(err)
 	_, err = db.Exec(ctx, `INSERT INTO war_reminder_jobs(schedule_key,minutes_remaining,run_at) VALUES($1,15,now()-interval '1 second')`, schedule)
 	must(err)
-	until(ctx, "scheduled delivery after discarding old manual event", func() bool { return fcmSends.Load() == 1 && discordSends.Load() == 2 })
+	until(ctx, "scheduled delivery after discarding old manual event", func() bool { return fcmSends.Load() == 2 && discordSends.Load() == 2 })
 	var jobs int
 	must(db.QueryRow(ctx, `SELECT count(*) FROM war_reminder_jobs WHERE schedule_key=$1`, schedule).Scan(&jobs))
 	check(jobs == 0, "due clock not consumed")
 	time.Sleep(1200 * time.Millisecond)
-	check(fcmSends.Load() == 1, "unexpected duplicate scheduled push")
+	check(fcmSends.Load() == 2, "unexpected duplicate scheduled push")
 	events, err = cache.Do(ctx, cache.B().Xrange().Key(stream).Start("-").End("+").Build()).AsXRange()
 	must(err)
 	scheduledCount := 0
@@ -243,7 +248,7 @@ func main() {
 		b, _ := os.ReadFile(logPath)
 		return e == nil && len(p) == 1 && strings.Contains(string(b), "war reminder minutes_remaining must be a positive integer")
 	})
-	check(fcmSends.Load() == 1, "malformed scheduled event produced a push")
+	check(fcmSends.Load() == 2, "malformed scheduled event produced a push")
 	stop()
 	for range 3 {
 		select {

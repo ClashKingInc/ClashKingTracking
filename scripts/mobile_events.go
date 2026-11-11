@@ -388,7 +388,7 @@ func (w *mobileEventsWorker) processEvent(ctx context.Context, entryID string, e
 		if !subscriptionWantsEvent(sub, event) {
 			continue
 		}
-		token, err := utils.DecryptSecret(sub.TokenCiphertext, w.cfg.MobilePushTokenKey)
+		token, err := utils.DecryptPushToken(sub.TokenCiphertext, w.cfg.MobilePushTokenKey, w.cfg.MobilePushLegacyTokenKey)
 		if err != nil || token == "" {
 			w.logDeliveryError("mobile FCM token decrypt failed", "clan_tag", event.ClanTag, "err", err)
 			continue
@@ -503,7 +503,7 @@ func (w *mobileEventsWorker) deliverLegendDefenseDevices(ctx context.Context, de
 		if delivered {
 			continue
 		}
-		token, err := utils.DecryptSecret(device.TokenCiphertext, w.cfg.MobilePushTokenKey)
+		token, err := utils.DecryptPushToken(device.TokenCiphertext, w.cfg.MobilePushTokenKey, w.cfg.MobilePushLegacyTokenKey)
 		if err != nil || token == "" {
 			if err == nil {
 				err = errors.New("decrypted token is empty")

@@ -69,6 +69,7 @@ type Config struct {
 	MobilePushFCMProjectID                 string
 	MobilePushFCMAPIOrigin                 string
 	MobilePushTokenKey                     string
+	MobilePushLegacyTokenKey               string
 	MobilePushScanSeconds                  int
 	RosterAutomationScanSeconds            int
 	RosterAutomationBatchSize              int
@@ -335,7 +336,8 @@ func applyEnvironment(cfg *Config) {
 	cfg.MobilePushFCMServiceAccountJSON = os.Getenv("MOBILE_PUSH_FCM_SERVICE_ACCOUNT_JSON")
 	cfg.MobilePushFCMProjectID = strings.TrimSpace(os.Getenv("MOBILE_PUSH_FCM_PROJECT_ID"))
 	cfg.MobilePushFCMAPIOrigin = normalizeOrigin(os.Getenv("CLASHKING_LOCAL_FCM_API_ORIGIN"))
-	cfg.MobilePushTokenKey = os.Getenv("DATA_ENCRYPTION_KEY")
+	cfg.MobilePushTokenKey = firstNonEmpty(os.Getenv("MOBILE_PUSH_TOKEN_ENCRYPTION_KEY"), os.Getenv("DATA_ENCRYPTION_KEY"))
+	cfg.MobilePushLegacyTokenKey = os.Getenv("DATA_ENCRYPTION_KEY")
 	cfg.DiscordBotToken = firstNonEmpty(os.Getenv("DISCORD_BOT_TOKEN"), os.Getenv("BOT_TOKEN"))
 	cfg.DiscordAPIURL = normalizeOrigin(os.Getenv("CLASHKING_LOCAL_DISCORD_API_URL"))
 	cfg.DiscordGuildAllowlist = parseStringSet(os.Getenv("DISCORD_GUILD_ALLOWLIST"))

@@ -41,3 +41,15 @@ func DecryptSecret(value, key string) (string, error) {
 	}
 	return string(plain), nil
 }
+
+// Push v2 is isolated from encryption of unrelated application credentials.
+// Keep v1 readable during rotation, while new registrations use the shared v2 key.
+func DecryptPushToken(value, currentKey, legacyKey string) (string, error) {
+	if strings.HasPrefix(value, "v2.") {
+		return DecryptSecret("v1."+strings.TrimPrefix(value, "v2."), currentKey)
+	}
+	if legacyKey == "" {
+		legacyKey = currentKey
+	}
+	return DecryptSecret(value, legacyKey)
+}
