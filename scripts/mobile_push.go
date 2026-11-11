@@ -12,7 +12,7 @@ import (
 
 const mobilePushDomainName = "mobile_push"
 
-// mobilePushDomain publishes scheduled posts, retries push deliveries, runs
+// mobilePushDomain publishes scheduled posts, consumes queued push requests, runs
 // recurring campaigns, and expires live posts without exposing an HTTP API.
 type mobilePushDomain struct {
 	store mobilePushStore
@@ -78,13 +78,13 @@ func (d *mobilePushDomain) runCycle(ctx context.Context, app *platform.App) erro
 		app.Stats.RecordWrite(mobilePushDomainName, 1)
 	}
 
-	retries, err := d.store.ClaimDuePushRetries(ctx, now)
+	queued, err := d.store.ClaimQueuedPostPushes(ctx, now)
 	if err != nil {
 		return err
 	}
-	for _, post := range retries {
-		if _, _, err := deliverPostPush(ctx, app, d.store, post, "retry"); err != nil {
-			app.Logger.Warn("mobile_push: automatic retry failed", "post_id", post.ID, "err", err)
+	for _, post := range queued {
+		if _, _, err := deliverPostPush(ctx, app, d.store, post, "manual"); err != nil {
+			app.Logger.Warn("mobile_push: queued delivery failed", "post_id", post.ID, "err", err)
 		}
 	}
 	if err := d.store.EnsureGameEventCampaigns(ctx, now); err != nil {
