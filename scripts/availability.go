@@ -5,7 +5,6 @@ import (
 	"encoding/json"
 	"errors"
 	"strconv"
-	"strings"
 	"time"
 
 	"clashking_tracking/internal/platform"
@@ -173,10 +172,5 @@ func isOfficialMaintenance(err error) bool {
 	if errors.As(err, &maintenance) {
 		return true
 	}
-	var gateway *clashy.GatewayError
-	if !errors.As(err, &gateway) || gateway.HTTPException == nil || gateway.Status != 500 {
-		return false
-	}
-	message := strings.ToLower(gateway.Reason + " " + gateway.Message + " " + string(gateway.Body))
-	return strings.Contains(message, "maintenance")
+	return false
 }

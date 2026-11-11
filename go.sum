@@ -35,6 +35,8 @@ github.com/clashkinginc/clashy.go v0.1.15-0.20260901045716-ed49cb54e8ea h1:erqv2
 github.com/clashkinginc/clashy.go v0.1.15-0.20260901045716-ed49cb54e8ea/go.mod h1:sI4kNkV/ooRDN49UvH4a1tmdbrkacmLZKgA1ATJYbp8=
 github.com/clashkinginc/clashy.go v0.1.18-0.20261108053152-86c7b1d28d5b h1:zHCoa6Uv6EfcIcvCSMJ9tW7zbJMGRJPwWhnX+pMgBmY=
 github.com/clashkinginc/clashy.go v0.1.18-0.20261108053152-86c7b1d28d5b/go.mod h1:sI4kNkV/ooRDN49UvH4a1tmdbrkacmLZKgA1ATJYbp8=
+github.com/clashkinginc/clashy.go v0.1.19-0.20261111050933-5640eb1b118d h1:bjaj5Xf6MtWIzIpHkmv/MMZJL1yVzqtOaHktjNtLZBY=
+github.com/clashkinginc/clashy.go v0.1.19-0.20261111050933-5640eb1b118d/go.mod h1:sI4kNkV/ooRDN49UvH4a1tmdbrkacmLZKgA1ATJYbp8=
 github.com/davecgh/go-spew v1.1.0/go.mod h1:J7Y8YcW2NihsgmVo/mv3lAwl/skON4iLHjSsI+c5H38=
 github.com/davecgh/go-spew v1.1.1 h1:vj9j/u1bqnvCEfJOwUhtlOARqs3+rkHYY13jYWTU97c=
 github.com/davecgh/go-spew v1.1.1/go.mod h1:J7Y8YcW2NihsgmVo/mv3lAwl/skON4iLHjSsI+c5H38=
