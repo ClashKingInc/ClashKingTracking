@@ -62,7 +62,7 @@ func main() {
 	must(db.QueryRow(ctx, "SELECT count(*) FROM mobile_push_devices").Scan(&count))
 	check(count == 0, "empty device store required")
 	const key = "local-token-key"
-	cases := []string{"unregistered", "bare404", "wrongtype", "auth", "malformed", "unknown", "rotated", "success"}
+	cases := []string{"unregistered", "bare404", "wrongtype", "auth", "malformed", "trailing", "oversized", "unknown", "rotated", "success"}
 	token := func(name string) string { return "fixture-sensitive-token-" + name }
 	var mu sync.Mutex
 	calls := map[string]int{}
@@ -104,6 +104,10 @@ func main() {
 			fmt.Fprint(w, `{"error":{"details":[{"@type":"other.Type","errorCode":"UNREGISTERED"}]}}`)
 		case "malformed":
 			fmt.Fprint(w, `{"error":`)
+		case "trailing":
+			fmt.Fprint(w, `{"error":{"details":[{"@type":"type.googleapis.com/google.firebase.fcm.v1.FcmError","errorCode":"UNREGISTERED"}]}}junk`)
+		case "oversized":
+			fmt.Fprintf(w, `{"error":{"message":"%s","details":[{"@type":"type.googleapis.com/google.firebase.fcm.v1.FcmError","errorCode":"UNREGISTERED"}]}}`, strings.Repeat("x", 17000))
 		case "unknown":
 			fmt.Fprint(w, `{"error":{"details":[{"@type":"type.googleapis.com/google.firebase.fcm.v1.FcmError","errorCode":"fixture-sensitive-message"}]}}`)
 		default:

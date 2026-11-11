@@ -257,7 +257,8 @@ func doSend(req *http.Request) error {
 				} `json:"details"`
 			} `json:"error"`
 		}
-		if json.NewDecoder(io.LimitReader(resp.Body, 16*1024)).Decode(&payload) == nil {
+		body, readErr := io.ReadAll(io.LimitReader(resp.Body, 16*1024+1))
+		if readErr == nil && len(body) <= 16*1024 && json.Unmarshal(body, &payload) == nil {
 			for _, detail := range payload.Error.Details {
 				if detail.Type != "type.googleapis.com/google.firebase.fcm.v1.FcmError" {
 					continue
