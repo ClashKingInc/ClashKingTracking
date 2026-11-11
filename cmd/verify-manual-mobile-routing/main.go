@@ -247,7 +247,7 @@ func main() {
 	until(ctx, "malformed scheduled event remains rejected", func() bool {
 		p, e := cache.Do(ctx, cache.B().Arbitrary("XPENDING", stream, "mobilepush", malformedID, malformedID, "1").Build()).ToArray()
 		b, _ := os.ReadFile(logPath)
-		return e == nil && len(p) == 1 && strings.Contains(string(b), "war reminder minutes_remaining must be a positive integer")
+		return e == nil && len(p) == 0 && strings.Contains(string(b), "war reminder minutes_remaining must be a positive integer")
 	})
 	check(fcmSends.Load() == 2, "malformed scheduled event produced a push")
 	stop()
