@@ -156,9 +156,9 @@ func main() {
 	must(err)
 	_, err = db.Exec(ctx, `INSERT INTO mobile_push_devices(user_id,device_id,platform,provider,environment,token_ciphertext,token_hash,authorization_status) VALUES($1,'fixture-device','ios','fcm','sandbox',$2,'fixture','authorized')`, user, encrypt("fixture-device-token", key))
 	must(err)
-	// Exercise both retained v1 devices and freshly rotated v2 devices through
+	// Exercise both previous-key devices and current-API-key devices through
 	// the actual notification stream consumer and local FCM HTTP provider.
-	_, err = db.Exec(ctx, `INSERT INTO mobile_push_devices(user_id,device_id,platform,provider,environment,token_ciphertext,token_hash,authorization_status) VALUES($1,'rotated-device','ios','fcm','sandbox',$2,'fixture-v2','authorized')`, user, strings.Replace(encrypt("rotated-device-token", currentKey), "v1.", "v2.", 1))
+	_, err = db.Exec(ctx, `INSERT INTO mobile_push_devices(user_id,device_id,platform,provider,environment,token_ciphertext,token_hash,authorization_status) VALUES($1,'rotated-device','ios','fcm','sandbox',$2,'fixture-v2','authorized')`, user, encrypt("rotated-device-token", currentKey))
 	must(err)
 	var reminder string
 	must(db.QueryRow(ctx, `INSERT INTO reminders(server_id,type,type_name,clan_tag,webhook_token,channel_id,webhook_id,minutes_remaining,roles,townhalls) VALUES($1,1,'War',$2,'',$3,$4,15,ARRAY['member'],ARRAY[16]) RETURNING id::text`, guild, clan, channel, hook).Scan(&reminder))
