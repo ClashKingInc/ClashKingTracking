@@ -3,9 +3,11 @@ package scripts
 import (
 	"bytes"
 	"context"
+	"crypto/sha256"
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"net/http"
 	"strings"
 	"sync"
@@ -14,6 +16,8 @@ import (
 	"clashking_tracking/internal/platform"
 	"clashking_tracking/internal/utils"
 	"clashking_tracking/models"
+
+	"github.com/jackc/pgx/v5"
 
 	"golang.org/x/oauth2"
 	"golang.org/x/oauth2/google"
@@ -34,9 +38,15 @@ type pushMessage struct {
 	Data  map[string]string
 }
 
-type pushProviderHTTPError struct{ Status int }
+type pushProviderHTTPError struct {
+	Status  int
+	FCMCode string
+}
 
 func (e *pushProviderHTTPError) Error() string {
+	if e.FCMCode != "" {
+		return fmt.Sprintf("FCM rejected request: %s (HTTP %d)", e.FCMCode, e.Status)
+	}
 	switch e.Status {
 	case http.StatusUnauthorized, http.StatusForbidden:
 		return fmt.Sprintf("push provider authentication or configuration failed with status %d", e.Status)
@@ -176,7 +186,16 @@ func sendFCM(ctx context.Context, app *platform.App, token string, msg pushMessa
 	}
 	req.Header.Set("Authorization", "Bearer "+accessToken)
 	req.Header.Set("Content-Type", "application/json")
-	return doSend(req)
+	err = doSend(req)
+	var rejected *pushProviderHTTPError
+	// Only FCM's typed UNREGISTERED response establishes a dead token. A bare
+	// 404, malformed body, or another provider error must never disable a device.
+	if errors.As(err, &rejected) && rejected.Status == http.StatusNotFound && rejected.FCMCode == "UNREGISTERED" {
+		if cleanupErr := disableUnregisteredFCMToken(ctx, app, token); cleanupErr != nil {
+			app.Logger.Warn("mobile_push: unregistered token cleanup failed", "err", cleanupErr)
+		}
+	}
+	return err
 }
 
 // fcmAccessToken uses service-account JSON or Application Default Credentials.
@@ -227,7 +246,53 @@ func doSend(req *http.Request) error {
 	}
 	defer resp.Body.Close()
 	if resp.StatusCode >= 300 {
-		return &pushProviderHTTPError{Status: resp.StatusCode}
+		failure := &pushProviderHTTPError{Status: resp.StatusCode}
+		// Never retain or log the provider's free-text message or response body:
+		// it can contain registration tokens or other request content.
+		var payload struct {
+			Error struct {
+				Details []struct {
+					Type string `json:"@type"`
+					Code string `json:"errorCode"`
+				} `json:"details"`
+			} `json:"error"`
+		}
+		if json.NewDecoder(io.LimitReader(resp.Body, 16*1024)).Decode(&payload) == nil {
+			for _, detail := range payload.Error.Details {
+				if detail.Type != "type.googleapis.com/google.firebase.fcm.v1.FcmError" {
+					continue
+				}
+				switch detail.Code {
+				case "UNREGISTERED", "INVALID_ARGUMENT", "SENDER_ID_MISMATCH", "QUOTA_EXCEEDED", "UNAVAILABLE", "INTERNAL", "THIRD_PARTY_AUTH_ERROR", "UNSPECIFIED_ERROR":
+					failure.FCMCode = detail.Code
+				}
+			}
+		}
+		return failure
 	}
+	return nil
+}
+
+// Token hashes use the same SHA-256 encoding as the API. Match the token, not
+// just the device ID: a delayed rejection for an old token must not disable
+// the device's newer registration. Keep preferences and authorization intact.
+func disableUnregisteredFCMToken(ctx context.Context, app *platform.App, token string) error {
+	if app.Config.DryRun || app.Config.MockDB {
+		return nil
+	}
+	cleanupCtx, cancel := context.WithTimeout(ctx, 5*time.Second)
+	defer cancel()
+	conn, err := pgx.Connect(cleanupCtx, app.Config.TimescaleURL)
+	if err != nil {
+		return fmt.Errorf("connect for token cleanup failed (%T)", err)
+	}
+	defer conn.Close(context.Background())
+	digest := sha256.Sum256([]byte(token))
+	result, err := conn.Exec(cleanupCtx, `UPDATE mobile_push_devices SET enabled=false
+  WHERE provider='fcm' AND token_hash=$1 AND enabled=true`, fmt.Sprintf("%x", digest))
+	if err != nil {
+		return fmt.Errorf("disable unregistered token failed (%T)", err)
+	}
+	app.Logger.Info("mobile_push: unregistered token disabled", "registrations", result.RowsAffected())
 	return nil
 }

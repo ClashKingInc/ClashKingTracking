@@ -81,6 +81,8 @@ jobs:
       - name: Verify unknown Discord channel compatibility
         run: bash .ci-schema/scripts/with-test-integration.sh --profile retained-api -- go run ./cmd/verify-gateway-channels
 
+      - name: Verify unregistered push token cleanup
+        run: bash .ci-schema/scripts/with-test-integration.sh --profile retained-api -- go run ./cmd/verify-invalid-push-tokens
       - name: Verify notification scan and explicit post delivery
         run: bash .ci-schema/scripts/with-test-integration.sh --profile retained-api -- go run ./cmd/verify-mobile-scan
 
