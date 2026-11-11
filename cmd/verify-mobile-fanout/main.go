@@ -25,6 +25,7 @@ import (
 
 	"clashking_tracking/internal/platform"
 	"clashking_tracking/scripts"
+	clashy "github.com/clashkinginc/clashy.go"
 	"github.com/jackc/pgx/v5/pgxpool"
 	valkey "github.com/valkey-io/valkey-go"
 )
@@ -67,10 +68,24 @@ func main() {
 	token := func(name string) string { return "fixture-sensitive-token-" + name }
 	var mu sync.Mutex
 	calls := map[string]int{}
+	end := time.Now().Add(time.Hour).UTC().Truncate(time.Second)
+	stamp := func(t time.Time) string { return t.Format("20060102T150405.000Z") }
+	liveWar := map[string]any{"state": "inWar", "teamSize": 1, "attacksPerMember": 2, "preparationStartTime": stamp(end.Add(-48 * time.Hour)), "startTime": stamp(end.Add(-24 * time.Hour)), "endTime": stamp(end), "clan": map[string]any{"tag": "#PYL", "name": "Fixture Clan", "members": []any{map[string]any{"tag": "#PYLQ", "name": "Fixture", "townhallLevel": 16, "mapPosition": 1, "attacks": []any{}}}}, "opponent": map[string]any{"tag": "#QYL", "name": "Opponent", "members": []any{}}}
 	provider := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "application/json")
 		if r.URL.Path == "/token" {
 			fmt.Fprint(w, `{"access_token":"fixture","token_type":"Bearer","expires_in":3600}`)
+			return
+		}
+		if r.Method == "GET" {
+			switch {
+			case strings.HasSuffix(r.URL.Path, "/currentwar"):
+				json.NewEncoder(w).Encode(liveWar)
+			case strings.HasSuffix(r.URL.Path, "/capitalraidseasons"):
+				json.NewEncoder(w).Encode(map[string]any{"items": []any{map[string]any{"state": "ongoing", "startTime": stamp(end.Add(-time.Hour)), "endTime": stamp(end), "members": []any{map[string]any{"tag": "#PYLQ", "name": "Fixture", "attacks": 0, "attackLimit": 5, "bonusAttackLimit": 1}}}}})
+			default:
+				json.NewEncoder(w).Encode(map[string]any{"tag": "#PYL", "name": "Fixture Clan", "memberList": []any{map[string]any{"tag": "#PYLQ", "name": "Fixture", "townHallLevel": 16}}})
+			}
 			return
 		}
 		check(r.URL.Path == "/v1/projects/fixture/messages:send", "unexpected request")
@@ -158,6 +173,20 @@ func main() {
 	cache, err := valkey.NewClient(valkey.ClientOption{InitAddress: []string{addr}})
 	must(err)
 	defer cache.Close()
+	cc := clashy.DefaultClientConfig()
+	cc.BaseURL = provider.URL + "/v1"
+	cc.LookupCache = false
+	cc.UpdateCache = false
+	client, err := clashy.NewClient(cc)
+	must(err)
+	defer client.Close()
+	app.Clash = client
+	_, err = db.Exec(ctx, `INSERT INTO player_links(tag,user_id,source,is_verified) VALUES('#PYLQ','local-push-user','discord',true)`)
+	must(err)
+	_, err = db.Exec(ctx, `INSERT INTO mobile_notification_accounts(user_id,player_tag,enabled) VALUES('local-push-user','#PYLQ',true)`)
+	must(err)
+	_, err = db.Exec(ctx, `UPDATE mobile_notification_preferences SET legend_defenses_enabled=true,war_reminders_enabled=true,raid_reminders_enabled=true,reminder_timings=ARRAY[15],raid_reminder_timings=ARRAY[60] WHERE user_id='local-push-user'`)
+	must(err)
 	app.Valkey = cache
 	app.Config.ValkeyAddr = addr
 	app.Config.EventStreamName = "fixture:mobile-fanout"
@@ -167,6 +196,8 @@ func main() {
 	_, err = db.Exec(ctx, `UPDATE mobile_notification_preferences SET war_state_enabled=true WHERE user_id='local-push-user'`)
 	must(err)
 	_, err = db.Exec(ctx, `INSERT INTO user_bookmarks(user_id,entity_type,tag,war_notifications_enabled,war_active_until) VALUES('local-push-user','clan','#PYL',true,now()+interval '1 day')`)
+	must(err)
+	_, err = db.Exec(ctx, `UPDATE user_bookmarks SET raid_notifications_enabled=true,raid_active_until=now()+interval '1 day' WHERE user_id='local-push-user'`)
 	must(err)
 	runCtx, stop := context.WithCancel(ctx)
 	done := make(chan error, 1)
@@ -178,12 +209,16 @@ func main() {
 	for _, item := range events {
 		must(app.PublishEvent(ctx, platform.Event{Topic: "war", ClanTag: "#PYL", Value: map[string]any{"type": item.kind, "war_role": item.role, "war": map[string]any{"state": item.state, "preparationStartTime": time.Now().Add(-48 * time.Hour).UTC().Format(time.RFC3339), "clan": map[string]any{"tag": "#PYL", "name": "Fixture Clan"}, "opponent": map[string]any{"tag": "#QYL", "name": "Opponent"}}}}))
 	}
+	must(app.PublishEvent(ctx, platform.Event{Topic: "legend", Value: map[string]any{"type": "legend_defense", "player_tag": "#PYLQ", "player_name": "Fixture", "opponent_name": "Opponent", "stars": 2, "destruction_percentage": 80, "event_id": "local-legend-1"}}))
+	must(app.PublishEvent(ctx, platform.Event{Topic: "reminder", ClanTag: "#PYL", Value: map[string]any{"type": "war", "minutes_remaining": 15, "data": liveWar}}))
+	must(app.PublishEvent(ctx, platform.Event{Topic: "reminder", ClanTag: "#PYL", Value: map[string]any{"type": "raid_mobile", "user_id": "local-push-user", "minutes_remaining": 60, "raid_end": end.Format(time.RFC3339)}}))
+	expected := 1 + len(events) + 3
 	deadline := time.Now().Add(10 * time.Second)
 	for {
 		mu.Lock()
 		n := calls["success"]
 		mu.Unlock()
-		if n >= 1+len(events) {
+		if n >= expected {
 			break
 		}
 		check(time.Now().Before(deadline), "war end never sent")
@@ -197,7 +232,7 @@ func main() {
 	mu.Lock()
 	n := calls["success"]
 	mu.Unlock()
-	check(n == 1+len(events), fmt.Sprintf("war events replayed successful recipient: %d sends for %d events", n-1, len(events)))
+	check(n == expected, fmt.Sprintf("war events replayed successful recipient: %d sends for %d events", n-1, expected-1))
 	// Simulate an interrupted previous worker: claim a new alert without
 	// processing it, then restart. That pending alert must never be replayed.
 	event := platform.Event{Topic: "war", ClanTag: "#PYL", Value: map[string]any{"type": "war_state", "war": map[string]any{"state": "warEnded", "preparationStartTime": time.Now().Add(-48 * time.Hour).UTC().Format(time.RFC3339), "clan": map[string]any{"tag": "#PYL", "name": "Fixture Clan"}, "opponent": map[string]any{"tag": "#QYL", "name": "Opponent"}}}}
@@ -231,5 +266,5 @@ func main() {
 	check(pendingCount == 0, "interrupted event left pending")
 	resumedStop()
 	<-resumedDone
-	fmt.Println("PASS real mobile fanout: mixed recipient failures do not replay successful war preparation/start/end or CWL-end notifications; restart does not replay interrupted alerts")
+	fmt.Println("PASS real mobile fanout: mixed recipient failures do not replay successful war preparation/start/end or CWL-end, Legend, war reminder and raid reminder notifications; restart does not replay interrupted alerts")
 }
