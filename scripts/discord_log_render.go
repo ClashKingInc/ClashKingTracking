@@ -52,6 +52,9 @@ func discordLogMessages(event mobileWarEvent, logType string, catalogs ...map[st
 				received = append(received, fmt.Sprintf("%s`%-3d` %s", icons.icon("down_red_arrow", "⬇️"), n, link))
 			}
 		}
+		if len(donated) == 0 && len(received) == 0 {
+			return nil
+		}
 		embed := discord.Embed{Description: fmt.Sprintf("[**%s**](https://link.clashofclans.com/en?action=OpenClanProfile&tag=%s)", discordLabel(clanName), url.QueryEscape(event.ClanTag))}
 		if badgeURL != "" {
 			embed.Thumbnail = &discord.EmbedResource{URL: badgeURL}
