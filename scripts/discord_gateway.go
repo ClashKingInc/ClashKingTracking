@@ -1371,7 +1371,7 @@ func discordCacheListener(
 				return
 			}
 			message := event.Message
-			if firstClashLink(message.Content) == nil && len(showClanQueries(message.Content)) == 0 {
+			if firstClashLink(message.Content) == nil && len(showClanQueries(message.Content)) == 0 && plainSlashCommandPath(message.Content) == "" {
 				return
 			}
 			attachments := make([]map[string]any, 0, len(message.Attachments))

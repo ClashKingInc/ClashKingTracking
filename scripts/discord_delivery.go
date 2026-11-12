@@ -155,17 +155,19 @@ func validateDiscordDeliveryConfig(cfg platform.Config, client valkey.Client) er
 }
 
 type discordDeliveryWorker struct {
-	profiles       map[string]discordWebhookProfile
-	emojis         map[string]string
-	nextEmojiLoad  time.Time
-	nextBoardCheck time.Time
-	loadEmojisFn   func() (map[string]string, error)
-	app            *platform.App
-	client         *bot.Client
-	pool           *pgxpool.Pool
-	processEventFn func(context.Context, mobileWarEvent) (bool, error)
-	ackFn          func(context.Context, string) error
-	disableFn      func(context.Context, discordDeliveryTarget, string) (int64, error)
+	profiles        map[string]discordWebhookProfile
+	emojis          map[string]string
+	nextEmojiLoad   time.Time
+	commandMentions map[string]string
+	nextCommandLoad time.Time
+	nextBoardCheck  time.Time
+	loadEmojisFn    func() (map[string]string, error)
+	app             *platform.App
+	client          *bot.Client
+	pool            *pgxpool.Pool
+	processEventFn  func(context.Context, mobileWarEvent) (bool, error)
+	ackFn           func(context.Context, string) error
+	disableFn       func(context.Context, discordDeliveryTarget, string) (int64, error)
 }
 
 func (w *discordDeliveryWorker) group() string { return "discord-delivery" }
@@ -334,6 +336,9 @@ func (w *discordDeliveryWorker) processEvent(ctx context.Context, event mobileWa
 	case "discord_member_join":
 		return true, w.deliverWelcomePanel(ctx, event)
 	case "discord_message_create":
+		if path := plainSlashCommandPath(stringMapValue(event.Value, "content")); path != "" {
+			return true, w.deliverCommandMention(ctx, event, path)
+		}
 		return true, w.deliverLinkParse(ctx, event)
 	case "clan", "war", "capital", "player", "reddit", "discord_legend", "maintenance":
 		return true, w.deliverLogEvent(ctx, event)
