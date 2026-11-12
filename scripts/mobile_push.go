@@ -32,6 +32,9 @@ func (d *mobilePushDomain) Run(ctx context.Context, app *platform.App) error {
 	}
 	defer store.Close()
 	d.store = store
+	if sqlStore, ok := store.(*timescaleMobilePushStore); ok {
+		ctx = context.WithValue(ctx, pushCleanupPoolKey{}, sqlStore.pool)
+	}
 
 	interval := time.Duration(app.Config.MobilePushScanSeconds) * time.Second
 	for {

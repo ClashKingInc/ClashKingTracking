@@ -55,6 +55,7 @@ func (d *mobileEventsDomain) Run(ctx context.Context, app *platform.App) error {
 		return err
 	}
 	defer pool.Close()
+	ctx = context.WithValue(ctx, pushCleanupPoolKey{}, pool)
 
 	worker := &mobileEventsWorker{
 		client: app.Valkey,

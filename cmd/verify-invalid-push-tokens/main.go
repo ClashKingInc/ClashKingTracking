@@ -136,7 +136,7 @@ func main() {
 	pooledURL, err := url.Parse(dsn)
 	must(err)
 	query := pooledURL.Query()
-	query.Set("pool_max_conns", "4")
+	query.Set("pool_max_conns", "1")
 	query.Set("pool_min_conns", "0")
 	pooledURL.RawQuery = query.Encode()
 	var logs bytes.Buffer

@@ -17,12 +17,13 @@ import (
 	"clashking_tracking/internal/utils"
 	"clashking_tracking/models"
 
-	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgxpool"
 
 	"golang.org/x/oauth2"
 	"golang.org/x/oauth2/google"
 )
+
+type pushCleanupPoolKey struct{}
 
 const firebaseMessagingScope = "https://www.googleapis.com/auth/firebase.messaging"
 
@@ -286,19 +287,14 @@ func disableUnregisteredFCMToken(ctx context.Context, app *platform.App, token s
 	}
 	cleanupCtx, cancel := context.WithTimeout(ctx, 5*time.Second)
 	defer cancel()
-	// Production DSNs include pool_* parameters. Parse them with pgxpool so
-	// they are not accidentally sent to PostgreSQL as session parameters.
-	poolConfig, err := pgxpool.ParseConfig(app.Config.TimescaleURL)
-	if err != nil {
-		return fmt.Errorf("parse token cleanup database configuration failed (%T)", err)
+	// Both notification domains provide their existing bounded pool. Do not
+	// open a connection per failed device or bypass the service's pool limit.
+	pool, ok := ctx.Value(pushCleanupPoolKey{}).(*pgxpool.Pool)
+	if !ok || pool == nil {
+		return errors.New("notification cleanup pool is unavailable")
 	}
-	conn, err := pgx.ConnectConfig(cleanupCtx, poolConfig.ConnConfig)
-	if err != nil {
-		return fmt.Errorf("connect for token cleanup failed (%T)", err)
-	}
-	defer conn.Close(context.Background())
 	digest := sha256.Sum256([]byte(token))
-	result, err := conn.Exec(cleanupCtx, `UPDATE mobile_push_devices SET enabled=false
+	result, err := pool.Exec(cleanupCtx, `UPDATE mobile_push_devices SET enabled=false
   WHERE provider='fcm' AND token_hash=$1 AND enabled=true`, fmt.Sprintf("%x", digest))
 	if err != nil {
 		return fmt.Errorf("disable unregistered token failed (%T)", err)
