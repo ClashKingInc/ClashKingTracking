@@ -168,7 +168,7 @@ type AdminPostInput struct {
 }
 
 // PushDevice is a row read from mobile_push_devices (owned by clashking-api;
-// this service only reads it) for the columns mobile_push needs to send.
+// this service can disable confirmed unregistered tokens) for the columns needed to send.
 type PushDevice struct {
 	UserID          string
 	DeviceID        string

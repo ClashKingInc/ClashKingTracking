@@ -20,7 +20,7 @@ import (
 type mobilePushStore interface {
 	Close()
 	RecordDeliveryAttempt(ctx context.Context, attempt models.AdminPostDeliveryAttempt) (models.AdminPostDeliveryAttempt, error)
-	ClaimDuePushRetries(ctx context.Context, now time.Time) ([]models.AdminPost, error)
+	ClaimQueuedPostPushes(ctx context.Context, now time.Time) ([]models.AdminPost, error)
 	ClaimDueCampaigns(ctx context.Context, now time.Time) ([]models.NotificationCampaign, error)
 	EnsureGameEventCampaigns(ctx context.Context, now time.Time) error
 	RecordCampaignDelivery(ctx context.Context, campaign models.NotificationCampaign, now time.Time, eligible, sent, skipped int, status string) error
@@ -679,26 +679,23 @@ func (s *timescaleMobilePushStore) ListDeliveryAttempts(ctx context.Context, id 
 	return out, rows.Err()
 }
 
-func (s *timescaleMobilePushStore) ClaimDuePushRetries(ctx context.Context, now time.Time) ([]models.AdminPost, error) {
-	// Cast the scan instant before interval subtraction. Otherwise PostgreSQL
-	// can infer the unknown bind parameter as interval and reject the comparison.
+// ClaimQueuedPostPushes consumes only explicit publish/resend requests. A failed,
+// partial, or interrupted attempt must never resend automatically: some devices
+// may already have received it. The queue row, not push_sent_at or a lifetime
+// attempt cap, is authoritative so a later manual resend remains possible.
+func (s *timescaleMobilePushStore) ClaimQueuedPostPushes(ctx context.Context, now time.Time) ([]models.AdminPost, error) {
 	tx, err := s.pool.Begin(ctx)
 	if err != nil {
 		return nil, err
 	}
 	defer tx.Rollback(ctx)
 	rows, err := tx.Query(ctx, `SELECT `+adminPostColumns+` FROM admin_posts p
-		WHERE p.status = 'live' AND p.push_sent_at IS NULL
-		  AND EXISTS (
-			SELECT 1 FROM admin_post_delivery_attempts a WHERE a.post_id = p.id
-			  AND a.attempt_number = (SELECT max(a2.attempt_number) FROM admin_post_delivery_attempts a2 WHERE a2.post_id = p.id)
-			  AND a.status IN ('queued', 'processing', 'failed', 'partial') AND a.attempt_number < 4
-			  AND (
-				a.status = 'queued'
-				OR (a.status IN ('failed', 'partial') AND a.attempted_at <= $1::timestamptz - interval '2 minutes')
-				OR (a.status = 'processing' AND a.attempted_at <= $1::timestamptz - interval '5 minutes')
-			  )
-			  ) FOR UPDATE SKIP LOCKED`, now)
+  WHERE p.status = 'live'
+   AND EXISTS (
+    SELECT 1 FROM admin_post_delivery_attempts a WHERE a.post_id = p.id
+     AND a.attempt_number = (SELECT max(a2.attempt_number) FROM admin_post_delivery_attempts a2 WHERE a2.post_id = p.id)
+     AND a.status = 'queued'
+   ) FOR UPDATE SKIP LOCKED`)
 	if err != nil {
 		return nil, err
 	}
@@ -717,25 +714,10 @@ func (s *timescaleMobilePushStore) ClaimDuePushRetries(ctx context.Context, now 
 	}
 	rows.Close()
 	for _, post := range out {
-		if _, err := tx.Exec(ctx, `WITH latest AS (
-				SELECT post_id, attempt_number, status
-				FROM admin_post_delivery_attempts
-				WHERE post_id=$1
-				ORDER BY attempt_number DESC
-				LIMIT 1
-				FOR UPDATE
-			), retry AS (
-				INSERT INTO admin_post_delivery_attempts
-					(post_id, attempt_number, trigger, eligible_count, sent_count, skipped_count, status, attempted_at)
-				SELECT post_id, attempt_number + 1, 'retry', 0, 0, 0, 'processing', $2
-				FROM latest
-				WHERE status IN ('failed', 'partial')
-			)
-			UPDATE admin_post_delivery_attempts
-			SET status='processing', attempted_at=$2
-			WHERE post_id=$1
-			  AND attempt_number=(SELECT attempt_number FROM latest)
-			  AND status IN ('queued', 'processing')`, post.ID, now); err != nil {
+		if _, err := tx.Exec(ctx, `UPDATE admin_post_delivery_attempts
+   SET status='processing', attempted_at=$2
+   WHERE id=(SELECT id FROM admin_post_delivery_attempts WHERE post_id=$1 ORDER BY attempt_number DESC LIMIT 1)
+    AND status='queued'`, post.ID, now); err != nil {
 			return nil, err
 		}
 	}
@@ -959,14 +941,13 @@ func (s *timescaleMobilePushStore) ClaimDueCampaigns(ctx context.Context, now ti
 	}
 	rows.Close()
 
+	// Retain an existing claim for inspection; never replay a partially sent campaign.
 	claimed := make([]models.NotificationCampaign, 0, len(due))
 	for _, campaign := range due {
 		tag, err := tx.Exec(ctx, `INSERT INTO admin_campaign_delivery_attempts
 			(campaign_id, scheduled_for, eligible_count, sent_count, skipped_count, status, attempted_at)
 			VALUES ($1, $2::date, 0, 0, 0, 'processing', $3)
-			ON CONFLICT (campaign_id, scheduled_for) DO UPDATE SET status='processing', attempted_at=$3
-			WHERE admin_campaign_delivery_attempts.status = 'processing'
-			  AND admin_campaign_delivery_attempts.attempted_at <= $3::timestamptz - interval '5 minutes'`,
+			ON CONFLICT (campaign_id, scheduled_for) DO NOTHING`,
 			campaign.ID, campaignScheduledFor(campaign, now), now)
 		if err != nil {
 			return nil, err
@@ -1379,7 +1360,7 @@ func (s *memoryMobilePushStore) ListDeliveryAttempts(_ context.Context, id strin
 	return attempts, nil
 }
 
-func (s *memoryMobilePushStore) ClaimDuePushRetries(_ context.Context, now time.Time) ([]models.AdminPost, error) {
+func (s *memoryMobilePushStore) ClaimQueuedPostPushes(_ context.Context, now time.Time) ([]models.AdminPost, error) {
 	out := []models.AdminPost{}
 	for id, attempts := range s.attempts {
 		if len(attempts) == 0 {
@@ -1387,27 +1368,13 @@ func (s *memoryMobilePushStore) ClaimDuePushRetries(_ context.Context, now time.
 		}
 		last := attempts[len(attempts)-1]
 		post := s.posts[id]
-		if post.Status != "live" || post.PushSentAt != nil || last.AttemptNumber >= 4 {
+		if post.Status != "live" || last.Status != "queued" {
 			continue
 		}
-		due := last.Status == "queued" ||
-			((last.Status == "failed" || last.Status == "partial") && !last.AttemptedAt.After(now.Add(-2*time.Minute))) ||
-			(last.Status == "processing" && !last.AttemptedAt.After(now.Add(-5*time.Minute)))
-		if !due {
-			continue
-		}
-		if last.Status == "failed" || last.Status == "partial" {
-			last = models.AdminPostDeliveryAttempt{
-				ID: uniqueSlug("attempt"), PostID: id, AttemptNumber: last.AttemptNumber + 1,
-				Trigger: "retry", Status: "processing", AttemptedAt: now,
-			}
-			s.attempts[id] = append(attempts, last)
-		} else {
-			last.Status = "processing"
-			last.AttemptedAt = now
-			attempts[len(attempts)-1] = last
-			s.attempts[id] = attempts
-		}
+		last.Status = "processing"
+		last.AttemptedAt = now
+		attempts[len(attempts)-1] = last
+		s.attempts[id] = attempts
 		out = append(out, post)
 	}
 	return out, nil
@@ -1457,9 +1424,8 @@ func (s *memoryMobilePushStore) ClaimDueCampaigns(_ context.Context, now time.Ti
 		due = due || monthlyCampaignDue(campaign, now)
 		claimKey := campaign.ID + ":" + campaignScheduledFor(campaign, now).Format("2006-01-02")
 		if due {
-			lastClaim, claimed := s.campaignClaims[claimKey]
-			lastStatus := s.campaignStatuses[claimKey]
-			if !claimed || (lastStatus == "processing" && !lastClaim.After(now.Add(-5*time.Minute))) {
+			_, claimed := s.campaignClaims[claimKey]
+			if !claimed {
 				s.campaignClaims[claimKey] = now
 				s.campaignStatuses[claimKey] = "processing"
 				out = append(out, campaign)
