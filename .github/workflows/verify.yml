@@ -75,6 +75,9 @@ jobs:
       - name: Verify automatic link parser previews
         run: bash .ci-schema/scripts/with-test-integration.sh --profile retained-api -- go run ./cmd/verify-link-parsers
 
+      - name: Verify plain-text slash command mentions
+        run: bash .ci-schema/scripts/with-test-integration.sh --profile retained-api -- go run ./cmd/verify-command-mentions
+
       - name: Verify Reddit post and subscribed comment delivery
         run: bash .ci-schema/scripts/with-test-integration.sh --profile retained-api -- go run ./cmd/verify-reddit-logs
 
