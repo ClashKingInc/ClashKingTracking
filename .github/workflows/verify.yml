@@ -56,7 +56,7 @@ jobs:
 
       - name: Verify maintenance recovery and observation ordering
         run: bash .ci-schema/scripts/with-test-integration.sh --profile retained-api -- go run -race ./cmd/verify-tracking-state
-      - name: Verify permanent and retriable notification source errors
+      - name: Verify notification source errors without replay
         run: bash .ci-schema/scripts/with-test-integration.sh --profile retained-api -- go run ./cmd/verify-notification-source-errors
       - name: Verify retained reminder webhook delivery
         run: bash .ci-schema/scripts/with-test-integration.sh --profile retained-api -- go run ./cmd/verify-reminder-webhooks
@@ -81,6 +81,10 @@ jobs:
       - name: Verify unknown Discord channel compatibility
         run: bash .ci-schema/scripts/with-test-integration.sh --profile retained-api -- go run ./cmd/verify-gateway-channels
 
+      - name: Verify mobile fanout does not replay successful recipients
+        run: bash .ci-schema/scripts/with-test-integration.sh --profile retained-api -- go run ./cmd/verify-mobile-fanout
+      - name: Verify unregistered push token cleanup
+        run: bash .ci-schema/scripts/with-test-integration.sh --profile retained-api -- go run ./cmd/verify-invalid-push-tokens
       - name: Verify notification scan and explicit post delivery
         run: bash .ci-schema/scripts/with-test-integration.sh --profile retained-api -- go run ./cmd/verify-mobile-scan
 

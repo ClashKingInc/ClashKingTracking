@@ -197,6 +197,11 @@ func main() {
 		return err == nil && decodeErr == nil && json.Unmarshal(decoded, &clan) == nil && len(clan.Members) == 2
 	})
 	stop()
+	// This phase stops clan polling and exercises a verified app account.
+	// Enroll it explicitly: otherwise eligibility relies on a stale clan cache
+	// even though the production target contract requires a recent app login.
+	_, err = db.Exec(ctx, "UPDATE player_links SET last_login=now() WHERE tag='#PYLQ' AND user_id=$1", actor)
+	must(err)
 	stop = run(scripts.NewTrackedPlayersDomain())
 	wait("player snapshot", func() bool {
 		count, err := cache.Do(ctx, cache.B().Exists().Key("ps:#PYLQ").Build()).ToInt64()

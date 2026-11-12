@@ -84,21 +84,19 @@ func main() {
 			}
 		}
 		wait(func() bool { return reads.Load() > 0 })
-		permanent := status == 400 || status == 403 || status == 404
-		if permanent {
-			wait(func() bool { return pending() == 0 })
-			must(app.PublishEvent(ctx, platform.Event{Topic: "ignored-health-marker", Value: map[string]any{}}))
-			time.Sleep(150 * time.Millisecond)
-			check(reads.Load() == 1, "permanent source error retried")
-			stats := app.Stats.Snapshot().Domains
-			check(len(stats) == 1 && stats[0].Errors == 1 && stats[0].Requests == 1 && !stats[0].Healthy, "ignored traffic erased permanent failure metrics")
-		} else {
-			wait(func() bool { return pending() == 1 })
-			code.Store(200)
-			wait(func() bool { return pending() == 0 && reads.Load() >= 2 })
-			stats := app.Stats.Snapshot().Domains
-			check(len(stats) == 1 && stats[0].Errors >= 1 && stats[0].Requests >= 2 && stats[0].Healthy, "retry metrics missing or healthy state not recovered")
-		}
+		expectedPending := int64(0)
+		wait(func() bool { return pending() == expectedPending })
+		must(app.PublishEvent(ctx, platform.Event{Topic: "ignored-health-marker", Value: map[string]any{}}))
+		time.Sleep(1200 * time.Millisecond)
+		check(reads.Load() == 1, "source failure automatically retried")
+		stats := app.Stats.Snapshot().Domains
+		check(len(stats) == 1 && stats[0].Errors == 1 && stats[0].Requests == 1 && !stats[0].Healthy, "ignored traffic erased failed health")
+		code.Store(200)
+		// A new event can recover; the previously attempted event stays untouched.
+		must(app.PublishEvent(ctx, platform.Event{Topic: "reminder", ClanTag: "#PYLQ", Value: map[string]any{"type": "war", "minutes_remaining": 15, "data": map[string]any{"state": "inWar", "endTime": time.Now().Add(time.Hour).UTC().Format("20060102T150405.000Z")}}}))
+		wait(func() bool { return reads.Load() == 2 && app.Stats.Snapshot().Domains[0].Healthy })
+		check(pending() == expectedPending, "old pending source event replayed")
+
 		stop()
 		select {
 		case <-done:
@@ -107,5 +105,5 @@ func main() {
 		}
 		must(cache.Do(ctx, cache.B().Del().Key(stream).Build()).Error())
 	}
-	fmt.Println("PASS actual notification consumer: permanent 400/403/404 acknowledged once; 401/429/503 retried and recovered; ignored traffic preserves failed health; attempt/error metrics recorded")
+	fmt.Println("PASS actual notification consumer: permanent 400/403/404 acknowledged once; 401/429/503 acknowledged without replay; new events recover; ignored traffic preserves failed health; attempt/error metrics recorded")
 }

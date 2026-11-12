@@ -83,6 +83,6 @@ func main() {
 	must(db.QueryRow(ctx, "SELECT status FROM admin_posts WHERE id=$1", ids["expired-post"]).Scan(&status))
 	check(status == "expired", "post not expired")
 	must(db.QueryRow(ctx, "SELECT status FROM admin_campaign_delivery_attempts WHERE campaign_id=$1", campaign).Scan(&status))
-	check(status == "no_audience", "stale campaign claim not completed")
-	fmt.Println("PASS actual mobile scan: explicit queued attempt 5, resend after success, no failed/partial/interrupted replay, stale campaign recovery, post publish/expiry; no devices or push requests")
+	check(status == "processing", "interrupted campaign was automatically replayed")
+	fmt.Println("PASS actual mobile scan: explicit queued attempt 5, resend after success, no failed/partial/interrupted replay, no interrupted campaign replay, post publish/expiry; no devices or push requests")
 }
