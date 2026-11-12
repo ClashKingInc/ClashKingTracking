@@ -79,7 +79,7 @@ func main() {
 			if code == 200 {
 				fmt.Fprint(w, `{"items":[]}`)
 			} else {
-				if code == 500 {
+				if code == 503 {
 					fmt.Fprint(w, `{"reason":"inMaintenance","message":"maintenance"}`)
 				} else {
 					fmt.Fprint(w, `{"reason":"badGateway"}`)
@@ -147,7 +147,7 @@ func main() {
 			must(err)
 		}
 	}
-	probeStatus.Store(500)
+	probeStatus.Store(503)
 	runProbe(false)
 	var detected bool
 	must(db.QueryRow(ctx, `SELECT official_started_at IS NOT NULL AND NOT available FROM tracking_availability`).Scan(&detected))

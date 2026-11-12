@@ -322,7 +322,9 @@ func (w *discordDeliveryWorker) processEvent(ctx context.Context, event mobileWa
 	}
 
 	if event.Topic == "clan" && stringMapValue(event.Value, "type") == "all_member_donations" {
-		return true, w.markDonationBoardsDirty(ctx, event)
+		// Donation boards and per-change logs are independent best-effort destinations.
+		// A failed board refresh must not suppress the configured log (or vice versa).
+		return true, errors.Join(w.markDonationBoardsDirty(ctx, event), w.deliverLogEvent(ctx, event))
 	}
 	switch event.Topic {
 	case "reminder":
@@ -960,8 +962,7 @@ func discordEventLogTypes(event mobileWarEvent) []string {
 	case "clan":
 		switch stringMapValue(event.Value, "type") {
 		case "all_member_donations":
-			// Donation events update the autoboard; never send per-event logs.
-			return nil
+			return []string{"donation_log"}
 		case "role_change":
 			return []string{"role_change"}
 		case "clan_description":

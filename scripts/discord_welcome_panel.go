@@ -5,6 +5,9 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"net/url"
+	"strconv"
+	"strings"
 	"time"
 
 	"github.com/disgoorg/disgo/discord"
@@ -29,12 +32,12 @@ func (w *discordDeliveryWorker) deliverWelcomePanel(ctx context.Context, event m
 	if event.Timestamp.IsZero() || time.Since(event.Timestamp) > 5*time.Minute {
 		return nil
 	}
-	var channel, color string
+	var channel, color, serverName, embedColor, guildIcon string
 	var raw []byte
-	err = w.pool.QueryRow(ctx, `SELECT panel.welcome_channel_id,panel.button_color,COALESCE(embed.data,'{}'::jsonb)
+	err = w.pool.QueryRow(ctx, `SELECT panel.welcome_channel_id,panel.button_color,COALESCE(embed.data,'{}'::jsonb),server.name,COALESCE(server.embed_color,'2829617'),COALESCE((SELECT data->>'icon' FROM discord_cache.guilds WHERE id=panel.server_id),'')
  FROM server_welcome_panels panel JOIN servers server ON server.id=panel.server_id
  LEFT JOIN server_custom_embeds embed ON embed.server_id=panel.server_id AND embed.name=panel.embed_name
- WHERE panel.server_id=$1 AND panel.welcome_channel_id IS NOT NULL AND server.left_at IS NULL`, guild).Scan(&channel, &color, &raw)
+ WHERE panel.server_id=$1 AND panel.welcome_channel_id IS NOT NULL AND server.left_at IS NULL`, guild).Scan(&channel, &color, &raw, &serverName, &embedColor, &guildIcon)
 	if errors.Is(err, pgx.ErrNoRows) {
 		return nil
 	}
@@ -57,6 +60,9 @@ func (w *discordDeliveryWorker) deliverWelcomePanel(ctx context.Context, event m
 		return err
 	}
 	defer rows.Close()
+	if err := w.refreshLogEmojis(time.Now()); err != nil {
+		w.app.Logger.Warn("welcome emoji lookup failed; using text", "err", err)
+	}
 	var buttons []discord.InteractiveComponent
 	seen := map[string]bool{}
 	for rows.Next() {
@@ -64,24 +70,24 @@ func (w *discordDeliveryWorker) deliverWelcomePanel(ctx context.Context, event m
 		if err = rows.Scan(&name); err != nil {
 			return err
 		}
-		action, label := "", ""
+		action, label, emoji := "", "", ""
 		switch name {
 		case "Link Button":
-			action, label = "link", "Link account"
+			action, label, emoji = "link", "Link Account", "🔗"
 		case "Link Help Button":
-			action, label = "help", "Link help"
+			action, label, emoji = "help", "Help", "❓"
 		case "Refresh Button":
-			action, label = "refresh", "Refresh roles"
+			action, label, emoji = "refresh", "Refresh Roles", discordLogIcons(w.emojis).icon("refresh", "🔄")
 		case "To-Do Button":
-			action, label = "todo", "My to-do"
+			action, label, emoji = "todo", "To-Do List", discordLogIcons(w.emojis).icon("green_check", "✅")
 		case "Roster Button":
-			action, label = "rosters", "My rosters"
+			action, label, emoji = "rosters", "My Rosters", discordLogIcons(w.emojis).icon("calendar", "📅")
 		}
 		if action == "" || seen[action] {
 			continue
 		}
 		seen[action] = true
-		button := discord.NewSecondaryButton(label, "ck:quick:"+guild+":"+action)
+		button := discord.NewSecondaryButton(label, "ck:quick:"+guild+":"+action).WithEmoji(redditButtonEmoji(emoji))
 		switch color {
 		case "Blue":
 			button.Style = discord.ButtonStylePrimary
@@ -108,11 +114,27 @@ func (w *discordDeliveryWorker) deliverWelcomePanel(ctx context.Context, event m
 		return err
 	}
 	guildChannel, ok := destination.(discord.GuildChannel)
-	if !ok || guildChannel.GuildID().String() != guild || (destination.Type() != discord.ChannelTypeGuildText && destination.Type() != discord.ChannelTypeGuildNews) {
-		return errors.New("welcome destination must be a text channel in its server")
+	validType := destination.Type() == discord.ChannelTypeGuildText || destination.Type() == discord.ChannelTypeGuildNews || destination.Type() == discord.ChannelTypeGuildNewsThread || destination.Type() == discord.ChannelTypeGuildPublicThread || destination.Type() == discord.ChannelTypeGuildPrivateThread
+	if !ok || guildChannel.GuildID().String() != guild || !validType {
+		return errors.New("welcome destination must be a text channel or thread in its server")
+	}
+	if thread, isThread := destination.(discord.GuildThread); isThread && (thread.ThreadMetadata.Locked || thread.ThreadMetadata.Archived) {
+		return nil
 	}
 	if stored.Content == "" && len(stored.Embeds) == 0 {
-		stored.Embeds = []discord.Embed{{Title: "Welcome to the server", Description: "Link your Clash of Clans accounts, refresh your roles, and view your tasks and rosters."}}
+		base := 10
+		if strings.HasPrefix(embedColor, "#") {
+			base = 16
+			embedColor = strings.TrimPrefix(embedColor, "#")
+		}
+		parsed, parseErr := strconv.ParseInt(embedColor, base, 32)
+		if parseErr != nil || parsed < 0 || parsed > 0xffffff {
+			parsed = 2829617
+		}
+		stored.Embeds = []discord.Embed{{Description: "**Welcome to " + discordLabel(serverName) + "!**\nUse the buttons below to get started.", Color: int(parsed)}}
+		if guildIcon != "" {
+			stored.Embeds[0].Thumbnail = &discord.EmbedResource{URL: "https://cdn.discordapp.com/icons/" + guild + "/" + url.PathEscape(guildIcon) + ".png"}
+		}
 	}
 	// Suppress mentions from saved content; only the newly joined member may ping.
 	message := discord.MessageCreate{Content: discordClip("<@"+user+">\n"+stored.Content, 2000), Embeds: stored.Embeds, Components: []discord.LayoutComponent{discord.NewActionRow(buttons...)}}
