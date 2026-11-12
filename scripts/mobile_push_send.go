@@ -18,6 +18,7 @@ import (
 	"clashking_tracking/models"
 
 	"github.com/jackc/pgx/v5"
+	"github.com/jackc/pgx/v5/pgxpool"
 
 	"golang.org/x/oauth2"
 	"golang.org/x/oauth2/google"
@@ -285,7 +286,13 @@ func disableUnregisteredFCMToken(ctx context.Context, app *platform.App, token s
 	}
 	cleanupCtx, cancel := context.WithTimeout(ctx, 5*time.Second)
 	defer cancel()
-	conn, err := pgx.Connect(cleanupCtx, app.Config.TimescaleURL)
+	// Production DSNs include pool_* parameters. Parse them with pgxpool so
+	// they are not accidentally sent to PostgreSQL as session parameters.
+	poolConfig, err := pgxpool.ParseConfig(app.Config.TimescaleURL)
+	if err != nil {
+		return fmt.Errorf("parse token cleanup database configuration failed (%T)", err)
+	}
+	conn, err := pgx.ConnectConfig(cleanupCtx, poolConfig.ConnConfig)
 	if err != nil {
 		return fmt.Errorf("connect for token cleanup failed (%T)", err)
 	}

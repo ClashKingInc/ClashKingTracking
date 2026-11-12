@@ -18,6 +18,7 @@ import (
 	"log/slog"
 	"net/http"
 	"net/http/httptest"
+	"net/url"
 	"os"
 	"strings"
 	"sync"
@@ -131,8 +132,15 @@ func main() {
 	must(db.QueryRow(ctx, "INSERT INTO admin_posts(slug,title,summary,status,platforms) VALUES('local-cleanup','Local','Local','live',ARRAY['android']) RETURNING id::text").Scan(&post))
 	_, err = db.Exec(ctx, "INSERT INTO admin_post_delivery_attempts(post_id,attempt_number,trigger,status) VALUES($1,1,'manual','queued')", post)
 	must(err)
+	// Use the production-style pooled DSN in the real worker, including cleanup.
+	pooledURL, err := url.Parse(dsn)
+	must(err)
+	query := pooledURL.Query()
+	query.Set("pool_max_conns", "4")
+	query.Set("pool_min_conns", "0")
+	pooledURL.RawQuery = query.Encode()
 	var logs bytes.Buffer
-	app := &platform.App{Config: platform.Config{TimescaleURL: dsn, MobilePushScanSeconds: 1, RunOnce: true, MobilePushTokenKey: key, MobilePushFCMProjectID: "fixture", MobilePushFCMServiceAccountJSON: string(sa), MobilePushFCMAPIOrigin: provider.URL}, Logger: slog.New(slog.NewTextHandler(&logs, nil)), Stats: platform.NewTracker()}
+	app := &platform.App{Config: platform.Config{TimescaleURL: pooledURL.String(), MobilePushScanSeconds: 1, RunOnce: true, MobilePushTokenKey: key, MobilePushFCMProjectID: "fixture", MobilePushFCMServiceAccountJSON: string(sa), MobilePushFCMAPIOrigin: provider.URL}, Logger: slog.New(slog.NewTextHandler(&logs, nil)), Stats: platform.NewTracker()}
 	must(scripts.NewMobilePushDomain().Run(ctx, app))
 	for _, name := range cases {
 		var enabled bool
