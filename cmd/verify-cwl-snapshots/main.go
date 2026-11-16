@@ -165,7 +165,13 @@ func main() {
 	defer stopHealth()
 	responseStatus.Store(403)
 	healthDone := make(chan error, 1)
-	go func() { healthDone <- scripts.NewCWLDomain().Run(healthCtx, app) }()
+	// Keep the polling calendar inside discovery/refresh season regardless of
+	// the day CI runs; use the current month to match the real SQL fixture.
+	fixtureNow := time.Now().UTC()
+	fixtureNow = time.Date(fixtureNow.Year(), fixtureNow.Month(), 2, 12, 0, 0, 0, time.UTC)
+	go func() {
+		healthDone <- scripts.NewCWLDomainWithClock(func() time.Time { return fixtureNow }).Run(healthCtx, app)
+	}()
 	state := func() platform.DomainStats {
 		for _, row := range app.Stats.Snapshot().Domains {
 			if row.Name == "cwl.groups" {

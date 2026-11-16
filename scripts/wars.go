@@ -237,7 +237,14 @@ func NewWarDiscoveryDomain() platform.Domain {
 }
 
 func NewCWLDomain() platform.Domain {
-	return &warsDomain{name: cwlDomainName, mode: cwlMode, now: time.Now, scheduled: make(map[string]time.Time)}
+	return NewCWLDomainWithClock(time.Now)
+}
+
+// NewCWLDomainWithClock runs the same service with an explicit calendar clock.
+// Integration scenarios must not stop exercising refreshes after the 15th;
+// SQL continues to select the real current season independently of this clock.
+func NewCWLDomainWithClock(now func() time.Time) platform.Domain {
+	return &warsDomain{name: cwlDomainName, mode: cwlMode, now: now, scheduled: make(map[string]time.Time)}
 }
 
 func (d *warsDomain) Name() string { return d.name }

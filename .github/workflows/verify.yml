@@ -9,7 +9,7 @@ permissions:
   contents: read
 
 jobs:
-  verify:
+  prepare:
     runs-on: ubuntu-latest
     timeout-minutes: 20
     steps:
@@ -36,95 +36,171 @@ jobs:
         run: python3 ops/verify_globalclans_observer.py
       - name: Install schema migrator
         run: go install github.com/pressly/goose/v3/cmd/goose@v3.26.0
+
+  integration:
+    needs: prepare
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    strategy:
+      fail-fast: false
+      matrix:
+        shard: [0, 1, 2, 3]
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+        with:
+          persist-credentials: false
+      # Pin the authoritative schema fixture so a moving branch cannot change
+      # the database under a tracking PR. Update with reviewed schema changes.
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+        with:
+          repository: ClashKingInc/DevKit
+          ref: 3059c577229daabf14a7d144303ed5070f64f6e9
+          path: .ci-schema
+          persist-credentials: false
+      - uses: actions/setup-go@40f1582b2485089dde7abd97c1529aa768e1baff
+        with:
+          go-version-file: go.mod
+          cache-dependency-path: go.sum
+      - name: Validate workflow
+        run: go run github.com/rhysd/actionlint/cmd/actionlint@v1.7.7 -shellcheck= .github/workflows/verify.yml
+      - name: Install schema migrator
+        run: go install github.com/pressly/goose/v3/cmd/goose@v3.26.0
       - name: Verify autoboard delivery
+        if: matrix.shard == 0
         run: bash .ci-schema/scripts/with-test-integration.sh --profile retained-api -- go run ./cmd/verify-autoboards
       - name: Verify role tracking
+        if: matrix.shard == 1
         run: bash .ci-schema/scripts/with-test-integration.sh --profile retained-api -- go run ./cmd/verify-role-tracking
       - name: Verify recorded Legend streaks
+        if: matrix.shard == 2
         run: bash .ci-schema/scripts/with-test-integration.sh --profile retained-api -- go run ./cmd/verify-legend-streaks
       - name: Verify welcome panel delivery
+        if: matrix.shard == 3
         run: bash .ci-schema/scripts/with-test-integration.sh --profile retained-api -- env CLASHKING_WELCOME_E2E=1 go run ./cmd/verify-welcome-delivery
       - name: Verify countdown channel updates
+        if: matrix.shard == 0
         run: bash .ci-schema/scripts/with-test-integration.sh --profile retained-api -- go run ./cmd/verify-countdowns
       - name: Verify capital raid history collection
+        if: matrix.shard == 1
         run: bash .ci-schema/scripts/with-test-integration.sh --profile retained-api -- go run ./cmd/verify-raid-history
       - name: Verify automatic Discord war events
+        if: matrix.shard == 2
         run: bash .ci-schema/scripts/with-test-integration.sh --profile retained-api -- go run ./cmd/verify-war-events
 
       - name: Verify Legend daily performance
+        if: matrix.shard == 3
         run: bash .ci-schema/scripts/with-test-integration.sh --profile retained-api -- go run ./cmd/verify-legend-performance
 
       - name: Verify maintenance recovery and observation ordering
+        if: matrix.shard == 0
         run: bash .ci-schema/scripts/with-test-integration.sh --profile retained-api -- go run -race ./cmd/verify-tracking-state
       - name: Verify notification source errors without replay
+        if: matrix.shard == 1
         run: bash .ci-schema/scripts/with-test-integration.sh --profile retained-api -- go run ./cmd/verify-notification-source-errors
       - name: Verify retained reminder webhook delivery
+        if: matrix.shard == 2
         run: bash .ci-schema/scripts/with-test-integration.sh --profile retained-api -- go run ./cmd/verify-reminder-webhooks
 
       - name: Verify reminder global avatar fallback
+        if: matrix.shard == 3
         run: bash .ci-schema/scripts/with-test-integration.sh --profile retained-api -- env CLASHKING_E2E_GLOBAL_AVATAR=1 go run ./cmd/verify-reminder-webhooks
 
       - name: Verify giveaway migration cutover
+        if: matrix.shard == 0
         run: bash .ci-schema/scripts/with-test-integration.sh --profile retained-api -- go run ./cmd/verify-giveaway-cutover
 
       - name: Verify all war types reach configured log threads
+        if: matrix.shard == 1
         run: bash .ci-schema/scripts/with-test-integration.sh --profile retained-api -- go run ./cmd/verify-war-logs
       - name: Verify clan join and leave league badges
+        if: matrix.shard == 2
         run: bash .ci-schema/scripts/with-test-integration.sh --profile retained-api -- go run ./cmd/verify-clan-log-emojis
 
       - name: Verify automatic link parser previews
+        if: matrix.shard == 3
         run: bash .ci-schema/scripts/with-test-integration.sh --profile retained-api -- go run ./cmd/verify-link-parsers
 
       - name: Verify plain-text slash command mentions
+        if: matrix.shard == 0
         run: bash .ci-schema/scripts/with-test-integration.sh --profile retained-api -- go run ./cmd/verify-command-mentions
 
       - name: Verify Reddit post and subscribed comment delivery
+        if: matrix.shard == 1
         run: bash .ci-schema/scripts/with-test-integration.sh --profile retained-api -- go run ./cmd/verify-reddit-logs
 
       - name: Verify unknown Discord channel compatibility
+        if: matrix.shard == 2
         run: bash .ci-schema/scripts/with-test-integration.sh --profile retained-api -- go run ./cmd/verify-gateway-channels
 
       - name: Verify mobile fanout does not replay successful recipients
+        if: matrix.shard == 3
         run: bash .ci-schema/scripts/with-test-integration.sh --profile retained-api -- go run ./cmd/verify-mobile-fanout
       - name: Verify unregistered push token cleanup
+        if: matrix.shard == 0
         run: bash .ci-schema/scripts/with-test-integration.sh --profile retained-api -- go run ./cmd/verify-invalid-push-tokens
       - name: Verify notification scan and explicit post delivery
+        if: matrix.shard == 1
         run: bash .ci-schema/scripts/with-test-integration.sh --profile retained-api -- go run ./cmd/verify-mobile-scan
 
       - name: Verify authoritative maintenance outcomes
+        if: matrix.shard == 2
         run: bash .ci-schema/scripts/with-test-integration.sh --profile retained-api -- go run ./cmd/verify-availability-contract
 
       - name: Verify manual reminders stay out of mobile delivery
+        if: matrix.shard == 3
         run: bash .ci-schema/scripts/with-test-integration.sh --profile retained-api -- go run ./cmd/verify-manual-mobile-routing
 
       - name: Verify reminder startup releases SQL reads
+        if: matrix.shard == 0
         run: bash .ci-schema/scripts/with-test-integration.sh --profile retained-api -- go run ./cmd/verify-reminder-startup
 
       - name: Verify case-insensitive reminder war filters
+        if: matrix.shard == 1
         run: bash .ci-schema/scripts/with-test-integration.sh --profile retained-api -- go run ./cmd/verify-reminder-war-types
 
       - name: Verify clan ingestion and CWL completion
+        if: matrix.shard == 2
         run: bash .ci-schema/scripts/with-test-integration.sh --profile retained-api -- bash -c 'bash .ci-schema/scripts/schema-smoke.sh && go run ./cmd/verify-clan-tracking'
 
       - name: Verify discovery throughput and scan ordering
+        if: matrix.shard == 3
         run: bash .ci-schema/scripts/with-test-integration.sh --profile retained-api -- go run -race ./cmd/verify-war-throughput
 
       - name: Verify tracked-player batched throughput and commit ordering
+        if: matrix.shard == 0
         run: bash .ci-schema/scripts/with-test-integration.sh --profile retained-api -- go run -race ./cmd/verify-player-throughput
 
       - name: Verify raw Legend Discord delivery without profile requests
+        if: matrix.shard == 1
         run: bash .ci-schema/scripts/with-test-integration.sh --profile retained-api -- go run -race ./cmd/verify-legend-delivery
       - name: Verify repeated CWL snapshots
+        if: matrix.shard == 2
         run: bash .ci-schema/scripts/with-test-integration.sh --profile retained-api -- go run -race ./cmd/verify-cwl-snapshots
 
       - name: Verify serialized leaderboard snapshot maintenance
+        if: matrix.shard == 3
         run: bash .ci-schema/scripts/with-test-timescale.sh --profile retained-api -- go run ./cmd/verify-leaderboard-maintenance
 
       - name: Verify late CWL discovery and delivery
+        if: matrix.shard == 0
         run: bash .ci-schema/scripts/with-test-integration.sh --profile retained-api -- go run ./cmd/verify-cwl-discovery
 
       - name: Verify manual CWL participation publication
+        if: matrix.shard == 1
         run: bash .ci-schema/scripts/with-test-timescale.sh --profile retained-api -- go run ./cmd/verify-cwl-participation
 
       - name: Verify one-month regular-war archive replay
+        if: matrix.shard == 2
         run: bash .ci-schema/scripts/with-test-timescale.sh --profile retained-api -- go run ./cmd/verify-war-triple-rebuild
+
+  # Preserve the required check name while each shard reports its own failure.
+  verify:
+    if: always()
+    needs: [prepare, integration]
+    runs-on: ubuntu-latest
+    steps:
+      - name: Require every verification group
+        env:
+          PREPARE_RESULT: ${{ needs.prepare.result }}
+          INTEGRATION_RESULT: ${{ needs.integration.result }}
+        run: test "$PREPARE_RESULT" = success && test "$INTEGRATION_RESULT" = success
